@@ -13,7 +13,7 @@
 - **Zero External Dependencies**: Implemented strictly using the Go standard library (`sync`, `container/list`, `math`, `strings`).
 - **Unified Interface**: Seamlessly switch between cache implementations (`MapCache`, `RadixCache`, `ArenaRadixCache`) without changing application logic.
 - **Size-Aware Eviction**: Eviction is driven by actual byte or logical size (`ValueType.Size()`), not just entry count.
-- **Subtree Prefix Eviction**: $O(\text{prefix\_len} + \text{subtree\_size})$ prefix deletion via radix tree engines—up to **20x–70x faster** than map scans.
+- **Subtree Prefix Eviction**: `O(prefix_len + subtree_size)` prefix deletion via radix tree engines—up to **20x–70x faster** than map scans.
 - **Memory Compactness**: Radix engines reduce heap footprint by **20% to 31%** compared to standard map-based LRUs.
 - **Zero GC Pointer Scanning**: The arena-backed engine allocates nodes in contiguous slice memory with 32-bit indices, eliminating garbage collector pointer graph traversals.
 - **Concurrent Safety**: Full multi-goroutine thread safety protected by standard synchronization (`sync.RWMutex` / `sync.Mutex`).
@@ -29,11 +29,11 @@
 | **Node Representation** | `list.Element` (48 B) + `entry` (32 B) + Map Buckets | `radixNode` struct (72 B heap object) | `arenaRadixNode` struct (56 B contiguous array entry) |
 | **Per-Node Heap Allocations** | 2–3 allocations per entry | 1 allocation per node | **0 allocations** (recycled via free-list) |
 | **Node Pointer Width** | 64-bit pointers | 64-bit pointers (5 pointers / node) | **32-bit indices** (`uint32`) |
-| **Max Entry Capacity** | Memory / Heap limited | Memory / Heap limited | **$2^{32}-1$ entries** (~4.29 billion nodes) |
-| **Point Lookup Latency** | **~50 ns/op** ($O(1)$ Hash Map) | ~170 ns/op ($O(K)$ Trie Descent) | **~100 ns/op** ($O(1)$ Hash Map + Zero-Alloc Path Check) |
+| **Max Entry Capacity** | Memory / Heap limited | Memory / Heap limited | **`2^32 - 1` entries** (~4.29 billion nodes) |
+| **Point Lookup Latency** | **~50 ns/op** (`O(1)` Hash Map) | ~170 ns/op (`O(K)` Trie Descent) | **~100 ns/op** (`O(1)` Hash Map + Zero-Alloc Path Check) |
 | **Sequential Insert Latency** | ~98 ns/op | ~175 ns/op (0 allocs) | ~270 ns/op |
 | **Point Update Latency** | ~82 ns/op | ~97 ns/op (0 allocs) | ~88 ns/op (0 allocs) |
-| **Prefix Erase (100 items)** | ~160 µs ($O(N)$ full scan) | **~2.2 µs** (**71x faster**) | **~27.6 µs** (**6x faster**) |
+| **Prefix Erase (100 items)** | ~160 µs (`O(N)` full scan) | **~2.2 µs** (**71x faster**) | **~27.6 µs** (**6x faster**) |
 | **Prefix Erase (50K/100K items)** | ~21.6 ms | **~1.05 ms** (**20.5x faster**) | ~13.6 ms |
 | **1M Items Heap Memory** | ~129.6 MB (~135.9 B/entry) | **~89.8 MB** (**~30.7% reduction**) | **~101.9 MB** (**~21.4% reduction**) |
 | **GC Pressure & Overhead** | High (millions of distinct heap objects) | Moderate (heap nodes with pointers) | **Ultra-Low** (flat slice; indices invisible to GC) |
@@ -47,16 +47,16 @@
 ### 1. `MapCache` (Standard Map LRU)
 The classic LRU implementation combining Go's built-in `map[string]*list.Element` with `container/list.List`.
 - **Strengths**: Fastest point lookups (~50 ns) and inserts (~98 ns).
-- **Trade-offs**: Prefix deletion requires a linear $O(N)$ scan across all map keys. Highest heap overhead per entry (~136 B/entry).
+- **Trade-offs**: Prefix deletion requires a linear `O(N)` scan across all map keys. Highest heap overhead per entry (~136 B/entry).
 
 ### 2. `RadixCache` (Pointer-Based Radix Tree LRU)
 A compact Radix Tree with Left-Child Right-Sibling (LCRS) tree layout and embedded intrusive doubly-linked list pointers (`prev`, `next`, `parent`, `child`, `sibling`).
 - **Strengths**: Subtree detachment allows deleting entire directory subtrees in microseconds. Uses ~30.7% less memory than `MapCache` due to prefix path compression. Zero-allocation node updates.
-- **Trade-offs**: Point lookups require traversing tree edges ($O(K)$ where $K$ is key length).
+- **Trade-offs**: Point lookups require traversing tree edges (`O(K)` where `K` is key length).
 
 ### 3. `ArenaRadixCache` (Flat-Slice Arena Radix Tree LRU)
-An arena-allocated radix tree storing all nodes in a contiguous slice `[]arenaRadixNode` indexed by 32-bit integers (`uint32`). Integrates an $O(1)$ FNV-1a hash map accelerator with zero-allocation bottom-up key verification (`verifyKey`).
-- **Strengths**: Constant-time lookup acceleration (~100 ns). Zero per-node heap allocations after warm-up via $O(1)$ singly-linked `freeHead` free-list reuse. Zero garbage collector pointer tracing overhead.
+An arena-allocated radix tree storing all nodes in a contiguous slice `[]arenaRadixNode` indexed by 32-bit integers (`uint32`). Integrates an `O(1)` FNV-1a hash map accelerator with zero-allocation bottom-up key verification (`verifyKey`).
+- **Strengths**: Constant-time lookup acceleration (~100 ns). Zero per-node heap allocations after warm-up via `O(1)` singly-linked `freeHead` free-list reuse. Zero garbage collector pointer tracing overhead.
 - **Trade-offs**: Slightly higher insert latency due to hash table maintenance and array index lookups.
 
 ---
@@ -173,7 +173,7 @@ cache := lrus.NewMapCache(1000000, lrus.WithInvariantChecking(true))
 
 When `WithInvariantChecking(true)` is enabled:
 - **`MapCache`**: Verifies `len(map) == entries.Len()`, total aggregated size matches `currentSize <= maxSize`, and bidirectional linked list pointer bijection.
-- **`RadixCache`**: Executes an $O(1)$-space non-recursive tree walk validating pre-order LCRS child/sibling links, LRU linked list consistency, and size accounting.
+- **`RadixCache`**: Executes an `O(1)`-space non-recursive tree walk validating pre-order LCRS child/sibling links, LRU linked list consistency, and size accounting.
 - **`ArenaRadixCache`**: Validates 32-bit array index references, free-list integrity, hash index 1:1 mapping, and tree-to-LRU bijection.
 
 *Note: Invariant validation is designed for testing/debugging and should be disabled (`false`, the default) in production for maximum throughput.*
@@ -200,7 +200,7 @@ Benchmarks executed on an **Intel Xeon CPU @ 2.60GHz (96 cores)**:
 
 ### 2. Prefix Deletion Latency (Subtree Eviction)
 
-| Prefix Topology | `MapCache` ($O(N)$ Scan) | `RadixCache` ($O(P+S)$ Subtree) | Speedup vs Map |
+| Prefix Topology | `MapCache` (`O(N)` Scan) | `RadixCache` (`O(P + S)` Subtree) | Speedup vs Map |
 | :--- | :--- | :--- | :--- |
 | **Flat Prefix (100 items)** | 160.6 µs/op | **2.25 µs/op** | **71.3x faster** |
 | **Nested Prefix (100 items)** | 151.2 µs/op | **2.30 µs/op** | **65.7x faster** |
