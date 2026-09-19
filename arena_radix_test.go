@@ -728,3 +728,348 @@ func TestArenaRadixCache_CheckInvariants_PanicScenarios(t *testing.T) {
 		c.checkInvariants()
 	})
 }
+
+func TestArenaRadixCache_ModeratePressureLosslessCompaction(t *testing.T) {
+	pressure := 0.10
+	c := NewArenaRadixCache(
+		20000,
+		WithInvariantChecking(true),
+		WithPressureFunc(func() float64 { return pressure }),
+		WithCompactionThreshold(0.75),
+		WithEvictionThreshold(0.90),
+	).(*arenaRadix)
+
+	// 1. Insert 1,000 hierarchical keys across shared prefixes.
+	const totalKeys = 1000
+	const survivingStart = 900 // Keep keys 900..999 (100 keys)
+	for i := range totalKeys {
+		key := fmt.Sprintf("bucket_%02d/dir_%02d/sub_%02d/obj_%04d.bin", i%10, (i/10)%10, (i/100)%10, i)
+		_, err := c.Insert(key, arenaTestData{Value: int64(i), DataSize: 10})
+		if err != nil {
+			t.Fatalf("failed inserting key %d: %v", i, err)
+		}
+	}
+
+	peakNodeLen := len(c.nodes)
+	peakNodeCap := cap(c.nodes)
+	if peakNodeLen <= 1000 {
+		t.Fatalf("expected >1000 nodes with routing splits, got %d", peakNodeLen)
+	}
+
+	// 2. Erase first 900 keys under low pressure (accumulating a large free-list).
+	for i := range survivingStart {
+		key := fmt.Sprintf("bucket_%02d/dir_%02d/sub_%02d/obj_%04d.bin", i%10, (i/10)%10, (i/100)%10, i)
+		if v := c.Erase(key); v == nil {
+			t.Fatalf("expected key %d to be erased", i)
+		}
+	}
+
+	if c.freeHead == nilNode {
+		t.Fatalf("expected non-empty freeHead before compaction")
+	}
+	if len(c.nodes) != peakNodeLen {
+		t.Fatalf("expected uncompacted nodes len %d to match peak %d", len(c.nodes), peakNodeLen)
+	}
+
+	// 3. Raise pressure to moderate (0.80 >= 0.75) and evaluate memory pressure.
+	pressure = 0.80
+	evicted := c.EvaluateMemoryPressure()
+	if len(evicted) != 0 {
+		t.Fatalf("expected zero evictions under moderate pressure, got %d", len(evicted))
+	}
+
+	// 4. Verify arena slice and map compaction post-conditions.
+	if c.freeHead != nilNode {
+		t.Fatalf("expected freeHead == nilNode after compaction, got %d", c.freeHead)
+	}
+	if len(c.nodes) != cap(c.nodes) {
+		t.Fatalf("expected len(nodes) == cap(nodes) after compaction, got len=%d cap=%d", len(c.nodes), cap(c.nodes))
+	}
+	if cap(c.nodes) >= peakNodeCap {
+		t.Fatalf("expected compacted cap(nodes) (%d) < peakNodeCap (%d)", cap(c.nodes), peakNodeCap)
+	}
+	if c.len != 100 || c.currentSize != 1000 {
+		t.Fatalf("expected 100 live entries (size 1000), got len=%d size=%d", c.len, c.currentSize)
+	}
+
+	// 5. Verify 100% of surviving keys return exact values without altering LRU order.
+	for i := survivingStart; i < totalKeys; i++ {
+		key := fmt.Sprintf("bucket_%02d/dir_%02d/sub_%02d/obj_%04d.bin", i%10, (i/10)%10, (i/100)%10, i)
+		v := c.LookUpWithoutChangingOrder(key)
+		if v == nil || v.(arenaTestData).Value != int64(i) {
+			t.Fatalf("expected surviving key %d to have value %d, got %v", i, i, v)
+		}
+	}
+
+	// 6. Verify exact LRU eviction order of surviving keys (900 is oldest, 999 is newest).
+	pressure = 0.10
+	// Fill remaining capacity (20000 - 1000 = 19000 bytes).
+	_, err := c.Insert("filler", arenaTestData{Value: 999999, DataSize: 19000})
+	if err != nil {
+		t.Fatalf("failed inserting filler: %v", err)
+	}
+	// Each subsequent 10-byte insert must evict keys 900, 901, ..., 999 in exact LRU order.
+	for expectedID := survivingStart; expectedID < totalKeys; expectedID++ {
+		ev, err := c.Insert(fmt.Sprintf("trigger_%d", expectedID), arenaTestData{Value: -1, DataSize: 10})
+		if err != nil {
+			t.Fatalf("trigger insert failed at %d: %v", expectedID, err)
+		}
+		if len(ev) != 1 || ev[0].(arenaTestData).Value != int64(expectedID) {
+			t.Fatalf("expected evicted value %d at step %d, got %v", expectedID, expectedID, ev)
+		}
+	}
+}
+
+func TestArenaRadixCache_CriticalPressureLRUShedding(t *testing.T) {
+	pressure := 0.10
+	c := NewArenaRadixCache(
+		1000,
+		WithInvariantChecking(true),
+		WithPressureFunc(func() float64 { return pressure }),
+		WithCompactionThreshold(0.75),
+		WithEvictionThreshold(0.90),
+		WithEvictionRetentionRatio(0.40),
+	).(*arenaRadix)
+
+	// Insert 100 entries of size 10 (total 1000 bytes).
+	// Entry 0 is LRU tail; Entry 99 is MRU head.
+	for i := range 100 {
+		key := fmt.Sprintf("dir_%d/item_%03d", i%5, i)
+		_, err := c.Insert(key, arenaTestData{Value: int64(i), DataSize: 10})
+		if err != nil {
+			t.Fatalf("insert failed for %d: %v", i, err)
+		}
+	}
+
+	// Trigger critical pressure (0.95 >= 0.90): should shed down to 40% of 1000 = 400 bytes (evicting 60 items: 0..59).
+	pressure = 0.95
+	evicted := c.EvaluateMemoryPressure()
+
+	if len(evicted) != 60 {
+		t.Fatalf("expected exactly 60 entries evicted under critical pressure, got %d", len(evicted))
+	}
+	for i, ev := range evicted {
+		if ev.(arenaTestData).Value != int64(i) {
+			t.Fatalf("expected evicted[%d] to be oldest entry %d, got %d", i, i, ev.(arenaTestData).Value)
+		}
+	}
+
+	// Verify post-shedding state and compaction post-conditions.
+	if c.currentSize != 400 || c.len != 40 {
+		t.Fatalf("expected currentSize=400 and len=40 after shedding, got currentSize=%d len=%d", c.currentSize, c.len)
+	}
+	if c.freeHead != nilNode {
+		t.Fatalf("expected freeHead == nilNode after critical shedding + compaction")
+	}
+	if len(c.nodes) != cap(c.nodes) {
+		t.Fatalf("expected len(nodes) == cap(nodes) after shedding + compaction")
+	}
+
+	// Verify entries 0..59 are gone and entries 60..99 are intact.
+	for i := range 60 {
+		key := fmt.Sprintf("dir_%d/item_%03d", i%5, i)
+		if v := c.LookUpWithoutChangingOrder(key); v != nil {
+			t.Fatalf("expected evicted key %s to be absent, got %v", key, v)
+		}
+	}
+	for i := 60; i < 100; i++ {
+		key := fmt.Sprintf("dir_%d/item_%03d", i%5, i)
+		if v := c.LookUpWithoutChangingOrder(key); v == nil || v.(arenaTestData).Value != int64(i) {
+			t.Fatalf("expected retained MRU key %s to have value %d, got %v", key, i, v)
+		}
+	}
+}
+
+func TestArenaRadixCache_AutomaticPressureTriggersAndReentrancy(t *testing.T) {
+	pressure := 0.10
+	var cacheRef Cache
+	reentrantReads := 0
+
+	// Custom PressureFunc that calls LookUpWithoutChangingOrder on the cache itself
+	// to prove lock-free sampling prevents re-entrant RWMutex deadlocks.
+	c := NewArenaRadixCache(
+		1000,
+		WithInvariantChecking(true),
+		WithPressureFunc(func() float64 {
+			if cacheRef != nil {
+				_ = cacheRef.LookUpWithoutChangingOrder("probe_key")
+				reentrantReads++
+			}
+			return pressure
+		}),
+		WithCompactionThreshold(0.75),
+		WithEvictionThreshold(0.90),
+		WithEvictionRetentionRatio(0.50),
+	).(*arenaRadix)
+	cacheRef = c
+
+	// Populate 20 keys of size 10 (total 200 bytes) and erase 10 of them under low pressure.
+	for i := range 20 {
+		_, _ = c.Insert(fmt.Sprintf("k_%02d", i), arenaTestData{Value: int64(i), DataSize: 10})
+	}
+	for i := range 10 {
+		_ = c.Erase(fmt.Sprintf("k_%02d", i))
+	}
+	if c.freeHead == nilNode {
+		t.Fatalf("expected non-empty free list before automatic moderate compaction")
+	}
+
+	// 1. Automatic Tier 1 compaction on Erase under moderate pressure.
+	pressure = 0.80
+	_ = c.Erase("non_existent_key")
+	if c.freeHead != nilNode || len(c.nodes) != cap(c.nodes) {
+		t.Fatalf("expected Erase under moderate pressure to compact arena")
+	}
+
+	// 2. Automatic Tier 2 shedding on Insert under critical pressure.
+	// Before insert: 10 entries (100 bytes). Insert 1 entry (10 bytes) -> 110 bytes.
+	// Retention 50% of 110 bytes = 55 bytes -> sheds down to 50 bytes (5 entries).
+	pressure = 0.95
+	evicted, err := c.Insert("new_mru", arenaTestData{Value: 999, DataSize: 10})
+	if err != nil {
+		t.Fatalf("Insert under critical pressure failed: %v", err)
+	}
+	if len(evicted) != 6 {
+		t.Fatalf("expected 6 LRU entries evicted during Insert under critical pressure, got %d", len(evicted))
+	}
+	if c.currentSize != 50 || c.freeHead != nilNode {
+		t.Fatalf("expected currentSize=50 and freeHead==nilNode, got size=%d freeHead=%d", c.currentSize, c.freeHead)
+	}
+	if reentrantReads == 0 {
+		t.Fatalf("expected reentrant PressureFunc callback to have executed")
+	}
+}
+
+func TestArenaRadixCache_CompactionAndSheddingEdgeCases(t *testing.T) {
+	t.Run("EmptyCacheCompactionAndShedding", func(t *testing.T) {
+		pressure := 0.95
+		c := NewArenaRadixCache(
+			100,
+			WithInvariantChecking(true),
+			WithPressureFunc(func() float64 { return pressure }),
+		).(*arenaRadix)
+
+		c.Compact()
+		ev := c.EvaluateMemoryPressure()
+		if len(ev) != 0 {
+			t.Fatalf("expected 0 evictions on empty cache, got %d", len(ev))
+		}
+		if len(c.nodes) != 1 || cap(c.nodes) != 1 || c.root != 0 || c.freeHead != nilNode {
+			t.Fatalf("expected single root node after empty cache compaction, got len=%d cap=%d root=%d", len(c.nodes), cap(c.nodes), c.root)
+		}
+	})
+
+	t.Run("SingleLargeEntryShedding", func(t *testing.T) {
+		pressure := 0.95
+		c := NewArenaRadixCache(
+			100,
+			WithInvariantChecking(true),
+			WithPressureFunc(func() float64 { return pressure }),
+			WithEvictionRetentionRatio(0.50),
+		).(*arenaRadix)
+
+		pressure = 0.0
+		_, _ = c.Insert("only_item", arenaTestData{Value: 42, DataSize: 80})
+
+		pressure = 0.95
+		ev := c.EvaluateMemoryPressure()
+		if len(ev) != 1 || ev[0].(arenaTestData).Value != 42 {
+			t.Fatalf("expected single large entry to be shed, got %v", ev)
+		}
+		if c.len != 0 || c.currentSize != 0 || len(c.nodes) != 1 || cap(c.nodes) != 1 {
+			t.Fatalf("expected cache reduced to root node only, got len=%d size=%d nodes=%d", c.len, c.currentSize, len(c.nodes))
+		}
+	})
+
+	t.Run("EmptyStringKeyAtRoot", func(t *testing.T) {
+		c := NewArenaRadixCache(100, WithInvariantChecking(true)).(*arenaRadix)
+		_, _ = c.Insert("", arenaTestData{Value: 777, DataSize: 10})
+		_, _ = c.Insert("a/b/c", arenaTestData{Value: 888, DataSize: 10})
+		_ = c.Erase("a/b/c")
+
+		c.Compact()
+		if v := c.LookUpWithoutChangingOrder(""); v == nil || v.(arenaTestData).Value != 777 {
+			t.Fatalf("expected root empty key value 777 preserved across compaction, got %v", v)
+		}
+	})
+
+	t.Run("ZeroSizeEntriesTermination", func(t *testing.T) {
+		pressure := 0.0
+		c := NewArenaRadixCache(
+			100,
+			WithInvariantChecking(true),
+			WithPressureFunc(func() float64 { return pressure }),
+			WithEvictionRetentionRatio(0.25),
+		).(*arenaRadix)
+
+		for i := range 5 {
+			_, _ = c.Insert(fmt.Sprintf("zero_%d", i), arenaTestData{Value: int64(i), DataSize: 0})
+		}
+		_, _ = c.Insert("nonzero", arenaTestData{Value: 99, DataSize: 40})
+
+		pressure = 0.95
+		ev := c.EvaluateMemoryPressure()
+		if c.currentSize > 10 {
+			t.Fatalf("expected currentSize <= 10 after shedding, got %d (evicted=%d)", c.currentSize, len(ev))
+		}
+	})
+}
+
+func TestArenaRadixCache_CheckInvariants_ExtendedChecks(t *testing.T) {
+	t.Run("NodeMapOutOfBounds", func(t *testing.T) {
+		c := NewArenaRadixCache(50).(*arenaRadix)
+		_, _ = c.Insert("k1", arenaTestData{Value: 1, DataSize: 10})
+		c.nodeMap[hashString("k1")] = 999
+		defer func() {
+			if r := recover(); r == nil {
+				t.Errorf("expected panic on nodeMap out-of-bounds index")
+			}
+		}()
+		c.checkInvariants()
+	})
+
+	t.Run("NodeMapNilValue", func(t *testing.T) {
+		c := NewArenaRadixCache(50).(*arenaRadix)
+		_, _ = c.Insert("k1", arenaTestData{Value: 1, DataSize: 10})
+		c.nodeMap[hashString("k1")] = c.root // c.root has nil value
+		defer func() {
+			if r := recover(); r == nil {
+				t.Errorf("expected panic on nodeMap pointing to nil-value node")
+			}
+		}()
+		c.checkInvariants()
+	})
+
+	t.Run("NodeMapHashMismatch", func(t *testing.T) {
+		c := NewArenaRadixCache(50).(*arenaRadix)
+		_, _ = c.Insert("k1", arenaTestData{Value: 1, DataSize: 10})
+		id := c.nodeMap[hashString("k1")]
+		c.nodeMap[12345] = id
+		defer func() {
+			if r := recover(); r == nil {
+				t.Errorf("expected panic on nodeMap hash mismatch")
+			}
+		}()
+		c.checkInvariants()
+	})
+
+	t.Run("LeakedNodeAccountingMismatch", func(t *testing.T) {
+		c := NewArenaRadixCache(50).(*arenaRadix)
+		_, _ = c.Insert("k1", arenaTestData{Value: 1, DataSize: 10})
+		// Append an unlinked orphan node that is neither in tree nor in free-list.
+		c.nodes = append(c.nodes, arenaRadixNode{
+			parent:  nilNode,
+			child:   nilNode,
+			sibling: nilNode,
+			prev:    nilNode,
+			next:    nilNode,
+		})
+		defer func() {
+			if r := recover(); r == nil {
+				t.Errorf("expected panic on liveTreeNodes + freeListCount != len(nodes)")
+			}
+		}()
+		c.checkInvariants()
+	})
+}
+

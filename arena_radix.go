@@ -440,3 +440,121 @@ func (c *arenaRadix) eraseInternal(nodeID uint32) ValueType {
 
 	return deletedEntry
 }
+
+// samplePressure reads normalized memory pressure lock-free outside c.mu.Lock()
+// to avoid re-entrant deadlocks and lock contention during metrics sampling.
+func (c *arenaRadix) samplePressure() float64 {
+	if c.options.PressureFunc != nil {
+		return c.options.PressureFunc()
+	}
+	return DefaultRuntimePressureFunc(c.options.MemoryBudget)()
+}
+
+// compactLocked performs lossless O(N) compaction of the node arena slice and hash lookup map.
+// It eliminates all free-list slots so len(c.nodes) == cap(c.nodes) == liveCount and c.freeHead == nilNode,
+// remaps all 8 uint32 index pointers (root, head, tail, parent, child, sibling, prev, next),
+// and reallocates c.nodeMap to eliminate Go map bucket slack while preserving 100% of live entries and LRU order.
+// Caller MUST hold c.mu.Lock().
+func (c *arenaRadix) compactLocked() {
+	oldLen := uint32(len(c.nodes))
+	oldToNew := make([]uint32, oldLen)
+
+	var liveCount uint32
+	for oldID := uint32(0); oldID < oldLen; oldID++ {
+		if oldID == c.root || c.nodes[oldID].parent != nilNode {
+			oldToNew[oldID] = liveCount
+			liveCount++
+		} else {
+			oldToNew[oldID] = nilNode
+		}
+	}
+
+	remap := func(idx uint32) uint32 {
+		if idx == nilNode {
+			return nilNode
+		}
+		return oldToNew[idx]
+	}
+
+	// Allocate brand-new slice with len(newNodes) == cap(newNodes) == liveCount.
+	newNodes := make([]arenaRadixNode, liveCount)
+	for oldID := uint32(0); oldID < oldLen; oldID++ {
+		newID := oldToNew[oldID]
+		if newID == nilNode {
+			continue
+		}
+		oldNode := &c.nodes[oldID]
+		newNodes[newID] = arenaRadixNode{
+			prefix:  oldNode.prefix,
+			value:   oldNode.value,
+			size:    oldNode.size,
+			parent:  remap(oldNode.parent),
+			child:   remap(oldNode.child),
+			sibling: remap(oldNode.sibling),
+			prev:    remap(oldNode.prev),
+			next:    remap(oldNode.next),
+		}
+	}
+
+	// Remap top-level arena indices and clear free-list head.
+	c.root = remap(c.root)
+	c.head = remap(c.head)
+	c.tail = remap(c.tail)
+	c.freeHead = nilNode
+	c.nodes = newNodes
+
+	// Allocate brand-new hash accelerator map to reclaim Go map bucket slack.
+	newNodeMap := make(map[uint64]uint32, len(c.nodeMap))
+	for h, oldID := range c.nodeMap {
+		if newID := remap(oldID); newID != nilNode {
+			newNodeMap[h] = newID
+		}
+	}
+	c.nodeMap = newNodeMap
+}
+
+// shedAndCompactLocked evicts least-recently-used entries strictly from c.tail until
+// c.currentSize <= targetSize (or the cache is empty), then performs lossless
+// arena and map compaction.
+// Caller MUST hold c.mu.Lock().
+func (c *arenaRadix) shedAndCompactLocked(targetSize uint64) []ValueType {
+	var evicted []ValueType
+	for c.currentSize > targetSize && c.tail != nilNode {
+		if val := c.evictOne(); val != nil {
+			evicted = append(evicted, val)
+		}
+	}
+	c.compactLocked()
+	return evicted
+}
+
+// maybeReclaimUnderPressureLocked evaluates the sampled pressure against configured thresholds:
+// - If pressure >= evictionThreshold (Tier 2 Critical Pressure): evict from LRU tail down to retention ratio, then compact.
+// - Else if pressure >= compactionThreshold (Tier 1 Moderate Pressure): perform lossless arena and map compaction.
+// Caller MUST hold c.mu.Lock().
+func (c *arenaRadix) maybeReclaimUnderPressureLocked(pressure float64) []ValueType {
+	compactThresh := c.options.CompactionThreshold
+	if compactThresh <= 0 {
+		compactThresh = DefaultCompactionThreshold
+	}
+	evictThresh := c.options.EvictionThreshold
+	if evictThresh <= 0 {
+		evictThresh = DefaultEvictionThreshold
+	}
+
+	if pressure >= evictThresh {
+		retention := c.options.EvictionRetentionRatio
+		if retention < 0 {
+			retention = DefaultEvictionRetentionRatio
+		} else if retention > 1.0 {
+			retention = 1.0
+		}
+		targetSize := uint64(float64(c.currentSize) * retention)
+		return c.shedAndCompactLocked(targetSize)
+	}
+	if pressure >= compactThresh {
+		c.compactLocked()
+	}
+	return nil
+}
+

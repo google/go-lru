@@ -15,6 +15,9 @@
 package lrus
 
 import (
+	"math"
+	"runtime/debug"
+	"sync"
 	"testing"
 )
 
@@ -140,3 +143,128 @@ func TestConstructors_Validation(t *testing.T) {
 		})
 	}
 }
+
+func TestOptions_MemoryPressureDefaults(t *testing.T) {
+	if DefaultCompactionThreshold != 0.75 {
+		t.Errorf("expected DefaultCompactionThreshold == 0.75, got %v", DefaultCompactionThreshold)
+	}
+	if DefaultEvictionThreshold != 0.90 {
+		t.Errorf("expected DefaultEvictionThreshold == 0.90, got %v", DefaultEvictionThreshold)
+	}
+	if DefaultEvictionRetentionRatio != 0.50 {
+		t.Errorf("expected DefaultEvictionRetentionRatio == 0.50, got %v", DefaultEvictionRetentionRatio)
+	}
+
+	opts := ApplyOptions()
+	if opts.CompactionThreshold != DefaultCompactionThreshold {
+		t.Errorf("expected default CompactionThreshold %v, got %v", DefaultCompactionThreshold, opts.CompactionThreshold)
+	}
+	if opts.EvictionThreshold != DefaultEvictionThreshold {
+		t.Errorf("expected default EvictionThreshold %v, got %v", DefaultEvictionThreshold, opts.EvictionThreshold)
+	}
+	if opts.EvictionRetentionRatio != DefaultEvictionRetentionRatio {
+		t.Errorf("expected default EvictionRetentionRatio %v, got %v", DefaultEvictionRetentionRatio, opts.EvictionRetentionRatio)
+	}
+	if opts.PressureFunc == nil {
+		t.Fatalf("expected non-nil default PressureFunc")
+	}
+}
+
+func TestOptions_MemoryPressureCustomAndValidation(t *testing.T) {
+	customFn := func() float64 { return 0.88 }
+	opts := ApplyOptions(
+		WithPressureFunc(customFn),
+		WithMemoryBudget(256*1024*1024),
+		WithCompactionThreshold(0.60),
+		WithEvictionThreshold(0.85),
+		WithEvictionRetentionRatio(0.35),
+	)
+
+	if opts.MemoryBudget != 256*1024*1024 {
+		t.Errorf("expected MemoryBudget 268435456, got %d", opts.MemoryBudget)
+	}
+	if opts.CompactionThreshold != 0.60 {
+		t.Errorf("expected CompactionThreshold 0.60, got %v", opts.CompactionThreshold)
+	}
+	if opts.EvictionThreshold != 0.85 {
+		t.Errorf("expected EvictionThreshold 0.85, got %v", opts.EvictionThreshold)
+	}
+	if opts.EvictionRetentionRatio != 0.35 {
+		t.Errorf("expected EvictionRetentionRatio 0.35, got %v", opts.EvictionRetentionRatio)
+	}
+	if opts.PressureFunc == nil || opts.PressureFunc() != 0.88 {
+		t.Errorf("expected custom PressureFunc returning 0.88, got %v", opts.PressureFunc())
+	}
+
+	// Verify explicit 0.0 retention ratio is preserved (shed 100%).
+	optsZeroRetention := ApplyOptions(WithEvictionRetentionRatio(0.0))
+	if optsZeroRetention.EvictionRetentionRatio != 0.0 {
+		t.Errorf("expected explicit 0.0 EvictionRetentionRatio to be preserved, got %v", optsZeroRetention.EvictionRetentionRatio)
+	}
+
+	// Verify out-of-range normalization.
+	optsClamped := ApplyOptions(
+		WithCompactionThreshold(-0.1),
+		WithEvictionThreshold(0),
+		WithEvictionRetentionRatio(1.5),
+	)
+	if optsClamped.CompactionThreshold != DefaultCompactionThreshold {
+		t.Errorf("expected negative CompactionThreshold normalized to default, got %v", optsClamped.CompactionThreshold)
+	}
+	if optsClamped.EvictionThreshold != DefaultEvictionThreshold {
+		t.Errorf("expected zero EvictionThreshold normalized to default, got %v", optsClamped.EvictionThreshold)
+	}
+	if optsClamped.EvictionRetentionRatio != 1.0 {
+		t.Errorf("expected >1.0 EvictionRetentionRatio clamped to 1.0, got %v", optsClamped.EvictionRetentionRatio)
+	}
+}
+
+func TestDefaultRuntimePressureFunc(t *testing.T) {
+	// Save and restore GOMEMLIMIT around test.
+	prevLimit := debug.SetMemoryLimit(-1)
+	defer debug.SetMemoryLimit(prevLimit)
+
+	// 1. When GOMEMLIMIT is unset (math.MaxInt64) and MemoryBudget == 0, pressure must be 0.0.
+	debug.SetMemoryLimit(math.MaxInt64)
+	probeUnbounded := DefaultRuntimePressureFunc(0)
+	if p := probeUnbounded(); p != 0.0 {
+		t.Errorf("expected 0.0 pressure when GOMEMLIMIT is unset and budget is 0, got %v", p)
+	}
+
+	// 2. When GOMEMLIMIT is set to 1 GiB, DefaultRuntimePressureFunc(0) returns positive pressure.
+	const oneGiB = int64(1 << 30)
+	debug.SetMemoryLimit(oneGiB)
+	pLimit := probeUnbounded()
+	if pLimit <= 0.0 || pLimit >= 1.0 {
+		t.Errorf("expected runtime pressure in (0.0, 1.0) with 1 GiB GOMEMLIMIT, got %v", pLimit)
+	}
+
+	// 3. Custom MemoryBudget overrides GOMEMLIMIT.
+	probeBudget512MB := DefaultRuntimePressureFunc(512 << 20)
+	probeBudget2GB := DefaultRuntimePressureFunc(2 << 30)
+	p512 := probeBudget512MB()
+	p2G := probeBudget2GB()
+	if p512 <= 0.0 || p2G <= 0.0 {
+		t.Fatalf("expected positive pressures for custom budgets, got p512=%v, p2G=%v", p512, p2G)
+	}
+	if p512 <= p2G {
+		t.Errorf("expected smaller budget (512MB) to report higher pressure than larger budget (2GB): p512=%v, p2G=%v", p512, p2G)
+	}
+
+	// 4. Concurrent race-free reads across multiple goroutines.
+	var wg sync.WaitGroup
+	for range 16 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for range 100 {
+				v := probeBudget512MB()
+				if v <= 0.0 {
+					t.Errorf("expected positive pressure in concurrent read, got %v", v)
+				}
+			}
+		}()
+	}
+	wg.Wait()
+}
+
