@@ -208,7 +208,7 @@ func (c *arenaRadix) checkInvariants() {
 		if c.nodes[id].value == nil {
 			panic(fmt.Sprintf("arenaRadix invariant violation: nodeMap points to node %d with nil value", id))
 		}
-		if hashString(c.getFullKey(id)) != h {
+		if c.hashNodeKey(id) != h {
 			panic(fmt.Sprintf("arenaRadix invariant violation: nodeMap hash mismatch for node %d", id))
 		}
 	}
@@ -229,6 +229,10 @@ func (c *arenaRadix) checkInvariants() {
 		if freeCount > len(c.nodes) {
 			panic("arenaRadix invariant violation: cycle detected in free-list")
 		}
+	}
+
+	if uint32(freeCount) != c.freeCount {
+		panic(fmt.Sprintf("arenaRadix invariant violation: free-list walk count (%d) != tracked freeCount (%d)", freeCount, c.freeCount))
 	}
 
 	if treeNodeCount+freeCount != len(c.nodes) {
@@ -254,7 +258,7 @@ func (c *arenaRadix) Compact() {
 // or Tier 1 (lossless compaction) if pressure meets or exceeds the configured thresholds.
 // Returns any values evicted during Tier 2 critical-pressure shedding.
 func (c *arenaRadix) EvaluateMemoryPressure() []ValueType {
-	pressure := c.samplePressure()
+	pressure := c.samplePressureFresh()
 
 	c.mu.Lock()
 	defer func() {
@@ -264,7 +268,7 @@ func (c *arenaRadix) EvaluateMemoryPressure() []ValueType {
 		c.mu.Unlock()
 	}()
 
-	return c.maybeReclaimUnderPressureLocked(pressure)
+	return c.maybeReclaimUnderPressureLocked(pressure, nilNode)
 }
 
 // Insert inserts or updates the given key and value in the cache.
@@ -303,7 +307,8 @@ func (c *arenaRadix) Insert(key string, value ValueType) ([]ValueType, error) {
 		evictedValues = append(evictedValues, c.evictOne())
 	}
 
-	if nodeID, oldValue := c.insertNode(key, value); oldValue != nil {
+	nodeID, oldValue := c.insertNode(key, value)
+	if oldValue != nil {
 		c.currentSize -= c.nodes[nodeID].size
 		c.currentSize += valueSize
 		c.nodes[nodeID].size = valueSize
@@ -321,7 +326,7 @@ func (c *arenaRadix) Insert(key string, value ValueType) ([]ValueType, error) {
 		evictedValues = append(evictedValues, c.evictOne())
 	}
 
-	if evictedByPressure := c.maybeReclaimUnderPressureLocked(pressure); len(evictedByPressure) > 0 {
+	if evictedByPressure := c.maybeReclaimUnderPressureLocked(pressure, nodeID); len(evictedByPressure) > 0 {
 		evictedValues = append(evictedValues, evictedByPressure...)
 	}
 
@@ -342,12 +347,11 @@ func (c *arenaRadix) Erase(key string) (value ValueType) {
 
 	nodeID, ok := c.getNodeKey(key)
 	if !ok {
-		c.maybeReclaimUnderPressureLocked(pressure)
 		return nil
 	}
 
 	deleted := c.eraseInternal(nodeID)
-	c.maybeReclaimUnderPressureLocked(pressure)
+	c.maybeCompactUnderPressureLocked(pressure)
 	return deleted
 }
 
@@ -400,6 +404,8 @@ func (c *arenaRadix) UpdateWithoutChangingOrder(key string, value ValueType) err
 		return ErrInvalidEntry
 	}
 
+	valueSize := value.Size()
+
 	c.mu.Lock()
 	defer func() {
 		if c.options.EnableInvariantChecking {
@@ -413,7 +419,7 @@ func (c *arenaRadix) UpdateWithoutChangingOrder(key string, value ValueType) err
 		return ErrEntryNotExist
 	}
 
-	if value.Size() != c.nodes[nodeID].size {
+	if valueSize != c.nodes[nodeID].size {
 		return ErrInvalidUpdateEntrySize
 	}
 
@@ -438,7 +444,6 @@ func (c *arenaRadix) UpdateSize(key string, sizeDelta uint64) error {
 
 	nodeID, ok := c.getNodeKey(key)
 	if !ok {
-		c.maybeReclaimUnderPressureLocked(pressure)
 		return ErrEntryNotExist
 	}
 
@@ -455,7 +460,7 @@ func (c *arenaRadix) UpdateSize(key string, sizeDelta uint64) error {
 		c.evictOne()
 	}
 
-	c.maybeReclaimUnderPressureLocked(pressure)
+	c.maybeCompactUnderPressureLocked(pressure)
 	return nil
 }
 
@@ -475,14 +480,17 @@ func (c *arenaRadix) EraseEntriesWithGivenPrefix(prefix string) {
 	if prefix == "" {
 		c.nodes = nil
 		c.freeHead = nilNode
+		c.freeCount = 0
 
 		c.root = c.allocateNode()
 		c.head = nilNode
 		c.tail = nilNode
 		c.currentSize = 0
 		c.len = 0
-		clear(c.nodeMap)
-		c.maybeReclaimUnderPressureLocked(pressure)
+		c.nodeMap = make(map[uint64]uint32)
+		if pressure >= c.options.CompactionThreshold {
+			c.compactLocked()
+		}
 		return
 	}
 
@@ -492,7 +500,6 @@ func (c *arenaRadix) EraseEntriesWithGivenPrefix(prefix string) {
 	for len(search) > 0 {
 		childID := c.getChild(nodeID, search[0])
 		if childID == nilNode {
-			c.maybeReclaimUnderPressureLocked(pressure)
 			return // Prefix doesn't exist
 		}
 
@@ -509,7 +516,7 @@ func (c *arenaRadix) EraseEntriesWithGivenPrefix(prefix string) {
 			// Now sweep the detached subtree to fix LRU, nodeMap, and currentSize
 			c.freeSubtree(childID)
 			c.compressPathUpwards(nodeID)
-			c.maybeReclaimUnderPressureLocked(pressure)
+			c.maybeCompactUnderPressureLocked(pressure)
 			return
 		}
 
@@ -519,7 +526,6 @@ func (c *arenaRadix) EraseEntriesWithGivenPrefix(prefix string) {
 			continue
 		}
 
-		c.maybeReclaimUnderPressureLocked(pressure)
 		return
 	}
 }
@@ -535,7 +541,7 @@ func (c *arenaRadix) freeSubtree(nodeID uint32) {
 		if c.nodes[currID].value != nil {
 			c.currentSize -= c.nodes[currID].size
 			c.remove(currID)
-			hash := hashString(c.getFullKey(currID))
+			hash := c.hashNodeKey(currID)
 			if c.nodeMap[hash] == currID {
 				delete(c.nodeMap, hash)
 			}

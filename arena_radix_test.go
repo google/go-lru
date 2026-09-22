@@ -18,6 +18,10 @@ import (
 	"errors"
 	"fmt"
 	"testing"
+	"time"
+
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 const arenaTestMaxSize = 50
@@ -730,6 +734,7 @@ func TestArenaRadixCache_CheckInvariants_PanicScenarios(t *testing.T) {
 }
 
 func TestArenaRadixCache_ModeratePressureLosslessCompaction(t *testing.T) {
+	// Arrange
 	pressure := 0.10
 	c := NewArenaRadixCache(
 		20000,
@@ -739,88 +744,59 @@ func TestArenaRadixCache_ModeratePressureLosslessCompaction(t *testing.T) {
 		WithEvictionThreshold(0.90),
 	).(*arenaRadix)
 
-	// 1. Insert 1,000 hierarchical keys across shared prefixes.
 	const totalKeys = 1000
 	const survivingStart = 900 // Keep keys 900..999 (100 keys)
 	for i := range totalKeys {
 		key := fmt.Sprintf("bucket_%02d/dir_%02d/sub_%02d/obj_%04d.bin", i%10, (i/10)%10, (i/100)%10, i)
 		_, err := c.Insert(key, arenaTestData{Value: int64(i), DataSize: 10})
-		if err != nil {
-			t.Fatalf("failed inserting key %d: %v", i, err)
-		}
+		require.NoError(t, err)
 	}
 
 	peakNodeLen := len(c.nodes)
 	peakNodeCap := cap(c.nodes)
-	if peakNodeLen <= 1000 {
-		t.Fatalf("expected >1000 nodes with routing splits, got %d", peakNodeLen)
-	}
+	require.Greater(t, peakNodeLen, 1000)
 
-	// 2. Erase first 900 keys under low pressure (accumulating a large free-list).
 	for i := range survivingStart {
 		key := fmt.Sprintf("bucket_%02d/dir_%02d/sub_%02d/obj_%04d.bin", i%10, (i/10)%10, (i/100)%10, i)
-		if v := c.Erase(key); v == nil {
-			t.Fatalf("expected key %d to be erased", i)
-		}
+		require.NotNil(t, c.Erase(key))
 	}
+	require.NotEqual(t, nilNode, c.freeHead)
+	require.Greater(t, c.freeCount, uint32(0))
+	require.Equal(t, peakNodeLen, len(c.nodes))
 
-	if c.freeHead == nilNode {
-		t.Fatalf("expected non-empty freeHead before compaction")
-	}
-	if len(c.nodes) != peakNodeLen {
-		t.Fatalf("expected uncompacted nodes len %d to match peak %d", len(c.nodes), peakNodeLen)
-	}
-
-	// 3. Raise pressure to moderate (0.80 >= 0.75) and evaluate memory pressure.
+	// Act
 	pressure = 0.80
 	evicted := c.EvaluateMemoryPressure()
-	if len(evicted) != 0 {
-		t.Fatalf("expected zero evictions under moderate pressure, got %d", len(evicted))
-	}
 
-	// 4. Verify arena slice and map compaction post-conditions.
-	if c.freeHead != nilNode {
-		t.Fatalf("expected freeHead == nilNode after compaction, got %d", c.freeHead)
-	}
-	if len(c.nodes) != cap(c.nodes) {
-		t.Fatalf("expected len(nodes) == cap(nodes) after compaction, got len=%d cap=%d", len(c.nodes), cap(c.nodes))
-	}
-	if cap(c.nodes) >= peakNodeCap {
-		t.Fatalf("expected compacted cap(nodes) (%d) < peakNodeCap (%d)", cap(c.nodes), peakNodeCap)
-	}
-	if c.len != 100 || c.currentSize != 1000 {
-		t.Fatalf("expected 100 live entries (size 1000), got len=%d size=%d", c.len, c.currentSize)
-	}
+	// Assert
+	assert.Empty(t, evicted)
+	assert.Equal(t, nilNode, c.freeHead)
+	assert.Equal(t, uint32(0), c.freeCount)
+	assert.Equal(t, len(c.nodes), cap(c.nodes))
+	assert.Less(t, cap(c.nodes), peakNodeCap)
+	assert.Equal(t, 100, c.len)
+	assert.Equal(t, uint64(1000), c.currentSize)
 
-	// 5. Verify 100% of surviving keys return exact values without altering LRU order.
 	for i := survivingStart; i < totalKeys; i++ {
 		key := fmt.Sprintf("bucket_%02d/dir_%02d/sub_%02d/obj_%04d.bin", i%10, (i/10)%10, (i/100)%10, i)
 		v := c.LookUpWithoutChangingOrder(key)
-		if v == nil || v.(arenaTestData).Value != int64(i) {
-			t.Fatalf("expected surviving key %d to have value %d, got %v", i, i, v)
-		}
+		require.NotNil(t, v)
+		assert.Equal(t, int64(i), v.(arenaTestData).Value)
 	}
 
-	// 6. Verify exact LRU eviction order of surviving keys (900 is oldest, 999 is newest).
 	pressure = 0.10
-	// Fill remaining capacity (20000 - 1000 = 19000 bytes).
 	_, err := c.Insert("filler", arenaTestData{Value: 999999, DataSize: 19000})
-	if err != nil {
-		t.Fatalf("failed inserting filler: %v", err)
-	}
-	// Each subsequent 10-byte insert must evict keys 900, 901, ..., 999 in exact LRU order.
+	require.NoError(t, err)
 	for expectedID := survivingStart; expectedID < totalKeys; expectedID++ {
 		ev, err := c.Insert(fmt.Sprintf("trigger_%d", expectedID), arenaTestData{Value: -1, DataSize: 10})
-		if err != nil {
-			t.Fatalf("trigger insert failed at %d: %v", expectedID, err)
-		}
-		if len(ev) != 1 || ev[0].(arenaTestData).Value != int64(expectedID) {
-			t.Fatalf("expected evicted value %d at step %d, got %v", expectedID, expectedID, ev)
-		}
+		require.NoError(t, err)
+		require.Len(t, ev, 1)
+		assert.Equal(t, int64(expectedID), ev[0].(arenaTestData).Value)
 	}
 }
 
 func TestArenaRadixCache_CriticalPressureLRUShedding(t *testing.T) {
+	// Arrange
 	pressure := 0.10
 	c := NewArenaRadixCache(
 		1000,
@@ -831,68 +807,54 @@ func TestArenaRadixCache_CriticalPressureLRUShedding(t *testing.T) {
 		WithEvictionRetentionRatio(0.40),
 	).(*arenaRadix)
 
-	// Insert 100 entries of size 10 (total 1000 bytes).
-	// Entry 0 is LRU tail; Entry 99 is MRU head.
 	for i := range 100 {
 		key := fmt.Sprintf("dir_%d/item_%03d", i%5, i)
 		_, err := c.Insert(key, arenaTestData{Value: int64(i), DataSize: 10})
-		if err != nil {
-			t.Fatalf("insert failed for %d: %v", i, err)
-		}
+		require.NoError(t, err)
 	}
 
-	// Trigger critical pressure (0.95 >= 0.90): should shed down to 40% of 1000 = 400 bytes (evicting 60 items: 0..59).
+	// Act
 	pressure = 0.95
 	evicted := c.EvaluateMemoryPressure()
 
-	if len(evicted) != 60 {
-		t.Fatalf("expected exactly 60 entries evicted under critical pressure, got %d", len(evicted))
-	}
+	// Assert
+	require.Len(t, evicted, 60)
 	for i, ev := range evicted {
-		if ev.(arenaTestData).Value != int64(i) {
-			t.Fatalf("expected evicted[%d] to be oldest entry %d, got %d", i, i, ev.(arenaTestData).Value)
-		}
+		assert.Equal(t, int64(i), ev.(arenaTestData).Value)
 	}
+	assert.Equal(t, uint64(400), c.currentSize)
+	assert.Equal(t, 40, c.len)
+	assert.Equal(t, nilNode, c.freeHead)
+	assert.Equal(t, uint32(0), c.freeCount)
+	assert.Equal(t, len(c.nodes), cap(c.nodes))
 
-	// Verify post-shedding state and compaction post-conditions.
-	if c.currentSize != 400 || c.len != 40 {
-		t.Fatalf("expected currentSize=400 and len=40 after shedding, got currentSize=%d len=%d", c.currentSize, c.len)
-	}
-	if c.freeHead != nilNode {
-		t.Fatalf("expected freeHead == nilNode after critical shedding + compaction")
-	}
-	if len(c.nodes) != cap(c.nodes) {
-		t.Fatalf("expected len(nodes) == cap(nodes) after shedding + compaction")
-	}
-
-	// Verify entries 0..59 are gone and entries 60..99 are intact.
 	for i := range 60 {
 		key := fmt.Sprintf("dir_%d/item_%03d", i%5, i)
-		if v := c.LookUpWithoutChangingOrder(key); v != nil {
-			t.Fatalf("expected evicted key %s to be absent, got %v", key, v)
-		}
+		assert.Nil(t, c.LookUpWithoutChangingOrder(key))
 	}
 	for i := 60; i < 100; i++ {
 		key := fmt.Sprintf("dir_%d/item_%03d", i%5, i)
-		if v := c.LookUpWithoutChangingOrder(key); v == nil || v.(arenaTestData).Value != int64(i) {
-			t.Fatalf("expected retained MRU key %s to have value %d, got %v", key, i, v)
-		}
+		v := c.LookUpWithoutChangingOrder(key)
+		require.NotNil(t, v)
+		assert.Equal(t, int64(i), v.(arenaTestData).Value)
 	}
 }
 
 func TestArenaRadixCache_AutomaticPressureTriggersAndReentrancy(t *testing.T) {
+	// Arrange
 	pressure := 0.10
 	var cacheRef Cache
 	reentrantReads := 0
 
-	// Custom PressureFunc that calls LookUpWithoutChangingOrder on the cache itself
-	// to prove lock-free sampling prevents re-entrant RWMutex deadlocks.
 	c := NewArenaRadixCache(
-		1000,
+		200,
 		WithInvariantChecking(true),
 		WithPressureFunc(func() float64 {
 			if cacheRef != nil {
 				_ = cacheRef.LookUpWithoutChangingOrder("probe_key")
+				// Also verify mutating re-entrancy is guarded against infinite recursion.
+				_, _ = cacheRef.Insert("reentrant_probe", arenaTestData{Value: 1, DataSize: 0})
+				_ = cacheRef.Erase("reentrant_probe")
 				reentrantReads++
 			}
 			return pressure
@@ -903,45 +865,42 @@ func TestArenaRadixCache_AutomaticPressureTriggersAndReentrancy(t *testing.T) {
 	).(*arenaRadix)
 	cacheRef = c
 
-	// Populate 20 keys of size 10 (total 200 bytes) and erase 10 of them under low pressure.
 	for i := range 20 {
-		_, _ = c.Insert(fmt.Sprintf("k_%02d", i), arenaTestData{Value: int64(i), DataSize: 10})
+		_, err := c.Insert(fmt.Sprintf("k_%02d", i), arenaTestData{Value: int64(i), DataSize: 10})
+		require.NoError(t, err)
 	}
-	for i := range 10 {
-		_ = c.Erase(fmt.Sprintf("k_%02d", i))
+	for i := range 9 {
+		require.NotNil(t, c.Erase(fmt.Sprintf("k_%02d", i)))
 	}
-	if c.freeHead == nilNode {
-		t.Fatalf("expected non-empty free list before automatic moderate compaction")
-	}
+	require.NotEqual(t, nilNode, c.freeHead)
 
-	// 1. Automatic Tier 1 compaction on Erase under moderate pressure.
+	// Act 1: Automatic Tier 1 compaction on Erase of existing key under moderate pressure.
 	pressure = 0.80
-	_ = c.Erase("non_existent_key")
-	if c.freeHead != nilNode || len(c.nodes) != cap(c.nodes) {
-		t.Fatalf("expected Erase under moderate pressure to compact arena")
-	}
+	require.NotNil(t, c.Erase("k_09"))
 
-	// 2. Automatic Tier 2 shedding on Insert under critical pressure.
-	// Before insert: 10 entries (100 bytes). Insert 1 entry (10 bytes) -> 110 bytes.
-	// Retention 50% of 110 bytes = 55 bytes -> sheds down to 50 bytes (5 entries).
+	// Assert 1
+	assert.Equal(t, nilNode, c.freeHead)
+	assert.Equal(t, len(c.nodes), cap(c.nodes))
+	assert.Equal(t, uint64(100), c.currentSize)
+
+	// Act 2: Automatic Tier 2 shedding on Insert under critical pressure.
+	// maxSize = 200, retention = 0.50 -> targetSize = 100 bytes.
+	// Before insert: 10 entries (100 bytes). Insert "new_mru" (60 bytes) -> 160 bytes -> sheds 6 oldest entries (60 bytes) down to 100 bytes.
 	pressure = 0.95
-	evicted, err := c.Insert("new_mru", arenaTestData{Value: 999, DataSize: 10})
-	if err != nil {
-		t.Fatalf("Insert under critical pressure failed: %v", err)
-	}
-	if len(evicted) != 6 {
-		t.Fatalf("expected 6 LRU entries evicted during Insert under critical pressure, got %d", len(evicted))
-	}
-	if c.currentSize != 50 || c.freeHead != nilNode {
-		t.Fatalf("expected currentSize=50 and freeHead==nilNode, got size=%d freeHead=%d", c.currentSize, c.freeHead)
-	}
-	if reentrantReads == 0 {
-		t.Fatalf("expected reentrant PressureFunc callback to have executed")
-	}
+	evicted, err := c.Insert("new_mru", arenaTestData{Value: 999, DataSize: 60})
+
+	// Assert 2
+	require.NoError(t, err)
+	assert.Len(t, evicted, 6)
+	assert.Equal(t, uint64(100), c.currentSize)
+	assert.Equal(t, nilNode, c.freeHead)
+	assert.NotNil(t, c.LookUpWithoutChangingOrder("new_mru"))
+	assert.Greater(t, reentrantReads, 0)
 }
 
 func TestArenaRadixCache_CompactionAndSheddingEdgeCases(t *testing.T) {
 	t.Run("EmptyCacheCompactionAndShedding", func(t *testing.T) {
+		// Arrange
 		pressure := 0.95
 		c := NewArenaRadixCache(
 			100,
@@ -949,114 +908,304 @@ func TestArenaRadixCache_CompactionAndSheddingEdgeCases(t *testing.T) {
 			WithPressureFunc(func() float64 { return pressure }),
 		).(*arenaRadix)
 
+		// Act
 		c.Compact()
 		ev := c.EvaluateMemoryPressure()
-		if len(ev) != 0 {
-			t.Fatalf("expected 0 evictions on empty cache, got %d", len(ev))
-		}
-		if len(c.nodes) != 1 || cap(c.nodes) != 1 || c.root != 0 || c.freeHead != nilNode {
-			t.Fatalf("expected single root node after empty cache compaction, got len=%d cap=%d root=%d", len(c.nodes), cap(c.nodes), c.root)
-		}
+
+		// Assert
+		assert.Empty(t, ev)
+		assert.Equal(t, 1, len(c.nodes))
+		assert.Equal(t, 1, cap(c.nodes))
+		assert.Equal(t, uint32(0), c.root)
+		assert.Equal(t, nilNode, c.freeHead)
 	})
 
 	t.Run("SingleLargeEntryShedding", func(t *testing.T) {
-		pressure := 0.95
+		// Arrange
+		pressure := 0.0
 		c := NewArenaRadixCache(
 			100,
 			WithInvariantChecking(true),
 			WithPressureFunc(func() float64 { return pressure }),
 			WithEvictionRetentionRatio(0.50),
 		).(*arenaRadix)
+		_, err := c.Insert("only_item", arenaTestData{Value: 42, DataSize: 80})
+		require.NoError(t, err)
 
-		pressure = 0.0
-		_, _ = c.Insert("only_item", arenaTestData{Value: 42, DataSize: 80})
-
+		// Act
 		pressure = 0.95
 		ev := c.EvaluateMemoryPressure()
-		if len(ev) != 1 || ev[0].(arenaTestData).Value != 42 {
-			t.Fatalf("expected single large entry to be shed, got %v", ev)
-		}
-		if c.len != 0 || c.currentSize != 0 || len(c.nodes) != 1 || cap(c.nodes) != 1 {
-			t.Fatalf("expected cache reduced to root node only, got len=%d size=%d nodes=%d", c.len, c.currentSize, len(c.nodes))
-		}
+
+		// Assert
+		require.Len(t, ev, 1)
+		assert.Equal(t, int64(42), ev[0].(arenaTestData).Value)
+		assert.Equal(t, 0, c.len)
+		assert.Equal(t, uint64(0), c.currentSize)
+		assert.Equal(t, 1, len(c.nodes))
+		assert.Equal(t, 1, cap(c.nodes))
 	})
 
 	t.Run("EmptyStringKeyAtRoot", func(t *testing.T) {
+		// Arrange
 		c := NewArenaRadixCache(100, WithInvariantChecking(true)).(*arenaRadix)
-		_, _ = c.Insert("", arenaTestData{Value: 777, DataSize: 10})
-		_, _ = c.Insert("a/b/c", arenaTestData{Value: 888, DataSize: 10})
+		_, err := c.Insert("", arenaTestData{Value: 777, DataSize: 10})
+		require.NoError(t, err)
+		_, err = c.Insert("a/b/c", arenaTestData{Value: 888, DataSize: 10})
+		require.NoError(t, err)
 		_ = c.Erase("a/b/c")
 
+		// Act
 		c.Compact()
-		if v := c.LookUpWithoutChangingOrder(""); v == nil || v.(arenaTestData).Value != 777 {
-			t.Fatalf("expected root empty key value 777 preserved across compaction, got %v", v)
-		}
+		v := c.LookUpWithoutChangingOrder("")
+
+		// Assert
+		require.NotNil(t, v)
+		assert.Equal(t, int64(777), v.(arenaTestData).Value)
 	})
 
-	t.Run("ZeroSizeEntriesTermination", func(t *testing.T) {
+	t.Run("ZeroSizeEntriesTerminationAndFullEvictionWhenRetentionZero", func(t *testing.T) {
+		// Arrange
 		pressure := 0.0
 		c := NewArenaRadixCache(
 			100,
 			WithInvariantChecking(true),
 			WithPressureFunc(func() float64 { return pressure }),
-			WithEvictionRetentionRatio(0.25),
+			WithEvictionRetentionRatio(0.0),
 		).(*arenaRadix)
 
 		for i := range 5 {
-			_, _ = c.Insert(fmt.Sprintf("zero_%d", i), arenaTestData{Value: int64(i), DataSize: 0})
+			_, err := c.Insert(fmt.Sprintf("zero_%d", i), arenaTestData{Value: int64(i), DataSize: 0})
+			require.NoError(t, err)
 		}
-		_, _ = c.Insert("nonzero", arenaTestData{Value: 99, DataSize: 40})
+		_, err := c.Insert("nonzero", arenaTestData{Value: 99, DataSize: 40})
+		require.NoError(t, err)
 
+		// Act
 		pressure = 0.95
 		ev := c.EvaluateMemoryPressure()
-		if c.currentSize > 10 {
-			t.Fatalf("expected currentSize <= 10 after shedding, got %d (evicted=%d)", c.currentSize, len(ev))
+
+		// Assert
+		assert.Len(t, ev, 6)
+		assert.Equal(t, uint64(0), c.currentSize)
+		assert.Equal(t, 0, c.len)
+	})
+}
+
+type deadlockProbeValue struct {
+	size   uint64
+	onSize func()
+}
+
+func (v deadlockProbeValue) Size() uint64 {
+	if v.onSize != nil {
+		v.onSize()
+	}
+	return v.size
+}
+
+func TestArenaRadixCache_AdversarialAuditRegressions(t *testing.T) {
+	t.Run("InsertIntoEmptyOrUnderTargetCacheDoesNotSelfEvict", func(t *testing.T) {
+		// Arrange
+		c := NewArenaRadixCache(
+			1000,
+			WithInvariantChecking(true),
+			WithPressureFunc(func() float64 { return 0.95 }),
+			WithEvictionRetentionRatio(0.50),
+		).(*arenaRadix)
+
+		// Act
+		evicted, err := c.Insert("first_key", arenaTestData{Value: 42, DataSize: 10})
+		lookedUp := c.LookUpWithoutChangingOrder("first_key")
+
+		// Assert
+		require.NoError(t, err)
+		assert.Empty(t, evicted)
+		require.NotNil(t, lookedUp)
+		assert.Equal(t, int64(42), lookedUp.(arenaTestData).Value)
+		assert.Equal(t, uint64(10), c.currentSize)
+		assert.Equal(t, 1, c.len)
+	})
+
+	t.Run("SustainedCriticalPressureConvergesIdempotentlyWithoutCompoundDecay", func(t *testing.T) {
+		// Arrange
+		pressure := 0.0
+		c := NewArenaRadixCache(
+			1000,
+			WithInvariantChecking(true),
+			WithPressureFunc(func() float64 { return pressure }),
+			WithEvictionRetentionRatio(0.50),
+		).(*arenaRadix)
+		for i := range 100 {
+			_, err := c.Insert(fmt.Sprintf("k-%03d", i), arenaTestData{Value: int64(i), DataSize: 10})
+			require.NoError(t, err)
 		}
+		require.Equal(t, uint64(1000), c.currentSize)
+		pressure = 0.95
+
+		// Act: Evaluate critical pressure 10 times consecutively.
+		firstEvicted := c.EvaluateMemoryPressure()
+		for range 9 {
+			subsequentEvicted := c.EvaluateMemoryPressure()
+			assert.Empty(t, subsequentEvicted)
+		}
+
+		// Assert: Stabilizes idempotently at maxSize * retentionRatio (500 bytes, 50 entries).
+		assert.Len(t, firstEvicted, 50)
+		assert.Equal(t, uint64(500), c.currentSize)
+		assert.Equal(t, 50, c.len)
+	})
+
+	t.Run("KeyMissesOnEraseUpdateSizeAndPrefixDoNotEvictLiveEntries", func(t *testing.T) {
+		// Arrange
+		pressure := 0.0
+		c := NewArenaRadixCache(
+			1000,
+			WithInvariantChecking(true),
+			WithPressureFunc(func() float64 { return pressure }),
+			WithEvictionRetentionRatio(0.50),
+		).(*arenaRadix)
+		for i := range 10 {
+			_, err := c.Insert(fmt.Sprintf("k-%d", i), arenaTestData{Value: int64(i), DataSize: 10})
+			require.NoError(t, err)
+		}
+		pressure = 0.95
+
+		// Act
+		erased := c.Erase("absent_key")
+		err := c.UpdateSize("absent_key", 10)
+		c.EraseEntriesWithGivenPrefix("absent_prefix/")
+
+		// Assert
+		assert.Nil(t, erased)
+		assert.ErrorIs(t, err, ErrEntryNotExist)
+		assert.Equal(t, 10, c.len)
+		assert.Equal(t, uint64(100), c.currentSize)
+	})
+
+	t.Run("CompactFastPathPerformsZeroAllocationsWhenAlreadyCompact", func(t *testing.T) {
+		// Arrange
+		c := NewArenaRadixCache(10000, WithInvariantChecking(true)).(*arenaRadix)
+		for i := range 200 {
+			_, err := c.Insert(fmt.Sprintf("key-%03d", i), arenaTestData{Value: int64(i), DataSize: 10})
+			require.NoError(t, err)
+		}
+		c.Compact()
+		require.Equal(t, nilNode, c.freeHead)
+		require.Equal(t, len(c.nodes), cap(c.nodes))
+		ptrBefore := &c.nodes[0]
+
+		// Act
+		allocsPerRun := testing.AllocsPerRun(20, func() {
+			c.Compact()
+		})
+		ptrAfter := &c.nodes[0]
+
+		// Assert
+		assert.Equal(t, 0.0, allocsPerRun)
+		assert.Same(t, ptrBefore, ptrAfter)
+	})
+
+	t.Run("UpdateWithoutChangingOrderSamplesValueSizeOutsideLock", func(t *testing.T) {
+		// Arrange
+		c := NewArenaRadixCache(100, WithInvariantChecking(true)).(*arenaRadix)
+		_, err := c.Insert("k1", arenaTestData{Value: 1, DataSize: 10})
+		require.NoError(t, err)
+
+		readBlockedInsideSize := true
+		probe := deadlockProbeValue{
+			size: 10,
+			onSize: func() {
+				lookupDone := make(chan struct{})
+				go func() {
+					_ = c.LookUpWithoutChangingOrder("k1")
+					close(lookupDone)
+				}()
+				select {
+				case <-lookupDone:
+					readBlockedInsideSize = false
+				case <-time.After(100 * time.Millisecond):
+					readBlockedInsideSize = true
+				}
+			},
+		}
+
+		// Act
+		err = c.UpdateWithoutChangingOrder("k1", probe)
+
+		// Assert
+		require.NoError(t, err)
+		assert.False(t, readBlockedInsideSize)
+	})
+
+	t.Run("FNV1aHashCollisionPreservedAcrossCompaction", func(t *testing.T) {
+		// Arrange: Two distinct strings with identical 64-bit FNV-1a hash: "811c9dc5" vs synthetic or forced collision.
+		c := NewArenaRadixCache(1000, WithInvariantChecking(true)).(*arenaRadix)
+		_, err := c.Insert("alpha/one", arenaTestData{Value: 101, DataSize: 10})
+		require.NoError(t, err)
+		_, err = c.Insert("alpha/two", arenaTestData{Value: 202, DataSize: 10})
+		require.NoError(t, err)
+		_, err = c.Insert("beta/three", arenaTestData{Value: 303, DataSize: 10})
+		require.NoError(t, err)
+		_ = c.Erase("alpha/two")
+
+		// Simulate hash collision by removing "alpha/one" from nodeMap so getNodeKey falls back to trie walk.
+		delete(c.nodeMap, hashString("alpha/one"))
+
+		// Act
+		c.Compact()
+
+		// Assert
+		v1 := c.LookUpWithoutChangingOrder("alpha/one")
+		v3 := c.LookUpWithoutChangingOrder("beta/three")
+		require.NotNil(t, v1)
+		require.NotNil(t, v3)
+		assert.Equal(t, int64(101), v1.(arenaTestData).Value)
+		assert.Equal(t, int64(303), v3.(arenaTestData).Value)
 	})
 }
 
 func TestArenaRadixCache_CheckInvariants_ExtendedChecks(t *testing.T) {
 	t.Run("NodeMapOutOfBounds", func(t *testing.T) {
+		// Arrange
 		c := NewArenaRadixCache(50).(*arenaRadix)
 		_, _ = c.Insert("k1", arenaTestData{Value: 1, DataSize: 10})
 		c.nodeMap[hashString("k1")] = 999
-		defer func() {
-			if r := recover(); r == nil {
-				t.Errorf("expected panic on nodeMap out-of-bounds index")
-			}
-		}()
-		c.checkInvariants()
+
+		// Act & Assert
+		assert.Panics(t, func() {
+			c.checkInvariants()
+		})
 	})
 
 	t.Run("NodeMapNilValue", func(t *testing.T) {
+		// Arrange
 		c := NewArenaRadixCache(50).(*arenaRadix)
 		_, _ = c.Insert("k1", arenaTestData{Value: 1, DataSize: 10})
-		c.nodeMap[hashString("k1")] = c.root // c.root has nil value
-		defer func() {
-			if r := recover(); r == nil {
-				t.Errorf("expected panic on nodeMap pointing to nil-value node")
-			}
-		}()
-		c.checkInvariants()
+		c.nodeMap[hashString("k1")] = c.root
+
+		// Act & Assert
+		assert.Panics(t, func() {
+			c.checkInvariants()
+		})
 	})
 
 	t.Run("NodeMapHashMismatch", func(t *testing.T) {
+		// Arrange
 		c := NewArenaRadixCache(50).(*arenaRadix)
 		_, _ = c.Insert("k1", arenaTestData{Value: 1, DataSize: 10})
 		id := c.nodeMap[hashString("k1")]
 		c.nodeMap[12345] = id
-		defer func() {
-			if r := recover(); r == nil {
-				t.Errorf("expected panic on nodeMap hash mismatch")
-			}
-		}()
-		c.checkInvariants()
+
+		// Act & Assert
+		assert.Panics(t, func() {
+			c.checkInvariants()
+		})
 	})
 
 	t.Run("LeakedNodeAccountingMismatch", func(t *testing.T) {
+		// Arrange
 		c := NewArenaRadixCache(50).(*arenaRadix)
 		_, _ = c.Insert("k1", arenaTestData{Value: 1, DataSize: 10})
-		// Append an unlinked orphan node that is neither in tree nor in free-list.
 		c.nodes = append(c.nodes, arenaRadixNode{
 			parent:  nilNode,
 			child:   nilNode,
@@ -1064,12 +1213,23 @@ func TestArenaRadixCache_CheckInvariants_ExtendedChecks(t *testing.T) {
 			prev:    nilNode,
 			next:    nilNode,
 		})
-		defer func() {
-			if r := recover(); r == nil {
-				t.Errorf("expected panic on liveTreeNodes + freeListCount != len(nodes)")
-			}
-		}()
-		c.checkInvariants()
+
+		// Act & Assert
+		assert.Panics(t, func() {
+			c.checkInvariants()
+		})
+	})
+
+	t.Run("FreeCountDriftMismatch", func(t *testing.T) {
+		// Arrange
+		c := NewArenaRadixCache(50).(*arenaRadix)
+		_, _ = c.Insert("k1", arenaTestData{Value: 1, DataSize: 10})
+		_ = c.Erase("k1")
+		c.freeCount = 999
+
+		// Act & Assert
+		assert.Panics(t, func() {
+			c.checkInvariants()
+		})
 	})
 }
-

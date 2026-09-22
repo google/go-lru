@@ -93,12 +93,12 @@ func New(maxSize uint64, opts ...Option) Cache {
 // checkInvariants validates internal data structure consistency and panics if any invariant is violated.
 func (c *mapCache) checkInvariants() {
 	// Invariant 1: maxSize > 0
-	if !(c.maxSize > 0) {
+	if c.maxSize == 0 {
 		panic(fmt.Sprintf("Invalid maxSize: %v", c.maxSize))
 	}
 
 	// Invariant 2: currentSize <= maxSize
-	if !(c.currentSize <= c.maxSize) {
+	if c.currentSize > c.maxSize {
 		panic(fmt.Sprintf("CurrentSize %v over maxSize %v", c.currentSize, c.maxSize))
 	}
 

@@ -77,3 +77,17 @@ type Cache interface {
 	// If prefix is an empty string (""), all entries in the cache are deleted.
 	EraseEntriesWithGivenPrefix(prefix string)
 }
+
+// PressureAwareCache extends Cache with explicit arena compaction and memory-pressure reclamation.
+// ArenaRadixCache implements this interface.
+type PressureAwareCache interface {
+	Cache
+
+	// Compact performs lossless compaction of the internal node arena and lookup index.
+	Compact()
+
+	// EvaluateMemoryPressure samples the configured memory-pressure probe and executes
+	// Tier 1 (lossless compaction) or Tier 2 (LRU tail shedding + compaction) reclamation,
+	// returning any values evicted during Tier 2 shedding.
+	EvaluateMemoryPressure() []ValueType
+}

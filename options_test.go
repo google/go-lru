@@ -19,6 +19,9 @@ import (
 	"runtime/debug"
 	"sync"
 	"testing"
+
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 type testValue struct {
@@ -145,33 +148,25 @@ func TestConstructors_Validation(t *testing.T) {
 }
 
 func TestOptions_MemoryPressureDefaults(t *testing.T) {
-	if DefaultCompactionThreshold != 0.75 {
-		t.Errorf("expected DefaultCompactionThreshold == 0.75, got %v", DefaultCompactionThreshold)
-	}
-	if DefaultEvictionThreshold != 0.90 {
-		t.Errorf("expected DefaultEvictionThreshold == 0.90, got %v", DefaultEvictionThreshold)
-	}
-	if DefaultEvictionRetentionRatio != 0.50 {
-		t.Errorf("expected DefaultEvictionRetentionRatio == 0.50, got %v", DefaultEvictionRetentionRatio)
-	}
-
+	// Arrange & Act
 	opts := ApplyOptions()
-	if opts.CompactionThreshold != DefaultCompactionThreshold {
-		t.Errorf("expected default CompactionThreshold %v, got %v", DefaultCompactionThreshold, opts.CompactionThreshold)
-	}
-	if opts.EvictionThreshold != DefaultEvictionThreshold {
-		t.Errorf("expected default EvictionThreshold %v, got %v", DefaultEvictionThreshold, opts.EvictionThreshold)
-	}
-	if opts.EvictionRetentionRatio != DefaultEvictionRetentionRatio {
-		t.Errorf("expected default EvictionRetentionRatio %v, got %v", DefaultEvictionRetentionRatio, opts.EvictionRetentionRatio)
-	}
-	if opts.PressureFunc == nil {
-		t.Fatalf("expected non-nil default PressureFunc")
-	}
+
+	// Assert
+	assert.Equal(t, 0.75, DefaultCompactionThreshold)
+	assert.Equal(t, 0.90, DefaultEvictionThreshold)
+	assert.Equal(t, 0.50, DefaultEvictionRetentionRatio)
+	assert.Equal(t, DefaultCompactionThreshold, opts.CompactionThreshold)
+	assert.Equal(t, DefaultEvictionThreshold, opts.EvictionThreshold)
+	assert.Equal(t, DefaultEvictionRetentionRatio, opts.EvictionRetentionRatio)
+	require.NotNil(t, opts.PressureFunc)
+	assert.False(t, opts.hasCustomPressureFunc)
 }
 
 func TestOptions_MemoryPressureCustomAndValidation(t *testing.T) {
+	// Arrange
 	customFn := func() float64 { return 0.88 }
+
+	// Act
 	opts := ApplyOptions(
 		WithPressureFunc(customFn),
 		WithMemoryBudget(256*1024*1024),
@@ -179,92 +174,89 @@ func TestOptions_MemoryPressureCustomAndValidation(t *testing.T) {
 		WithEvictionThreshold(0.85),
 		WithEvictionRetentionRatio(0.35),
 	)
-
-	if opts.MemoryBudget != 256*1024*1024 {
-		t.Errorf("expected MemoryBudget 268435456, got %d", opts.MemoryBudget)
-	}
-	if opts.CompactionThreshold != 0.60 {
-		t.Errorf("expected CompactionThreshold 0.60, got %v", opts.CompactionThreshold)
-	}
-	if opts.EvictionThreshold != 0.85 {
-		t.Errorf("expected EvictionThreshold 0.85, got %v", opts.EvictionThreshold)
-	}
-	if opts.EvictionRetentionRatio != 0.35 {
-		t.Errorf("expected EvictionRetentionRatio 0.35, got %v", opts.EvictionRetentionRatio)
-	}
-	if opts.PressureFunc == nil || opts.PressureFunc() != 0.88 {
-		t.Errorf("expected custom PressureFunc returning 0.88, got %v", opts.PressureFunc())
-	}
-
-	// Verify explicit 0.0 retention ratio is preserved (shed 100%).
 	optsZeroRetention := ApplyOptions(WithEvictionRetentionRatio(0.0))
-	if optsZeroRetention.EvictionRetentionRatio != 0.0 {
-		t.Errorf("expected explicit 0.0 EvictionRetentionRatio to be preserved, got %v", optsZeroRetention.EvictionRetentionRatio)
-	}
-
-	// Verify out-of-range normalization.
 	optsClamped := ApplyOptions(
 		WithCompactionThreshold(-0.1),
 		WithEvictionThreshold(0),
 		WithEvictionRetentionRatio(1.5),
 	)
-	if optsClamped.CompactionThreshold != DefaultCompactionThreshold {
-		t.Errorf("expected negative CompactionThreshold normalized to default, got %v", optsClamped.CompactionThreshold)
-	}
-	if optsClamped.EvictionThreshold != DefaultEvictionThreshold {
-		t.Errorf("expected zero EvictionThreshold normalized to default, got %v", optsClamped.EvictionThreshold)
-	}
-	if optsClamped.EvictionRetentionRatio != 1.0 {
-		t.Errorf("expected >1.0 EvictionRetentionRatio clamped to 1.0, got %v", optsClamped.EvictionRetentionRatio)
-	}
+	optsNegativeRetention := ApplyOptions(WithEvictionRetentionRatio(-0.25))
+	optsInverted := ApplyOptions(
+		WithCompactionThreshold(0.85),
+		WithEvictionThreshold(0.70),
+	)
+	optsNaNAndInf := ApplyOptions(
+		WithCompactionThreshold(math.NaN()),
+		WithEvictionThreshold(math.Inf(1)),
+		WithEvictionRetentionRatio(math.NaN()),
+	)
+
+	// Assert
+	assert.Equal(t, uint64(256*1024*1024), opts.MemoryBudget)
+	assert.Equal(t, 0.60, opts.CompactionThreshold)
+	assert.Equal(t, 0.85, opts.EvictionThreshold)
+	assert.Equal(t, 0.35, opts.EvictionRetentionRatio)
+	require.NotNil(t, opts.PressureFunc)
+	assert.True(t, opts.hasCustomPressureFunc)
+	assert.Equal(t, 0.88, opts.PressureFunc())
+
+	assert.Equal(t, 0.0, optsZeroRetention.EvictionRetentionRatio)
+
+	assert.Equal(t, DefaultCompactionThreshold, optsClamped.CompactionThreshold)
+	assert.Equal(t, DefaultEvictionThreshold, optsClamped.EvictionThreshold)
+	assert.Equal(t, 1.0, optsClamped.EvictionRetentionRatio)
+
+	assert.Equal(t, DefaultEvictionRetentionRatio, optsNegativeRetention.EvictionRetentionRatio)
+
+	assert.Equal(t, 0.70, optsInverted.CompactionThreshold)
+	assert.Equal(t, 0.70, optsInverted.EvictionThreshold)
+
+	assert.Equal(t, DefaultCompactionThreshold, optsNaNAndInf.CompactionThreshold)
+	assert.Equal(t, DefaultEvictionThreshold, optsNaNAndInf.EvictionThreshold)
+	assert.Equal(t, DefaultEvictionRetentionRatio, optsNaNAndInf.EvictionRetentionRatio)
 }
 
 func TestDefaultRuntimePressureFunc(t *testing.T) {
-	// Save and restore GOMEMLIMIT around test.
+	// Arrange
 	prevLimit := debug.SetMemoryLimit(-1)
 	defer debug.SetMemoryLimit(prevLimit)
 
-	// 1. When GOMEMLIMIT is unset (math.MaxInt64) and MemoryBudget == 0, pressure must be 0.0.
+	// Act & Assert 1: Unbounded GOMEMLIMIT (math.MaxInt64) with MemoryBudget == 0 returns 0.0.
 	debug.SetMemoryLimit(math.MaxInt64)
 	probeUnbounded := DefaultRuntimePressureFunc(0)
-	if p := probeUnbounded(); p != 0.0 {
-		t.Errorf("expected 0.0 pressure when GOMEMLIMIT is unset and budget is 0, got %v", p)
-	}
+	assert.Equal(t, 0.0, probeUnbounded())
 
-	// 2. When GOMEMLIMIT is set to 1 GiB, DefaultRuntimePressureFunc(0) returns positive pressure.
+	// Act & Assert 2: Configured 1 GiB GOMEMLIMIT returns positive normalized pressure in (0.0, 1.0).
 	const oneGiB = int64(1 << 30)
 	debug.SetMemoryLimit(oneGiB)
 	pLimit := probeUnbounded()
-	if pLimit <= 0.0 || pLimit >= 1.0 {
-		t.Errorf("expected runtime pressure in (0.0, 1.0) with 1 GiB GOMEMLIMIT, got %v", pLimit)
-	}
+	assert.Greater(t, pLimit, 0.0)
+	assert.Less(t, pLimit, 1.0)
 
-	// 3. Custom MemoryBudget overrides GOMEMLIMIT.
+	// Act & Assert 3: Custom MemoryBudget overrides GOMEMLIMIT and allocates 0 heap objects per call.
 	probeBudget512MB := DefaultRuntimePressureFunc(512 << 20)
 	probeBudget2GB := DefaultRuntimePressureFunc(2 << 30)
 	p512 := probeBudget512MB()
 	p2G := probeBudget2GB()
-	if p512 <= 0.0 || p2G <= 0.0 {
-		t.Fatalf("expected positive pressures for custom budgets, got p512=%v, p2G=%v", p512, p2G)
-	}
-	if p512 <= p2G {
-		t.Errorf("expected smaller budget (512MB) to report higher pressure than larger budget (2GB): p512=%v, p2G=%v", p512, p2G)
-	}
+	require.Greater(t, p512, 0.0)
+	require.Greater(t, p2G, 0.0)
+	assert.Greater(t, p512, p2G)
 
-	// 4. Concurrent race-free reads across multiple goroutines.
+	allocsPerRun := testing.AllocsPerRun(50, func() {
+		_ = probeBudget512MB()
+	})
+	assert.Equal(t, 0.0, allocsPerRun)
+
+	// Act & Assert 4: Concurrent race-free reads across 16 goroutines.
 	var wg sync.WaitGroup
 	for range 16 {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
 			for range 100 {
-				v := probeBudget512MB()
-				if v <= 0.0 {
-					t.Errorf("expected positive pressure in concurrent read, got %v", v)
-				}
+				assert.Greater(t, probeBudget512MB(), 0.0)
 			}
 		}()
 	}
 	wg.Wait()
 }
-

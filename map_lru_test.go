@@ -621,4 +621,3 @@ func TestMapCache_EraseEntriesWithGivenPrefix_EmptyPrefixFastPath(t *testing.T) 
 		t.Errorf("expected empty cache state after erasing empty cache")
 	}
 }
-

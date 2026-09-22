@@ -23,6 +23,8 @@ import (
 	"testing"
 
 	lrus "github.com/googlecloudplatform/gcsfuse/v3/internal/cache/lru"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 type concValue struct {
@@ -290,6 +292,7 @@ func TestConcurrency_EvictionThrashingWithInvariants(t *testing.T) {
 // while memory pressure dynamically oscillates across normal, moderate, and critical tiers
 // with WithInvariantChecking(true) enabled.
 func TestConcurrency_MemoryPressureCompactionAndEviction(t *testing.T) {
+	// Arrange
 	const (
 		numGoroutines = 16
 		opsPerWorker  = 250
@@ -315,15 +318,10 @@ func TestConcurrency_MemoryPressureCompactionAndEviction(t *testing.T) {
 		lrus.WithEvictionRetentionRatio(0.50),
 	)
 
-	type pressureReclaimer interface {
-		Compact()
-		EvaluateMemoryPressure() []lrus.ValueType
-	}
-	reclaimer, ok := cache.(pressureReclaimer)
-	if !ok {
-		t.Fatalf("expected ArenaRadixCache to implement Compact() and EvaluateMemoryPressure()")
-	}
+	reclaimer, ok := cache.(lrus.PressureAwareCache)
+	require.True(t, ok, "expected ArenaRadixCache to implement PressureAwareCache")
 
+	// Act
 	var wg sync.WaitGroup
 	for g := range numGoroutines {
 		wg.Add(1)
@@ -352,8 +350,8 @@ func TestConcurrency_MemoryPressureCompactionAndEviction(t *testing.T) {
 				switch {
 				case op < 30:
 					_, err := cache.Insert(key, concValue{id: key, size: 10})
-					if err != nil && !errors.Is(err, lrus.ErrInvalidEntrySize) {
-						t.Errorf("worker %d: unexpected insert error: %v", workerID, err)
+					if err != nil {
+						assert.ErrorIs(t, err, lrus.ErrInvalidEntrySize)
 					}
 				case op < 50:
 					_ = cache.LookUp(key)
@@ -361,13 +359,13 @@ func TestConcurrency_MemoryPressureCompactionAndEviction(t *testing.T) {
 					_ = cache.LookUpWithoutChangingOrder(key)
 				case op < 76:
 					err := cache.UpdateWithoutChangingOrder(key, concValue{id: key + "_u", size: 10})
-					if err != nil && !errors.Is(err, lrus.ErrEntryNotExist) && !errors.Is(err, lrus.ErrInvalidUpdateEntrySize) {
-						t.Errorf("worker %d: unexpected update error: %v", workerID, err)
+					if err != nil {
+						assert.True(t, errors.Is(err, lrus.ErrEntryNotExist) || errors.Is(err, lrus.ErrInvalidUpdateEntrySize))
 					}
 				case op < 84:
 					err := cache.UpdateSize(key, 5)
-					if err != nil && !errors.Is(err, lrus.ErrEntryNotExist) {
-						t.Errorf("worker %d: unexpected update size error: %v", workerID, err)
+					if err != nil {
+						assert.ErrorIs(t, err, lrus.ErrEntryNotExist)
 					}
 				case op < 90:
 					_ = cache.Erase(key)
@@ -385,7 +383,6 @@ func TestConcurrency_MemoryPressureCompactionAndEviction(t *testing.T) {
 
 	wg.Wait()
 
-	// Final compaction and invariant check on quiescent cache.
+	// Assert: Final compaction and invariant check on quiescent cache succeed cleanly.
 	reclaimer.Compact()
 }
-
