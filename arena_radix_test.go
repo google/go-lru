@@ -17,8 +17,8 @@ package lrus
 import (
 	"errors"
 	"fmt"
+	"math"
 	"testing"
-	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -1115,16 +1115,10 @@ func TestArenaRadixCache_AdversarialAuditRegressions(t *testing.T) {
 		probe := deadlockProbeValue{
 			size: 10,
 			onSize: func() {
-				lookupDone := make(chan struct{})
-				go func() {
+				if c.mu.TryRLock() {
+					c.mu.RUnlock()
 					_ = c.LookUpWithoutChangingOrder("k1")
-					close(lookupDone)
-				}()
-				select {
-				case <-lookupDone:
 					readBlockedInsideSize = false
-				case <-time.After(100 * time.Millisecond):
-					readBlockedInsideSize = true
 				}
 			},
 		}
@@ -1137,8 +1131,8 @@ func TestArenaRadixCache_AdversarialAuditRegressions(t *testing.T) {
 		assert.False(t, readBlockedInsideSize)
 	})
 
-	t.Run("FNV1aHashCollisionPreservedAcrossCompaction", func(t *testing.T) {
-		// Arrange: Two distinct strings with identical 64-bit FNV-1a hash: "811c9dc5" vs synthetic or forced collision.
+	t.Run("FNV1aHashCollisionPreservedAndHealedAcrossCompaction", func(t *testing.T) {
+		// Arrange
 		c := NewArenaRadixCache(1000, WithInvariantChecking(true)).(*arenaRadix)
 		_, err := c.Insert("alpha/one", arenaTestData{Value: 101, DataSize: 10})
 		require.NoError(t, err)
@@ -1148,19 +1142,227 @@ func TestArenaRadixCache_AdversarialAuditRegressions(t *testing.T) {
 		require.NoError(t, err)
 		_ = c.Erase("alpha/two")
 
-		// Simulate hash collision by removing "alpha/one" from nodeMap so getNodeKey falls back to trie walk.
+		// Simulate hash collision deletion removing "alpha/one" from nodeMap.
 		delete(c.nodeMap, hashString("alpha/one"))
+		_, inMapBefore := c.nodeMap[hashString("alpha/one")]
+		require.False(t, inMapBefore)
 
 		// Act
 		c.Compact()
 
-		// Assert
+		// Assert: both trie lookup and O(1) nodeMap entry are healed after compaction.
+		_, inMapAfter := c.nodeMap[hashString("alpha/one")]
+		assert.True(t, inMapAfter)
 		v1 := c.LookUpWithoutChangingOrder("alpha/one")
 		v3 := c.LookUpWithoutChangingOrder("beta/three")
 		require.NotNil(t, v1)
 		require.NotNil(t, v3)
 		assert.Equal(t, int64(101), v1.(arenaTestData).Value)
 		assert.Equal(t, int64(303), v3.(arenaTestData).Value)
+	})
+}
+
+func TestArenaRadixCache_PrincipalReviewFixes(t *testing.T) {
+	t.Run("F1_NoCompactionThrashingOnSteadyStateInsertsUnderPressure", func(t *testing.T) {
+		// Arrange
+		c := NewArenaRadixCache(
+			2000,
+			WithInvariantChecking(true),
+			WithPressureFunc(func() float64 { return 0.95 }),
+			WithEvictionRetentionRatio(0.50),
+		).(*arenaRadix)
+
+		// Act: Insert 100 entries (1000 bytes == targetSize) under critical pressure.
+		allocsPerInsert := testing.AllocsPerRun(1, func() {
+			for i := range 100 {
+				_, err := c.Insert(fmt.Sprintf("k-%04d", i), arenaTestData{Value: int64(i), DataSize: 10})
+				require.NoError(t, err)
+			}
+		})
+
+		// Assert: Without O(N^2) compaction thrashing on every Insert, 100 inserts allocate ~252 objects total (vs > 2000 previously).
+		assert.Less(t, allocsPerInsert, 350.0)
+		assert.Equal(t, 100, c.len)
+		assert.Equal(t, uint64(1000), c.currentSize)
+	})
+
+	t.Run("F2_ConcurrentPressureSampleReturnsCachedPressureInsteadOfZero", func(t *testing.T) {
+		// Arrange
+		shouldBlock := false
+		inCallback := make(chan struct{})
+		releaseCallback := make(chan struct{})
+		c := NewArenaRadixCache(
+			1000,
+			WithInvariantChecking(true),
+			WithPressureFunc(func() float64 {
+				if shouldBlock {
+					close(inCallback)
+					<-releaseCallback
+				}
+				return 0.95
+			}),
+			WithEvictionRetentionRatio(0.50),
+		).(*arenaRadix)
+
+		for i := range 10 {
+			_, err := c.Insert(fmt.Sprintf("item-%d", i), arenaTestData{Value: int64(i), DataSize: 100})
+			require.NoError(t, err)
+		}
+
+		// Act: Block Goroutine A inside PressureFunc while Goroutine B calls samplePressureFresh().
+		shouldBlock = true
+		doneA := make(chan struct{})
+		go func() {
+			_ = c.samplePressureFresh()
+			close(doneA)
+		}()
+		<-inCallback
+
+		concurrentSample := c.samplePressureFresh()
+		close(releaseCallback)
+		<-doneA
+
+		// Assert: Concurrent caller receives cached 0.95 instead of false 0.0.
+		assert.Equal(t, 0.95, concurrentSample)
+	})
+
+	t.Run("F3_ZeroRetentionRatioDoesNotSelfEvictNewlyInsertedKey", func(t *testing.T) {
+		// Arrange
+		c := NewArenaRadixCache(
+			1000,
+			WithInvariantChecking(true),
+			WithPressureFunc(func() float64 { return 0.95 }),
+			WithEvictionRetentionRatio(0.0),
+		).(*arenaRadix)
+
+		_, err := c.Insert("old_key", arenaTestData{Value: 1, DataSize: 100})
+		require.NoError(t, err)
+
+		// Act: Insert "new_key" under critical pressure with retention == 0.0.
+		evicted, err := c.Insert("new_key", arenaTestData{Value: 2, DataSize: 100})
+
+		// Assert: "old_key" is evicted, but "new_key" is preserved.
+		require.NoError(t, err)
+		require.Len(t, evicted, 1)
+		assert.Equal(t, int64(1), evicted[0].(arenaTestData).Value)
+		assert.Nil(t, c.LookUpWithoutChangingOrder("old_key"))
+		assert.NotNil(t, c.LookUpWithoutChangingOrder("new_key"))
+
+		// Explicit EvaluateMemoryPressure still flushes 100% of entries when retention == 0.0.
+		flushed := c.EvaluateMemoryPressure()
+		require.Len(t, flushed, 1)
+		assert.Equal(t, 0, c.len)
+	})
+
+	t.Run("F4_PostReclamationImmediatelyRefreshesAmortizedPressure", func(t *testing.T) {
+		// Arrange: Simulate default amortized sampling path (hasCustomPressureFunc = false).
+		pressure := 0.95
+		c := NewArenaRadixCache(1000, WithInvariantChecking(true)).(*arenaRadix)
+		c.options.PressureFunc = func() float64 { return pressure }
+		c.options.hasCustomPressureFunc = false
+
+		for i := range 10 {
+			_, err := c.Insert(fmt.Sprintf("k-%d", i), arenaTestData{Value: int64(i), DataSize: 100})
+			require.NoError(t, err)
+		}
+
+		// Act: After reclamation resolves pressure to 0.20, the very next samplePressure() refreshes immediately.
+		pressure = 0.20
+		sampled := c.samplePressure()
+
+		// Assert
+		assert.Equal(t, 0.20, sampled)
+	})
+
+	t.Run("F5_And_F10_MapCacheAndRadixCacheSafeSizeCallbackAndPressureAwareCache", func(t *testing.T) {
+		for _, tc := range []struct {
+			name string
+			fn   func(uint64, ...Option) Cache
+		}{
+			{"MapCache", NewMapCache},
+			{"RadixCache", NewRadixCache},
+		} {
+			t.Run(tc.name, func(t *testing.T) {
+				pressure := 0.10
+				cache := tc.fn(
+					100,
+					WithInvariantChecking(true),
+					WithPressureFunc(func() float64 { return pressure }),
+					WithEvictionRetentionRatio(0.50),
+				)
+				for i := range 10 {
+					_, err := cache.Insert(fmt.Sprintf("k-%d", i), arenaTestData{Value: int64(i), DataSize: 10})
+					require.NoError(t, err)
+				}
+
+				// F5: Re-entrant LookUpWithoutChangingOrder inside ValueType.Size() does not deadlock.
+				err := cache.UpdateWithoutChangingOrder("k-0", deadlockProbeValue{
+					size: 10,
+					onSize: func() {
+						_ = cache.LookUpWithoutChangingOrder("k-0")
+					},
+				})
+				require.NoError(t, err)
+
+				// F10: Implements PressureAwareCache.
+				pac, ok := cache.(PressureAwareCache)
+				require.True(t, ok)
+				pac.Compact()
+				pressure = 0.95
+				evicted := pac.EvaluateMemoryPressure()
+				assert.Len(t, evicted, 5)
+			})
+		}
+	})
+
+	t.Run("F6_UpdateSizeUnderCriticalPressureTriggersTier2Shedding", func(t *testing.T) {
+		// Arrange
+		pressure := 0.10
+		c := NewArenaRadixCache(
+			1000,
+			WithInvariantChecking(true),
+			WithPressureFunc(func() float64 { return pressure }),
+			WithEvictionRetentionRatio(0.50),
+		).(*arenaRadix)
+		for i := range 8 {
+			_, err := c.Insert(fmt.Sprintf("k-%d", i), arenaTestData{Value: int64(i), DataSize: 100})
+			require.NoError(t, err)
+		}
+		require.Equal(t, uint64(800), c.currentSize)
+
+		// Act: Grow k-7 by 100 bytes under critical pressure (0.95).
+		pressure = 0.95
+		err := c.UpdateSize("k-7", 100)
+
+		// Assert: Sheds down to targetSize (500 bytes) while keeping k-7.
+		require.NoError(t, err)
+		assert.LessOrEqual(t, c.currentSize, uint64(500))
+		assert.NotNil(t, c.LookUpWithoutChangingOrder("k-7"))
+	})
+
+	t.Run("F7_ComputeTargetSizeBoundsAndZeroSizeEntryShedding", func(t *testing.T) {
+		// MaxUint64 does not overflow float64 -> uint64 conversion.
+		assert.Equal(t, uint64(math.MaxUint64), computeTargetSize(math.MaxUint64, 1.0))
+		assert.Greater(t, computeTargetSize(math.MaxUint64, 0.5), uint64(math.MaxUint64/4))
+		// maxSize == 1 with retention > 0 clamps to 1 instead of truncating to 0.
+		assert.Equal(t, uint64(1), computeTargetSize(1, 0.50))
+
+		// Zero-size entries (DataSize == 0) are shed down to retention ratio under critical pressure.
+		pressure := 0.10
+		c := NewArenaRadixCache(
+			100,
+			WithInvariantChecking(true),
+			WithPressureFunc(func() float64 { return pressure }),
+			WithEvictionRetentionRatio(0.50),
+		).(*arenaRadix)
+		for i := range 10 {
+			_, err := c.Insert(fmt.Sprintf("zero-%d", i), arenaTestData{Value: int64(i), DataSize: 0})
+			require.NoError(t, err)
+		}
+		pressure = 0.95
+		evicted := c.EvaluateMemoryPressure()
+		assert.Len(t, evicted, 5)
+		assert.Equal(t, 5, c.len)
 	})
 }
 

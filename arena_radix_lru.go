@@ -287,6 +287,7 @@ func (c *arenaRadix) Insert(key string, value ValueType) ([]ValueType, error) {
 		return nil, ErrInvalidEntrySize
 	}
 
+	sampledEpoch := c.reclaimEpoch.Load()
 	pressure := c.samplePressure()
 
 	c.mu.Lock()
@@ -305,6 +306,14 @@ func (c *arenaRadix) Insert(key string, value ValueType) ([]ValueType, error) {
 	// is freed to the freelist, we proactively evict until we have at least 2 free nodes.
 	for uint32(len(c.nodes)) >= nilNode-2 && c.tail != nilNode && (c.freeHead == nilNode || c.nodes[c.freeHead].next == nilNode) {
 		evictedValues = append(evictedValues, c.evictOne())
+	}
+
+	// If inserting a brand-new key would exceed maxSize, evict from the LRU tail before
+	// allocating new arena nodes so insertNode immediately recycles the freed slot(s) from freeHead.
+	if _, exists := c.getNodeKey(key); !exists {
+		for c.currentSize+valueSize > c.maxSize && c.tail != nilNode {
+			evictedValues = append(evictedValues, c.evictOne())
+		}
 	}
 
 	nodeID, oldValue := c.insertNode(key, value)
@@ -326,6 +335,9 @@ func (c *arenaRadix) Insert(key string, value ValueType) ([]ValueType, error) {
 		evictedValues = append(evictedValues, c.evictOne())
 	}
 
+	if !c.options.hasCustomPressureFunc && sampledEpoch != c.reclaimEpoch.Load() {
+		pressure = c.samplePressure()
+	}
 	if evictedByPressure := c.maybeReclaimUnderPressureLocked(pressure, nodeID); len(evictedByPressure) > 0 {
 		evictedValues = append(evictedValues, evictedByPressure...)
 	}
@@ -335,6 +347,7 @@ func (c *arenaRadix) Insert(key string, value ValueType) ([]ValueType, error) {
 
 // Erase removes the entry associated with key from the cache, returning its value (or nil if not found).
 func (c *arenaRadix) Erase(key string) (value ValueType) {
+	sampledEpoch := c.reclaimEpoch.Load()
 	pressure := c.samplePressure()
 
 	c.mu.Lock()
@@ -351,6 +364,9 @@ func (c *arenaRadix) Erase(key string) (value ValueType) {
 	}
 
 	deleted := c.eraseInternal(nodeID)
+	if !c.options.hasCustomPressureFunc && sampledEpoch != c.reclaimEpoch.Load() {
+		pressure = c.samplePressure()
+	}
 	c.maybeCompactUnderPressureLocked(pressure)
 	return deleted
 }
@@ -432,6 +448,7 @@ func (c *arenaRadix) UpdateWithoutChangingOrder(key string, value ValueType) err
 //
 // Returns ErrEntryNotExist if key is not present in the cache.
 func (c *arenaRadix) UpdateSize(key string, sizeDelta uint64) error {
+	sampledEpoch := c.reclaimEpoch.Load()
 	pressure := c.samplePressure()
 
 	c.mu.Lock()
@@ -460,7 +477,14 @@ func (c *arenaRadix) UpdateSize(key string, sizeDelta uint64) error {
 		c.evictOne()
 	}
 
-	c.maybeCompactUnderPressureLocked(pressure)
+	if !c.options.hasCustomPressureFunc && sampledEpoch != c.reclaimEpoch.Load() {
+		pressure = c.samplePressure()
+	}
+	if sizeDelta > 0 {
+		c.maybeReclaimUnderPressureLocked(pressure, nodeID)
+	} else {
+		c.maybeCompactUnderPressureLocked(pressure)
+	}
 	return nil
 }
 

@@ -214,6 +214,20 @@ func TestOptions_MemoryPressureCustomAndValidation(t *testing.T) {
 	assert.Equal(t, DefaultCompactionThreshold, optsNaNAndInf.CompactionThreshold)
 	assert.Equal(t, DefaultEvictionThreshold, optsNaNAndInf.EvictionThreshold)
 	assert.Equal(t, DefaultEvictionRetentionRatio, optsNaNAndInf.EvictionRetentionRatio)
+
+	// F8: Single threshold customization preserves Tier 1 compaction window.
+	optsHighCompactionOnly := ApplyOptions(WithCompactionThreshold(0.92))
+	assert.Equal(t, 0.92, optsHighCompactionOnly.CompactionThreshold)
+	assert.Greater(t, optsHighCompactionOnly.EvictionThreshold, optsHighCompactionOnly.CompactionThreshold)
+
+	optsLowEvictionOnly := ApplyOptions(WithEvictionThreshold(0.60))
+	assert.Equal(t, 0.60, optsLowEvictionOnly.EvictionThreshold)
+	assert.Less(t, optsLowEvictionOnly.CompactionThreshold, optsLowEvictionOnly.EvictionThreshold)
+
+	optsDirectStructPressure := ApplyOptions(func(o *Options) {
+		o.PressureFunc = customFn
+	})
+	assert.True(t, optsDirectStructPressure.hasCustomPressureFunc)
 }
 
 func TestDefaultRuntimePressureFunc(t *testing.T) {

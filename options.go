@@ -79,12 +79,14 @@ type Options struct {
 
 	// CompactionThreshold specifies the normalized pressure threshold for Tier 1 lossless compaction.
 	// Defaults to DefaultCompactionThreshold (0.75) if <= 0, NaN, or Inf.
-	// If CompactionThreshold > EvictionThreshold, it is clamped down to EvictionThreshold.
-	CompactionThreshold float64
+	// If CompactionThreshold > EvictionThreshold, thresholds are reconciled to preserve ordering.
+	CompactionThreshold          float64
+	hasCustomCompactionThreshold bool
 
 	// EvictionThreshold specifies the normalized pressure threshold for Tier 2 LRU shedding + compaction.
 	// Defaults to DefaultEvictionThreshold (0.90) if <= 0, NaN, or Inf.
-	EvictionThreshold float64
+	EvictionThreshold          float64
+	hasCustomEvictionThreshold bool
 
 	// EvictionRetentionRatio specifies the fraction [0.0, 1.0] of cache maxSize to retain
 	// when Critical Pressure (EvictionThreshold) is reached.
@@ -102,7 +104,7 @@ func WithInvariantChecking(enabled bool) Option {
 	}
 }
 
-// WithPressureFunc configures a custom memory-pressure probe function (supported by ArenaRadixCache).
+// WithPressureFunc configures a custom memory-pressure probe function.
 func WithPressureFunc(fn PressureFunc) Option {
 	return func(o *Options) {
 		o.PressureFunc = fn
@@ -110,32 +112,32 @@ func WithPressureFunc(fn PressureFunc) Option {
 	}
 }
 
-// WithMemoryBudget configures a custom memory budget in bytes for the built-in runtime/metrics probe
-// (supported by ArenaRadixCache).
+// WithMemoryBudget configures a process-wide runtime memory budget ceiling in bytes for the built-in
+// runtime/metrics probe when GOMEMLIMIT is unset or higher than the desired process ceiling.
 func WithMemoryBudget(bytes uint64) Option {
 	return func(o *Options) {
 		o.MemoryBudget = bytes
 	}
 }
 
-// WithCompactionThreshold configures the Moderate Pressure threshold for lossless arena/map compaction
-// (supported by ArenaRadixCache).
+// WithCompactionThreshold configures the Moderate Pressure threshold for lossless arena/map compaction.
 func WithCompactionThreshold(threshold float64) Option {
 	return func(o *Options) {
 		o.CompactionThreshold = threshold
+		o.hasCustomCompactionThreshold = true
 	}
 }
 
-// WithEvictionThreshold configures the Critical Pressure threshold for proactive LRU shedding
-// (supported by ArenaRadixCache).
+// WithEvictionThreshold configures the Critical Pressure threshold for proactive LRU shedding.
 func WithEvictionThreshold(threshold float64) Option {
 	return func(o *Options) {
 		o.EvictionThreshold = threshold
+		o.hasCustomEvictionThreshold = true
 	}
 }
 
 // WithEvictionRetentionRatio configures the target retention ratio [0.0, 1.0] of maxSize
-// retained during Critical Pressure LRU shedding (supported by ArenaRadixCache).
+// retained during Critical Pressure LRU shedding.
 func WithEvictionRetentionRatio(ratio float64) Option {
 	return func(o *Options) {
 		o.EvictionRetentionRatio = ratio
@@ -191,12 +193,28 @@ func ApplyOptions(opts ...Option) Options {
 	}
 	if math.IsNaN(options.CompactionThreshold) || math.IsInf(options.CompactionThreshold, 0) || options.CompactionThreshold <= 0 {
 		options.CompactionThreshold = DefaultCompactionThreshold
+		options.hasCustomCompactionThreshold = false
 	}
 	if math.IsNaN(options.EvictionThreshold) || math.IsInf(options.EvictionThreshold, 0) || options.EvictionThreshold <= 0 {
 		options.EvictionThreshold = DefaultEvictionThreshold
+		options.hasCustomEvictionThreshold = false
 	}
 	if options.CompactionThreshold > options.EvictionThreshold {
-		options.CompactionThreshold = options.EvictionThreshold
+		switch {
+		case options.hasCustomCompactionThreshold && !options.hasCustomEvictionThreshold:
+			// Caller raised CompactionThreshold above default EvictionThreshold; advance EvictionThreshold
+			// to preserve the Tier 1 compaction window.
+			options.EvictionThreshold = math.Min(1.0, options.CompactionThreshold+(DefaultEvictionThreshold-DefaultCompactionThreshold))
+			if options.EvictionThreshold < options.CompactionThreshold {
+				options.EvictionThreshold = options.CompactionThreshold
+			}
+		case !options.hasCustomCompactionThreshold && options.hasCustomEvictionThreshold:
+			// Caller lowered EvictionThreshold below default CompactionThreshold; scale CompactionThreshold
+			// proportionally to preserve the Tier 1 compaction window.
+			options.CompactionThreshold = options.EvictionThreshold * (DefaultCompactionThreshold / DefaultEvictionThreshold)
+		default:
+			options.CompactionThreshold = options.EvictionThreshold
+		}
 	}
 	if math.IsNaN(options.EvictionRetentionRatio) || math.IsInf(options.EvictionRetentionRatio, -1) || options.EvictionRetentionRatio < 0 {
 		options.EvictionRetentionRatio = DefaultEvictionRetentionRatio
@@ -206,6 +224,8 @@ func ApplyOptions(opts ...Option) Options {
 	if options.PressureFunc == nil {
 		options.PressureFunc = DefaultRuntimePressureFunc(options.MemoryBudget)
 		options.hasCustomPressureFunc = false
+	} else {
+		options.hasCustomPressureFunc = true
 	}
 	return options
 }
