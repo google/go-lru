@@ -111,5 +111,3 @@ go test -v -run=^Example ./...
 
 Released under the [Apache 2.0 License](LICENSE). See [CONTRIBUTING.md](CONTRIBUTING.md) for contribution guidelines.
 This is not an officially supported Google product. This project is not eligible for the [Google Open Source Software Vulnerability Rewards Program](https://bughunters.google.com/open-source-security).
-
-<!-- b06a -->

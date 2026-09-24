@@ -9,18 +9,18 @@ This document details the internal data structures, concurrency models, and memo
 | Dimension | `MapCache` (`NewMapCache`) | `RadixCache` (`NewRadixCache`) | `ArenaRadixCache` (`NewArenaRadixCache`) |
 | :--- | :--- | :--- | :--- |
 | **Primary Data Structure** | `map[string]*list.Element` + `container/list.List` | Compressed Radix Tree (LCRS) + Intrusive Pointer LRU List | Contiguous Slice Arena `[]arenaRadixNode` + Freelist + Hash Index |
-| **Node Representation** | `list.Element` (48 B) + `entry` (32 B) + Map Buckets | `radixNode` struct (72 B heap object) | `arenaRadixNode` struct (56 B contiguous array entry) |
-| **Per-Node Heap Allocations** | 2–3 allocations per entry | 1 allocation per node | **0 allocations** (recycled via intrusive free-list) |
+| **Node Representation** | `list.Element` (48 B) + `entry` (40 B) + Map Buckets | `radixNode` struct (72 B heap object) | `arenaRadixNode` struct (64 B contiguous array entry) |
+| **Per-Node Heap Allocations** | 2 allocations per entry (0 on update) | 1 allocation per node | **0 allocations** (recycled via intrusive free-list) |
 | **Node Pointer Width** | 64-bit pointers | 64-bit pointers (5 pointers / node) | **32-bit indices** (`uint32`, sentinel `nilNode = math.MaxUint32`) |
-| **Max Entry Capacity** | Memory / Heap limited | Memory / Heap limited | **`2^32 - 1` entries** (~4.29 billion nodes) |
+| **Max Entry Capacity** | Memory / Heap limited | Memory / Heap limited | **`2^32 - 1` total arena nodes** (~4.29B nodes including routing nodes) |
 | **Point Lookup Latency** | **~50 ns/op** (`O(1)` Hash Map) | ~170 ns/op (`O(K)` Trie Descent) | **~100 ns/op** (`O(1)` FNV-1a Hash Map + Zero-Alloc Path Check) |
 | **Sequential Insert Latency** | ~98 ns/op | ~175 ns/op (0 allocs) | ~270 ns/op |
-| **Point Update Latency** | ~82 ns/op | ~97 ns/op (0 allocs) | ~88 ns/op (0 allocs) |
-| **Prefix Erase (100 items)** | ~160 µs (`O(N)` full scan) | **~2.2 µs** (**71x faster**) | **~27.6 µs** (**6x faster**) |
-| **Prefix Erase (50K/100K items)** | ~21.6 ms | **~1.05 ms** (**20.5x faster**) | ~13.6 ms |
+| **Point Update Latency** | ~82 ns/op (0 allocs) | ~97 ns/op (0 allocs) | ~88 ns/op (0 allocs) |
+| **Prefix Erase (100 items)** | ~160 µs (`O(N)` full scan) | **~2.2 µs** (**71x faster**) | **~4.5 µs** (**35x faster**) |
+| **Prefix Erase (50K/100K items)** | ~21.6 ms | **~1.05 ms** (**20.5x faster**) | ~2.5 ms |
 | **1M Items Heap Memory** | ~129.6 MB (~135.9 B/entry) | **~89.8 MB** (**~30.7% reduction**) | **~101.9 MB** (**~21.4% reduction**) |
 | **GC Pressure & Overhead** | High (millions of distinct heap objects) | Moderate (heap nodes with pointers) | **Ultra-Low** (flat slice; internal tree indices invisible to GC) |
-| **Concurrency Lock** | `sync.RWMutex` | `sync.RWMutex` | `sync.Mutex` |
+| **Concurrency Lock** | `sync.RWMutex` | `sync.RWMutex` | `sync.RWMutex` |
 | **Best Used For** | Flat keys, maximum read/write throughput | File systems, directory trees, prefix purges | Large-scale hierarchical caches (1M+ items) under strict memory limits |
 
 ---
@@ -39,12 +39,12 @@ This document details the internal data structures, concurrency models, and memo
 - **Path Compression**: When an internal node loses children after `Erase` or eviction, `compressPathUpwards` merges single-child routing nodes with their parent to keep tree depth minimal.
 
 ### 2.3 `ArenaRadixCache` (`arena_radix.go`, `arena_radix_lru.go`)
-`ArenaRadixCache` eliminates per-node heap objects and pointer-graph scanning by storing all nodes in a contiguous slice `[]arenaRadixNode` (`56 bytes` per node) indexed by 32-bit integers (`uint32`, with `nilNode = math.MaxUint32`).
+`ArenaRadixCache` eliminates per-node heap objects and pointer-graph scanning by storing all nodes in a contiguous slice `[]arenaRadixNode` (`64 bytes` per node) indexed by 32-bit integers (`uint32`, with `nilNode = math.MaxUint32`).
 - **Intrusive O(1) Free-List**: Erased or evicted node slots are pushed onto an intrusive singly-linked free-list (`freeHead`, linked via `next` index with `parent = nilNode`, `child = nilNode`, `sibling = nilNode`, `prev = nilNode`) and recycled on subsequent insertions with zero heap allocations.
 - **O(1) 64-Bit FNV-1a Lookup Accelerator**:
   - `nodeMap map[uint64]uint32` maps the 64-bit FNV-1a hash of full keys directly to their arena node index.
   - `verifyKey(nodeID, key)` walks `parent` indices from `nodeID` up to `root`, verifying byte-for-byte suffix equality against `key` in zero allocations.
-  - If two distinct keys collide on the same 64-bit FNV-1a hash, `ArenaRadixCache` preserves full correctness by falling back to `O(K)` trie descent (`findNode`) and re-indexing surviving colliding keys (`reindexCollidingKey`) upon deletion or compaction.
+  - If two distinct keys collide on the same 64-bit FNV-1a hash, `ArenaRadixCache` preserves full correctness by falling back to `O(K)` trie descent (`getNodeKeyWithHash`) and healing `nodeMap` entries on `LookUp` or `compactLocked()`.
 
 ---
 
@@ -77,5 +77,3 @@ Enabling `WithInvariantChecking(true)` validates structural integrity across eve
 2. **Iterative Tree Walk**: Uses parent/sibling pointers (`radixCache`) or `uint32` index links (`ArenaRadixCache`) to traverse the entire LCRS tree in `O(1)` auxiliary space without recursion, verifying parent-child symmetry and absence of cycles.
 3. **LRU List Bijection**: Verifies that every value-bearing tree node appears in the doubly-linked `head`/`tail` list with matching forward and reverse traversal counts and exact `currentSize` sum parity.
 4. **Free-List & Hash Index Integrity (`ArenaRadixCache`)**: Confirms `len(nodes) - freeCount == treeNodeCount`, verifies zero overlap between free-list slots and live tree nodes, and checks `nodeMap` index consistency.
-
-<!-- 333d5 -->

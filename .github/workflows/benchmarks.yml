@@ -46,9 +46,13 @@ jobs:
         if: github.event_name == 'pull_request'
         continue-on-error: true
         run: |
+          HEAD_SHA=$(git rev-parse HEAD)
+          trap 'git checkout "$HEAD_SHA"' EXIT
           git checkout "${{ github.event.pull_request.base.sha }}"
           go test -run=^$ -bench=. -benchmem -benchtime=10ms -count=2 ./... | tee benchmark-base.txt
-          git checkout -
+          git checkout "$HEAD_SHA"
+          trap - EXIT
+          sed -i 's|^pkg: .*|pkg: github.com/google/go-lru|' benchmark-base.txt
           benchstat benchmark-base.txt benchmark-head.txt | tee benchstat-comparison.txt
 
       - name: Publish Benchmark & Resource Footprint Summary
@@ -88,5 +92,3 @@ jobs:
             benchstat-comparison.txt
           if-no-files-found: ignore
           retention-days: 30
-
-# 213c

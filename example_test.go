@@ -117,5 +117,3 @@ func ExampleNew_memoryPressure() {
 	// Output:
 	// shed entries=1, item1 remaining=false, item2 remaining=true
 }
-
-// 7c02

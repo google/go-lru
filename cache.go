@@ -66,8 +66,9 @@ type Cache interface {
 
 	// UpdateSize adjusts the size accounting for an existing key by sizeDelta without altering its LRU position.
 	// Useful for entries whose size grows incrementally (e.g. sparse files).
-	// If the cache capacity is exceeded as a result of the size adjustment, least recently used (LRU) entries
-	// are evicted immediately to maintain capacity invariants.
+	// If the entry's updated size (existingSize + sizeDelta) exceeds maxSize, the entry itself is evicted
+	// immediately without evicting other entries. Otherwise, if total cache capacity is exceeded,
+	// least recently used (LRU) entries are evicted immediately to maintain capacity invariants.
 	//
 	// Returns ErrEntryNotExist if key is not present in the cache.
 	// Returns ErrInvalidUpdateEntrySize if sizeDelta causes uint64 integer overflow.
@@ -78,12 +79,12 @@ type Cache interface {
 	EraseEntriesWithGivenPrefix(prefix string)
 }
 
-// PressureAwareCache extends Cache with explicit arena compaction and memory-pressure reclamation.
-// ArenaRadixCache implements this interface.
+// PressureAwareCache extends Cache with explicit arena/map compaction and memory-pressure reclamation.
+// All three cache backends (MapCache, RadixCache, and ArenaRadixCache) implement this interface.
 type PressureAwareCache interface {
 	Cache
 
-	// Compact performs lossless compaction of the internal node arena and lookup index.
+	// Compact performs lossless compaction of the internal node arena and/or lookup index.
 	Compact()
 
 	// EvaluateMemoryPressure samples the configured memory-pressure probe and executes
@@ -97,8 +98,7 @@ type PressureAwareCache interface {
 // engine via WithBackend(BackendRadix) or WithBackend(BackendArenaRadix), or invoke
 // NewMapCache, NewRadixCache, or NewArenaRadixCache directly.
 //
-// When WithBackend(BackendArenaRadix) is used, the returned Cache also implements
-// PressureAwareCache.
+// All returned Cache instances also implement PressureAwareCache.
 //
 // maxSize must be greater than zero; otherwise New panics.
 func New(maxSize uint64, opts ...Option) Cache {
@@ -108,14 +108,12 @@ func New(maxSize uint64, opts ...Option) Cache {
 	options := ApplyOptions(opts...)
 	switch options.Backend {
 	case BackendRadix:
-		return NewRadixCache(maxSize, opts...)
+		return newRadixCacheWithOptions(maxSize, options)
 	case BackendArenaRadix:
-		return NewArenaRadixCache(maxSize, opts...)
+		return newArenaRadixCacheWithOptions(maxSize, options)
 	case BackendMap:
 		fallthrough
 	default:
-		return NewMapCache(maxSize, opts...)
+		return newMapCacheWithOptions(maxSize, options)
 	}
 }
-
-// ca8f

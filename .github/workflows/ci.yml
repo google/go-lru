@@ -48,6 +48,11 @@ jobs:
       - name: Run go vet
         run: go vet ./...
 
+      - name: Run golangci-lint
+        uses: golangci/golangci-lint-action@v6
+        with:
+          version: latest
+
       - name: Verify go.mod and go.sum are tidy
         run: |
           go mod tidy
@@ -101,5 +106,3 @@ jobs:
             coverage.out
             coverage.txt
           retention-days: 14
-
-# 48427

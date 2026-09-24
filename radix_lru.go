@@ -19,6 +19,7 @@ import (
 	"math"
 	"strings"
 	"sync"
+	"sync/atomic"
 )
 
 // radixNode represents a node in the compressed radix tree (trie).
@@ -61,6 +62,10 @@ type radixCache struct {
 
 	// opts contains configuration options such as invariant checking.
 	opts Options
+
+	// samplingPressure guards against infinite recursion when a custom PressureFunc re-enters EvaluateMemoryPressure.
+	samplingPressure   atomic.Bool
+	cachedPressureBits atomic.Uint64
 }
 
 // NewRadixCache creates a new RadixCache instance bounded by maxSize (in bytes).
@@ -69,7 +74,10 @@ func NewRadixCache(maxSize uint64, opts ...Option) Cache {
 	if maxSize == 0 {
 		panic("maxSize must be greater than zero")
 	}
-	options := ApplyOptions(opts...)
+	return newRadixCacheWithOptions(maxSize, ApplyOptions(opts...))
+}
+
+func newRadixCacheWithOptions(maxSize uint64, options Options) Cache {
 	c := &radixCache{
 		maxSize: maxSize,
 		root:    &radixNode{},
@@ -101,6 +109,9 @@ func (c *radixCache) checkInvariants() {
 
 	for curr := c.head; curr != nil; curr = curr.next {
 		lruCount++
+		if math.MaxUint64-sumSize < curr.size {
+			panic("radixCache invariant violation: sumSize uint64 overflow")
+		}
 		sumSize += curr.size
 		if curr.value == nil {
 			panic(fmt.Sprintf("radixCache invariant violation: unexpected nil value in LRU list for prefix '%s'", curr.prefix))
@@ -151,6 +162,9 @@ func (c *radixCache) checkInvariants() {
 	if c.root == nil {
 		panic("radixCache invariant violation: root node is nil")
 	}
+	if c.root.prefix != "" {
+		panic("radixCache invariant violation: root node must have empty prefix")
+	}
 	if c.root.parent != nil {
 		panic("radixCache invariant violation: root node must not have a parent")
 	}
@@ -167,6 +181,9 @@ func (c *radixCache) checkInvariants() {
 	for curr != nil {
 		if curr.value != nil {
 			treeCount++
+			if math.MaxUint64-treeSumSize < curr.size {
+				panic("radixCache invariant violation: treeSumSize uint64 overflow")
+			}
 			treeSumSize += curr.size
 			// A node is verifiably in the LRU list if it is the head or has a non-nil prev pointer.
 			inLRU := c.head == curr || curr.prev != nil
@@ -267,6 +284,7 @@ func (n *radixNode) removeChild(childToRemove *radixNode) {
 			return
 		}
 	}
+	panic("removeChild: requested child not found in sibling list")
 }
 
 // replaceChild finds oldChild in the sibling linked list and substitutes it with newChild,
@@ -274,6 +292,7 @@ func (n *radixNode) removeChild(childToRemove *radixNode) {
 func (n *radixNode) replaceChild(oldChild, newChild *radixNode) {
 	for pcurr := &n.child; *pcurr != nil; pcurr = &(*pcurr).sibling {
 		if *pcurr == oldChild {
+			newChild.parent = n
 			newChild.sibling = oldChild.sibling
 			*pcurr = newChild
 
@@ -282,6 +301,7 @@ func (n *radixNode) replaceChild(oldChild, newChild *radixNode) {
 			return
 		}
 	}
+	panic("replaceChild: requested child not found in sibling list")
 }
 
 // insertNode inserts a new key into the radix tree and returns the leaf node and previous value (if any).
@@ -319,14 +339,16 @@ func (c *radixCache) insertNode(key string, value ValueType) (*radixNode, ValueT
 			continue
 		}
 
+		// child.prefix was already cloned on creation; slicing it directly avoids 2 heap allocations.
+		oldPrefix := child.prefix
 		splitNode := &radixNode{
-			prefix: strings.Clone(child.prefix[:lcp]),
+			prefix: oldPrefix[:lcp],
 			parent: node,
 		}
 
 		node.replaceChild(child, splitNode)
 
-		child.prefix = strings.Clone(child.prefix[lcp:])
+		child.prefix = oldPrefix[lcp:]
 		child.sibling = nil
 		splitNode.addChild(child)
 
@@ -547,18 +569,25 @@ func (c *radixCache) Insert(key string, value ValueType) ([]ValueType, error) {
 		c.mu.Unlock()
 	}()
 
+	var evictedValues []ValueType
+
 	if node, oldValue := c.insertNode(key, value); oldValue != nil {
+		c.moveToFront(node)
 		c.currentSize -= node.size
+		for valueSize > c.maxSize-c.currentSize && c.tail != nil && c.tail != node {
+			evictedValues = append(evictedValues, c.evictOne())
+		}
 		c.currentSize += valueSize
 		node.size = valueSize
-		c.moveToFront(node)
 	} else {
+		for valueSize > c.maxSize-c.currentSize && c.tail != nil {
+			evictedValues = append(evictedValues, c.evictOne())
+		}
 		node.size = valueSize
 		c.pushFront(node)
 		c.currentSize += valueSize
 	}
 
-	var evictedValues []ValueType
 	for c.currentSize > c.maxSize && c.tail != nil {
 		evictedValues = append(evictedValues, c.evictOne())
 	}
@@ -657,8 +686,10 @@ func (c *radixCache) UpdateWithoutChangingOrder(key string, value ValueType) err
 }
 
 // UpdateSize updates the size accounting for an existing key by sizeDelta and evicts excess entries if needed.
+// If node.size + sizeDelta exceeds maxSize, only node itself is evicted without evicting other entries.
 //
 // Returns ErrEntryNotExist if key does not exist.
+// Returns ErrInvalidUpdateEntrySize if sizeDelta causes uint64 integer overflow.
 func (c *radixCache) UpdateSize(key string, sizeDelta uint64) error {
 	c.mu.Lock()
 	defer func() {
@@ -675,6 +706,17 @@ func (c *radixCache) UpdateSize(key string, sizeDelta uint64) error {
 
 	if math.MaxUint64-node.size < sizeDelta || math.MaxUint64-c.currentSize < sizeDelta {
 		return ErrInvalidUpdateEntrySize
+	}
+	if node.size+sizeDelta > c.maxSize {
+		c.eraseInternal(node)
+		return nil
+	}
+
+	for sizeDelta > c.maxSize-c.currentSize && c.tail != nil {
+		if c.tail == node {
+			break
+		}
+		c.evictOne()
 	}
 
 	node.size += sizeDelta
@@ -746,16 +788,28 @@ func (c *radixCache) Compact() {
 	}()
 }
 
+// samplePressureFresh evaluates c.opts.PressureFunc with an atomic re-entrancy guard.
+func (c *radixCache) samplePressureFresh() float64 {
+	if c.opts.PressureFunc == nil {
+		return 0.0
+	}
+	if !c.samplingPressure.CompareAndSwap(false, true) {
+		return math.Float64frombits(c.cachedPressureBits.Load())
+	}
+	defer c.samplingPressure.Store(false)
+
+	pressure := c.opts.PressureFunc()
+	if math.IsNaN(pressure) || pressure < 0.0 {
+		pressure = 0.0
+	}
+	c.cachedPressureBits.Store(math.Float64bits(pressure))
+	return pressure
+}
+
 // EvaluateMemoryPressure samples the configured memory-pressure probe and sheds LRU tail entries
 // down to maxSize * EvictionRetentionRatio if critical pressure is reached.
 func (c *radixCache) EvaluateMemoryPressure() []ValueType {
-	var pressure float64
-	if c.opts.PressureFunc != nil {
-		pressure = c.opts.PressureFunc()
-		if math.IsNaN(pressure) || pressure < 0.0 {
-			pressure = 0.0
-		}
-	}
+	pressure := c.samplePressureFresh()
 
 	c.mu.Lock()
 	defer func() {
@@ -768,14 +822,15 @@ func (c *radixCache) EvaluateMemoryPressure() []ValueType {
 	if pressure >= c.opts.EvictionThreshold {
 		retention := c.opts.EvictionRetentionRatio
 		targetSize := computeTargetSize(c.maxSize, retention)
+		onlyZeroSizeEntries := c.currentSize == 0
 		targetLen := 0
-		if c.currentSize == 0 && c.len > 0 && retention > 0.0 {
+		if onlyZeroSizeEntries && c.len > 0 && retention > 0.0 {
 			targetLen = int(float64(c.len) * retention)
 		}
 		var evicted []ValueType
 		for c.tail != nil {
 			needByteShed := c.currentSize > targetSize
-			needZeroSizeShed := c.currentSize == 0 && c.len > targetLen
+			needZeroSizeShed := onlyZeroSizeEntries && c.len > targetLen
 			needFullFlush := retention == 0.0
 			if !needByteShed && !needZeroSizeShed && !needFullFlush {
 				break
@@ -788,5 +843,3 @@ func (c *radixCache) EvaluateMemoryPressure() []ValueType {
 	}
 	return nil
 }
-
-// 25c7

@@ -208,8 +208,9 @@ func TestOptions_MemoryPressureCustomAndValidation(t *testing.T) {
 
 	assert.Equal(t, DefaultEvictionRetentionRatio, optsNegativeRetention.EvictionRetentionRatio)
 
-	assert.Equal(t, 0.70, optsInverted.CompactionThreshold)
+	assert.InDelta(t, 0.70*(DefaultCompactionThreshold/DefaultEvictionThreshold), optsInverted.CompactionThreshold, 1e-9)
 	assert.Equal(t, 0.70, optsInverted.EvictionThreshold)
+	assert.Less(t, optsInverted.CompactionThreshold, optsInverted.EvictionThreshold)
 
 	assert.Equal(t, DefaultCompactionThreshold, optsNaNAndInf.CompactionThreshold)
 	assert.Equal(t, DefaultEvictionThreshold, optsNaNAndInf.EvictionThreshold)
@@ -274,5 +275,3 @@ func TestDefaultRuntimePressureFunc(t *testing.T) {
 	}
 	wg.Wait()
 }
-
-// 172a4

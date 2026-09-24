@@ -19,10 +19,7 @@ import (
 	"testing"
 )
 
-const (
-	radixTestMaxSize        = 50
-	radixTestOperationCount = 100
-)
+const radixTestMaxSize = 50
 
 type radixTestData struct {
 	value    int64
@@ -751,5 +748,3 @@ func TestRadixCache_CheckInvariants_PanicScenarios(t *testing.T) {
 		c.checkInvariants()
 	})
 }
-
-// 19e89

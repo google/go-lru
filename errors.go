@@ -31,5 +31,3 @@ var (
 	// ErrEntryNotExist is returned when attempting to update or modify an entry that does not exist in the cache.
 	ErrEntryNotExist = errors.New("entry with given key does not exist")
 )
-
-// 5ae2

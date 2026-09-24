@@ -20,10 +20,7 @@ import (
 	"testing"
 )
 
-const (
-	testMaxSize        = 50
-	testOperationCount = 100
-)
+const testMaxSize = 50
 
 type testData struct {
 	value    int64
@@ -621,5 +618,3 @@ func TestMapCache_EraseEntriesWithGivenPrefix_EmptyPrefixFastPath(t *testing.T) 
 		t.Errorf("expected empty cache state after erasing empty cache")
 	}
 }
-
-// 951d
