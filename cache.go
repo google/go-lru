@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-// Package lrus provides high-performance, concurrent, zero-dependency LRU cache implementations
+// Package lru provides high-performance, concurrent, zero-dependency LRU cache implementations
 // adapted from Google Cloud Storage FUSE (GCSFuse).
 //
 // The package defines a unified Cache interface satisfied by three specialized engines:
@@ -23,7 +23,7 @@
 //     and prefixes retain standard Go GC properties.
 //
 // All cache constructors require maxSize > 0 and unconditionally panic if maxSize == 0.
-package lrus
+package lru
 
 // ValueType represents an entry stored in a Cache that reports its logical or memory size.
 // The cache uses Size() to calculate total capacity and trigger LRU eviction when capacity is exceeded.
@@ -91,3 +91,31 @@ type PressureAwareCache interface {
 	// returning any values evicted during Tier 2 shedding.
 	EvaluateMemoryPressure() []ValueType
 }
+
+// New creates and returns a new LRU Cache bounded by maxSize.
+// By default, New constructs a MapCache (BackendMap). Callers can select an alternative
+// engine via WithBackend(BackendRadix) or WithBackend(BackendArenaRadix), or invoke
+// NewMapCache, NewRadixCache, or NewArenaRadixCache directly.
+//
+// When WithBackend(BackendArenaRadix) is used, the returned Cache also implements
+// PressureAwareCache.
+//
+// maxSize must be greater than zero; otherwise New panics.
+func New(maxSize uint64, opts ...Option) Cache {
+	if maxSize == 0 {
+		panic("maxSize must be greater than zero")
+	}
+	options := ApplyOptions(opts...)
+	switch options.Backend {
+	case BackendRadix:
+		return NewRadixCache(maxSize, opts...)
+	case BackendArenaRadix:
+		return NewArenaRadixCache(maxSize, opts...)
+	case BackendMap:
+		fallthrough
+	default:
+		return NewMapCache(maxSize, opts...)
+	}
+}
+
+// ca8f

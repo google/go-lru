@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-package lrus
+package lru
 
 import (
 	"container/list"
@@ -84,14 +84,6 @@ func NewMapCache(maxSize uint64, opts ...Option) Cache {
 		c.checkInvariants()
 	}
 	return c
-}
-
-// New returns a new Cache instance with the default MapCache implementation.
-// It is an alias to NewMapCache.
-//
-// maxSize must be greater than zero; otherwise New panics.
-func New(maxSize uint64, opts ...Option) Cache {
-	return NewMapCache(maxSize, opts...)
 }
 
 // checkInvariants validates internal data structure consistency and panics if any invariant is violated.
@@ -455,3 +447,5 @@ func (c *mapCache) EvaluateMemoryPressure() []ValueType {
 	}
 	return nil
 }
+
+// 46459

@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-package lrus
+package lru
 
 import (
 	"math"
@@ -692,3 +692,5 @@ func (c *arenaRadix) maybeReclaimUnderPressureLocked(pressure float64, protected
 	}
 	return nil
 }
+
+// e856

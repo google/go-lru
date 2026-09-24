@@ -1,0 +1,105 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - main
+      - master
+      - "feat/**"
+    tags:
+      - "v*"
+  pull_request:
+    branches:
+      - main
+      - master
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  lint:
+    name: Format & Vet
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Check formatting (gofmt -s)
+        run: |
+          UNFORMATTED=$(gofmt -s -l .)
+          if [ -n "$UNFORMATTED" ]; then
+            echo "The following files are not properly formatted with 'gofmt -s':"
+            echo "$UNFORMATTED"
+            exit 1
+          fi
+
+      - name: Run go vet
+        run: go vet ./...
+
+      - name: Verify go.mod and go.sum are tidy
+        run: |
+          go mod tidy
+          git diff --exit-code go.mod go.sum
+
+  test:
+    name: Correctness, Concurrency & Coverage
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    needs: lint
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Run Unit, Differential, and Concurrency Tests with Race Detector & Coverage
+        run: go test -v -race -covermode=atomic -coverprofile=coverage.out ./...
+
+      - name: Run Documentation Examples
+        run: go test -v -run=^Example ./...
+
+      - name: Generate Code Coverage Report & Summary
+        run: |
+          go tool cover -func=coverage.out | tee coverage.txt
+          TOTAL_COV=$(tail -n 1 coverage.txt | awk '{print $3}')
+          {
+            echo "## ✅ Correctness, Concurrency & Coverage Summary"
+            echo ""
+            echo "- **Race Detector (\`-race\`)**: Passed"
+            echo "- **Unit, Differential & Concurrency Suites**: Passed"
+            echo "- **Total Statement Coverage**: **${TOTAL_COV}**"
+            echo ""
+            echo "<details><summary>Per-Function Coverage Breakdown</summary>"
+            echo ""
+            echo '```text'
+            cat coverage.txt
+            echo '```'
+            echo "</details>"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload Coverage Artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-report
+          path: |
+            coverage.out
+            coverage.txt
+          retention-days: 14
+
+# 48427

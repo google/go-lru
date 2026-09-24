@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-package lrus
+package lru
 
 import (
 	"errors"
@@ -621,3 +621,5 @@ func TestMapCache_EraseEntriesWithGivenPrefix_EmptyPrefixFastPath(t *testing.T) 
 		t.Errorf("expected empty cache state after erasing empty cache")
 	}
 }
+
+// 951d

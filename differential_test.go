@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-package lrus_test
+package lru_test
 
 import (
 	"fmt"
@@ -21,7 +21,7 @@ import (
 	"strings"
 	"testing"
 
-	lrus "github.com/googlecloudplatform/gcsfuse/v3/internal/cache/lru"
+	"github.com/google/go-lru"
 )
 
 type diffValue struct {
@@ -46,7 +46,7 @@ func (v *diffValue) String() string {
 type diffInstance struct {
 	name       string
 	invariants bool
-	cache      lrus.Cache
+	cache      lru.Cache
 }
 
 type differentialHarness struct {
@@ -63,16 +63,16 @@ func newDifferentialHarness(t *testing.T, maxSize uint64) *differentialHarness {
 
 	configs := []struct {
 		name        string
-		constructor func(uint64, ...lrus.Option) lrus.Cache
+		constructor func(uint64, ...lru.Option) lru.Cache
 	}{
-		{"MapCache", lrus.NewMapCache},
-		{"RadixCache", lrus.NewRadixCache},
-		{"ArenaRadixCache", lrus.NewArenaRadixCache},
+		{"MapCache", lru.NewMapCache},
+		{"RadixCache", lru.NewRadixCache},
+		{"ArenaRadixCache", lru.NewArenaRadixCache},
 	}
 
 	for _, cfg := range configs {
 		for _, inv := range []bool{false, true} {
-			c := cfg.constructor(maxSize, lrus.WithInvariantChecking(inv))
+			c := cfg.constructor(maxSize, lru.WithInvariantChecking(inv))
 			h.instances = append(h.instances, diffInstance{
 				name:       cfg.name,
 				invariants: inv,
@@ -94,7 +94,7 @@ func (h *differentialHarness) compareErrors(op string, baseErr, targetErr error,
 	}
 }
 
-func (h *differentialHarness) compareValues(op string, baseVal, targetVal lrus.ValueType, instName string, invariants bool) {
+func (h *differentialHarness) compareValues(op string, baseVal, targetVal lru.ValueType, instName string, invariants bool) {
 	h.t.Helper()
 	if (baseVal == nil && targetVal != nil) || (baseVal != nil && targetVal == nil) {
 		h.t.Fatalf("[%s] value nil parity mismatch with %s (inv=%v): base = %v, target = %v", op, instName, invariants, baseVal, targetVal)
@@ -112,7 +112,7 @@ func (h *differentialHarness) compareValues(op string, baseVal, targetVal lrus.V
 	}
 }
 
-func (h *differentialHarness) compareEvicted(op string, baseEvicted, targetEvicted []lrus.ValueType, instName string, invariants bool) {
+func (h *differentialHarness) compareEvicted(op string, baseEvicted, targetEvicted []lru.ValueType, instName string, invariants bool) {
 	h.t.Helper()
 	if len(baseEvicted) != len(targetEvicted) {
 		h.t.Fatalf("[%s] evicted slice length mismatch with %s (inv=%v): base len = %d, target len = %d", op, instName, invariants, len(baseEvicted), len(targetEvicted))
@@ -122,9 +122,9 @@ func (h *differentialHarness) compareEvicted(op string, baseEvicted, targetEvict
 	}
 }
 
-func (h *differentialHarness) Insert(key string, val lrus.ValueType) []lrus.ValueType {
+func (h *differentialHarness) Insert(key string, val lru.ValueType) []lru.ValueType {
 	h.t.Helper()
-	var baseEvicted []lrus.ValueType
+	var baseEvicted []lru.ValueType
 	var baseErr error
 
 	for i, inst := range h.instances {
@@ -140,9 +140,9 @@ func (h *differentialHarness) Insert(key string, val lrus.ValueType) []lrus.Valu
 	return baseEvicted
 }
 
-func (h *differentialHarness) Erase(key string) lrus.ValueType {
+func (h *differentialHarness) Erase(key string) lru.ValueType {
 	h.t.Helper()
-	var baseVal lrus.ValueType
+	var baseVal lru.ValueType
 
 	for i, inst := range h.instances {
 		val := inst.cache.Erase(key)
@@ -155,9 +155,9 @@ func (h *differentialHarness) Erase(key string) lrus.ValueType {
 	return baseVal
 }
 
-func (h *differentialHarness) LookUp(key string) lrus.ValueType {
+func (h *differentialHarness) LookUp(key string) lru.ValueType {
 	h.t.Helper()
-	var baseVal lrus.ValueType
+	var baseVal lru.ValueType
 
 	for i, inst := range h.instances {
 		val := inst.cache.LookUp(key)
@@ -170,9 +170,9 @@ func (h *differentialHarness) LookUp(key string) lrus.ValueType {
 	return baseVal
 }
 
-func (h *differentialHarness) LookUpWithoutChangingOrder(key string) lrus.ValueType {
+func (h *differentialHarness) LookUpWithoutChangingOrder(key string) lru.ValueType {
 	h.t.Helper()
-	var baseVal lrus.ValueType
+	var baseVal lru.ValueType
 
 	for i, inst := range h.instances {
 		val := inst.cache.LookUpWithoutChangingOrder(key)
@@ -185,7 +185,7 @@ func (h *differentialHarness) LookUpWithoutChangingOrder(key string) lrus.ValueT
 	return baseVal
 }
 
-func (h *differentialHarness) UpdateWithoutChangingOrder(key string, val lrus.ValueType) {
+func (h *differentialHarness) UpdateWithoutChangingOrder(key string, val lru.ValueType) {
 	h.t.Helper()
 	var baseErr error
 
@@ -447,3 +447,5 @@ func TestDifferential_BoundaryAndEdgeCases(t *testing.T) {
 
 	h.DrainAndVerifyEvictionOrder(adversarialKeys)
 }
+
+// 14a13

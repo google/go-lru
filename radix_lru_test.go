@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-package lrus
+package lru
 
 import (
 	"errors"
@@ -751,3 +751,5 @@ func TestRadixCache_CheckInvariants_PanicScenarios(t *testing.T) {
 		c.checkInvariants()
 	})
 }
+
+// 19e89
