@@ -23,6 +23,8 @@ import (
 	"testing"
 
 	lrus "github.com/googlecloudplatform/gcsfuse/v3/internal/cache/lru"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 type concValue struct {
@@ -283,4 +285,104 @@ func TestConcurrency_EvictionThrashingWithInvariants(t *testing.T) {
 			wg.Wait()
 		})
 	}
+}
+
+// TestConcurrency_MemoryPressureCompactionAndEviction exercises concurrent reads, inserts,
+// updates, size updates, erasures, prefix deletions, and explicit/automatic compactions
+// while memory pressure dynamically oscillates across normal, moderate, and critical tiers
+// with WithInvariantChecking(true) enabled.
+func TestConcurrency_MemoryPressureCompactionAndEviction(t *testing.T) {
+	// Arrange
+	const (
+		numGoroutines = 16
+		opsPerWorker  = 250
+		numKeys       = 120
+		capacity      = 4000
+	)
+
+	var pressureBits atomic.Uint64
+	setPressure := func(p float64) {
+		pressureBits.Store(uint64(p * 1000))
+	}
+	getPressure := func() float64 {
+		return float64(pressureBits.Load()) / 1000.0
+	}
+	setPressure(0.20)
+
+	cache := lrus.NewArenaRadixCache(
+		capacity,
+		lrus.WithInvariantChecking(true),
+		lrus.WithPressureFunc(getPressure),
+		lrus.WithCompactionThreshold(0.75),
+		lrus.WithEvictionThreshold(0.90),
+		lrus.WithEvictionRetentionRatio(0.50),
+	)
+
+	reclaimer, ok := cache.(lrus.PressureAwareCache)
+	require.True(t, ok, "expected ArenaRadixCache to implement PressureAwareCache")
+
+	// Act
+	var wg sync.WaitGroup
+	for g := range numGoroutines {
+		wg.Add(1)
+		go func(workerID int) {
+			defer wg.Done()
+			r := rand.New(rand.NewSource(int64(workerID*13337 + 99)))
+
+			for step := range opsPerWorker {
+				// Dynamically oscillate simulated pressure across Normal (0.20),
+				// Moderate (0.80), and Critical (0.95) tiers.
+				switch (workerID + step) % 3 {
+				case 0:
+					setPressure(0.20)
+				case 1:
+					setPressure(0.80)
+				case 2:
+					setPressure(0.95)
+				}
+
+				op := r.Intn(100)
+				kIdx := r.Intn(numKeys)
+				dirIdx := kIdx % 6
+				subIdx := (kIdx / 6) % 5
+				key := fmt.Sprintf("mp_dir_%02d/sub_%02d/file_%03d.dat", dirIdx, subIdx, kIdx)
+
+				switch {
+				case op < 30:
+					_, err := cache.Insert(key, concValue{id: key, size: 10})
+					if err != nil {
+						assert.ErrorIs(t, err, lrus.ErrInvalidEntrySize)
+					}
+				case op < 50:
+					_ = cache.LookUp(key)
+				case op < 68:
+					_ = cache.LookUpWithoutChangingOrder(key)
+				case op < 76:
+					err := cache.UpdateWithoutChangingOrder(key, concValue{id: key + "_u", size: 10})
+					if err != nil {
+						assert.True(t, errors.Is(err, lrus.ErrEntryNotExist) || errors.Is(err, lrus.ErrInvalidUpdateEntrySize))
+					}
+				case op < 84:
+					err := cache.UpdateSize(key, 5)
+					if err != nil {
+						assert.ErrorIs(t, err, lrus.ErrEntryNotExist)
+					}
+				case op < 90:
+					_ = cache.Erase(key)
+				case op < 95:
+					prefix := fmt.Sprintf("mp_dir_%02d/", dirIdx)
+					cache.EraseEntriesWithGivenPrefix(prefix)
+				case op < 98:
+					reclaimer.Compact()
+				default:
+					_ = reclaimer.EvaluateMemoryPressure()
+				}
+			}
+		}(g)
+	}
+
+	wg.Wait()
+
+	// Assert: Final compaction and invariant check on quiescent cache succeed cleanly.
+	reclaimer.Compact()
 }

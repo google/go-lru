@@ -60,6 +60,9 @@ type mapCache struct {
 
 	// checkInvariantsEnabled indicates whether invariant checks are executed on lock/unlock.
 	checkInvariantsEnabled bool
+
+	// options holds the parsed cache configuration.
+	options Options
 }
 
 // NewMapCache returns a new map-based LRU Cache initialized with the supplied maxSize.
@@ -75,6 +78,7 @@ func NewMapCache(maxSize uint64, opts ...Option) Cache {
 		maxSize:                maxSize,
 		index:                  make(map[string]*list.Element),
 		checkInvariantsEnabled: options.EnableInvariantChecking,
+		options:                options,
 	}
 	if c.checkInvariantsEnabled {
 		c.checkInvariants()
@@ -93,12 +97,12 @@ func New(maxSize uint64, opts ...Option) Cache {
 // checkInvariants validates internal data structure consistency and panics if any invariant is violated.
 func (c *mapCache) checkInvariants() {
 	// Invariant 1: maxSize > 0
-	if !(c.maxSize > 0) {
+	if c.maxSize == 0 {
 		panic(fmt.Sprintf("Invalid maxSize: %v", c.maxSize))
 	}
 
 	// Invariant 2: currentSize <= maxSize
-	if !(c.currentSize <= c.maxSize) {
+	if c.currentSize > c.maxSize {
 		panic(fmt.Sprintf("CurrentSize %v over maxSize %v", c.currentSize, c.maxSize))
 	}
 
@@ -328,6 +332,8 @@ func (c *mapCache) UpdateWithoutChangingOrder(key string, value ValueType) error
 		return ErrInvalidEntry
 	}
 
+	valueSize := value.Size()
+
 	c.lock()
 	defer c.unlock()
 
@@ -337,7 +343,7 @@ func (c *mapCache) UpdateWithoutChangingOrder(key string, value ValueType) error
 	}
 
 	entryVal := e.Value.(entry)
-	if value.Size() != entryVal.size {
+	if valueSize != entryVal.size {
 		return ErrInvalidUpdateEntrySize
 	}
 
@@ -393,4 +399,59 @@ func (c *mapCache) EraseEntriesWithGivenPrefix(prefix string) {
 			c.eraseInternal(key)
 		}
 	}
+}
+
+// Compact reallocates the internal hash index to reclaim Go map bucket slack while preserving all live entries.
+func (c *mapCache) Compact() {
+	c.lock()
+	defer c.unlock()
+	c.compactLocked()
+}
+
+func (c *mapCache) compactLocked() {
+	newIndex := make(map[string]*list.Element, len(c.index))
+	for k, v := range c.index {
+		newIndex[k] = v
+	}
+	c.index = newIndex
+}
+
+// EvaluateMemoryPressure samples the configured memory-pressure probe and executes
+// Tier 2 (LRU shedding + map compaction) or Tier 1 (lossless map compaction) if thresholds are met.
+func (c *mapCache) EvaluateMemoryPressure() []ValueType {
+	var pressure float64
+	if c.options.PressureFunc != nil {
+		pressure = c.options.PressureFunc()
+		if math.IsNaN(pressure) || pressure < 0.0 {
+			pressure = 0.0
+		}
+	}
+
+	c.lock()
+	defer c.unlock()
+
+	if pressure >= c.options.EvictionThreshold {
+		retention := c.options.EvictionRetentionRatio
+		targetSize := computeTargetSize(c.maxSize, retention)
+		targetLen := 0
+		if c.currentSize == 0 && c.entries.Len() > 0 && retention > 0.0 {
+			targetLen = int(float64(c.entries.Len()) * retention)
+		}
+		var evicted []ValueType
+		for c.entries.Len() > 0 {
+			needByteShed := c.currentSize > targetSize
+			needZeroSizeShed := c.currentSize == 0 && c.entries.Len() > targetLen
+			needFullFlush := retention == 0.0
+			if !needByteShed && !needZeroSizeShed && !needFullFlush {
+				break
+			}
+			evicted = append(evicted, c.evictOne())
+		}
+		c.compactLocked()
+		return evicted
+	}
+	if pressure >= c.options.CompactionThreshold {
+		c.compactLocked()
+	}
+	return nil
 }

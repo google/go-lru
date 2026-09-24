@@ -633,6 +633,8 @@ func (c *radixCache) UpdateWithoutChangingOrder(key string, value ValueType) err
 		return ErrInvalidEntry
 	}
 
+	valueSize := value.Size()
+
 	c.mu.Lock()
 	defer func() {
 		if c.opts.EnableInvariantChecking {
@@ -646,7 +648,7 @@ func (c *radixCache) UpdateWithoutChangingOrder(key string, value ValueType) err
 		return ErrEntryNotExist
 	}
 
-	if value.Size() != node.size {
+	if valueSize != node.size {
 		return ErrInvalidUpdateEntrySize
 	}
 
@@ -731,4 +733,58 @@ func (c *radixCache) EraseEntriesWithGivenPrefix(prefix string) {
 
 		return
 	}
+}
+
+// Compact satisfies PressureAwareCache on radixCache (pointer-based nodes are reclaimed directly by Go GC upon deletion).
+func (c *radixCache) Compact() {
+	c.mu.Lock()
+	defer func() {
+		if c.opts.EnableInvariantChecking {
+			c.checkInvariants()
+		}
+		c.mu.Unlock()
+	}()
+}
+
+// EvaluateMemoryPressure samples the configured memory-pressure probe and sheds LRU tail entries
+// down to maxSize * EvictionRetentionRatio if critical pressure is reached.
+func (c *radixCache) EvaluateMemoryPressure() []ValueType {
+	var pressure float64
+	if c.opts.PressureFunc != nil {
+		pressure = c.opts.PressureFunc()
+		if math.IsNaN(pressure) || pressure < 0.0 {
+			pressure = 0.0
+		}
+	}
+
+	c.mu.Lock()
+	defer func() {
+		if c.opts.EnableInvariantChecking {
+			c.checkInvariants()
+		}
+		c.mu.Unlock()
+	}()
+
+	if pressure >= c.opts.EvictionThreshold {
+		retention := c.opts.EvictionRetentionRatio
+		targetSize := computeTargetSize(c.maxSize, retention)
+		targetLen := 0
+		if c.currentSize == 0 && c.len > 0 && retention > 0.0 {
+			targetLen = int(float64(c.len) * retention)
+		}
+		var evicted []ValueType
+		for c.tail != nil {
+			needByteShed := c.currentSize > targetSize
+			needZeroSizeShed := c.currentSize == 0 && c.len > targetLen
+			needFullFlush := retention == 0.0
+			if !needByteShed && !needZeroSizeShed && !needFullFlush {
+				break
+			}
+			if val := c.evictOne(); val != nil {
+				evicted = append(evicted, val)
+			}
+		}
+		return evicted
+	}
+	return nil
 }

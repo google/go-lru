@@ -139,9 +139,11 @@ func (c *arenaRadix) checkInvariants() {
 	// Validates tree integrity, sibling sorted order, parent pointers, compactness,
 	// and 1:1 bijection between value-bearing nodes and LRU list elements.
 	treeCount := 0
+	treeNodeCount := 0
 	var treeSumSize uint64
 	currID := c.root
 	for currID != nilNode {
+		treeNodeCount++
 		if c.nodes[currID].value != nil {
 			treeCount++
 			treeSumSize += c.nodes[currID].size
@@ -197,6 +199,76 @@ func (c *arenaRadix) checkInvariants() {
 	if treeSumSize != c.currentSize {
 		panic(fmt.Sprintf("arenaRadix: currentSize drift in tree: currentSize=%d treeSumSize=%d", c.currentSize, treeSumSize))
 	}
+
+	// INVARIANT 6: Hash accelerator map (nodeMap) index bounds, non-nil value, and hash consistency.
+	for h, id := range c.nodeMap {
+		if id >= uint32(len(c.nodes)) {
+			panic(fmt.Sprintf("arenaRadix invariant violation: nodeMap contains out-of-bounds index %d (len=%d)", id, len(c.nodes)))
+		}
+		if c.nodes[id].value == nil {
+			panic(fmt.Sprintf("arenaRadix invariant violation: nodeMap points to node %d with nil value", id))
+		}
+		if c.hashNodeKey(id) != h {
+			panic(fmt.Sprintf("arenaRadix invariant violation: nodeMap hash mismatch for node %d", id))
+		}
+	}
+
+	// INVARIANT 7: Free-list integrity and total node accounting (liveTreeNodes + freeListCount == len(nodes)).
+	freeCount := 0
+	for freeID := c.freeHead; freeID != nilNode; freeID = c.nodes[freeID].next {
+		if freeID >= uint32(len(c.nodes)) {
+			panic(fmt.Sprintf("arenaRadix invariant violation: free-list contains out-of-bounds index %d (len=%d)", freeID, len(c.nodes)))
+		}
+		if c.nodes[freeID].value != nil {
+			panic(fmt.Sprintf("arenaRadix invariant violation: free-list node %d has non-nil value", freeID))
+		}
+		if c.nodes[freeID].size != 0 {
+			panic(fmt.Sprintf("arenaRadix invariant violation: free-list node %d has non-zero size %d", freeID, c.nodes[freeID].size))
+		}
+		freeCount++
+		if freeCount > len(c.nodes) {
+			panic("arenaRadix invariant violation: cycle detected in free-list")
+		}
+	}
+
+	if uint32(freeCount) != c.freeCount {
+		panic(fmt.Sprintf("arenaRadix invariant violation: free-list walk count (%d) != tracked freeCount (%d)", freeCount, c.freeCount))
+	}
+
+	if treeNodeCount+freeCount != len(c.nodes) {
+		panic(fmt.Sprintf("arenaRadix invariant violation: live tree nodes (%d) + free list nodes (%d) != len(nodes) (%d)", treeNodeCount, freeCount, len(c.nodes)))
+	}
+}
+
+// Compact performs lossless O(N) compaction of the arena node slice and hash lookup map
+// under exclusive write lock while preserving 100% of live entries, sizes, and exact LRU order.
+func (c *arenaRadix) Compact() {
+	c.mu.Lock()
+	defer func() {
+		if c.options.EnableInvariantChecking {
+			c.checkInvariants()
+		}
+		c.mu.Unlock()
+	}()
+	c.compactLocked()
+}
+
+// EvaluateMemoryPressure samples the configured memory-pressure probe lock-free,
+// then acquires the exclusive write lock to execute Tier 2 (LRU tail shedding + compaction)
+// or Tier 1 (lossless compaction) if pressure meets or exceeds the configured thresholds.
+// Returns any values evicted during Tier 2 critical-pressure shedding.
+func (c *arenaRadix) EvaluateMemoryPressure() []ValueType {
+	pressure := c.samplePressureFresh()
+
+	c.mu.Lock()
+	defer func() {
+		if c.options.EnableInvariantChecking {
+			c.checkInvariants()
+		}
+		c.mu.Unlock()
+	}()
+
+	return c.maybeReclaimUnderPressureLocked(pressure, nilNode)
 }
 
 // Insert inserts or updates the given key and value in the cache.
@@ -214,6 +286,9 @@ func (c *arenaRadix) Insert(key string, value ValueType) ([]ValueType, error) {
 	if valueSize > c.maxSize {
 		return nil, ErrInvalidEntrySize
 	}
+
+	sampledEpoch := c.reclaimEpoch.Load()
+	pressure := c.samplePressure()
 
 	c.mu.Lock()
 	defer func() {
@@ -233,7 +308,16 @@ func (c *arenaRadix) Insert(key string, value ValueType) ([]ValueType, error) {
 		evictedValues = append(evictedValues, c.evictOne())
 	}
 
-	if nodeID, oldValue := c.insertNode(key, value); oldValue != nil {
+	// If inserting a brand-new key would exceed maxSize, evict from the LRU tail before
+	// allocating new arena nodes so insertNode immediately recycles the freed slot(s) from freeHead.
+	if _, exists := c.getNodeKey(key); !exists {
+		for c.currentSize+valueSize > c.maxSize && c.tail != nilNode {
+			evictedValues = append(evictedValues, c.evictOne())
+		}
+	}
+
+	nodeID, oldValue := c.insertNode(key, value)
+	if oldValue != nil {
 		c.currentSize -= c.nodes[nodeID].size
 		c.currentSize += valueSize
 		c.nodes[nodeID].size = valueSize
@@ -251,11 +335,21 @@ func (c *arenaRadix) Insert(key string, value ValueType) ([]ValueType, error) {
 		evictedValues = append(evictedValues, c.evictOne())
 	}
 
+	if !c.options.hasCustomPressureFunc && sampledEpoch != c.reclaimEpoch.Load() {
+		pressure = c.samplePressure()
+	}
+	if evictedByPressure := c.maybeReclaimUnderPressureLocked(pressure, nodeID); len(evictedByPressure) > 0 {
+		evictedValues = append(evictedValues, evictedByPressure...)
+	}
+
 	return evictedValues, nil
 }
 
 // Erase removes the entry associated with key from the cache, returning its value (or nil if not found).
 func (c *arenaRadix) Erase(key string) (value ValueType) {
+	sampledEpoch := c.reclaimEpoch.Load()
+	pressure := c.samplePressure()
+
 	c.mu.Lock()
 	defer func() {
 		if c.options.EnableInvariantChecking {
@@ -269,7 +363,12 @@ func (c *arenaRadix) Erase(key string) (value ValueType) {
 		return nil
 	}
 
-	return c.eraseInternal(nodeID)
+	deleted := c.eraseInternal(nodeID)
+	if !c.options.hasCustomPressureFunc && sampledEpoch != c.reclaimEpoch.Load() {
+		pressure = c.samplePressure()
+	}
+	c.maybeCompactUnderPressureLocked(pressure)
+	return deleted
 }
 
 // LookUp retrieves the value associated with key and promotes it to MRU position.
@@ -321,6 +420,8 @@ func (c *arenaRadix) UpdateWithoutChangingOrder(key string, value ValueType) err
 		return ErrInvalidEntry
 	}
 
+	valueSize := value.Size()
+
 	c.mu.Lock()
 	defer func() {
 		if c.options.EnableInvariantChecking {
@@ -334,7 +435,7 @@ func (c *arenaRadix) UpdateWithoutChangingOrder(key string, value ValueType) err
 		return ErrEntryNotExist
 	}
 
-	if value.Size() != c.nodes[nodeID].size {
+	if valueSize != c.nodes[nodeID].size {
 		return ErrInvalidUpdateEntrySize
 	}
 
@@ -347,6 +448,9 @@ func (c *arenaRadix) UpdateWithoutChangingOrder(key string, value ValueType) err
 //
 // Returns ErrEntryNotExist if key is not present in the cache.
 func (c *arenaRadix) UpdateSize(key string, sizeDelta uint64) error {
+	sampledEpoch := c.reclaimEpoch.Load()
+	pressure := c.samplePressure()
+
 	c.mu.Lock()
 	defer func() {
 		if c.options.EnableInvariantChecking {
@@ -373,12 +477,22 @@ func (c *arenaRadix) UpdateSize(key string, sizeDelta uint64) error {
 		c.evictOne()
 	}
 
+	if !c.options.hasCustomPressureFunc && sampledEpoch != c.reclaimEpoch.Load() {
+		pressure = c.samplePressure()
+	}
+	if sizeDelta > 0 {
+		c.maybeReclaimUnderPressureLocked(pressure, nodeID)
+	} else {
+		c.maybeCompactUnderPressureLocked(pressure)
+	}
 	return nil
 }
 
 // EraseEntriesWithGivenPrefix deletes all entries whose keys begin with prefix.
 // It severs the matching subtree in O(1) and iteratively reclaims all nodes into the free-list.
 func (c *arenaRadix) EraseEntriesWithGivenPrefix(prefix string) {
+	pressure := c.samplePressure()
+
 	c.mu.Lock()
 	defer func() {
 		if c.options.EnableInvariantChecking {
@@ -390,13 +504,17 @@ func (c *arenaRadix) EraseEntriesWithGivenPrefix(prefix string) {
 	if prefix == "" {
 		c.nodes = nil
 		c.freeHead = nilNode
+		c.freeCount = 0
 
 		c.root = c.allocateNode()
 		c.head = nilNode
 		c.tail = nilNode
 		c.currentSize = 0
 		c.len = 0
-		clear(c.nodeMap)
+		c.nodeMap = make(map[uint64]uint32)
+		if pressure >= c.options.CompactionThreshold {
+			c.compactLocked()
+		}
 		return
 	}
 
@@ -422,6 +540,7 @@ func (c *arenaRadix) EraseEntriesWithGivenPrefix(prefix string) {
 			// Now sweep the detached subtree to fix LRU, nodeMap, and currentSize
 			c.freeSubtree(childID)
 			c.compressPathUpwards(nodeID)
+			c.maybeCompactUnderPressureLocked(pressure)
 			return
 		}
 
@@ -446,7 +565,7 @@ func (c *arenaRadix) freeSubtree(nodeID uint32) {
 		if c.nodes[currID].value != nil {
 			c.currentSize -= c.nodes[currID].size
 			c.remove(currID)
-			hash := hashString(c.getFullKey(currID))
+			hash := c.hashNodeKey(currID)
 			if c.nodeMap[hash] == currID {
 				delete(c.nodeMap, hash)
 			}

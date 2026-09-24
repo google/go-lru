@@ -437,3 +437,45 @@ func Benchmark_LargeScale_PrefixErase_100K(b *testing.B) {
 	b.Run("RadixCache", func(b *testing.B) { runPrefixErase100K(b, lrus.NewRadixCache) })
 	b.Run("ArenaRadixCache", func(b *testing.B) { runPrefixErase100K(b, lrus.NewArenaRadixCache) })
 }
+
+// ============================================================================
+// 9. Memory Pressure Compaction & Reclamation Benchmarks
+// ============================================================================
+
+func Benchmark_ArenaRadixCache_Compact(b *testing.B) {
+	const numKeys = 10000
+	data := benchValue{val: 1, dataSize: 10}
+
+	b.ReportAllocs()
+	for range b.N {
+		b.StopTimer()
+		cache := lrus.NewArenaRadixCache(uint64(numKeys * 20)).(lrus.PressureAwareCache)
+		for i := range numKeys {
+			_, _ = cache.Insert(fmt.Sprintf("dir_%02d/file_%05d", i%50, i), data)
+		}
+		for i := range numKeys / 2 {
+			_ = cache.Erase(fmt.Sprintf("dir_%02d/file_%05d", i%50, i))
+		}
+		b.StartTimer()
+
+		cache.Compact()
+	}
+}
+
+func Benchmark_ArenaRadixCache_InsertUnderPressure(b *testing.B) {
+	const numKeys = 10000
+	data := benchValue{val: 1, dataSize: 10}
+	cache := lrus.NewArenaRadixCache(
+		uint64(numKeys*10),
+		lrus.WithPressureFunc(func() float64 { return 0.92 }),
+		lrus.WithEvictionRetentionRatio(0.50),
+	)
+
+	b.ReportAllocs()
+	b.ResetTimer()
+	i := 0
+	for b.Loop() {
+		_, _ = cache.Insert(fmt.Sprintf("dir_%02d/file_%05d", i%50, i%(numKeys*2)), data)
+		i++
+	}
+}
