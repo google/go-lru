@@ -944,7 +944,7 @@ func TestRegression_F14(t *testing.T) {
 	assert.Contains(t, cfg, "thelper")
 	assert.Contains(t, cfg, "revive")
 	assert.Contains(t, cfg, "goimports")
-	assert.Contains(t, ciText, "golangci/golangci-lint-action@v7")
+	assert.Contains(t, ciText, "golangci/golangci-lint-action@9fae48acfc02a90574d7c304a1758ef9895495fa")
 	assert.Contains(t, ciText, "goimports -l .")
 }
 
