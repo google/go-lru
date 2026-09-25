@@ -55,6 +55,7 @@ func allEngines() []struct {
 func TestConcurrency_MixedOperations(t *testing.T) {
 	for _, eng := range allEngines() {
 		t.Run(eng.name, func(t *testing.T) {
+			// Arrange
 			const (
 				numGoroutines = 16
 				opsPerWorker  = 300
@@ -67,11 +68,10 @@ func TestConcurrency_MixedOperations(t *testing.T) {
 			for i := range numKeys {
 				key := fmt.Sprintf("dir_%02d/sub_%02d/file_%03d.txt", i%5, (i/5)%10, i)
 				_, err := cache.Insert(key, concValue{id: key, size: 10})
-				if err != nil {
-					t.Fatalf("unexpected pre-population error: %v", err)
-				}
+				require.NoError(t, err)
 			}
 
+			// Act
 			var wg sync.WaitGroup
 			for g := range numGoroutines {
 				wg.Add(1)
@@ -89,8 +89,8 @@ func TestConcurrency_MixedOperations(t *testing.T) {
 						switch {
 						case op < 30:
 							_, err := cache.Insert(key, concValue{id: key, size: 10})
-							if err != nil && !errors.Is(err, lru.ErrInvalidEntrySize) {
-								t.Errorf("worker %d: unexpected insert error: %v", workerID, err)
+							if err != nil {
+								assert.ErrorIs(t, err, lru.ErrInvalidEntrySize)
 							}
 						case op < 55:
 							_ = cache.LookUp(key)
@@ -98,13 +98,13 @@ func TestConcurrency_MixedOperations(t *testing.T) {
 							_ = cache.LookUpWithoutChangingOrder(key)
 						case op < 80:
 							err := cache.UpdateWithoutChangingOrder(key, concValue{id: key + "_upd", size: 10})
-							if err != nil && !errors.Is(err, lru.ErrEntryNotExist) && !errors.Is(err, lru.ErrInvalidUpdateEntrySize) {
-								t.Errorf("worker %d: unexpected update error: %v", workerID, err)
+							if err != nil {
+								assert.True(t, errors.Is(err, lru.ErrEntryNotExist) || errors.Is(err, lru.ErrInvalidUpdateEntrySize))
 							}
 						case op < 88:
 							err := cache.UpdateSize(key, 0)
-							if err != nil && !errors.Is(err, lru.ErrEntryNotExist) {
-								t.Errorf("worker %d: unexpected update size error: %v", workerID, err)
+							if err != nil {
+								assert.ErrorIs(t, err, lru.ErrEntryNotExist)
 							}
 						case op < 95:
 							_ = cache.Erase(key)
@@ -117,6 +117,11 @@ func TestConcurrency_MixedOperations(t *testing.T) {
 			}
 
 			wg.Wait()
+
+			// Assert
+			_, err := cache.Insert("post_conc_check", concValue{id: "post_conc_check", size: 10})
+			require.NoError(t, err)
+			assert.NotNil(t, cache.LookUp("post_conc_check"))
 		})
 	}
 }
@@ -127,6 +132,7 @@ func TestConcurrency_MixedOperations(t *testing.T) {
 func TestConcurrency_PrefixErasureAtomicity(t *testing.T) {
 	for _, eng := range allEngines() {
 		t.Run(eng.name, func(t *testing.T) {
+			// Arrange
 			const (
 				numWriters   = 8
 				opsPerWriter = 100
@@ -134,28 +140,30 @@ func TestConcurrency_PrefixErasureAtomicity(t *testing.T) {
 
 			cache := eng.constructor(100000)
 
-			// Pre-populate target and retained entries.
-			for i := 0; i < 20; i++ {
+			for i := range 20 {
 				kTarget := fmt.Sprintf("/target/init_%d", i)
-				_, _ = cache.Insert(kTarget, concValue{id: kTarget, size: 10})
+				_, err := cache.Insert(kTarget, concValue{id: kTarget, size: 10})
+				require.NoError(t, err)
 				kKeep := fmt.Sprintf("/keep/init_%d", i)
-				_, _ = cache.Insert(kKeep, concValue{id: kKeep, size: 10})
+				_, err = cache.Insert(kKeep, concValue{id: kKeep, size: 10})
+				require.NoError(t, err)
 			}
 
+			// Act
 			var writerWg sync.WaitGroup
-			for w := 0; w < numWriters; w++ {
+			for w := range numWriters {
 				writerWg.Add(1)
 				go func(workerID int) {
 					defer writerWg.Done()
-					for op := 0; op < opsPerWriter; op++ {
+					for op := range opsPerWriter {
 						key := fmt.Sprintf("/target/w%d_%d", workerID, op)
-						_, _ = cache.Insert(key, concValue{id: key, size: 10})
+						_, err := cache.Insert(key, concValue{id: key, size: 10})
+						assert.NoError(t, err)
 					}
 				}(w)
 			}
 
-			// Concurrent erasures during writes.
-			for i := 0; i < 10; i++ {
+			for range 10 {
 				cache.EraseEntriesWithGivenPrefix("/target/")
 			}
 
@@ -164,23 +172,18 @@ func TestConcurrency_PrefixErasureAtomicity(t *testing.T) {
 			// Final prefix erase after writers finish must remove all /target/ keys.
 			cache.EraseEntriesWithGivenPrefix("/target/")
 
-			for i := 0; i < 20; i++ {
+			// Assert
+			for i := range 20 {
 				kTarget := fmt.Sprintf("/target/init_%d", i)
-				if val := cache.LookUp(kTarget); val != nil {
-					t.Fatalf("[%s] pre-existing target key %s survived prefix erasure", eng.name, kTarget)
-				}
+				assert.Nil(t, cache.LookUp(kTarget))
 				kKeep := fmt.Sprintf("/keep/init_%d", i)
-				if val := cache.LookUp(kKeep); val == nil {
-					t.Fatalf("[%s] retained key %s was erroneously erased", eng.name, kKeep)
-				}
+				assert.NotNil(t, cache.LookUp(kKeep))
 			}
 
-			for w := 0; w < numWriters; w++ {
-				for op := 0; op < opsPerWriter; op++ {
+			for w := range numWriters {
+				for op := range opsPerWriter {
 					key := fmt.Sprintf("/target/w%d_%d", w, op)
-					if val := cache.LookUp(key); val != nil {
-						t.Fatalf("[%s] writer target key %s survived final prefix erasure", eng.name, key)
-					}
+					assert.Nil(t, cache.LookUp(key))
 				}
 			}
 		})
@@ -192,6 +195,7 @@ func TestConcurrency_PrefixErasureAtomicity(t *testing.T) {
 func TestConcurrency_ParallelReadersWithoutChangingOrder(t *testing.T) {
 	for _, eng := range allEngines() {
 		t.Run(eng.name, func(t *testing.T) {
+			// Arrange
 			const (
 				totalKeys  = 200
 				numReaders = 16
@@ -201,26 +205,25 @@ func TestConcurrency_ParallelReadersWithoutChangingOrder(t *testing.T) {
 
 			cache := eng.constructor(capacity)
 
-			for i := 0; i < totalKeys; i++ {
+			for i := range totalKeys {
 				k := fmt.Sprintf("key_%04d", i)
 				_, err := cache.Insert(k, concValue{id: k, size: 10})
-				if err != nil {
-					t.Fatalf("[%s] pre-population failed: %v", eng.name, err)
-				}
+				require.NoError(t, err)
 			}
 
+			// Act
 			var readerWg sync.WaitGroup
-			for r := 0; r < numReaders; r++ {
+			for r := range numReaders {
 				readerWg.Add(1)
 				go func(readerID int) {
 					defer readerWg.Done()
-					for i := 0; i < readsPerG; i++ {
+					for i := range readsPerG {
 						targetKey := "key_0000"
 						if i%2 == 1 {
 							targetKey = fmt.Sprintf("key_%04d", (readerID*17+i)%totalKeys)
 						}
-						if val := cache.LookUpWithoutChangingOrder(targetKey); val == nil {
-							t.Errorf("[%s] reader %d: unexpected nil lookup for key %s", eng.name, readerID, targetKey)
+						val := cache.LookUpWithoutChangingOrder(targetKey)
+						if !assert.NotNil(t, val) {
 							return
 						}
 					}
@@ -229,22 +232,19 @@ func TestConcurrency_ParallelReadersWithoutChangingOrder(t *testing.T) {
 			readerWg.Wait()
 
 			// Fill remaining capacity (50,000 - 2,000 = 48,000 bytes).
-			for i := 0; i < 48; i++ {
+			for i := range 48 {
 				k := fmt.Sprintf("filler_%03d", i)
 				_, err := cache.Insert(k, concValue{id: k, size: 1000})
-				if err != nil {
-					t.Fatalf("[%s] failed to insert filler: %v", eng.name, err)
-				}
+				require.NoError(t, err)
 			}
 
 			// Next 10-byte insert must evict key_0000 (the untouched LRU tail).
 			evicted, err := cache.Insert("overflow_trigger", concValue{id: "overflow", size: 10})
-			if err != nil {
-				t.Fatalf("[%s] overflow insert failed: %v", eng.name, err)
-			}
-			if len(evicted) != 1 || evicted[0].(concValue).id != "key_0000" {
-				t.Fatalf("[%s] expected oldest entry key_0000 to be evicted, got %v", eng.name, evicted)
-			}
+
+			// Assert
+			require.NoError(t, err)
+			require.Len(t, evicted, 1)
+			assert.Equal(t, "key_0000", evicted[0].(concValue).id)
 		})
 	}
 }
@@ -254,6 +254,7 @@ func TestConcurrency_ParallelReadersWithoutChangingOrder(t *testing.T) {
 func TestConcurrency_EvictionThrashingWithInvariants(t *testing.T) {
 	for _, eng := range allEngines() {
 		t.Run(eng.name, func(t *testing.T) {
+			// Arrange
 			const (
 				numGoroutines = 8
 				opsPerWorker  = 150
@@ -264,25 +265,27 @@ func TestConcurrency_EvictionThrashingWithInvariants(t *testing.T) {
 			var wg sync.WaitGroup
 			var totalEvictions atomic.Int64
 
-			for g := range numGoroutines {
+			// Act
+			for range numGoroutines {
 				wg.Add(1)
-				go func(workerID int) {
+				go func() {
 					defer wg.Done()
 					for i := range opsPerWorker {
 						key := fmt.Sprintf("inv/p%d/item_%d", i%5, i)
 						evicted, err := cache.Insert(key, concValue{id: key, size: 10})
-						if err != nil {
-							t.Errorf("worker %d: unexpected insert error: %v", workerID, err)
-						}
+						assert.NoError(t, err)
 						totalEvictions.Add(int64(len(evicted)))
 						if i%20 == 0 {
 							cache.EraseEntriesWithGivenPrefix(fmt.Sprintf("inv/p%d/", i%5))
 						}
 					}
-				}(g)
+				}()
 			}
 
 			wg.Wait()
+
+			// Assert
+			assert.Positive(t, totalEvictions.Load())
 		})
 	}
 }

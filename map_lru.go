@@ -19,6 +19,7 @@ import (
 	"fmt"
 	"maps"
 	"math"
+	"runtime"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -57,7 +58,11 @@ type mapCache struct {
 	index map[string]*list.Element
 
 	// dirtyIndex records whether entries have been deleted since the last index reallocation.
-	dirtyIndex bool
+	dirtyIndex             bool
+	deletedSinceCompact    int
+	peakIndexLen           int
+	zeroSizeCount          int
+	lastReclaimedZeroCount int
 
 	// mu synchronizes access to internal state.
 	mu sync.RWMutex
@@ -68,10 +73,25 @@ type mapCache struct {
 	// options holds the parsed cache configuration.
 	options Options
 
-	// samplingPressure guards against infinite recursion when a custom PressureFunc re-enters EvaluateMemoryPressure.
-	samplingPressure   atomic.Bool
-	cachedPressureBits atomic.Uint64
+	// Atomic state for lock-free pressure sampling and reclamation epoch synchronization.
+	samplingPressure        atomic.Bool
+	fallbackSampling        atomic.Bool
+	pressureInitialized     atomic.Bool
+	lastSampledInitialized  atomic.Bool
+	pressureNeedsRefresh    atomic.Bool
+	overflowSamplingCount   atomic.Int32
+	samplingGID             atomic.Uint64
+	fallbackGID             atomic.Uint64
+	overflowSamplingGIDs    sync.Map
+	pressureSampleSeq       atomic.Uint64
+	cachedPressureBits      atomic.Uint64
+	cachedPressureEpoch     atomic.Uint64
+	lastSampledPressureBits atomic.Uint64
+	lastSampledEpoch        atomic.Uint64
+	reclaimEpoch            atomic.Uint64
 }
+
+var foregroundNoProtectElem list.Element
 
 // NewMapCache returns a new map-based LRU Cache initialized with the supplied maxSize.
 // Optional configuration parameters can be passed via opts (e.g. WithInvariantChecking).
@@ -109,15 +129,6 @@ func (c *mapCache) checkInvariants() {
 		panic(fmt.Sprintf("CurrentSize %v over maxSize %v", c.currentSize, c.maxSize))
 	}
 
-	// Invariant 3: Element payload type safety
-	for e := c.entries.Front(); e != nil; e = e.Next() {
-		switch e.Value.(type) {
-		case *entry, entry:
-		default:
-			panic(fmt.Sprintf("Unexpected element type: %T", e.Value))
-		}
-	}
-
 	// Invariant 4: Map-to-list cardinality bijection
 	if c.entries.Len() != len(c.index) {
 		panic(fmt.Sprintf("Length mismatch: %v vs. %v", c.entries.Len(), len(c.index)))
@@ -134,10 +145,12 @@ func (c *mapCache) checkInvariants() {
 		}
 	}
 
-	// Invariant 6: Bidirectional pointer linkage, map-to-list consistency, and size sum parity
+	// Invariant 3 & 6: Element payload type safety (*entry), bidirectional pointer linkage,
+	// map-to-list consistency, and size sum parity.
 	var prevElem *list.Element
 	var sumSize uint64
 	lruCount := 0
+	zeroCount := 0
 
 	for e := c.entries.Front(); e != nil; e = e.Next() {
 		lruCount++
@@ -162,13 +175,11 @@ func (c *mapCache) checkInvariants() {
 		}
 		prevElem = e
 
-		var entryVal entry
-		switch v := e.Value.(type) {
-		case *entry:
-			entryVal = *v
-		case entry:
-			entryVal = v
+		entryPtr, ok := e.Value.(*entry)
+		if !ok || entryPtr == nil {
+			panic(fmt.Sprintf("Unexpected element type: %T", e.Value))
 		}
+		entryVal := *entryPtr
 		if c.index[entryVal.key] != e {
 			panic(fmt.Sprintf("Mismatch for key %v", entryVal.key))
 		}
@@ -176,10 +187,17 @@ func (c *mapCache) checkInvariants() {
 			panic("mapCache invariant violation: sumSize uint64 overflow")
 		}
 		sumSize += entryVal.size
+		if entryVal.size == 0 {
+			zeroCount++
+		}
 	}
 
 	if lruCount != c.entries.Len() {
 		panic(fmt.Sprintf("mapCache invariant violation: LRU list count %d does not match entries.Len() %d", lruCount, c.entries.Len()))
+	}
+
+	if zeroCount != c.zeroSizeCount {
+		panic(fmt.Sprintf("mapCache invariant violation: zeroSizeCount %d does not match live zero-size entries %d", c.zeroSizeCount, zeroCount))
 	}
 
 	// Invariant 7: Sum of entry sizes matches currentSize
@@ -218,15 +236,7 @@ func (c *mapCache) evictOne() ValueType {
 		return nil
 	}
 	entryVal := e.Value.(*entry)
-	key := entryVal.key
-	evictedValue := entryVal.value
-	c.currentSize -= entryVal.size
-
-	c.entries.Remove(e)
-	delete(c.index, key)
-	c.dirtyIndex = true
-
-	return evictedValue
+	return c.eraseInternal(entryVal.key)
 }
 
 // Insert inserts or updates the given key and value in the cache.
@@ -246,7 +256,16 @@ func (c *mapCache) Insert(key string, value ValueType) ([]ValueType, error) {
 		return nil, ErrInvalidEntrySize
 	}
 
+	sampledEpoch := c.reclaimEpoch.Load()
+	pressure := c.samplePressure()
+
 	c.lock()
+	for sampledEpoch != c.reclaimEpoch.Load() {
+		c.mu.Unlock()
+		sampledEpoch = c.reclaimEpoch.Load()
+		pressure = c.samplePressure()
+		c.mu.Lock()
+	}
 	defer c.unlock()
 
 	var evictedValues []ValueType
@@ -255,6 +274,14 @@ func (c *mapCache) Insert(key string, value ValueType) ([]ValueType, error) {
 	if ok {
 		// Update existing entry in place (0 heap allocations).
 		entryVal := e.Value.(*entry)
+		if entryVal.size == 0 && valueSize > 0 && c.zeroSizeCount > 0 {
+			c.zeroSizeCount--
+			if c.zeroSizeCount < c.lastReclaimedZeroCount {
+				c.lastReclaimedZeroCount = c.zeroSizeCount
+			}
+		} else if entryVal.size > 0 && valueSize == 0 {
+			c.zeroSizeCount++
+		}
 		c.entries.MoveToFront(e)
 		c.currentSize -= entryVal.size
 		for valueSize > c.maxSize-c.currentSize && c.entries.Len() > 1 {
@@ -276,9 +303,19 @@ func (c *mapCache) Insert(key string, value ValueType) ([]ValueType, error) {
 		}
 		// Clone key to prevent substring keys from pinning large caller backing arrays.
 		clonedKey := strings.Clone(key)
-		e := c.entries.PushFront(&entry{key: clonedKey, value: value, size: valueSize})
+		e = c.entries.PushFront(&entry{key: clonedKey, value: value, size: valueSize})
 		c.index[clonedKey] = e
+		if len(c.index) > c.peakIndexLen {
+			c.peakIndexLen = len(c.index)
+		}
+		if valueSize == 0 {
+			c.zeroSizeCount++
+		}
 		c.currentSize += valueSize
+	}
+
+	if evictedByPressure := c.maybeReclaimUnderPressureLocked(pressure, e); len(evictedByPressure) > 0 {
+		evictedValues = append(evictedValues, evictedByPressure...)
 	}
 
 	return evictedValues, nil
@@ -295,22 +332,62 @@ func (c *mapCache) eraseInternal(key string) ValueType {
 
 	entryVal := e.Value.(*entry)
 	deletedEntry := entryVal.value
+	if entryVal.size == 0 && c.zeroSizeCount > 0 {
+		c.zeroSizeCount--
+		if c.zeroSizeCount < c.lastReclaimedZeroCount {
+			c.lastReclaimedZeroCount = c.zeroSizeCount
+		}
+	}
 	c.currentSize -= entryVal.size
 
 	delete(c.index, key)
 	c.dirtyIndex = true
+	c.deletedSinceCompact++
 	c.entries.Remove(e)
 
 	return deletedEntry
 }
 
+// resetEmptyIndexLocked releases peak map bucket memory when the cache transitions to empty.
+func (c *mapCache) resetEmptyIndexLocked() {
+	c.index = make(map[string]*list.Element)
+	c.dirtyIndex = false
+	c.deletedSinceCompact = 0
+	c.peakIndexLen = 0
+	c.zeroSizeCount = 0
+	c.lastReclaimedZeroCount = 0
+	c.markReclaimedLocked()
+}
+
 // Erase removes the entry associated with the given key from the cache.
 // Returns the value of the erased entry, or nil if the key was not found.
 func (c *mapCache) Erase(key string) ValueType {
+	sampledEpoch := c.reclaimEpoch.Load()
+	pressure := c.samplePressure()
+
 	c.lock()
+	for sampledEpoch != c.reclaimEpoch.Load() {
+		c.mu.Unlock()
+		sampledEpoch = c.reclaimEpoch.Load()
+		pressure = c.samplePressure()
+		c.mu.Lock()
+	}
 	defer c.unlock()
 
-	return c.eraseInternal(key)
+	deleted := c.eraseInternal(key)
+	if deleted == nil {
+		c.maybeReclaimUnderPressureLocked(pressure, &foregroundNoProtectElem)
+		return nil
+	}
+	if c.entries.Len() == 0 {
+		c.resetEmptyIndexLocked()
+		return deleted
+	}
+	c.maybeReclaimUnderPressureLocked(pressure, &foregroundNoProtectElem)
+	if c.reclaimEpoch.Load() == sampledEpoch && c.hasElevatedPressureToInvalidate(pressure) {
+		c.markReclaimedLocked()
+	}
+	return deleted
 }
 
 // LookUp retrieves the value associated with key and updates its position to MRU.
@@ -370,40 +447,86 @@ func (c *mapCache) UpdateWithoutChangingOrder(key string, value ValueType) error
 }
 
 // UpdateSize adjusts the size accounting for an existing key by sizeDelta without altering its LRU position.
-// If the entry's updated size exceeds maxSize, the entry itself is evicted immediately without evicting
-// other entries. Otherwise, least recently used entries are evicted to ensure the size invariant holds.
+// If the entry's updated size exceeds maxSize (or cannot fit alongside entries more recent than key),
+// the entry itself is evicted immediately without evicting older entries. Otherwise, least recently used
+// entries are evicted to ensure the size invariant holds.
 //
 // Returns ErrEntryNotExist if key is not present in the cache.
 // Returns ErrInvalidUpdateEntrySize if sizeDelta causes uint64 integer overflow.
 func (c *mapCache) UpdateSize(key string, sizeDelta uint64) error {
+	sampledEpoch := c.reclaimEpoch.Load()
+	pressure := c.samplePressure()
+
 	c.lock()
+	for sampledEpoch != c.reclaimEpoch.Load() {
+		c.mu.Unlock()
+		sampledEpoch = c.reclaimEpoch.Load()
+		pressure = c.samplePressure()
+		c.mu.Lock()
+	}
 	defer c.unlock()
 
 	e, ok := c.index[key]
 	if !ok {
+		c.maybeReclaimUnderPressureLocked(pressure, &foregroundNoProtectElem)
 		return ErrEntryNotExist
 	}
 
 	entryVal := e.Value.(*entry)
-	if math.MaxUint64-entryVal.size < sizeDelta || math.MaxUint64-c.currentSize < sizeDelta {
+	if math.MaxUint64-entryVal.size < sizeDelta {
 		return ErrInvalidUpdateEntrySize
 	}
+
+	avail := c.maxSize - c.currentSize
 	if entryVal.size+sizeDelta > c.maxSize {
+		avail = 0
+	} else {
+		for curr := c.entries.Back(); curr != nil && curr != e && sizeDelta > avail; curr = curr.Prev() {
+			avail += curr.Value.(*entry).size
+		}
+	}
+	if entryVal.size+sizeDelta > c.maxSize || sizeDelta > avail {
 		c.eraseInternal(entryVal.key)
+		if c.entries.Len() == 0 {
+			c.resetEmptyIndexLocked()
+			return nil
+		}
+		c.maybeReclaimUnderPressureLocked(pressure, &foregroundNoProtectElem)
+		if c.reclaimEpoch.Load() == sampledEpoch && c.hasElevatedPressureToInvalidate(pressure) {
+			c.markReclaimedLocked()
+		}
 		return nil
 	}
 
+	evictedAny := false
 	for sizeDelta > c.maxSize-c.currentSize && c.entries.Len() > 0 {
 		if c.entries.Back() == e {
 			break
 		}
 		c.evictOne()
+		evictedAny = true
 	}
 
+	if math.MaxUint64-c.currentSize < sizeDelta {
+		return ErrInvalidUpdateEntrySize
+	}
+
+	if entryVal.size == 0 && sizeDelta > 0 && c.zeroSizeCount > 0 {
+		c.zeroSizeCount--
+		if c.zeroSizeCount < c.lastReclaimedZeroCount {
+			c.lastReclaimedZeroCount = c.zeroSizeCount
+		}
+	}
 	entryVal.size += sizeDelta
 	c.currentSize += sizeDelta
-	for c.currentSize > c.maxSize && c.entries.Len() > 0 {
-		c.evictOne()
+
+	protectedElem := &foregroundNoProtectElem
+	if sizeDelta > 0 && e == c.entries.Front() {
+		protectedElem = e
+	}
+	c.maybeReclaimUnderPressureLocked(pressure, protectedElem)
+	if evictedAny && c.reclaimEpoch.Load() == sampledEpoch && c.hasElevatedPressureToInvalidate(pressure) {
+		c.markReclaimedLocked()
 	}
 
 	return nil
@@ -412,26 +535,100 @@ func (c *mapCache) UpdateSize(key string, sizeDelta uint64) error {
 // EraseEntriesWithGivenPrefix removes all entries from the cache whose keys start with prefix.
 // If prefix is empty (""), all entries in the cache are erased.
 func (c *mapCache) EraseEntriesWithGivenPrefix(prefix string) {
+	sampledEpoch := c.reclaimEpoch.Load()
+	pressure := c.samplePressure()
+
 	c.lock()
+	for sampledEpoch != c.reclaimEpoch.Load() {
+		c.mu.Unlock()
+		sampledEpoch = c.reclaimEpoch.Load()
+		pressure = c.samplePressure()
+		c.mu.Lock()
+	}
 	defer c.unlock()
 
 	if prefix == "" {
 		c.entries.Init()
-		c.index = make(map[string]*list.Element)
-		c.dirtyIndex = false
 		c.currentSize = 0
+		c.resetEmptyIndexLocked()
 		return
 	}
 
+	erasedAny := false
 	for key := range c.index {
 		if strings.HasPrefix(key, prefix) {
 			c.eraseInternal(key)
+			erasedAny = true
 		}
 	}
 	if c.entries.Len() == 0 && c.dirtyIndex {
-		c.index = make(map[string]*list.Element)
-		c.dirtyIndex = false
+		c.resetEmptyIndexLocked()
+		return
 	}
+	c.maybeReclaimUnderPressureLocked(pressure, &foregroundNoProtectElem)
+	if erasedAny && c.reclaimEpoch.Load() == sampledEpoch && c.hasElevatedPressureToInvalidate(pressure) {
+		c.markReclaimedLocked()
+	}
+}
+
+func (c *mapCache) hasOverflowSamplingGID(gid uint64) bool {
+	if gid == 0 || c.overflowSamplingCount.Load() <= 0 {
+		return false
+	}
+	_, ok := c.overflowSamplingGIDs.Load(gid)
+	return ok
+}
+
+func (c *mapCache) isCurrentGoroutineSampling(gid uint64) bool {
+	if gid == 0 {
+		return false
+	}
+	return c.samplingGID.Load() == gid ||
+		c.fallbackGID.Load() == gid ||
+		c.hasOverflowSamplingGID(gid)
+}
+
+func (c *mapCache) isSamplingGoroutine() bool {
+	if !c.options.hasCustomPressureFunc {
+		return false
+	}
+	sGID := c.samplingGID.Load()
+	fGID := c.fallbackGID.Load()
+	oCount := c.overflowSamplingCount.Load()
+	if sGID == 0 && fGID == 0 && oCount <= 0 {
+		return false
+	}
+	return c.isCurrentGoroutineSampling(currentGoroutineID())
+}
+
+func (c *mapCache) markReclaimedLocked() {
+	if c.isSamplingGoroutine() {
+		return
+	}
+	c.reclaimEpoch.Add(1)
+	c.pressureNeedsRefresh.Store(true)
+	c.pressureInitialized.Store(false)
+	c.lastSampledInitialized.Store(false)
+	c.cachedPressureBits.Store(0)
+	c.lastSampledPressureBits.Store(0)
+}
+
+func (c *mapCache) hasElevatedPressureToInvalidate(pressure float64) bool {
+	thresh := c.options.CompactionThreshold
+	return pressure >= thresh ||
+		math.Float64frombits(c.cachedPressureBits.Load()) >= thresh ||
+		math.Float64frombits(c.lastSampledPressureBits.Load()) >= thresh ||
+		c.pressureNeedsRefresh.Load() ||
+		c.samplingPressure.Load() ||
+		c.fallbackSampling.Load() ||
+		c.overflowSamplingCount.Load() > 0
+}
+
+func (c *mapCache) shouldAutoCompactLocked(protectedElem *list.Element) bool {
+	if protectedElem == nil {
+		return c.dirtyIndex
+	}
+	return c.dirtyIndex && c.peakIndexLen > len(c.index) && uint64(c.peakIndexLen-len(c.index))*4 >= uint64(c.peakIndexLen)
 }
 
 // Compact reallocates the internal hash index to reclaim Go map bucket slack while preserving all live entries.
@@ -442,61 +639,299 @@ func (c *mapCache) Compact() {
 }
 
 func (c *mapCache) compactLocked() {
+	if !c.dirtyIndex {
+		return
+	}
 	newIndex := make(map[string]*list.Element, len(c.index))
 	maps.Copy(newIndex, c.index)
 	c.index = newIndex
 	c.dirtyIndex = false
+	c.deletedSinceCompact = 0
+	c.peakIndexLen = len(c.index)
+	c.markReclaimedLocked()
 }
 
-// samplePressureFresh evaluates c.options.PressureFunc with an atomic re-entrancy guard.
+func (c *mapCache) storeSampledPressure(epoch uint64, p float64) {
+	if c.reclaimEpoch.Load() == epoch {
+		bits := math.Float64bits(p)
+		c.lastSampledPressureBits.Store(bits)
+		c.lastSampledEpoch.Store(epoch)
+		c.lastSampledInitialized.Store(true)
+		c.cachedPressureBits.Store(bits)
+		c.cachedPressureEpoch.Store(epoch)
+		c.pressureInitialized.Store(true)
+		c.pressureNeedsRefresh.Store(false)
+		if c.reclaimEpoch.Load() != epoch {
+			c.pressureNeedsRefresh.Store(true)
+			c.pressureInitialized.Store(false)
+			c.lastSampledInitialized.Store(false)
+			c.cachedPressureBits.Store(0)
+			c.lastSampledPressureBits.Store(0)
+		}
+	} else {
+		c.pressureNeedsRefresh.Store(true)
+	}
+}
+
+// samplePressureFresh evaluates c.options.PressureFunc lock-free outside c.mu.Lock()
+// with a goroutine-aware re-entrancy guard and cold-start fallback.
 func (c *mapCache) samplePressureFresh() float64 {
 	if c.options.PressureFunc == nil {
 		return 0.0
 	}
-	if !c.samplingPressure.CompareAndSwap(false, true) {
-		return math.Float64frombits(c.cachedPressureBits.Load())
+	if c.isSamplingGoroutine() {
+		return 0.0
 	}
-	defer c.samplingPressure.Store(false)
+	if !c.samplingPressure.CompareAndSwap(false, true) {
+		var gid uint64
+		if c.options.hasCustomPressureFunc {
+			gid = currentGoroutineID()
+			if c.isCurrentGoroutineSampling(gid) {
+				return 0.0
+			}
+		}
+		if epoch := c.reclaimEpoch.Load(); c.pressureInitialized.Load() && c.cachedPressureEpoch.Load() == epoch {
+			bits := c.cachedPressureBits.Load()
+			if c.pressureInitialized.Load() && c.cachedPressureEpoch.Load() == epoch && c.reclaimEpoch.Load() == epoch {
+				return math.Float64frombits(bits)
+			}
+		}
+		if epoch := c.reclaimEpoch.Load(); c.lastSampledInitialized.Load() && c.lastSampledEpoch.Load() == epoch {
+			bits := c.lastSampledPressureBits.Load()
+			if c.lastSampledInitialized.Load() && c.lastSampledEpoch.Load() == epoch && c.reclaimEpoch.Load() == epoch {
+				return math.Float64frombits(bits)
+			}
+		}
+		for range 100 {
+			epoch := c.reclaimEpoch.Load()
+			if !c.samplingPressure.Load() ||
+				(c.pressureInitialized.Load() && c.cachedPressureEpoch.Load() == epoch) ||
+				(c.lastSampledInitialized.Load() && c.lastSampledEpoch.Load() == epoch) {
+				break
+			}
+			runtime.Gosched()
+		}
+		if epoch := c.reclaimEpoch.Load(); c.pressureInitialized.Load() && c.cachedPressureEpoch.Load() == epoch {
+			bits := c.cachedPressureBits.Load()
+			if c.pressureInitialized.Load() && c.cachedPressureEpoch.Load() == epoch && c.reclaimEpoch.Load() == epoch {
+				return math.Float64frombits(bits)
+			}
+		}
+		if epoch := c.reclaimEpoch.Load(); c.lastSampledInitialized.Load() && c.lastSampledEpoch.Load() == epoch {
+			bits := c.lastSampledPressureBits.Load()
+			if c.lastSampledInitialized.Load() && c.lastSampledEpoch.Load() == epoch && c.reclaimEpoch.Load() == epoch {
+				return math.Float64frombits(bits)
+			}
+		}
+		if c.options.hasCustomPressureFunc && c.isCurrentGoroutineSampling(gid) {
+			return 0.0
+		}
+		if c.fallbackSampling.CompareAndSwap(false, true) {
+			if c.options.hasCustomPressureFunc {
+				c.fallbackGID.Store(gid)
+				defer func() {
+					c.fallbackGID.Store(0)
+					c.fallbackSampling.Store(false)
+				}()
+			} else {
+				defer c.fallbackSampling.Store(false)
+			}
+		} else {
+			if c.options.hasCustomPressureFunc {
+				c.overflowSamplingGIDs.Store(gid, struct{}{})
+			}
+			c.overflowSamplingCount.Add(1)
+			defer func() {
+				if c.options.hasCustomPressureFunc {
+					c.overflowSamplingGIDs.Delete(gid)
+				}
+				c.overflowSamplingCount.Add(-1)
+			}()
+		}
+		epoch := c.reclaimEpoch.Load()
+		p := c.options.PressureFunc()
+		if math.IsNaN(p) || p < 0.0 {
+			p = 0.0
+		}
+		c.storeSampledPressure(epoch, p)
+		return p
+	}
+	if c.options.hasCustomPressureFunc {
+		c.samplingGID.Store(currentGoroutineID())
+		defer func() {
+			c.samplingGID.Store(0)
+			c.samplingPressure.Store(false)
+		}()
+	} else {
+		defer c.samplingPressure.Store(false)
+	}
 
+	epoch := c.reclaimEpoch.Load()
 	pressure := c.options.PressureFunc()
 	if math.IsNaN(pressure) || pressure < 0.0 {
 		pressure = 0.0
 	}
-	c.cachedPressureBits.Store(math.Float64bits(pressure))
+	c.storeSampledPressure(epoch, pressure)
 	return pressure
+}
+
+func (c *mapCache) samplePressure() float64 {
+	if c.options.hasCustomPressureFunc {
+		return c.samplePressureFresh()
+	}
+	epoch := c.reclaimEpoch.Load()
+	seq := c.pressureSampleSeq.Add(1)
+	if (seq&255) == 1 || !c.pressureInitialized.Load() || c.pressureNeedsRefresh.Load() || c.cachedPressureEpoch.Load() != epoch {
+		return c.samplePressureFresh()
+	}
+	bits := c.cachedPressureBits.Load()
+	if !c.pressureInitialized.Load() || c.pressureNeedsRefresh.Load() || c.cachedPressureEpoch.Load() != epoch || c.reclaimEpoch.Load() != epoch {
+		return c.samplePressureFresh()
+	}
+	return math.Float64frombits(bits)
+}
+
+func (c *mapCache) shedAndCompactLocked(targetSize uint64, retention float64, protectedElem *list.Element) []ValueType {
+	autoCompactElem := protectedElem
+	if protectedElem != nil && (protectedElem != c.entries.Front() || protectedElem.Prev() != nil) {
+		protectedElem = nil
+	}
+
+	effectiveTarget := targetSize
+	if protectedElem != nil && retention > 0.0 {
+		if protectedSize := protectedElem.Value.(*entry).size; protectedSize > effectiveTarget {
+			effectiveTarget = protectedSize
+		}
+	}
+
+	targetLen := 0
+	targetZeroCount := 0
+	if retention > 0.0 {
+		if c.entries.Len() > 0 {
+			targetLen = int(float64(c.entries.Len()) * retention)
+			if protectedElem != nil && targetLen < 1 {
+				targetLen = 1
+			}
+		}
+		if c.zeroSizeCount > 0 {
+			targetZeroCount = int(float64(c.zeroSizeCount) * retention)
+			if protectedElem != nil && protectedElem.Value.(*entry).size == 0 && targetZeroCount < 1 {
+				targetZeroCount = 1
+			}
+			if c.lastReclaimedZeroCount > targetZeroCount {
+				targetZeroCount = c.lastReclaimedZeroCount
+			}
+		}
+	}
+
+	needFullFlush := retention == 0.0
+	var evicted []ValueType
+	victim := c.entries.Back()
+	for victim != nil {
+		needByteShed := c.currentSize > effectiveTarget || needFullFlush
+		needZeroShed := !needFullFlush && c.zeroSizeCount > targetZeroCount && c.entries.Len() > targetLen
+		if !needByteShed && !needZeroShed {
+			break
+		}
+		switch {
+		case needFullFlush || (needByteShed && needZeroShed):
+			for victim != nil && victim == protectedElem {
+				victim = victim.Prev()
+			}
+		case needByteShed:
+			for victim != nil && (victim == protectedElem || victim.Value.(*entry).size == 0) {
+				victim = victim.Prev()
+			}
+		default:
+			for victim != nil && (victim == protectedElem || victim.Value.(*entry).size > 0) {
+				victim = victim.Prev()
+			}
+		}
+		if victim == nil {
+			break
+		}
+		nextVictim := victim.Prev()
+		if val := c.eraseInternal(victim.Value.(*entry).key); val != nil {
+			evicted = append(evicted, val)
+		}
+		victim = nextVictim
+	}
+
+	if retention > 0.0 && c.zeroSizeCount > 0 {
+		c.lastReclaimedZeroCount = c.zeroSizeCount
+	} else {
+		c.lastReclaimedZeroCount = 0
+	}
+
+	c.markReclaimedLocked()
+	if c.shouldAutoCompactLocked(autoCompactElem) {
+		c.compactLocked()
+	}
+	return evicted
+}
+
+func (c *mapCache) maybeReclaimUnderPressureLocked(pressure float64, protectedElem *list.Element) []ValueType {
+	autoCompactElem := protectedElem
+	shedProtectedElem := protectedElem
+	if shedProtectedElem != nil && (shedProtectedElem != c.entries.Front() || shedProtectedElem.Prev() != nil) {
+		shedProtectedElem = nil
+	}
+	epochBefore := c.reclaimEpoch.Load()
+	var evicted []ValueType
+	if pressure >= c.options.EvictionThreshold {
+		retention := c.options.EvictionRetentionRatio
+		targetSize := computeTargetSize(c.maxSize, retention)
+		targetLen := int(float64(c.entries.Len()) * retention)
+		if shedProtectedElem != nil && retention > 0.0 && targetLen < 1 {
+			targetLen = 1
+		}
+		targetZeroCount := int(float64(c.zeroSizeCount) * retention)
+		if shedProtectedElem != nil && retention > 0.0 && shedProtectedElem.Value.(*entry).size == 0 && targetZeroCount < 1 {
+			targetZeroCount = 1
+		}
+		if retention > 0.0 && c.lastReclaimedZeroCount > targetZeroCount {
+			targetZeroCount = c.lastReclaimedZeroCount
+		}
+		if c.currentSize > targetSize || (c.zeroSizeCount > targetZeroCount && c.entries.Len() > targetLen) || (retention == 0.0 && c.entries.Len() > 0) {
+			evicted = c.shedAndCompactLocked(targetSize, retention, autoCompactElem)
+		} else if c.shouldAutoCompactLocked(autoCompactElem) {
+			c.compactLocked()
+		}
+	} else {
+		c.lastReclaimedZeroCount = 0
+		if pressure >= c.options.CompactionThreshold {
+			if c.shouldAutoCompactLocked(autoCompactElem) {
+				c.compactLocked()
+			}
+		}
+	}
+	if autoCompactElem != nil && autoCompactElem != &foregroundNoProtectElem && c.reclaimEpoch.Load() == epochBefore {
+		c.lastSampledPressureBits.Store(math.Float64bits(pressure))
+		c.lastSampledEpoch.Store(epochBefore)
+		c.lastSampledInitialized.Store(true)
+		if c.reclaimEpoch.Load() != epochBefore {
+			c.lastSampledInitialized.Store(false)
+			c.lastSampledPressureBits.Store(0)
+		}
+	}
+	return evicted
 }
 
 // EvaluateMemoryPressure samples the configured memory-pressure probe and executes
 // Tier 2 (LRU shedding + map compaction) or Tier 1 (lossless map compaction) if thresholds are met.
 func (c *mapCache) EvaluateMemoryPressure() []ValueType {
+	sampledEpoch := c.reclaimEpoch.Load()
 	pressure := c.samplePressureFresh()
 
 	c.lock()
 	defer c.unlock()
 
-	if pressure >= c.options.EvictionThreshold {
-		retention := c.options.EvictionRetentionRatio
-		targetSize := computeTargetSize(c.maxSize, retention)
-		onlyZeroSizeEntries := c.currentSize == 0
-		targetLen := 0
-		if onlyZeroSizeEntries && c.entries.Len() > 0 && retention > 0.0 {
-			targetLen = int(float64(c.entries.Len()) * retention)
-		}
-		var evicted []ValueType
-		for c.entries.Len() > 0 {
-			needByteShed := c.currentSize > targetSize
-			needZeroSizeShed := onlyZeroSizeEntries && c.entries.Len() > targetLen
-			needFullFlush := retention == 0.0
-			if !needByteShed && !needZeroSizeShed && !needFullFlush {
-				break
-			}
-			evicted = append(evicted, c.evictOne())
-		}
-		c.compactLocked()
-		return evicted
+	for sampledEpoch != c.reclaimEpoch.Load() {
+		c.mu.Unlock()
+		sampledEpoch = c.reclaimEpoch.Load()
+		pressure = c.samplePressureFresh()
+		c.mu.Lock()
 	}
-	if pressure >= c.options.CompactionThreshold && c.dirtyIndex {
-		c.compactLocked()
-	}
-	return nil
+
+	return c.maybeReclaimUnderPressureLocked(pressure, nil)
 }

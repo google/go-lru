@@ -80,7 +80,9 @@ type Cache interface {
 }
 
 // PressureAwareCache extends Cache with explicit arena/map compaction and memory-pressure reclamation.
-// All three cache backends (MapCache, RadixCache, and ArenaRadixCache) implement this interface.
+// All three cache backends (MapCache, RadixCache, and ArenaRadixCache) implement this interface
+// and perform both automatic amortized foreground reclamation (on Insert, Erase, UpdateSize,
+// and EraseEntriesWithGivenPrefix) and explicit reclamation via EvaluateMemoryPressure() and Compact().
 type PressureAwareCache interface {
 	Cache
 

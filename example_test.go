@@ -26,7 +26,7 @@ func ExampleNew() {
 	cache := lru.New(1024)
 
 	_, _ = cache.Insert("greeting", lru.StringValue("hello, world"))
-	_, _ = cache.Insert("payload", lru.BytesValue([]byte{0xDE, 0xAD, 0xBE, 0xEF}))
+	_, _ = cache.Insert("payload", lru.NewBytesValue([]byte{0xDE, 0xAD, 0xBE, 0xEF}))
 	_, _ = cache.Insert("inode-42", lru.NewValue(42, 64))
 
 	if v := cache.LookUp("greeting"); v != nil {

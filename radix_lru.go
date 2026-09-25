@@ -17,6 +17,7 @@ package lru
 import (
 	"fmt"
 	"math"
+	"runtime"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -55,7 +56,9 @@ type radixCache struct {
 	tail *radixNode
 
 	// len is the number of value-bearing entries currently tracked in the LRU list.
-	len int
+	len                    int
+	zeroSizeCount          int
+	lastReclaimedZeroCount int
 
 	// mu synchronizes concurrent access to all cache data structures.
 	mu sync.RWMutex
@@ -63,10 +66,25 @@ type radixCache struct {
 	// opts contains configuration options such as invariant checking.
 	opts Options
 
-	// samplingPressure guards against infinite recursion when a custom PressureFunc re-enters EvaluateMemoryPressure.
-	samplingPressure   atomic.Bool
-	cachedPressureBits atomic.Uint64
+	// Atomic state for lock-free pressure sampling and reclamation epoch synchronization.
+	samplingPressure        atomic.Bool
+	fallbackSampling        atomic.Bool
+	pressureInitialized     atomic.Bool
+	lastSampledInitialized  atomic.Bool
+	pressureNeedsRefresh    atomic.Bool
+	overflowSamplingCount   atomic.Int32
+	samplingGID             atomic.Uint64
+	fallbackGID             atomic.Uint64
+	overflowSamplingGIDs    sync.Map
+	pressureSampleSeq       atomic.Uint64
+	cachedPressureBits      atomic.Uint64
+	cachedPressureEpoch     atomic.Uint64
+	lastSampledPressureBits atomic.Uint64
+	lastSampledEpoch        atomic.Uint64
+	reclaimEpoch            atomic.Uint64
 }
+
+var foregroundNoProtectNode radixNode
 
 // NewRadixCache creates a new RadixCache instance bounded by maxSize (in bytes).
 // maxSize must be greater than zero; otherwise NewRadixCache panics.
@@ -104,6 +122,7 @@ func (c *radixCache) checkInvariants() {
 
 	// INVARIANT 3: LRU list validation
 	lruCount := 0
+	zeroCount := 0
 	var sumSize uint64
 	var prevNode *radixNode
 
@@ -113,6 +132,9 @@ func (c *radixCache) checkInvariants() {
 			panic("radixCache invariant violation: sumSize uint64 overflow")
 		}
 		sumSize += curr.size
+		if curr.size == 0 {
+			zeroCount++
+		}
 		if curr.value == nil {
 			panic(fmt.Sprintf("radixCache invariant violation: unexpected nil value in LRU list for prefix '%s'", curr.prefix))
 		}
@@ -142,6 +164,10 @@ func (c *radixCache) checkInvariants() {
 
 	if lruCount != c.len {
 		panic(fmt.Sprintf("radixCache invariant violation: LRU list count %d does not match tracked len %d", lruCount, c.len))
+	}
+
+	if zeroCount != c.zeroSizeCount {
+		panic(fmt.Sprintf("radixCache invariant violation: zeroSizeCount %d does not match live zero-size entries %d", c.zeroSizeCount, zeroCount))
 	}
 
 	if sumSize != c.currentSize {
@@ -324,7 +350,7 @@ func (c *radixCache) insertNode(key string, value ValueType) (*radixNode, ValueT
 		if child == nil {
 			// Clone the substring to prevent memory leaks from sliced string headers pinning large backing arrays
 			newLeaf := &radixNode{
-				prefix: strings.Clone(search),
+				prefix: clonePrefix(search),
 				value:  value,
 			}
 			node.addChild(newLeaf)
@@ -339,16 +365,17 @@ func (c *radixCache) insertNode(key string, value ValueType) (*radixNode, ValueT
 			continue
 		}
 
-		// child.prefix was already cloned on creation; slicing it directly avoids 2 heap allocations.
+		// Clone both split prefix halves so surviving intermediate routing nodes never pin
+		// the underlying backing arrays of large evicted leaf keys.
 		oldPrefix := child.prefix
 		splitNode := &radixNode{
-			prefix: oldPrefix[:lcp],
+			prefix: clonePrefix(oldPrefix[:lcp]),
 			parent: node,
 		}
 
 		node.replaceChild(child, splitNode)
 
-		child.prefix = oldPrefix[lcp:]
+		child.prefix = clonePrefix(oldPrefix[lcp:])
 		child.sibling = nil
 		splitNode.addChild(child)
 
@@ -359,7 +386,7 @@ func (c *radixCache) insertNode(key string, value ValueType) (*radixNode, ValueT
 		}
 
 		newLeaf := &radixNode{
-			prefix: strings.Clone(search[lcp:]),
+			prefix: clonePrefix(search[lcp:]),
 			value:  value,
 		}
 		splitNode.addChild(newLeaf)
@@ -497,6 +524,12 @@ func (c *radixCache) remove(node *radixNode) {
 // It returns the deleted ValueType.
 func (c *radixCache) eraseInternal(node *radixNode) ValueType {
 	deletedEntry := node.value
+	if deletedEntry != nil && node.size == 0 && c.zeroSizeCount > 0 {
+		c.zeroSizeCount--
+		if c.zeroSizeCount < c.lastReclaimedZeroCount {
+			c.lastReclaimedZeroCount = c.zeroSizeCount
+		}
+	}
 	c.currentSize -= node.size
 	node.size = 0
 
@@ -520,6 +553,12 @@ func (c *radixCache) sweepAndUnlink(node *radixNode) {
 	curr := node
 	for curr != nil {
 		if curr.value != nil {
+			if curr.size == 0 && c.zeroSizeCount > 0 {
+				c.zeroSizeCount--
+				if c.zeroSizeCount < c.lastReclaimedZeroCount {
+					c.lastReclaimedZeroCount = c.zeroSizeCount
+				}
+			}
 			c.currentSize -= curr.size
 			curr.size = 0
 			c.remove(curr)
@@ -545,6 +584,13 @@ func (c *radixCache) sweepAndUnlink(node *radixNode) {
 // Cache Interface Implementation
 // ============================================================================
 
+func (c *radixCache) unlock() {
+	if c.opts.EnableInvariantChecking {
+		c.checkInvariants()
+	}
+	c.mu.Unlock()
+}
+
 // Insert inserts or updates a key-value entry in the cache.
 // If the key exists, its value is updated and moved to MRU.
 // If capacity is exceeded, excess LRU entries are evicted and returned.
@@ -561,29 +607,48 @@ func (c *radixCache) Insert(key string, value ValueType) ([]ValueType, error) {
 		return nil, ErrInvalidEntrySize
 	}
 
+	sampledEpoch := c.reclaimEpoch.Load()
+	pressure := c.samplePressure()
+
 	c.mu.Lock()
-	defer func() {
-		if c.opts.EnableInvariantChecking {
-			c.checkInvariants()
-		}
+	for sampledEpoch != c.reclaimEpoch.Load() {
 		c.mu.Unlock()
-	}()
+		sampledEpoch = c.reclaimEpoch.Load()
+		pressure = c.samplePressure()
+		c.mu.Lock()
+	}
+	defer c.unlock()
 
 	var evictedValues []ValueType
 
-	if node, oldValue := c.insertNode(key, value); oldValue != nil {
+	node, exists := c.getNode(key)
+	if exists {
+		if node.size == 0 && valueSize > 0 && c.zeroSizeCount > 0 {
+			c.zeroSizeCount--
+			if c.zeroSizeCount < c.lastReclaimedZeroCount {
+				c.lastReclaimedZeroCount = c.zeroSizeCount
+			}
+		} else if node.size > 0 && valueSize == 0 {
+			c.zeroSizeCount++
+		}
 		c.moveToFront(node)
 		c.currentSize -= node.size
 		for valueSize > c.maxSize-c.currentSize && c.tail != nil && c.tail != node {
 			evictedValues = append(evictedValues, c.evictOne())
 		}
-		c.currentSize += valueSize
+		node.value = value
 		node.size = valueSize
+		c.currentSize += valueSize
 	} else {
+		// Evict from the LRU tail before inserting into the trie to avoid redundant node splits and merges.
 		for valueSize > c.maxSize-c.currentSize && c.tail != nil {
 			evictedValues = append(evictedValues, c.evictOne())
 		}
+		node, _ = c.insertNode(key, value)
 		node.size = valueSize
+		if valueSize == 0 {
+			c.zeroSizeCount++
+		}
 		c.pushFront(node)
 		c.currentSize += valueSize
 	}
@@ -592,12 +657,25 @@ func (c *radixCache) Insert(key string, value ValueType) ([]ValueType, error) {
 		evictedValues = append(evictedValues, c.evictOne())
 	}
 
+	if evictedByPressure := c.maybeReclaimUnderPressureLocked(pressure, node); len(evictedByPressure) > 0 {
+		evictedValues = append(evictedValues, evictedByPressure...)
+	}
+
 	return evictedValues, nil
 }
 
 // Erase removes the entry associated with key, returning its value (or nil if not found).
 func (c *radixCache) Erase(key string) (value ValueType) {
+	sampledEpoch := c.reclaimEpoch.Load()
+	pressure := c.samplePressure()
+
 	c.mu.Lock()
+	for sampledEpoch != c.reclaimEpoch.Load() {
+		c.mu.Unlock()
+		sampledEpoch = c.reclaimEpoch.Load()
+		pressure = c.samplePressure()
+		c.mu.Lock()
+	}
 	defer func() {
 		if c.opts.EnableInvariantChecking {
 			c.checkInvariants()
@@ -607,10 +685,22 @@ func (c *radixCache) Erase(key string) (value ValueType) {
 
 	node, ok := c.getNode(key)
 	if !ok {
+		c.maybeReclaimUnderPressureLocked(pressure, &foregroundNoProtectNode)
 		return nil
 	}
 
-	return c.eraseInternal(node)
+	deleted := c.eraseInternal(node)
+	if c.len == 0 {
+		c.zeroSizeCount = 0
+		c.lastReclaimedZeroCount = 0
+		c.markReclaimedLocked()
+		return deleted
+	}
+	c.maybeReclaimUnderPressureLocked(pressure, &foregroundNoProtectNode)
+	if c.reclaimEpoch.Load() == sampledEpoch && c.hasElevatedPressureToInvalidate(pressure) {
+		c.markReclaimedLocked()
+	}
+	return deleted
 }
 
 // LookUp retrieves the value for key and promotes it to the MRU position.
@@ -686,12 +776,22 @@ func (c *radixCache) UpdateWithoutChangingOrder(key string, value ValueType) err
 }
 
 // UpdateSize updates the size accounting for an existing key by sizeDelta and evicts excess entries if needed.
-// If node.size + sizeDelta exceeds maxSize, only node itself is evicted without evicting other entries.
+// If node.size + sizeDelta exceeds maxSize (or cannot fit alongside entries more recent than node),
+// only node itself is evicted without evicting older entries.
 //
 // Returns ErrEntryNotExist if key does not exist.
 // Returns ErrInvalidUpdateEntrySize if sizeDelta causes uint64 integer overflow.
 func (c *radixCache) UpdateSize(key string, sizeDelta uint64) error {
+	sampledEpoch := c.reclaimEpoch.Load()
+	pressure := c.samplePressure()
+
 	c.mu.Lock()
+	for sampledEpoch != c.reclaimEpoch.Load() {
+		c.mu.Unlock()
+		sampledEpoch = c.reclaimEpoch.Load()
+		pressure = c.samplePressure()
+		c.mu.Lock()
+	}
 	defer func() {
 		if c.opts.EnableInvariantChecking {
 			c.checkInvariants()
@@ -701,29 +801,66 @@ func (c *radixCache) UpdateSize(key string, sizeDelta uint64) error {
 
 	node, ok := c.getNode(key)
 	if !ok {
+		c.maybeReclaimUnderPressureLocked(pressure, &foregroundNoProtectNode)
 		return ErrEntryNotExist
 	}
 
-	if math.MaxUint64-node.size < sizeDelta || math.MaxUint64-c.currentSize < sizeDelta {
+	if math.MaxUint64-node.size < sizeDelta {
 		return ErrInvalidUpdateEntrySize
 	}
+
+	avail := c.maxSize - c.currentSize
 	if node.size+sizeDelta > c.maxSize {
+		avail = 0
+	} else {
+		for curr := c.tail; curr != nil && curr != node && sizeDelta > avail; curr = curr.prev {
+			avail += curr.size
+		}
+	}
+	if node.size+sizeDelta > c.maxSize || sizeDelta > avail {
 		c.eraseInternal(node)
+		if c.len == 0 {
+			c.zeroSizeCount = 0
+			c.lastReclaimedZeroCount = 0
+			c.markReclaimedLocked()
+			return nil
+		}
+		c.maybeReclaimUnderPressureLocked(pressure, &foregroundNoProtectNode)
+		if c.reclaimEpoch.Load() == sampledEpoch && c.hasElevatedPressureToInvalidate(pressure) {
+			c.markReclaimedLocked()
+		}
 		return nil
 	}
 
+	evictedAny := false
 	for sizeDelta > c.maxSize-c.currentSize && c.tail != nil {
 		if c.tail == node {
 			break
 		}
 		c.evictOne()
+		evictedAny = true
 	}
 
+	if math.MaxUint64-c.currentSize < sizeDelta {
+		return ErrInvalidUpdateEntrySize
+	}
+
+	if node.size == 0 && sizeDelta > 0 && c.zeroSizeCount > 0 {
+		c.zeroSizeCount--
+		if c.zeroSizeCount < c.lastReclaimedZeroCount {
+			c.lastReclaimedZeroCount = c.zeroSizeCount
+		}
+	}
 	node.size += sizeDelta
 	c.currentSize += sizeDelta
 
-	for c.currentSize > c.maxSize && c.tail != nil {
-		c.evictOne()
+	protectedNode := &foregroundNoProtectNode
+	if sizeDelta > 0 && node == c.head {
+		protectedNode = node
+	}
+	c.maybeReclaimUnderPressureLocked(pressure, protectedNode)
+	if evictedAny && c.reclaimEpoch.Load() == sampledEpoch && c.hasElevatedPressureToInvalidate(pressure) {
+		c.markReclaimedLocked()
 	}
 
 	return nil
@@ -732,7 +869,16 @@ func (c *radixCache) UpdateSize(key string, sizeDelta uint64) error {
 // EraseEntriesWithGivenPrefix deletes all entries whose keys start with prefix.
 // Prunes subtrees in O(prefix_length + subtree_size) time and sweeps detached nodes.
 func (c *radixCache) EraseEntriesWithGivenPrefix(prefix string) {
+	sampledEpoch := c.reclaimEpoch.Load()
+	pressure := c.samplePressure()
+
 	c.mu.Lock()
+	for sampledEpoch != c.reclaimEpoch.Load() {
+		c.mu.Unlock()
+		sampledEpoch = c.reclaimEpoch.Load()
+		pressure = c.samplePressure()
+		c.mu.Lock()
+	}
 	defer func() {
 		if c.opts.EnableInvariantChecking {
 			c.checkInvariants()
@@ -746,6 +892,9 @@ func (c *radixCache) EraseEntriesWithGivenPrefix(prefix string) {
 		c.tail = nil
 		c.currentSize = 0
 		c.len = 0
+		c.zeroSizeCount = 0
+		c.lastReclaimedZeroCount = 0
+		c.markReclaimedLocked()
 		return
 	}
 
@@ -755,6 +904,7 @@ func (c *radixCache) EraseEntriesWithGivenPrefix(prefix string) {
 	for len(search) > 0 {
 		child := node.getChild(search[0])
 		if child == nil {
+			c.maybeReclaimUnderPressureLocked(pressure, &foregroundNoProtectNode)
 			return
 		}
 
@@ -764,6 +914,16 @@ func (c *radixCache) EraseEntriesWithGivenPrefix(prefix string) {
 			node.removeChild(child)
 			c.sweepAndUnlink(child)
 			c.compressPathUpwards(node)
+			if c.len == 0 {
+				c.zeroSizeCount = 0
+				c.lastReclaimedZeroCount = 0
+				c.markReclaimedLocked()
+				return
+			}
+			c.maybeReclaimUnderPressureLocked(pressure, &foregroundNoProtectNode)
+			if c.reclaimEpoch.Load() == sampledEpoch && c.hasElevatedPressureToInvalidate(pressure) {
+				c.markReclaimedLocked()
+			}
 			return
 		}
 
@@ -773,8 +933,62 @@ func (c *radixCache) EraseEntriesWithGivenPrefix(prefix string) {
 			continue
 		}
 
+		c.maybeReclaimUnderPressureLocked(pressure, &foregroundNoProtectNode)
 		return
 	}
+}
+
+func (c *radixCache) hasOverflowSamplingGID(gid uint64) bool {
+	if gid == 0 || c.overflowSamplingCount.Load() <= 0 {
+		return false
+	}
+	_, ok := c.overflowSamplingGIDs.Load(gid)
+	return ok
+}
+
+func (c *radixCache) isCurrentGoroutineSampling(gid uint64) bool {
+	if gid == 0 {
+		return false
+	}
+	return c.samplingGID.Load() == gid ||
+		c.fallbackGID.Load() == gid ||
+		c.hasOverflowSamplingGID(gid)
+}
+
+func (c *radixCache) isSamplingGoroutine() bool {
+	if !c.opts.hasCustomPressureFunc {
+		return false
+	}
+	sGID := c.samplingGID.Load()
+	fGID := c.fallbackGID.Load()
+	oCount := c.overflowSamplingCount.Load()
+	if sGID == 0 && fGID == 0 && oCount <= 0 {
+		return false
+	}
+	return c.isCurrentGoroutineSampling(currentGoroutineID())
+}
+
+func (c *radixCache) markReclaimedLocked() {
+	if c.isSamplingGoroutine() {
+		return
+	}
+	c.reclaimEpoch.Add(1)
+	c.pressureNeedsRefresh.Store(true)
+	c.pressureInitialized.Store(false)
+	c.lastSampledInitialized.Store(false)
+	c.cachedPressureBits.Store(0)
+	c.lastSampledPressureBits.Store(0)
+}
+
+func (c *radixCache) hasElevatedPressureToInvalidate(pressure float64) bool {
+	thresh := c.opts.CompactionThreshold
+	return pressure >= thresh ||
+		math.Float64frombits(c.cachedPressureBits.Load()) >= thresh ||
+		math.Float64frombits(c.lastSampledPressureBits.Load()) >= thresh ||
+		c.pressureNeedsRefresh.Load() ||
+		c.samplingPressure.Load() ||
+		c.fallbackSampling.Load() ||
+		c.overflowSamplingCount.Load() > 0
 }
 
 // Compact satisfies PressureAwareCache on radixCache (pointer-based nodes are reclaimed directly by Go GC upon deletion).
@@ -786,29 +1000,265 @@ func (c *radixCache) Compact() {
 		}
 		c.mu.Unlock()
 	}()
+	c.markReclaimedLocked()
 }
 
-// samplePressureFresh evaluates c.opts.PressureFunc with an atomic re-entrancy guard.
+func (c *radixCache) storeSampledPressure(epoch uint64, p float64) {
+	if c.reclaimEpoch.Load() == epoch {
+		bits := math.Float64bits(p)
+		c.lastSampledPressureBits.Store(bits)
+		c.lastSampledEpoch.Store(epoch)
+		c.lastSampledInitialized.Store(true)
+		c.cachedPressureBits.Store(bits)
+		c.cachedPressureEpoch.Store(epoch)
+		c.pressureInitialized.Store(true)
+		c.pressureNeedsRefresh.Store(false)
+		if c.reclaimEpoch.Load() != epoch {
+			c.pressureNeedsRefresh.Store(true)
+			c.pressureInitialized.Store(false)
+			c.lastSampledInitialized.Store(false)
+			c.cachedPressureBits.Store(0)
+			c.lastSampledPressureBits.Store(0)
+		}
+	} else {
+		c.pressureNeedsRefresh.Store(true)
+	}
+}
+
+// samplePressureFresh evaluates c.opts.PressureFunc lock-free outside c.mu.Lock()
+// with a goroutine-aware re-entrancy guard and cold-start fallback.
 func (c *radixCache) samplePressureFresh() float64 {
 	if c.opts.PressureFunc == nil {
 		return 0.0
 	}
-	if !c.samplingPressure.CompareAndSwap(false, true) {
-		return math.Float64frombits(c.cachedPressureBits.Load())
+	if c.isSamplingGoroutine() {
+		return 0.0
 	}
-	defer c.samplingPressure.Store(false)
+	if !c.samplingPressure.CompareAndSwap(false, true) {
+		var gid uint64
+		if c.opts.hasCustomPressureFunc {
+			gid = currentGoroutineID()
+			if c.isCurrentGoroutineSampling(gid) {
+				return 0.0
+			}
+		}
+		if epoch := c.reclaimEpoch.Load(); c.pressureInitialized.Load() && c.cachedPressureEpoch.Load() == epoch {
+			bits := c.cachedPressureBits.Load()
+			if c.pressureInitialized.Load() && c.cachedPressureEpoch.Load() == epoch && c.reclaimEpoch.Load() == epoch {
+				return math.Float64frombits(bits)
+			}
+		}
+		if epoch := c.reclaimEpoch.Load(); c.lastSampledInitialized.Load() && c.lastSampledEpoch.Load() == epoch {
+			bits := c.lastSampledPressureBits.Load()
+			if c.lastSampledInitialized.Load() && c.lastSampledEpoch.Load() == epoch && c.reclaimEpoch.Load() == epoch {
+				return math.Float64frombits(bits)
+			}
+		}
+		for range 100 {
+			epoch := c.reclaimEpoch.Load()
+			if !c.samplingPressure.Load() ||
+				(c.pressureInitialized.Load() && c.cachedPressureEpoch.Load() == epoch) ||
+				(c.lastSampledInitialized.Load() && c.lastSampledEpoch.Load() == epoch) {
+				break
+			}
+			runtime.Gosched()
+		}
+		if epoch := c.reclaimEpoch.Load(); c.pressureInitialized.Load() && c.cachedPressureEpoch.Load() == epoch {
+			bits := c.cachedPressureBits.Load()
+			if c.pressureInitialized.Load() && c.cachedPressureEpoch.Load() == epoch && c.reclaimEpoch.Load() == epoch {
+				return math.Float64frombits(bits)
+			}
+		}
+		if epoch := c.reclaimEpoch.Load(); c.lastSampledInitialized.Load() && c.lastSampledEpoch.Load() == epoch {
+			bits := c.lastSampledPressureBits.Load()
+			if c.lastSampledInitialized.Load() && c.lastSampledEpoch.Load() == epoch && c.reclaimEpoch.Load() == epoch {
+				return math.Float64frombits(bits)
+			}
+		}
+		if c.opts.hasCustomPressureFunc && c.isCurrentGoroutineSampling(gid) {
+			return 0.0
+		}
+		if c.fallbackSampling.CompareAndSwap(false, true) {
+			if c.opts.hasCustomPressureFunc {
+				c.fallbackGID.Store(gid)
+				defer func() {
+					c.fallbackGID.Store(0)
+					c.fallbackSampling.Store(false)
+				}()
+			} else {
+				defer c.fallbackSampling.Store(false)
+			}
+		} else {
+			if c.opts.hasCustomPressureFunc {
+				c.overflowSamplingGIDs.Store(gid, struct{}{})
+			}
+			c.overflowSamplingCount.Add(1)
+			defer func() {
+				if c.opts.hasCustomPressureFunc {
+					c.overflowSamplingGIDs.Delete(gid)
+				}
+				c.overflowSamplingCount.Add(-1)
+			}()
+		}
+		epoch := c.reclaimEpoch.Load()
+		p := c.opts.PressureFunc()
+		if math.IsNaN(p) || p < 0.0 {
+			p = 0.0
+		}
+		c.storeSampledPressure(epoch, p)
+		return p
+	}
+	if c.opts.hasCustomPressureFunc {
+		c.samplingGID.Store(currentGoroutineID())
+		defer func() {
+			c.samplingGID.Store(0)
+			c.samplingPressure.Store(false)
+		}()
+	} else {
+		defer c.samplingPressure.Store(false)
+	}
 
+	epoch := c.reclaimEpoch.Load()
 	pressure := c.opts.PressureFunc()
 	if math.IsNaN(pressure) || pressure < 0.0 {
 		pressure = 0.0
 	}
-	c.cachedPressureBits.Store(math.Float64bits(pressure))
+	c.storeSampledPressure(epoch, pressure)
 	return pressure
+}
+
+func (c *radixCache) samplePressure() float64 {
+	if c.opts.hasCustomPressureFunc {
+		return c.samplePressureFresh()
+	}
+	epoch := c.reclaimEpoch.Load()
+	seq := c.pressureSampleSeq.Add(1)
+	if (seq&255) == 1 || !c.pressureInitialized.Load() || c.pressureNeedsRefresh.Load() || c.cachedPressureEpoch.Load() != epoch {
+		return c.samplePressureFresh()
+	}
+	bits := c.cachedPressureBits.Load()
+	if !c.pressureInitialized.Load() || c.pressureNeedsRefresh.Load() || c.cachedPressureEpoch.Load() != epoch || c.reclaimEpoch.Load() != epoch {
+		return c.samplePressureFresh()
+	}
+	return math.Float64frombits(bits)
+}
+
+func (c *radixCache) shedAndCompactLocked(targetSize uint64, retention float64, protectedNode *radixNode) []ValueType {
+	if protectedNode != nil && (protectedNode != c.head || protectedNode.prev != nil) {
+		protectedNode = nil
+	}
+
+	effectiveTarget := targetSize
+	if protectedNode != nil && retention > 0.0 && protectedNode.size > effectiveTarget {
+		effectiveTarget = protectedNode.size
+	}
+
+	targetLen := 0
+	targetZeroCount := 0
+	if retention > 0.0 {
+		if c.len > 0 {
+			targetLen = int(float64(c.len) * retention)
+			if protectedNode != nil && targetLen < 1 {
+				targetLen = 1
+			}
+		}
+		if c.zeroSizeCount > 0 {
+			targetZeroCount = int(float64(c.zeroSizeCount) * retention)
+			if protectedNode != nil && protectedNode.size == 0 && targetZeroCount < 1 {
+				targetZeroCount = 1
+			}
+			if c.lastReclaimedZeroCount > targetZeroCount {
+				targetZeroCount = c.lastReclaimedZeroCount
+			}
+		}
+	}
+
+	needFullFlush := retention == 0.0
+	var evicted []ValueType
+	victim := c.tail
+	for victim != nil {
+		needByteShed := c.currentSize > effectiveTarget || needFullFlush
+		needZeroShed := !needFullFlush && c.zeroSizeCount > targetZeroCount && c.len > targetLen
+		if !needByteShed && !needZeroShed {
+			break
+		}
+		switch {
+		case needFullFlush || (needByteShed && needZeroShed):
+			for victim != nil && victim == protectedNode {
+				victim = victim.prev
+			}
+		case needByteShed:
+			for victim != nil && (victim == protectedNode || victim.size == 0) {
+				victim = victim.prev
+			}
+		default:
+			for victim != nil && (victim == protectedNode || victim.size > 0) {
+				victim = victim.prev
+			}
+		}
+		if victim == nil {
+			break
+		}
+		nextVictim := victim.prev
+		if val := c.eraseInternal(victim); val != nil {
+			evicted = append(evicted, val)
+		}
+		victim = nextVictim
+	}
+
+	if retention > 0.0 && c.zeroSizeCount > 0 {
+		c.lastReclaimedZeroCount = c.zeroSizeCount
+	} else {
+		c.lastReclaimedZeroCount = 0
+	}
+
+	c.markReclaimedLocked()
+	return evicted
+}
+
+func (c *radixCache) maybeReclaimUnderPressureLocked(pressure float64, protectedNode *radixNode) []ValueType {
+	shedProtectedNode := protectedNode
+	if shedProtectedNode != nil && (shedProtectedNode != c.head || shedProtectedNode.prev != nil) {
+		shedProtectedNode = nil
+	}
+	epochBefore := c.reclaimEpoch.Load()
+	var evicted []ValueType
+	if pressure >= c.opts.EvictionThreshold {
+		retention := c.opts.EvictionRetentionRatio
+		targetSize := computeTargetSize(c.maxSize, retention)
+		targetLen := int(float64(c.len) * retention)
+		if shedProtectedNode != nil && retention > 0.0 && targetLen < 1 {
+			targetLen = 1
+		}
+		targetZeroCount := int(float64(c.zeroSizeCount) * retention)
+		if shedProtectedNode != nil && retention > 0.0 && shedProtectedNode.size == 0 && targetZeroCount < 1 {
+			targetZeroCount = 1
+		}
+		if retention > 0.0 && c.lastReclaimedZeroCount > targetZeroCount {
+			targetZeroCount = c.lastReclaimedZeroCount
+		}
+		if c.currentSize > targetSize || (c.zeroSizeCount > targetZeroCount && c.len > targetLen) || (retention == 0.0 && c.tail != nil) {
+			evicted = c.shedAndCompactLocked(targetSize, retention, shedProtectedNode)
+		}
+	} else {
+		c.lastReclaimedZeroCount = 0
+	}
+	if protectedNode != nil && protectedNode != &foregroundNoProtectNode && c.reclaimEpoch.Load() == epochBefore {
+		c.lastSampledPressureBits.Store(math.Float64bits(pressure))
+		c.lastSampledEpoch.Store(epochBefore)
+		c.lastSampledInitialized.Store(true)
+		if c.reclaimEpoch.Load() != epochBefore {
+			c.lastSampledInitialized.Store(false)
+			c.lastSampledPressureBits.Store(0)
+		}
+	}
+	return evicted
 }
 
 // EvaluateMemoryPressure samples the configured memory-pressure probe and sheds LRU tail entries
 // down to maxSize * EvictionRetentionRatio if critical pressure is reached.
 func (c *radixCache) EvaluateMemoryPressure() []ValueType {
+	sampledEpoch := c.reclaimEpoch.Load()
 	pressure := c.samplePressureFresh()
 
 	c.mu.Lock()
@@ -819,27 +1269,12 @@ func (c *radixCache) EvaluateMemoryPressure() []ValueType {
 		c.mu.Unlock()
 	}()
 
-	if pressure >= c.opts.EvictionThreshold {
-		retention := c.opts.EvictionRetentionRatio
-		targetSize := computeTargetSize(c.maxSize, retention)
-		onlyZeroSizeEntries := c.currentSize == 0
-		targetLen := 0
-		if onlyZeroSizeEntries && c.len > 0 && retention > 0.0 {
-			targetLen = int(float64(c.len) * retention)
-		}
-		var evicted []ValueType
-		for c.tail != nil {
-			needByteShed := c.currentSize > targetSize
-			needZeroSizeShed := onlyZeroSizeEntries && c.len > targetLen
-			needFullFlush := retention == 0.0
-			if !needByteShed && !needZeroSizeShed && !needFullFlush {
-				break
-			}
-			if val := c.evictOne(); val != nil {
-				evicted = append(evicted, val)
-			}
-		}
-		return evicted
+	for sampledEpoch != c.reclaimEpoch.Load() {
+		c.mu.Unlock()
+		sampledEpoch = c.reclaimEpoch.Load()
+		pressure = c.samplePressureFresh()
+		c.mu.Lock()
 	}
-	return nil
+
+	return c.maybeReclaimUnderPressureLocked(pressure, nil)
 }

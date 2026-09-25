@@ -75,6 +75,7 @@ func generateBenchmarkKeys(prefixCount, itemsPerPrefix, depth int) (keys []strin
 // ============================================================================
 
 func runBenchmarkInsert(b *testing.B, constructor func(uint64, ...lru.Option) lru.Cache, depth int) {
+	b.Helper()
 	const prefixCount = 100
 	const itemsPerPrefix = 100
 	keys, _, _ := generateBenchmarkKeys(prefixCount, itemsPerPrefix, depth)
@@ -117,6 +118,7 @@ func Benchmark_Insert_ArenaRadixCache(b *testing.B) {
 // ============================================================================
 
 func runBenchmarkLookUp(b *testing.B, constructor func(uint64, ...lru.Option) lru.Cache, depth int) {
+	b.Helper()
 	const prefixCount = 100
 	const itemsPerPrefix = 100
 	keys, _, _ := generateBenchmarkKeys(prefixCount, itemsPerPrefix, depth)
@@ -162,6 +164,7 @@ func Benchmark_LookUp_ArenaRadixCache(b *testing.B) {
 // ============================================================================
 
 func runBenchmarkLookUpWithoutChangingOrder(b *testing.B, constructor func(uint64, ...lru.Option) lru.Cache, depth int) {
+	b.Helper()
 	const prefixCount = 100
 	const itemsPerPrefix = 100
 	keys, _, _ := generateBenchmarkKeys(prefixCount, itemsPerPrefix, depth)
@@ -201,6 +204,7 @@ func Benchmark_LookUpWithoutChangingOrder_ArenaRadixCache(b *testing.B) {
 // ============================================================================
 
 func runBenchmarkUpdate(b *testing.B, constructor func(uint64, ...lru.Option) lru.Cache) {
+	b.Helper()
 	const numKeys = 10000
 	keys := make([]string, numKeys)
 	for i := range numKeys {
@@ -234,6 +238,7 @@ func Benchmark_Update_ArenaRadixCache(b *testing.B) { runBenchmarkUpdate(b, lru.
 // ============================================================================
 
 func runBenchmarkErase(b *testing.B, constructor func(uint64, ...lru.Option) lru.Cache) {
+	b.Helper()
 	const batchSize = 10000
 	keys := make([]string, batchSize)
 	for i := range batchSize {
@@ -267,6 +272,7 @@ func Benchmark_Erase_ArenaRadixCache(b *testing.B) { runBenchmarkErase(b, lru.Ne
 // ============================================================================
 
 func runBenchmarkErasePrefix(b *testing.B, constructor func(uint64, ...lru.Option) lru.Cache, depth int) {
+	b.Helper()
 	const prefixCount = 100
 	const itemsPerPrefix = 100
 	keys, prefixMap, prefixes := generateBenchmarkKeys(prefixCount, itemsPerPrefix, depth)
@@ -317,6 +323,7 @@ func Benchmark_ErasePrefix_ArenaRadixCache(b *testing.B) {
 // ============================================================================
 
 func runParallelWorkload(b *testing.B, constructor func(uint64, ...lru.Option) lru.Cache, insertPct, lookupPct int) {
+	b.Helper()
 	const cacheSize = 50000000
 	const keySpace = 20000
 	data := benchValue{val: 1, dataSize: 10}
@@ -384,6 +391,7 @@ func Benchmark_LargeScale_Insert_100K(b *testing.B) {
 	}
 
 	runInsert100K := func(b *testing.B, constructor func(uint64, ...lru.Option) lru.Cache) {
+		b.Helper()
 		b.ReportAllocs()
 		var mBefore, mAfter runtime.MemStats
 		var lastCache lru.Cache
@@ -423,6 +431,7 @@ func Benchmark_LargeScale_PrefixErase_100K(b *testing.B) {
 	cacheMaxSize := uint64(numEntries * 20)
 
 	runPrefixErase100K := func(b *testing.B, constructor func(uint64, ...lru.Option) lru.Cache) {
+		b.Helper()
 		b.ReportAllocs()
 		for range b.N {
 			b.StopTimer()

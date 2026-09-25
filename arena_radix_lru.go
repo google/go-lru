@@ -70,6 +70,7 @@ func (c *arenaRadix) checkInvariants() {
 
 	// INVARIANT 3: LRU list validation
 	lruCount := 0
+	zeroCount := 0
 	var sumSize uint64
 	prevID := nilNode
 
@@ -79,6 +80,9 @@ func (c *arenaRadix) checkInvariants() {
 			panic("arenaRadix invariant violation: sumSize uint64 overflow")
 		}
 		sumSize += c.nodes[currID].size
+		if c.nodes[currID].size == 0 {
+			zeroCount++
+		}
 		if c.nodes[currID].value == nil {
 			panic(fmt.Sprintf("arenaRadix invariant violation: unexpected nil value in LRU list for prefix '%s'", c.nodes[currID].prefix))
 		}
@@ -108,6 +112,10 @@ func (c *arenaRadix) checkInvariants() {
 
 	if lruCount != c.len {
 		panic(fmt.Sprintf("arenaRadix invariant violation: LRU list count %d does not match tracked len %d", lruCount, c.len))
+	}
+
+	if zeroCount != c.zeroSizeCount {
+		panic(fmt.Sprintf("arenaRadix invariant violation: zeroSizeCount %d does not match live zero-size entries %d", c.zeroSizeCount, zeroCount))
 	}
 
 	if sumSize != c.currentSize {
@@ -212,7 +220,10 @@ func (c *arenaRadix) checkInvariants() {
 		panic(fmt.Sprintf("arenaRadix: currentSize drift in tree: currentSize=%d treeSumSize=%d", c.currentSize, treeSumSize))
 	}
 
-	// INVARIANT 6: Hash accelerator map (nodeMap) index bounds, non-nil value, and hash consistency.
+	// INVARIANT 6: Hash accelerator map (nodeMap) index bounds, non-nil value, hash consistency, and expectedNodeMapLen parity.
+	if c.expectedNodeMapLen != len(c.nodeMap) {
+		panic(fmt.Sprintf("arenaRadix invariant violation: expectedNodeMapLen %d does not match len(nodeMap) %d", c.expectedNodeMapLen, len(c.nodeMap)))
+	}
 	for h, id := range c.nodeMap {
 		if id >= uint32(len(c.nodes)) {
 			panic(fmt.Sprintf("arenaRadix invariant violation: nodeMap contains out-of-bounds index %d (len=%d)", id, len(c.nodes)))
@@ -270,6 +281,7 @@ func (c *arenaRadix) Compact() {
 // or Tier 1 (lossless compaction) if pressure meets or exceeds the configured thresholds.
 // Returns any values evicted during Tier 2 critical-pressure shedding.
 func (c *arenaRadix) EvaluateMemoryPressure() []ValueType {
+	sampledEpoch := c.reclaimEpoch.Load()
 	pressure := c.samplePressureFresh()
 
 	c.mu.Lock()
@@ -279,6 +291,13 @@ func (c *arenaRadix) EvaluateMemoryPressure() []ValueType {
 		}
 		c.mu.Unlock()
 	}()
+
+	for sampledEpoch != c.reclaimEpoch.Load() {
+		c.mu.Unlock()
+		sampledEpoch = c.reclaimEpoch.Load()
+		pressure = c.samplePressureFresh()
+		c.mu.Lock()
+	}
 
 	return c.maybeReclaimUnderPressureLocked(pressure, nilNode)
 }
@@ -303,6 +322,12 @@ func (c *arenaRadix) Insert(key string, value ValueType) ([]ValueType, error) {
 	pressure := c.samplePressure()
 
 	c.mu.Lock()
+	for sampledEpoch != c.reclaimEpoch.Load() {
+		c.mu.Unlock()
+		sampledEpoch = c.reclaimEpoch.Load()
+		pressure = c.samplePressure()
+		c.mu.Lock()
+	}
 	defer func() {
 		if c.options.EnableInvariantChecking {
 			c.checkInvariants()
@@ -316,6 +341,14 @@ func (c *arenaRadix) Insert(key string, value ValueType) ([]ValueType, error) {
 	nodeID, exists := c.getNodeKeyWithHash(key, keyHash)
 	if exists {
 		// Updating an existing key requires 0 new node allocations and 0 trie walks.
+		if c.nodes[nodeID].size == 0 && valueSize > 0 && c.zeroSizeCount > 0 {
+			c.zeroSizeCount--
+			if c.zeroSizeCount < c.lastReclaimedZeroCount {
+				c.lastReclaimedZeroCount = c.zeroSizeCount
+			}
+		} else if c.nodes[nodeID].size > 0 && valueSize == 0 {
+			c.zeroSizeCount++
+		}
 		c.moveToFront(nodeID)
 		c.currentSize -= c.nodes[nodeID].size
 		for valueSize > c.maxSize-c.currentSize && c.tail != nilNode && c.tail != nodeID {
@@ -324,9 +357,7 @@ func (c *arenaRadix) Insert(key string, value ValueType) ([]ValueType, error) {
 		c.nodes[nodeID].value = value
 		c.nodes[nodeID].size = valueSize
 		c.currentSize += valueSize
-		if prevID, occupied := c.nodeMap[keyHash]; occupied && prevID != nodeID {
-			c.nodeMapDirty = true
-		} else if !occupied {
+		if _, occupied := c.nodeMap[keyHash]; !occupied {
 			c.expectedNodeMapLen++
 		}
 		c.nodeMap[keyHash] = nodeID
@@ -349,11 +380,12 @@ func (c *arenaRadix) Insert(key string, value ValueType) ([]ValueType, error) {
 
 		nodeID, _ = c.insertNode(key, value)
 		c.nodes[nodeID].size = valueSize
+		if valueSize == 0 {
+			c.zeroSizeCount++
+		}
 		c.pushFront(nodeID)
 		c.currentSize += valueSize
-		if prevID, occupied := c.nodeMap[keyHash]; occupied && prevID != nodeID {
-			c.nodeMapDirty = true
-		} else if !occupied {
+		if _, occupied := c.nodeMap[keyHash]; !occupied {
 			c.expectedNodeMapLen++
 		}
 		c.nodeMap[keyHash] = nodeID
@@ -364,9 +396,6 @@ func (c *arenaRadix) Insert(key string, value ValueType) ([]ValueType, error) {
 		evictedValues = append(evictedValues, c.evictOne())
 	}
 
-	if !c.options.hasCustomPressureFunc && sampledEpoch != c.reclaimEpoch.Load() {
-		pressure = math.Float64frombits(c.cachedPressureBits.Load())
-	}
 	if evictedByPressure := c.maybeReclaimUnderPressureLocked(pressure, nodeID); len(evictedByPressure) > 0 {
 		evictedValues = append(evictedValues, evictedByPressure...)
 	}
@@ -380,6 +409,12 @@ func (c *arenaRadix) Erase(key string) (value ValueType) {
 	pressure := c.samplePressure()
 
 	c.mu.Lock()
+	for sampledEpoch != c.reclaimEpoch.Load() {
+		c.mu.Unlock()
+		sampledEpoch = c.reclaimEpoch.Load()
+		pressure = c.samplePressure()
+		c.mu.Lock()
+	}
 	defer func() {
 		if c.options.EnableInvariantChecking {
 			c.checkInvariants()
@@ -389,14 +424,19 @@ func (c *arenaRadix) Erase(key string) (value ValueType) {
 
 	nodeID, ok := c.getNodeKey(key)
 	if !ok {
+		c.maybeReclaimUnderPressureLocked(pressure, foregroundNoProtect)
 		return nil
 	}
 
 	deleted := c.eraseInternal(nodeID)
-	if !c.options.hasCustomPressureFunc && sampledEpoch != c.reclaimEpoch.Load() {
-		pressure = math.Float64frombits(c.cachedPressureBits.Load())
+	if c.len == 0 {
+		c.resetEmptyArenaLocked()
+		return deleted
 	}
-	c.maybeCompactUnderPressureLocked(pressure)
+	c.maybeReclaimUnderPressureLocked(pressure, foregroundNoProtect)
+	if c.reclaimEpoch.Load() == sampledEpoch && c.hasElevatedPressureToInvalidate(pressure) {
+		c.markReclaimedLocked()
+	}
 	return deleted
 }
 
@@ -421,7 +461,6 @@ func (c *arenaRadix) LookUp(key string) (value ValueType) {
 		c.expectedNodeMapLen++
 	} else if prevID != nodeID {
 		c.nodeMap[keyHash] = nodeID
-		c.nodeMapDirty = true
 	}
 	c.moveToFront(nodeID)
 
@@ -481,7 +520,8 @@ func (c *arenaRadix) UpdateWithoutChangingOrder(key string, value ValueType) err
 }
 
 // UpdateSize adjusts the size accounting for an existing key by sizeDelta without altering its LRU position.
-// If node.size + sizeDelta exceeds maxSize, only the entry itself is evicted without evicting other entries.
+// If node.size + sizeDelta exceeds maxSize (or cannot fit alongside entries more recent than node),
+// only the entry itself is evicted without evicting older entries.
 // Otherwise, if the updated cache size exceeds maxSize, excess LRU entries are evicted to maintain capacity invariants.
 //
 // Returns ErrEntryNotExist if key is not present in the cache.
@@ -491,6 +531,12 @@ func (c *arenaRadix) UpdateSize(key string, sizeDelta uint64) error {
 	pressure := c.samplePressure()
 
 	c.mu.Lock()
+	for sampledEpoch != c.reclaimEpoch.Load() {
+		c.mu.Unlock()
+		sampledEpoch = c.reclaimEpoch.Load()
+		pressure = c.samplePressure()
+		c.mu.Lock()
+	}
 	defer func() {
 		if c.options.EnableInvariantChecking {
 			c.checkInvariants()
@@ -500,48 +546,64 @@ func (c *arenaRadix) UpdateSize(key string, sizeDelta uint64) error {
 
 	nodeID, ok := c.getNodeKey(key)
 	if !ok {
+		c.maybeReclaimUnderPressureLocked(pressure, foregroundNoProtect)
 		return ErrEntryNotExist
 	}
 
-	if math.MaxUint64-c.nodes[nodeID].size < sizeDelta || math.MaxUint64-c.currentSize < sizeDelta {
+	if math.MaxUint64-c.nodes[nodeID].size < sizeDelta {
 		return ErrInvalidUpdateEntrySize
 	}
+
+	avail := c.maxSize - c.currentSize
 	if c.nodes[nodeID].size+sizeDelta > c.maxSize {
-		c.eraseInternal(nodeID)
-		if !c.options.hasCustomPressureFunc && sampledEpoch != c.reclaimEpoch.Load() {
-			pressure = math.Float64frombits(c.cachedPressureBits.Load())
+		avail = 0
+	} else {
+		for currID := c.tail; currID != nilNode && currID != nodeID && sizeDelta > avail; currID = c.nodes[currID].prev {
+			avail += c.nodes[currID].size
 		}
-		c.maybeCompactUnderPressureLocked(pressure)
+	}
+	if c.nodes[nodeID].size+sizeDelta > c.maxSize || sizeDelta > avail {
+		c.eraseInternal(nodeID)
+		if c.len == 0 {
+			c.resetEmptyArenaLocked()
+			return nil
+		}
+		c.maybeReclaimUnderPressureLocked(pressure, foregroundNoProtect)
+		if c.reclaimEpoch.Load() == sampledEpoch && c.hasElevatedPressureToInvalidate(pressure) {
+			c.markReclaimedLocked()
+		}
 		return nil
 	}
 
+	evictedAny := false
 	for sizeDelta > c.maxSize-c.currentSize && c.tail != nilNode {
 		if c.tail == nodeID {
 			break
 		}
 		c.evictOne()
+		evictedAny = true
 	}
 
-	// Update size accounting
+	if math.MaxUint64-c.currentSize < sizeDelta {
+		return ErrInvalidUpdateEntrySize
+	}
+
+	if c.nodes[nodeID].size == 0 && sizeDelta > 0 && c.zeroSizeCount > 0 {
+		c.zeroSizeCount--
+		if c.zeroSizeCount < c.lastReclaimedZeroCount {
+			c.lastReclaimedZeroCount = c.zeroSizeCount
+		}
+	}
 	c.nodes[nodeID].size += sizeDelta
 	c.currentSize += sizeDelta
 
-	// Evict until we're at or below maxSize to maintain invariants
-	for c.currentSize > c.maxSize && c.tail != nilNode {
-		c.evictOne()
+	protectedID := foregroundNoProtect
+	if sizeDelta > 0 && nodeID == c.head && c.nodes[nodeID].value != nil {
+		protectedID = nodeID
 	}
-
-	if !c.options.hasCustomPressureFunc && sampledEpoch != c.reclaimEpoch.Load() {
-		pressure = math.Float64frombits(c.cachedPressureBits.Load())
-	}
-	if sizeDelta > 0 {
-		protectedID := nodeID
-		if c.nodes[nodeID].value == nil {
-			protectedID = nilNode
-		}
-		c.maybeReclaimUnderPressureLocked(pressure, protectedID)
-	} else {
-		c.maybeCompactUnderPressureLocked(pressure)
+	c.maybeReclaimUnderPressureLocked(pressure, protectedID)
+	if evictedAny && c.reclaimEpoch.Load() == sampledEpoch && c.hasElevatedPressureToInvalidate(pressure) {
+		c.markReclaimedLocked()
 	}
 	return nil
 }
@@ -553,6 +615,12 @@ func (c *arenaRadix) EraseEntriesWithGivenPrefix(prefix string) {
 	pressure := c.samplePressure()
 
 	c.mu.Lock()
+	for sampledEpoch != c.reclaimEpoch.Load() {
+		c.mu.Unlock()
+		sampledEpoch = c.reclaimEpoch.Load()
+		pressure = c.samplePressure()
+		c.mu.Lock()
+	}
 	defer func() {
 		if c.options.EnableInvariantChecking {
 			c.checkInvariants()
@@ -561,20 +629,7 @@ func (c *arenaRadix) EraseEntriesWithGivenPrefix(prefix string) {
 	}()
 
 	if prefix == "" {
-		c.nodes = nil
-		c.freeHead = nilNode
-		c.freeCount = 0
-
-		c.root = c.allocateNode()
-		c.head = nilNode
-		c.tail = nilNode
-		c.currentSize = 0
-		c.len = 0
-		c.nodeMap = make(map[uint64]uint32)
-		c.expectedNodeMapLen = 0
-		c.nodeMapDirty = false
-		c.pressureNeedsRefresh.Store(true)
-		c.reclaimEpoch.Add(1)
+		c.resetEmptyArenaLocked()
 		return
 	}
 
@@ -584,6 +639,7 @@ func (c *arenaRadix) EraseEntriesWithGivenPrefix(prefix string) {
 	for len(search) > 0 {
 		childID := c.getChild(nodeID, search[0])
 		if childID == nilNode {
+			c.maybeReclaimUnderPressureLocked(pressure, foregroundNoProtect)
 			return // Prefix doesn't exist
 		}
 
@@ -601,21 +657,13 @@ func (c *arenaRadix) EraseEntriesWithGivenPrefix(prefix string) {
 			c.freeSubtree(childID)
 			c.compressPathUpwards(nodeID)
 			if c.len == 0 {
-				c.nodes = nil
-				c.freeHead = nilNode
-				c.freeCount = 0
-				c.root = c.allocateNode()
-				c.nodeMap = make(map[uint64]uint32)
-				c.expectedNodeMapLen = 0
-				c.nodeMapDirty = false
-				c.pressureNeedsRefresh.Store(true)
-				c.reclaimEpoch.Add(1)
+				c.resetEmptyArenaLocked()
 				return
 			}
-			if !c.options.hasCustomPressureFunc && sampledEpoch != c.reclaimEpoch.Load() {
-				pressure = math.Float64frombits(c.cachedPressureBits.Load())
+			c.maybeReclaimUnderPressureLocked(pressure, foregroundNoProtect)
+			if c.reclaimEpoch.Load() == sampledEpoch && c.hasElevatedPressureToInvalidate(pressure) {
+				c.markReclaimedLocked()
 			}
-			c.maybeCompactUnderPressureLocked(pressure)
 			return
 		}
 
@@ -625,6 +673,7 @@ func (c *arenaRadix) EraseEntriesWithGivenPrefix(prefix string) {
 			continue
 		}
 
+		c.maybeReclaimUnderPressureLocked(pressure, foregroundNoProtect)
 		return
 	}
 }
@@ -644,11 +693,20 @@ func (c *arenaRadix) freeSubtree(nodeID uint32) {
 	currID := nodeID
 	for currID != nilNode {
 		if c.nodes[currID].value != nil {
+			if c.nodes[currID].size == 0 && c.zeroSizeCount > 0 {
+				c.zeroSizeCount--
+				if c.zeroSizeCount < c.lastReclaimedZeroCount {
+					c.lastReclaimedZeroCount = c.zeroSizeCount
+				}
+			}
 			c.currentSize -= c.nodes[currID].size
 			c.remove(currID)
-			if c.nodeMap[currHash] == currID {
+			if mappedID, ok := c.nodeMap[currHash]; ok && mappedID == currID {
 				delete(c.nodeMap, currHash)
 				c.nodeMapDirty = true
+				if c.expectedNodeMapLen > 0 {
+					c.expectedNodeMapLen--
+				}
 			}
 			c.nodes[currID].value = nil
 			c.nodes[currID].size = 0

@@ -45,13 +45,23 @@ jobs:
             exit 1
           fi
 
+      - name: Check imports (goimports)
+        run: |
+          go install golang.org/x/tools/cmd/goimports@latest
+          UNFORMATTED_IMPORTS=$("$(go env GOPATH)/bin/goimports" -l .)
+          if [ -n "$UNFORMATTED_IMPORTS" ]; then
+            echo "The following files have unformatted imports ('goimports -l .'):"
+            echo "$UNFORMATTED_IMPORTS"
+            exit 1
+          fi
+
       - name: Run go vet
         run: go vet ./...
 
       - name: Run golangci-lint
-        uses: golangci/golangci-lint-action@v6
+        uses: golangci/golangci-lint-action@v7
         with:
-          version: latest
+          version: v2.13.1
 
       - name: Verify go.mod and go.sum are tidy
         run: |

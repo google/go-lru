@@ -22,6 +22,7 @@ import (
 	"testing"
 
 	"github.com/google/go-lru"
+	"github.com/stretchr/testify/require"
 )
 
 type diffValue struct {
@@ -56,6 +57,7 @@ type differentialHarness struct {
 }
 
 func newDifferentialHarness(t *testing.T, maxSize uint64) *differentialHarness {
+	t.Helper()
 	h := &differentialHarness{
 		t:       t,
 		maxSize: maxSize,
@@ -86,37 +88,35 @@ func newDifferentialHarness(t *testing.T, maxSize uint64) *differentialHarness {
 
 func (h *differentialHarness) compareErrors(op string, baseErr, targetErr error, instName string, invariants bool) {
 	h.t.Helper()
-	if (baseErr == nil && targetErr != nil) || (baseErr != nil && targetErr == nil) {
-		h.t.Fatalf("[%s] error parity mismatch with %s (inv=%v): base err = %v, target err = %v", op, instName, invariants, baseErr, targetErr)
+	if baseErr == nil {
+		require.NoErrorf(h.t, targetErr, "[%s] error parity mismatch with %s (inv=%v)", op, instName, invariants)
+		return
 	}
-	if baseErr != nil && targetErr != nil && baseErr.Error() != targetErr.Error() {
-		h.t.Fatalf("[%s] error message mismatch with %s (inv=%v): base = %q, target = %q", op, instName, invariants, baseErr, targetErr)
-	}
+	require.Errorf(h.t, targetErr, "[%s] error parity mismatch with %s (inv=%v): base err = %v", op, instName, invariants, baseErr)
+	require.EqualErrorf(h.t, targetErr, baseErr.Error(), "[%s] error message mismatch with %s (inv=%v)", op, instName, invariants)
 }
 
 func (h *differentialHarness) compareValues(op string, baseVal, targetVal lru.ValueType, instName string, invariants bool) {
 	h.t.Helper()
-	if (baseVal == nil && targetVal != nil) || (baseVal != nil && targetVal == nil) {
-		h.t.Fatalf("[%s] value nil parity mismatch with %s (inv=%v): base = %v, target = %v", op, instName, invariants, baseVal, targetVal)
+	if baseVal == nil {
+		require.Nilf(h.t, targetVal, "[%s] value nil parity mismatch with %s (inv=%v)", op, instName, invariants)
+		return
 	}
-	if baseVal != nil && targetVal != nil {
-		bv, ok1 := baseVal.(*diffValue)
-		tv, ok2 := targetVal.(*diffValue)
-		if ok1 && ok2 {
-			if bv.id != tv.id || bv.size != tv.size {
-				h.t.Fatalf("[%s] value content mismatch with %s (inv=%v): base = %v, target = %v", op, instName, invariants, bv, tv)
-			}
-		} else if baseVal.Size() != targetVal.Size() {
-			h.t.Fatalf("[%s] value size mismatch with %s (inv=%v): base size = %d, target size = %d", op, instName, invariants, baseVal.Size(), targetVal.Size())
-		}
+	require.NotNilf(h.t, targetVal, "[%s] value nil parity mismatch with %s (inv=%v): base = %v", op, instName, invariants, baseVal)
+
+	bv, ok1 := baseVal.(*diffValue)
+	tv, ok2 := targetVal.(*diffValue)
+	if ok1 && ok2 {
+		require.Equalf(h.t, bv.id, tv.id, "[%s] value id mismatch with %s (inv=%v)", op, instName, invariants)
+		require.Equalf(h.t, bv.size, tv.size, "[%s] value size mismatch with %s (inv=%v)", op, instName, invariants)
+	} else {
+		require.Equalf(h.t, baseVal.Size(), targetVal.Size(), "[%s] value size mismatch with %s (inv=%v)", op, instName, invariants)
 	}
 }
 
 func (h *differentialHarness) compareEvicted(op string, baseEvicted, targetEvicted []lru.ValueType, instName string, invariants bool) {
 	h.t.Helper()
-	if len(baseEvicted) != len(targetEvicted) {
-		h.t.Fatalf("[%s] evicted slice length mismatch with %s (inv=%v): base len = %d, target len = %d", op, instName, invariants, len(baseEvicted), len(targetEvicted))
-	}
+	require.Lenf(h.t, targetEvicted, len(baseEvicted), "[%s] evicted slice length mismatch with %s (inv=%v)", op, instName, invariants)
 	for i := range baseEvicted {
 		h.compareValues(fmt.Sprintf("%s.evicted[%d]", op, i), baseEvicted[i], targetEvicted[i], instName, invariants)
 	}
@@ -204,11 +204,6 @@ func (h *differentialHarness) UpdateSize(key string, delta uint64) {
 	var baseErr error
 
 	val := h.LookUpWithoutChangingOrder(key)
-	if val != nil && delta <= math.MaxUint64-val.Size() {
-		if tv, ok := val.(*diffValue); ok {
-			tv.size += delta
-		}
-	}
 
 	for i, inst := range h.instances {
 		err := inst.cache.UpdateSize(key, delta)
@@ -216,6 +211,12 @@ func (h *differentialHarness) UpdateSize(key string, delta uint64) {
 			baseErr = err
 		} else {
 			h.compareErrors(fmt.Sprintf("UpdateSize(%q, %d)", key, delta), baseErr, err, inst.name, inst.invariants)
+		}
+	}
+
+	if baseErr == nil && val != nil && h.LookUpWithoutChangingOrder(key) != nil {
+		if tv, ok := val.(*diffValue); ok {
+			tv.size += delta
 		}
 	}
 }
@@ -237,6 +238,7 @@ func (h *differentialHarness) DrainAndVerifyEvictionOrder(allKnownKeys []string)
 }
 
 func TestDifferential_FlatWorkload(t *testing.T) {
+	// Arrange
 	r := rand.New(rand.NewSource(1337))
 	const (
 		numOps        = 5000
@@ -251,6 +253,7 @@ func TestDifferential_FlatWorkload(t *testing.T) {
 
 	h := newDifferentialHarness(t, cacheCapacity)
 
+	// Act
 	for op := range numOps {
 		k := keys[r.Intn(keyPoolSize)]
 		dice := r.Intn(100)
@@ -280,10 +283,12 @@ func TestDifferential_FlatWorkload(t *testing.T) {
 		}
 	}
 
+	// Assert
 	h.DrainAndVerifyEvictionOrder(keys)
 }
 
 func TestDifferential_HierarchicalDirectoryWorkload(t *testing.T) {
+	// Arrange
 	r := rand.New(rand.NewSource(4242))
 	const (
 		numOps        = 5000
@@ -306,6 +311,7 @@ func TestDifferential_HierarchicalDirectoryWorkload(t *testing.T) {
 
 	h := newDifferentialHarness(t, cacheCapacity)
 
+	// Act
 	for op := range numOps {
 		path := paths[r.Intn(len(paths))]
 		dice := r.Intn(100)
@@ -333,10 +339,12 @@ func TestDifferential_HierarchicalDirectoryWorkload(t *testing.T) {
 		}
 	}
 
+	// Assert
 	h.DrainAndVerifyEvictionOrder(paths)
 }
 
 func TestDifferential_CapacityThrashingAndSizeUpdates(t *testing.T) {
+	// Arrange
 	r := rand.New(rand.NewSource(7777))
 	const (
 		numOps        = 5000
@@ -350,7 +358,7 @@ func TestDifferential_CapacityThrashingAndSizeUpdates(t *testing.T) {
 
 	h := newDifferentialHarness(t, cacheCapacity)
 
-	// Explicitly verify uint64 overflow rejection parity across all engines.
+	// Act: Explicitly verify uint64 overflow rejection parity across all engines.
 	h.Insert("overflow_key", &diffValue{id: "ovf", size: 20})
 	h.UpdateSize("overflow_key", math.MaxUint64)
 	h.UpdateSize("overflow_key", math.MaxUint64-10)
@@ -376,10 +384,12 @@ func TestDifferential_CapacityThrashingAndSizeUpdates(t *testing.T) {
 		}
 	}
 
+	// Assert
 	h.DrainAndVerifyEvictionOrder(keys)
 }
 
 func TestDifferential_BoundaryAndEdgeCases(t *testing.T) {
+	// Arrange
 	r := rand.New(rand.NewSource(12345))
 	const (
 		numOps        = 3000
@@ -401,6 +411,7 @@ func TestDifferential_BoundaryAndEdgeCases(t *testing.T) {
 
 	h := newDifferentialHarness(t, cacheCapacity)
 
+	// Act
 	for op := range numOps {
 		k := adversarialKeys[r.Intn(len(adversarialKeys))]
 		dice := r.Intn(100)
@@ -445,5 +456,20 @@ func TestDifferential_BoundaryAndEdgeCases(t *testing.T) {
 		}
 	}
 
+	// Assert
 	h.DrainAndVerifyEvictionOrder(adversarialKeys)
+}
+
+func TestDifferential_UpdateSizeSelfEvictionPreservesDiffValueSize(t *testing.T) {
+	// Arrange
+	h := newDifferentialHarness(t, 100)
+	dv := &diffValue{id: "self_evict", size: 50}
+	h.Insert("k1", dv)
+
+	// Act: Grow k1 by +60 (50 + 60 = 110 > maxSize 100), triggering self-eviction across all backends.
+	h.UpdateSize("k1", 60)
+
+	// Assert: k1 is evicted and dv.size remains 50 (not mutated to 110).
+	require.Nil(t, h.LookUpWithoutChangingOrder("k1"))
+	require.Equal(t, uint64(50), dv.Size())
 }

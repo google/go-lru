@@ -14,8 +14,6 @@
 
 package lru
 
-import "bytes"
-
 // StringValue is a ValueType wrapper for a standard Go string whose Size() is its byte length (len(s)).
 type StringValue string
 
@@ -34,24 +32,39 @@ func (s StringValue) String() string {
 	return string(s)
 }
 
-// BytesValue is a ValueType wrapper for an immutable copy of a byte slice whose Size() is its byte length (len(b)).
-type BytesValue []byte
+// BytesValue is an immutable, comparable ValueType wrapper for a byte slice whose Size() is its byte length (len(b)).
+type BytesValue struct {
+	data   string
+	nonNil bool
+}
 
-// NewBytesValue clones b and wraps it as a BytesValue implementing ValueType.
+// NewBytesValue clones b and wraps it as an immutable BytesValue implementing ValueType.
 // Cloning prevents caller mutations from racing with cached readers and prevents sub-slices
 // from pinning large underlying backing arrays in memory.
 func NewBytesValue(b []byte) BytesValue {
-	return BytesValue(bytes.Clone(b))
+	if b == nil {
+		return BytesValue{}
+	}
+	return BytesValue{
+		data:   string(b),
+		nonNil: true,
+	}
 }
 
 // Size returns the byte length of the slice (uint64(len(b))).
 func (b BytesValue) Size() uint64 {
-	return uint64(len(b))
+	return uint64(len(b.data))
 }
 
 // Bytes returns a defensive copy of the underlying []byte slice.
 func (b BytesValue) Bytes() []byte {
-	return bytes.Clone([]byte(b))
+	if len(b.data) == 0 {
+		if !b.nonNil {
+			return nil
+		}
+		return []byte{}
+	}
+	return []byte(b.data)
 }
 
 // SizedValue wraps an arbitrary value of type T with an explicit logical or byte size,

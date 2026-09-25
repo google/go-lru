@@ -71,13 +71,18 @@ func TestValueWrappers(t *testing.T) {
 	assert.Equal(t, uint64(4), bv.Size())
 	assert.Equal(t, []byte{0x01, 0x02, 0x03, 0x04}, bv.Bytes())
 
+	var v1, v2 ValueType = NewBytesValue([]byte("alpha")), NewBytesValue([]byte("alpha"))
+	areEqual := v1 == v2
+	assert.Equal(t, v1, v2)
+	assert.True(t, areEqual)
+
 	assert.Equal(t, uint64(128), sized.Size())
 	assert.Equal(t, customPayload{ID: 7, Name: "node"}, sized.Unwrap())
 
 	assert.Equal(t, uint64(64), shorthand.Size())
 	assert.Equal(t, "inline-payload", shorthand.Unwrap())
 
-	// Verify caching across all three backends
+	// Act & Assert: Verify caching across all three backends
 	for _, b := range []Backend{BackendMap, BackendRadix, BackendArenaRadix} {
 		cache := New(512, WithBackend(b), WithInvariantChecking(true))
 		evicted, err := cache.Insert("k1", sv)

@@ -87,8 +87,9 @@ var metricsSamplePool = sync.Pool{
 
 // Options contains configuration parameters for Cache instances.
 // Memory-pressure reclamation options (PressureFunc, MemoryBudget, CompactionThreshold,
-// EvictionThreshold, EvictionRetentionRatio) configure PressureAwareCache behavior across
-// ArenaRadixCache, MapCache, and RadixCache.
+// EvictionThreshold, EvictionRetentionRatio) configure both automatic amortized foreground
+// reclamation (on Insert, Erase, UpdateSize, and EraseEntriesWithGivenPrefix) and explicit
+// EvaluateMemoryPressure() / Compact() calls across ArenaRadixCache, MapCache, and RadixCache.
 type Options struct {
 	// Backend selects the underlying cache engine when calling New.
 	// Defaults to BackendMap.
@@ -247,12 +248,13 @@ func ApplyOptions(opts ...Option) Options {
 		options.EvictionThreshold = DefaultEvictionThreshold
 		options.hasCustomEvictionThreshold = false
 	}
-	if options.CompactionThreshold > options.EvictionThreshold {
+	if options.CompactionThreshold > options.EvictionThreshold ||
+		(options.CompactionThreshold == options.EvictionThreshold && options.hasCustomCompactionThreshold != options.hasCustomEvictionThreshold) {
 		switch {
 		case options.hasCustomCompactionThreshold && !options.hasCustomEvictionThreshold:
 			// Caller raised CompactionThreshold above default EvictionThreshold; advance EvictionThreshold
 			// to preserve the Tier 1 compaction window.
-			options.EvictionThreshold = math.Min(1.0, options.CompactionThreshold+(DefaultEvictionThreshold-DefaultCompactionThreshold))
+			options.EvictionThreshold = options.CompactionThreshold + (DefaultEvictionThreshold - DefaultCompactionThreshold)
 			if options.EvictionThreshold < options.CompactionThreshold {
 				options.EvictionThreshold = options.CompactionThreshold
 			}
