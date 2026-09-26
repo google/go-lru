@@ -41,6 +41,10 @@ func setupArenaRadixCacheTest(t *testing.T) Cache {
 
 func assertEvictedArenaValues(t *testing.T, evicted []ValueType, expectedValues []int64) {
 	t.Helper()
+	if len(expectedValues) == 0 {
+		assert.Empty(t, evicted)
+		return
+	}
 	require.Len(t, evicted, len(expectedValues))
 	for i, v := range evicted {
 		td, ok := v.(arenaTestData)
@@ -836,7 +840,7 @@ func TestArenaRadixCache_ModeratePressureLosslessCompaction(t *testing.T) {
 	assert.Empty(t, evicted)
 	assert.Equal(t, nilNode, c.freeHead)
 	assert.Equal(t, uint32(0), c.freeCount)
-	assert.Equal(t, len(c.nodes), cap(c.nodes))
+	assert.Len(t, c.nodes, cap(c.nodes))
 	assert.Less(t, cap(c.nodes), peakNodeCap)
 	assert.Equal(t, 100, c.len)
 	assert.Equal(t, uint64(1000), c.currentSize)
@@ -890,7 +894,7 @@ func TestArenaRadixCache_CriticalPressureLRUShedding(t *testing.T) {
 	assert.Equal(t, 40, c.len)
 	assert.Equal(t, nilNode, c.freeHead)
 	assert.Equal(t, uint32(0), c.freeCount)
-	assert.Equal(t, len(c.nodes), cap(c.nodes))
+	assert.Len(t, c.nodes, cap(c.nodes))
 
 	for i := range 60 {
 		key := fmt.Sprintf("dir_%d/item_%03d", i%5, i)
@@ -944,7 +948,7 @@ func TestArenaRadixCache_AutomaticPressureTriggersAndReentrancy(t *testing.T) {
 
 	// Assert 1
 	assert.Equal(t, nilNode, c.freeHead)
-	assert.Equal(t, len(c.nodes), cap(c.nodes))
+	assert.Len(t, c.nodes, cap(c.nodes))
 	assert.Equal(t, uint64(100), c.currentSize)
 
 	// Act 2: Automatic Tier 2 shedding on Insert under critical pressure.
@@ -1155,7 +1159,7 @@ func TestArenaRadixCache_AdversarialAuditRegressions(t *testing.T) {
 		}
 		c.Compact()
 		require.Equal(t, nilNode, c.freeHead)
-		require.Equal(t, len(c.nodes), cap(c.nodes))
+		require.Len(t, c.nodes, cap(c.nodes))
 		ptrBefore := &c.nodes[0]
 
 		// Act
@@ -1350,6 +1354,7 @@ func TestArenaRadixCache_PrincipalReviewFixes(t *testing.T) {
 			{"RadixCache", NewRadixCache},
 		} {
 			t.Run(tc.name, func(t *testing.T) {
+				// Arrange
 				pressure := 0.10
 				cache := tc.fn(
 					100,
@@ -1362,21 +1367,21 @@ func TestArenaRadixCache_PrincipalReviewFixes(t *testing.T) {
 					require.NoError(t, err)
 				}
 
-				// F5: Re-entrant LookUpWithoutChangingOrder inside ValueType.Size() does not deadlock.
+				// Act: Re-entrant LookUpWithoutChangingOrder inside ValueType.Size() and PressureAwareCache evaluation.
 				err := cache.UpdateWithoutChangingOrder("k-0", deadlockProbeValue{
 					size: 10,
 					onSize: func() {
 						_ = cache.LookUpWithoutChangingOrder("k-0")
 					},
 				})
-				require.NoError(t, err)
-
-				// F10: Implements PressureAwareCache.
 				pac, ok := cache.(PressureAwareCache)
 				require.True(t, ok)
 				pac.Compact()
 				pressure = 0.95
 				evicted := pac.EvaluateMemoryPressure()
+
+				// Assert
+				require.NoError(t, err)
 				assert.Len(t, evicted, 5)
 			})
 		}
@@ -1408,13 +1413,7 @@ func TestArenaRadixCache_PrincipalReviewFixes(t *testing.T) {
 	})
 
 	t.Run("F7_ComputeTargetSizeBoundsAndZeroSizeEntryShedding", func(t *testing.T) {
-		// MaxUint64 does not overflow float64 -> uint64 conversion.
-		assert.Equal(t, uint64(math.MaxUint64), computeTargetSize(math.MaxUint64, 1.0))
-		assert.Greater(t, computeTargetSize(math.MaxUint64, 0.5), uint64(math.MaxUint64/4))
-		// maxSize == 1 with retention > 0 clamps to 1 instead of truncating to 0.
-		assert.Equal(t, uint64(1), computeTargetSize(1, 0.50))
-
-		// Zero-size entries (DataSize == 0) are shed down to retention ratio under critical pressure.
+		// Arrange
 		pressure := 0.10
 		c := NewArenaRadixCache(
 			100,
@@ -1426,8 +1425,18 @@ func TestArenaRadixCache_PrincipalReviewFixes(t *testing.T) {
 			_, err := c.Insert(fmt.Sprintf("zero-%d", i), arenaTestData{Value: int64(i), DataSize: 0})
 			require.NoError(t, err)
 		}
+
+		// Act
+		maxUintTarget := computeTargetSize(math.MaxUint64, 1.0)
+		halfMaxUintTarget := computeTargetSize(math.MaxUint64, 0.5)
+		minClampedTarget := computeTargetSize(1, 0.50)
 		pressure = 0.95
 		evicted := c.EvaluateMemoryPressure()
+
+		// Assert
+		assert.Equal(t, uint64(math.MaxUint64), maxUintTarget)
+		assert.Greater(t, halfMaxUintTarget, uint64(math.MaxUint64/4))
+		assert.Equal(t, uint64(1), minClampedTarget)
 		assert.Len(t, evicted, 5)
 		assert.Equal(t, 5, c.len)
 	})

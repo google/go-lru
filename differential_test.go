@@ -473,3 +473,94 @@ func TestDifferential_UpdateSizeSelfEvictionPreservesDiffValueSize(t *testing.T)
 	require.Nil(t, h.LookUpWithoutChangingOrder("k1"))
 	require.Equal(t, uint64(50), dv.Size())
 }
+
+func TestDifferential_PressureAwareAndCompactionParity(t *testing.T) {
+	// Arrange
+	r := rand.New(rand.NewSource(20260925))
+	const (
+		numOps        = 2000
+		cacheCapacity = 1000
+	)
+	pressure := 0.10
+
+	h := &differentialHarness{
+		t:       t,
+		maxSize: cacheCapacity,
+	}
+	configs := []struct {
+		name        string
+		constructor func(uint64, ...lru.Option) lru.Cache
+	}{
+		{"MapCache", lru.NewMapCache},
+		{"RadixCache", lru.NewRadixCache},
+		{"ArenaRadixCache", lru.NewArenaRadixCache},
+	}
+	for _, cfg := range configs {
+		for _, inv := range []bool{false, true} {
+			c := cfg.constructor(
+				cacheCapacity,
+				lru.WithInvariantChecking(inv),
+				lru.WithPressureFunc(func() float64 { return pressure }),
+				lru.WithCompactionThreshold(0.75),
+				lru.WithEvictionThreshold(0.90),
+				lru.WithEvictionRetentionRatio(0.50),
+			)
+			h.instances = append(h.instances, diffInstance{
+				name:       cfg.name,
+				invariants: inv,
+				cache:      c,
+			})
+		}
+	}
+
+	keys := make([]string, 80)
+	for i := range keys {
+		keys[i] = fmt.Sprintf("bucket_%d/dir_%d/item_%03d", i%4, (i/4)%4, i)
+	}
+
+	// Act
+	for op := range numOps {
+		switch op % 25 {
+		case 0:
+			pressure = 0.80 // Tier 1 moderate pressure
+		case 10:
+			pressure = 0.95 // Tier 2 critical pressure
+		case 15:
+			pressure = 0.10 // Normal pressure
+		}
+
+		k := keys[r.Intn(len(keys))]
+		dice := r.Intn(100)
+		switch {
+		case dice < 35:
+			sz := uint64(r.Intn(45) + 5)
+			h.Insert(k, &diffValue{id: fmt.Sprintf("pv_%d", op), size: sz})
+		case dice < 55:
+			h.LookUp(k)
+		case dice < 68:
+			h.LookUpWithoutChangingOrder(k)
+		case dice < 78:
+			h.Erase(k)
+		case dice < 86:
+			h.UpdateSize(k, uint64(r.Intn(20)+1))
+		case dice < 93:
+			for _, inst := range h.instances {
+				inst.cache.(lru.PressureAwareCache).Compact()
+			}
+		default:
+			var baseEvicted []lru.ValueType
+			for i, inst := range h.instances {
+				ev := inst.cache.(lru.PressureAwareCache).EvaluateMemoryPressure()
+				if i == 0 {
+					baseEvicted = ev
+				} else {
+					h.compareEvicted("EvaluateMemoryPressure()", baseEvicted, ev, inst.name, inst.invariants)
+				}
+			}
+		}
+	}
+
+	// Assert
+	pressure = 0.10
+	h.DrainAndVerifyEvictionOrder(keys)
+}

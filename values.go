@@ -14,12 +14,15 @@
 
 package lru
 
+import "strings"
+
 // StringValue is a ValueType wrapper for a standard Go string whose Size() is its byte length (len(s)).
 type StringValue string
 
-// NewStringValue wraps s as a StringValue implementing ValueType.
+// NewStringValue clones s and wraps it as a StringValue implementing ValueType.
+// Cloning prevents substring values from pinning large underlying caller backing arrays in memory.
 func NewStringValue(s string) StringValue {
-	return StringValue(s)
+	return StringValue(strings.Clone(s))
 }
 
 // Size returns the byte length of the string (uint64(len(s))).

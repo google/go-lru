@@ -67,6 +67,7 @@ type radixCache struct {
 	opts Options
 
 	// Atomic state for lock-free pressure sampling and reclamation epoch synchronization.
+	pressureWriteMu         sync.Mutex
 	samplingPressure        atomic.Bool
 	fallbackSampling        atomic.Bool
 	pressureInitialized     atomic.Bool
@@ -211,8 +212,8 @@ func (c *radixCache) checkInvariants() {
 				panic("radixCache invariant violation: treeSumSize uint64 overflow")
 			}
 			treeSumSize += curr.size
-			// A node is verifiably in the LRU list if it is the head or has a non-nil prev pointer.
-			inLRU := c.head == curr || curr.prev != nil
+			// A node is verifiably in the LRU list iff it is the head (with nil prev) or its prev's next points back to it.
+			inLRU := (c.head == curr && curr.prev == nil) || (curr.prev != nil && curr.prev.next == curr)
 			if !inLRU {
 				panic(fmt.Sprintf("radixCache invariant violation: node with prefix '%s' has value but is missing from LRU list", curr.prefix))
 			}
@@ -611,7 +612,7 @@ func (c *radixCache) Insert(key string, value ValueType) ([]ValueType, error) {
 	pressure := c.samplePressure()
 
 	c.mu.Lock()
-	for sampledEpoch != c.reclaimEpoch.Load() {
+	for retries := 0; sampledEpoch != c.reclaimEpoch.Load() && retries < 2; retries++ {
 		c.mu.Unlock()
 		sampledEpoch = c.reclaimEpoch.Load()
 		pressure = c.samplePressure()
@@ -670,7 +671,7 @@ func (c *radixCache) Erase(key string) (value ValueType) {
 	pressure := c.samplePressure()
 
 	c.mu.Lock()
-	for sampledEpoch != c.reclaimEpoch.Load() {
+	for retries := 0; sampledEpoch != c.reclaimEpoch.Load() && retries < 2; retries++ {
 		c.mu.Unlock()
 		sampledEpoch = c.reclaimEpoch.Load()
 		pressure = c.samplePressure()
@@ -786,7 +787,7 @@ func (c *radixCache) UpdateSize(key string, sizeDelta uint64) error {
 	pressure := c.samplePressure()
 
 	c.mu.Lock()
-	for sampledEpoch != c.reclaimEpoch.Load() {
+	for retries := 0; sampledEpoch != c.reclaimEpoch.Load() && retries < 2; retries++ {
 		c.mu.Unlock()
 		sampledEpoch = c.reclaimEpoch.Load()
 		pressure = c.samplePressure()
@@ -873,7 +874,7 @@ func (c *radixCache) EraseEntriesWithGivenPrefix(prefix string) {
 	pressure := c.samplePressure()
 
 	c.mu.Lock()
-	for sampledEpoch != c.reclaimEpoch.Load() {
+	for retries := 0; sampledEpoch != c.reclaimEpoch.Load() && retries < 2; retries++ {
 		c.mu.Unlock()
 		sampledEpoch = c.reclaimEpoch.Load()
 		pressure = c.samplePressure()
@@ -969,10 +970,11 @@ func (c *radixCache) isSamplingGoroutine() bool {
 }
 
 func (c *radixCache) markReclaimedLocked() {
-	if c.isSamplingGoroutine() {
-		return
+	c.pressureWriteMu.Lock()
+	defer c.pressureWriteMu.Unlock()
+	if !c.isSamplingGoroutine() {
+		c.reclaimEpoch.Add(1)
 	}
-	c.reclaimEpoch.Add(1)
 	c.pressureNeedsRefresh.Store(true)
 	c.pressureInitialized.Store(false)
 	c.lastSampledInitialized.Store(false)
@@ -1004,22 +1006,19 @@ func (c *radixCache) Compact() {
 }
 
 func (c *radixCache) storeSampledPressure(epoch uint64, p float64) {
+	c.pressureWriteMu.Lock()
+	defer c.pressureWriteMu.Unlock()
 	if c.reclaimEpoch.Load() == epoch {
 		bits := math.Float64bits(p)
-		c.lastSampledPressureBits.Store(bits)
+		c.pressureInitialized.Store(false)
+		c.lastSampledInitialized.Store(false)
 		c.lastSampledEpoch.Store(epoch)
+		c.lastSampledPressureBits.Store(bits)
 		c.lastSampledInitialized.Store(true)
-		c.cachedPressureBits.Store(bits)
 		c.cachedPressureEpoch.Store(epoch)
+		c.cachedPressureBits.Store(bits)
 		c.pressureInitialized.Store(true)
 		c.pressureNeedsRefresh.Store(false)
-		if c.reclaimEpoch.Load() != epoch {
-			c.pressureNeedsRefresh.Store(true)
-			c.pressureInitialized.Store(false)
-			c.lastSampledInitialized.Store(false)
-			c.cachedPressureBits.Store(0)
-			c.lastSampledPressureBits.Store(0)
-		}
 	} else {
 		c.pressureNeedsRefresh.Store(true)
 	}
@@ -1244,13 +1243,14 @@ func (c *radixCache) maybeReclaimUnderPressureLocked(pressure float64, protected
 		c.lastReclaimedZeroCount = 0
 	}
 	if protectedNode != nil && protectedNode != &foregroundNoProtectNode && c.reclaimEpoch.Load() == epochBefore {
-		c.lastSampledPressureBits.Store(math.Float64bits(pressure))
-		c.lastSampledEpoch.Store(epochBefore)
-		c.lastSampledInitialized.Store(true)
-		if c.reclaimEpoch.Load() != epochBefore {
+		c.pressureWriteMu.Lock()
+		if c.reclaimEpoch.Load() == epochBefore {
 			c.lastSampledInitialized.Store(false)
-			c.lastSampledPressureBits.Store(0)
+			c.lastSampledEpoch.Store(epochBefore)
+			c.lastSampledPressureBits.Store(math.Float64bits(pressure))
+			c.lastSampledInitialized.Store(true)
 		}
+		c.pressureWriteMu.Unlock()
 	}
 	return evicted
 }
@@ -1262,19 +1262,18 @@ func (c *radixCache) EvaluateMemoryPressure() []ValueType {
 	pressure := c.samplePressureFresh()
 
 	c.mu.Lock()
+	for retries := 0; sampledEpoch != c.reclaimEpoch.Load() && retries < 2; retries++ {
+		c.mu.Unlock()
+		sampledEpoch = c.reclaimEpoch.Load()
+		pressure = c.samplePressureFresh()
+		c.mu.Lock()
+	}
 	defer func() {
 		if c.opts.EnableInvariantChecking {
 			c.checkInvariants()
 		}
 		c.mu.Unlock()
 	}()
-
-	for sampledEpoch != c.reclaimEpoch.Load() {
-		c.mu.Unlock()
-		sampledEpoch = c.reclaimEpoch.Load()
-		pressure = c.samplePressureFresh()
-		c.mu.Lock()
-	}
 
 	return c.maybeReclaimUnderPressureLocked(pressure, nil)
 }

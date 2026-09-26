@@ -74,6 +74,7 @@ type mapCache struct {
 	options Options
 
 	// Atomic state for lock-free pressure sampling and reclamation epoch synchronization.
+	pressureWriteMu         sync.Mutex
 	samplingPressure        atomic.Bool
 	fallbackSampling        atomic.Bool
 	pressureInitialized     atomic.Bool
@@ -180,6 +181,9 @@ func (c *mapCache) checkInvariants() {
 			panic(fmt.Sprintf("Unexpected element type: %T", e.Value))
 		}
 		entryVal := *entryPtr
+		if entryVal.value == nil {
+			panic(fmt.Sprintf("mapCache invariant violation: unexpected nil value in LRU list for key '%s'", entryVal.key))
+		}
 		if c.index[entryVal.key] != e {
 			panic(fmt.Sprintf("Mismatch for key %v", entryVal.key))
 		}
@@ -260,7 +264,7 @@ func (c *mapCache) Insert(key string, value ValueType) ([]ValueType, error) {
 	pressure := c.samplePressure()
 
 	c.lock()
-	for sampledEpoch != c.reclaimEpoch.Load() {
+	for retries := 0; sampledEpoch != c.reclaimEpoch.Load() && retries < 2; retries++ {
 		c.mu.Unlock()
 		sampledEpoch = c.reclaimEpoch.Load()
 		pressure = c.samplePressure()
@@ -300,6 +304,14 @@ func (c *mapCache) Insert(key string, value ValueType) ([]ValueType, error) {
 			if evicted != nil {
 				evictedValues = append(evictedValues, evicted)
 			}
+		}
+		if c.entries.Len() == 0 && c.peakIndexLen >= 64 {
+			c.index = make(map[string]*list.Element)
+			c.dirtyIndex = false
+			c.deletedSinceCompact = 0
+			c.peakIndexLen = 0
+			c.zeroSizeCount = 0
+			c.lastReclaimedZeroCount = 0
 		}
 		// Clone key to prevent substring keys from pinning large caller backing arrays.
 		clonedKey := strings.Clone(key)
@@ -344,6 +356,10 @@ func (c *mapCache) eraseInternal(key string) ValueType {
 	c.dirtyIndex = true
 	c.deletedSinceCompact++
 	c.entries.Remove(e)
+	entryVal.key = ""
+	entryVal.value = nil
+	entryVal.size = 0
+	e.Value = nil
 
 	return deletedEntry
 }
@@ -366,7 +382,7 @@ func (c *mapCache) Erase(key string) ValueType {
 	pressure := c.samplePressure()
 
 	c.lock()
-	for sampledEpoch != c.reclaimEpoch.Load() {
+	for retries := 0; sampledEpoch != c.reclaimEpoch.Load() && retries < 2; retries++ {
 		c.mu.Unlock()
 		sampledEpoch = c.reclaimEpoch.Load()
 		pressure = c.samplePressure()
@@ -458,7 +474,7 @@ func (c *mapCache) UpdateSize(key string, sizeDelta uint64) error {
 	pressure := c.samplePressure()
 
 	c.lock()
-	for sampledEpoch != c.reclaimEpoch.Load() {
+	for retries := 0; sampledEpoch != c.reclaimEpoch.Load() && retries < 2; retries++ {
 		c.mu.Unlock()
 		sampledEpoch = c.reclaimEpoch.Load()
 		pressure = c.samplePressure()
@@ -539,7 +555,7 @@ func (c *mapCache) EraseEntriesWithGivenPrefix(prefix string) {
 	pressure := c.samplePressure()
 
 	c.lock()
-	for sampledEpoch != c.reclaimEpoch.Load() {
+	for retries := 0; sampledEpoch != c.reclaimEpoch.Load() && retries < 2; retries++ {
 		c.mu.Unlock()
 		sampledEpoch = c.reclaimEpoch.Load()
 		pressure = c.samplePressure()
@@ -602,10 +618,11 @@ func (c *mapCache) isSamplingGoroutine() bool {
 }
 
 func (c *mapCache) markReclaimedLocked() {
-	if c.isSamplingGoroutine() {
-		return
+	c.pressureWriteMu.Lock()
+	defer c.pressureWriteMu.Unlock()
+	if !c.isSamplingGoroutine() {
+		c.reclaimEpoch.Add(1)
 	}
-	c.reclaimEpoch.Add(1)
 	c.pressureNeedsRefresh.Store(true)
 	c.pressureInitialized.Store(false)
 	c.lastSampledInitialized.Store(false)
@@ -652,22 +669,19 @@ func (c *mapCache) compactLocked() {
 }
 
 func (c *mapCache) storeSampledPressure(epoch uint64, p float64) {
+	c.pressureWriteMu.Lock()
+	defer c.pressureWriteMu.Unlock()
 	if c.reclaimEpoch.Load() == epoch {
 		bits := math.Float64bits(p)
-		c.lastSampledPressureBits.Store(bits)
+		c.pressureInitialized.Store(false)
+		c.lastSampledInitialized.Store(false)
 		c.lastSampledEpoch.Store(epoch)
+		c.lastSampledPressureBits.Store(bits)
 		c.lastSampledInitialized.Store(true)
-		c.cachedPressureBits.Store(bits)
 		c.cachedPressureEpoch.Store(epoch)
+		c.cachedPressureBits.Store(bits)
 		c.pressureInitialized.Store(true)
 		c.pressureNeedsRefresh.Store(false)
-		if c.reclaimEpoch.Load() != epoch {
-			c.pressureNeedsRefresh.Store(true)
-			c.pressureInitialized.Store(false)
-			c.lastSampledInitialized.Store(false)
-			c.cachedPressureBits.Store(0)
-			c.lastSampledPressureBits.Store(0)
-		}
 	} else {
 		c.pressureNeedsRefresh.Store(true)
 	}
@@ -857,6 +871,11 @@ func (c *mapCache) shedAndCompactLocked(targetSize uint64, retention float64, pr
 		victim = nextVictim
 	}
 
+	if c.entries.Len() == 0 {
+		c.resetEmptyIndexLocked()
+		return evicted
+	}
+
 	if retention > 0.0 && c.zeroSizeCount > 0 {
 		c.lastReclaimedZeroCount = c.zeroSizeCount
 	} else {
@@ -906,13 +925,14 @@ func (c *mapCache) maybeReclaimUnderPressureLocked(pressure float64, protectedEl
 		}
 	}
 	if autoCompactElem != nil && autoCompactElem != &foregroundNoProtectElem && c.reclaimEpoch.Load() == epochBefore {
-		c.lastSampledPressureBits.Store(math.Float64bits(pressure))
-		c.lastSampledEpoch.Store(epochBefore)
-		c.lastSampledInitialized.Store(true)
-		if c.reclaimEpoch.Load() != epochBefore {
+		c.pressureWriteMu.Lock()
+		if c.reclaimEpoch.Load() == epochBefore {
 			c.lastSampledInitialized.Store(false)
-			c.lastSampledPressureBits.Store(0)
+			c.lastSampledEpoch.Store(epochBefore)
+			c.lastSampledPressureBits.Store(math.Float64bits(pressure))
+			c.lastSampledInitialized.Store(true)
 		}
+		c.pressureWriteMu.Unlock()
 	}
 	return evicted
 }
@@ -924,14 +944,13 @@ func (c *mapCache) EvaluateMemoryPressure() []ValueType {
 	pressure := c.samplePressureFresh()
 
 	c.lock()
-	defer c.unlock()
-
-	for sampledEpoch != c.reclaimEpoch.Load() {
+	for retries := 0; sampledEpoch != c.reclaimEpoch.Load() && retries < 2; retries++ {
 		c.mu.Unlock()
 		sampledEpoch = c.reclaimEpoch.Load()
 		pressure = c.samplePressureFresh()
 		c.mu.Lock()
 	}
+	defer c.unlock()
 
 	return c.maybeReclaimUnderPressureLocked(pressure, nil)
 }

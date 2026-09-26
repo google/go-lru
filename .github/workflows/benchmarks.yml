@@ -5,6 +5,7 @@ on:
     branches:
       - main
       - master
+      - "feat/**"
   pull_request:
     branches:
       - main
@@ -40,7 +41,7 @@ jobs:
 
       - name: Run Performance & Memory Allocation Benchmarks (Head)
         run: |
-          go test -run=^$ -bench=. -benchmem -benchtime=10ms -count=2 ./... | tee benchmark-head.txt
+          go test -run=^$ -bench=. -benchmem -benchtime=10ms -count=6 ./... | tee benchmark-head.txt
 
       - name: Run Base Branch Benchmarks for Regression Comparison (PR only)
         if: github.event_name == 'pull_request'
@@ -49,7 +50,7 @@ jobs:
           HEAD_SHA=$(git rev-parse HEAD)
           trap 'git checkout "$HEAD_SHA"' EXIT
           git checkout "${{ github.event.pull_request.base.sha }}"
-          go test -run=^$ -bench=. -benchmem -benchtime=10ms -count=2 ./... | tee benchmark-base.txt
+          go test -run=^$ -bench=. -benchmem -benchtime=10ms -count=6 ./... | tee benchmark-base.txt
           git checkout "$HEAD_SHA"
           trap - EXIT
           sed -i 's|^pkg: .*|pkg: github.com/google/go-lru|' benchmark-base.txt
@@ -62,7 +63,7 @@ jobs:
             echo ""
             echo "| Benchmark | Iterations | Throughput (\`ns/op\`) | Memory (\`B/op\`) | Allocations (\`allocs/op\`) | Additional Resource Metrics |"
             echo "|---|---:|---:|---:|---:|---|"
-            awk '/^Benchmark_/ {
+            awk '/^Benchmark_/ && !seen[$1]++ {
               bench=$1; iters=$2; ns=$3 " " $4;
               b_op="-"; allocs="-"; extra="";
               for (i=5; i<=NF; i++) {

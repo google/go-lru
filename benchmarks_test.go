@@ -18,10 +18,15 @@ import (
 	"fmt"
 	"math/rand"
 	"runtime"
+	"sync/atomic"
 	"testing"
-	"time"
 
 	"github.com/google/go-lru"
+)
+
+var (
+	benchSinkVal lru.ValueType
+	benchSinkErr error
 )
 
 // benchValue implements lru.ValueType for benchmarking.
@@ -80,7 +85,7 @@ func runBenchmarkInsert(b *testing.B, constructor func(uint64, ...lru.Option) lr
 	const itemsPerPrefix = 100
 	keys, _, _ := generateBenchmarkKeys(prefixCount, itemsPerPrefix, depth)
 	data := benchValue{val: 1, dataSize: 10}
-	capacity := uint64(len(keys) * 100)
+	capacity := uint64(len(keys) * 5)
 
 	cache := constructor(capacity)
 
@@ -88,11 +93,13 @@ func runBenchmarkInsert(b *testing.B, constructor func(uint64, ...lru.Option) lr
 	b.ResetTimer()
 
 	i := 0
+	var lastErr error
 	for b.Loop() {
 		key := keys[i%len(keys)]
-		_, _ = cache.Insert(key, data)
+		_, lastErr = cache.Insert(key, data)
 		i++
 	}
+	benchSinkErr = lastErr
 }
 
 func Benchmark_Insert_MapCache(b *testing.B) {
@@ -134,11 +141,13 @@ func runBenchmarkLookUp(b *testing.B, constructor func(uint64, ...lru.Option) lr
 	b.ResetTimer()
 
 	i := 0
+	var lastVal lru.ValueType
 	for b.Loop() {
 		key := keys[i%len(keys)]
-		_ = cache.LookUp(key)
+		lastVal = cache.LookUp(key)
 		i++
 	}
+	benchSinkVal = lastVal
 }
 
 func Benchmark_LookUp_MapCache(b *testing.B) {
@@ -180,11 +189,13 @@ func runBenchmarkLookUpWithoutChangingOrder(b *testing.B, constructor func(uint6
 	b.ResetTimer()
 
 	i := 0
+	var lastVal lru.ValueType
 	for b.Loop() {
 		key := keys[i%len(keys)]
-		_ = cache.LookUpWithoutChangingOrder(key)
+		lastVal = cache.LookUpWithoutChangingOrder(key)
 		i++
 	}
+	benchSinkVal = lastVal
 }
 
 func Benchmark_LookUpWithoutChangingOrder_MapCache(b *testing.B) {
@@ -222,11 +233,13 @@ func runBenchmarkUpdate(b *testing.B, constructor func(uint64, ...lru.Option) lr
 	b.ResetTimer()
 
 	i := 0
+	var lastErr error
 	for b.Loop() {
 		key := keys[i%numKeys]
-		_ = cache.UpdateWithoutChangingOrder(key, updatedData)
+		lastErr = cache.UpdateWithoutChangingOrder(key, updatedData)
 		i++
 	}
+	benchSinkErr = lastErr
 }
 
 func Benchmark_Update_MapCache(b *testing.B)        { runBenchmarkUpdate(b, lru.NewMapCache) }
@@ -250,6 +263,7 @@ func runBenchmarkErase(b *testing.B, constructor func(uint64, ...lru.Option) lru
 	b.ReportAllocs()
 	b.ResetTimer()
 
+	var lastVal lru.ValueType
 	for i := range b.N {
 		idx := i % batchSize
 		if idx == 0 {
@@ -259,8 +273,9 @@ func runBenchmarkErase(b *testing.B, constructor func(uint64, ...lru.Option) lru
 			}
 			b.StartTimer()
 		}
-		_ = cache.Erase(keys[idx])
+		lastVal = cache.Erase(keys[idx])
 	}
+	benchSinkVal = lastVal
 }
 
 func Benchmark_Erase_MapCache(b *testing.B)        { runBenchmarkErase(b, lru.NewMapCache) }
@@ -268,35 +283,32 @@ func Benchmark_Erase_RadixCache(b *testing.B)      { runBenchmarkErase(b, lru.Ne
 func Benchmark_Erase_ArenaRadixCache(b *testing.B) { runBenchmarkErase(b, lru.NewArenaRadixCache) }
 
 // ============================================================================
-// 6. Prefix Deletion Benchmarks Across Topologies (Untimed Key Restoration)
+// 6. Prefix Deletion Benchmarks Across Topologies (Batched Untimed Restoration)
 // ============================================================================
 
 func runBenchmarkErasePrefix(b *testing.B, constructor func(uint64, ...lru.Option) lru.Cache, depth int) {
 	b.Helper()
 	const prefixCount = 100
 	const itemsPerPrefix = 100
-	keys, prefixMap, prefixes := generateBenchmarkKeys(prefixCount, itemsPerPrefix, depth)
+	keys, _, prefixes := generateBenchmarkKeys(prefixCount, itemsPerPrefix, depth)
 	data := benchValue{val: 1, dataSize: 10}
 	capacity := uint64(len(keys) * 100)
 
 	cache := constructor(capacity)
-	for _, key := range keys {
-		_, _ = cache.Insert(key, data)
-	}
 
 	b.ReportAllocs()
 	b.ResetTimer()
 
 	for i := range b.N {
-		prefix := prefixes[i%len(prefixes)]
-		cache.EraseEntriesWithGivenPrefix(prefix)
-
-		// UNTIMED: Pause clock, restore erased keys, and restart timer for next iteration
-		b.StopTimer()
-		for _, key := range prefixMap[prefix] {
-			_, _ = cache.Insert(key, data)
+		idx := i % len(prefixes)
+		if idx == 0 {
+			b.StopTimer()
+			for _, key := range keys {
+				_, _ = cache.Insert(key, data)
+			}
+			b.StartTimer()
 		}
-		b.StartTimer()
+		cache.EraseEntriesWithGivenPrefix(prefixes[idx])
 	}
 }
 
@@ -339,11 +351,13 @@ func runParallelWorkload(b *testing.B, constructor func(uint64, ...lru.Option) l
 		_, _ = cache.Insert(keys[i], data)
 	}
 
+	var workerSeq atomic.Int64
 	b.ReportAllocs()
 	b.ResetTimer()
 
 	b.RunParallel(func(pb *testing.PB) {
-		r := rand.New(rand.NewSource(time.Now().UnixNano()))
+		workerID := workerSeq.Add(1)
+		r := rand.New(rand.NewSource(42 + workerID*10007))
 		for pb.Next() {
 			op := r.Intn(100)
 			key := keys[r.Intn(keySpace)]
@@ -429,6 +443,14 @@ func Benchmark_LargeScale_PrefixErase_100K(b *testing.B) {
 	const numEntries = 100000
 	data := benchValue{val: 1, dataSize: 10}
 	cacheMaxSize := uint64(numEntries * 20)
+	keys := make([]string, numEntries)
+	for j := range numEntries {
+		if j%2 == 0 {
+			keys[j] = fmt.Sprintf("target_prefix/key-%d", j)
+		} else {
+			keys[j] = fmt.Sprintf("other_prefix/key-%d", j)
+		}
+	}
 
 	runPrefixErase100K := func(b *testing.B, constructor func(uint64, ...lru.Option) lru.Cache) {
 		b.Helper()
@@ -437,13 +459,7 @@ func Benchmark_LargeScale_PrefixErase_100K(b *testing.B) {
 			b.StopTimer()
 			cache := constructor(cacheMaxSize)
 			for j := range numEntries {
-				var key string
-				if j%2 == 0 {
-					key = fmt.Sprintf("target_prefix/key-%d", j)
-				} else {
-					key = fmt.Sprintf("other_prefix/key-%d", j)
-				}
-				_, _ = cache.Insert(key, data)
+				_, _ = cache.Insert(keys[j], data)
 			}
 			b.StartTimer()
 
@@ -464,6 +480,10 @@ func Benchmark_LargeScale_PrefixErase_100K(b *testing.B) {
 func Benchmark_ArenaRadixCache_Compact(b *testing.B) {
 	const numKeys = 10000
 	data := benchValue{val: 1, dataSize: 10}
+	keys := make([]string, numKeys)
+	for i := range numKeys {
+		keys[i] = fmt.Sprintf("dir_%02d/file_%05d", i%50, i)
+	}
 
 	b.ReportAllocs()
 	var reclaimedBytes uint64
@@ -471,10 +491,10 @@ func Benchmark_ArenaRadixCache_Compact(b *testing.B) {
 		b.StopTimer()
 		cache := lru.NewArenaRadixCache(uint64(numKeys * 20)).(lru.PressureAwareCache)
 		for i := range numKeys {
-			_, _ = cache.Insert(fmt.Sprintf("dir_%02d/file_%05d", i%50, i), data)
+			_, _ = cache.Insert(keys[i], data)
 		}
 		for i := range numKeys / 2 {
-			_ = cache.Erase(fmt.Sprintf("dir_%02d/file_%05d", i%50, i))
+			_ = cache.Erase(keys[i])
 		}
 		var mBefore, mAfter runtime.MemStats
 		if iter == b.N-1 {

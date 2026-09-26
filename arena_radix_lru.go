@@ -75,6 +75,9 @@ func (c *arenaRadix) checkInvariants() {
 	prevID := nilNode
 
 	for currID := c.head; currID != nilNode; currID = c.nodes[currID].next {
+		if currID >= uint32(len(c.nodes)) {
+			panic(fmt.Sprintf("arenaRadix invariant violation: LRU list contains out-of-bounds index %d (len=%d)", currID, len(c.nodes)))
+		}
 		lruCount++
 		if math.MaxUint64-sumSize < c.nodes[currID].size {
 			panic("arenaRadix invariant violation: sumSize uint64 overflow")
@@ -130,6 +133,9 @@ func (c *arenaRadix) checkInvariants() {
 		if c.head == nilNode || c.tail == nilNode {
 			panic("arenaRadix invariant violation: head or tail is nilNode when len > 0")
 		}
+		if c.head >= uint32(len(c.nodes)) || c.tail >= uint32(len(c.nodes)) {
+			panic("arenaRadix invariant violation: head or tail index out of bounds")
+		}
 		if c.nodes[c.head].prev != nilNode {
 			panic("arenaRadix invariant violation: head prev pointer is not nilNode")
 		}
@@ -139,8 +145,8 @@ func (c *arenaRadix) checkInvariants() {
 	}
 
 	// INVARIANT 4: Root structure checks
-	if c.root == nilNode {
-		panic("arenaRadix invariant violation: root node is nilNode")
+	if c.root == nilNode || c.root >= uint32(len(c.nodes)) {
+		panic("arenaRadix invariant violation: root node is nilNode or out of bounds")
 	}
 	if c.nodes[c.root].prefix != "" {
 		panic("arenaRadix invariant violation: root node must have empty prefix")
@@ -160,6 +166,9 @@ func (c *arenaRadix) checkInvariants() {
 	var treeSumSize uint64
 	currID := c.root
 	for currID != nilNode {
+		if currID >= uint32(len(c.nodes)) {
+			panic(fmt.Sprintf("arenaRadix invariant violation: tree contains out-of-bounds index %d (len=%d)", currID, len(c.nodes)))
+		}
 		treeNodeCount++
 		if c.nodes[currID].value != nil {
 			treeCount++
@@ -167,8 +176,9 @@ func (c *arenaRadix) checkInvariants() {
 				panic("arenaRadix invariant violation: treeSumSize uint64 overflow")
 			}
 			treeSumSize += c.nodes[currID].size
-			// A node is verifiably in the LRU list if it is the head or has a non-nilNode prev pointer.
-			inLRU := c.head == currID || c.nodes[currID].prev != nilNode
+			// A node is verifiably in the LRU list iff it is the head (with nilNode prev) or its prev's next points back to it.
+			prev := c.nodes[currID].prev
+			inLRU := (c.head == currID && prev == nilNode) || (prev != nilNode && prev < uint32(len(c.nodes)) && c.nodes[prev].next == currID)
 			if !inLRU {
 				panic(fmt.Sprintf("arenaRadix invariant violation: node with prefix '%s' has value but is missing from LRU list", c.nodes[currID].prefix))
 			}
@@ -177,6 +187,9 @@ func (c *arenaRadix) checkInvariants() {
 		// Validate child pointers and sibling ordering
 		prevSiblingID := nilNode
 		for chID := c.nodes[currID].child; chID != nilNode; chID = c.nodes[chID].sibling {
+			if chID >= uint32(len(c.nodes)) {
+				panic(fmt.Sprintf("arenaRadix invariant violation: child index %d out of bounds (len=%d)", chID, len(c.nodes)))
+			}
 			if c.nodes[chID].parent != currID {
 				panic(fmt.Sprintf("arenaRadix invariant violation: child with prefix '%s' has incorrect parent pointer", c.nodes[chID].prefix))
 			}
@@ -285,19 +298,18 @@ func (c *arenaRadix) EvaluateMemoryPressure() []ValueType {
 	pressure := c.samplePressureFresh()
 
 	c.mu.Lock()
+	for retries := 0; sampledEpoch != c.reclaimEpoch.Load() && retries < 2; retries++ {
+		c.mu.Unlock()
+		sampledEpoch = c.reclaimEpoch.Load()
+		pressure = c.samplePressureFresh()
+		c.mu.Lock()
+	}
 	defer func() {
 		if c.options.EnableInvariantChecking {
 			c.checkInvariants()
 		}
 		c.mu.Unlock()
 	}()
-
-	for sampledEpoch != c.reclaimEpoch.Load() {
-		c.mu.Unlock()
-		sampledEpoch = c.reclaimEpoch.Load()
-		pressure = c.samplePressureFresh()
-		c.mu.Lock()
-	}
 
 	return c.maybeReclaimUnderPressureLocked(pressure, nilNode)
 }
@@ -322,7 +334,7 @@ func (c *arenaRadix) Insert(key string, value ValueType) ([]ValueType, error) {
 	pressure := c.samplePressure()
 
 	c.mu.Lock()
-	for sampledEpoch != c.reclaimEpoch.Load() {
+	for retries := 0; sampledEpoch != c.reclaimEpoch.Load() && retries < 2; retries++ {
 		c.mu.Unlock()
 		sampledEpoch = c.reclaimEpoch.Load()
 		pressure = c.samplePressure()
@@ -364,7 +376,7 @@ func (c *arenaRadix) Insert(key string, value ValueType) ([]ValueType, error) {
 	} else {
 		// A single new-key insert can allocate up to 2 nodes (one routing node, one leaf).
 		// If the slice has reached its physical uint32 maximum, ensure at least 2 free slots exist.
-		for uint32(len(c.nodes)) >= nilNode-2 && c.freeCount < 2 && c.tail != nilNode {
+		for uint32(len(c.nodes)) >= foregroundNoProtect-2 && c.freeCount < 2 && c.tail != nilNode {
 			prevFree := c.freeCount
 			evictedValues = append(evictedValues, c.evictOne())
 			if c.freeCount == prevFree && c.tail == nilNode {
@@ -376,6 +388,20 @@ func (c *arenaRadix) Insert(key string, value ValueType) ([]ValueType, error) {
 		// (using subtraction to avoid uint64 addition overflow when maxSize is near math.MaxUint64).
 		for valueSize > c.maxSize-c.currentSize && c.tail != nilNode {
 			evictedValues = append(evictedValues, c.evictOne())
+		}
+		if c.len == 0 && c.freeCount >= 64 {
+			c.nodes = make([]arenaRadixNode, 0, 16)
+			c.freeHead = nilNode
+			c.freeCount = 0
+			c.root = c.allocateNode()
+			c.head = nilNode
+			c.tail = nilNode
+			c.currentSize = 0
+			c.zeroSizeCount = 0
+			c.lastReclaimedZeroCount = 0
+			c.nodeMap = make(map[uint64]uint32, 16)
+			c.expectedNodeMapLen = 0
+			c.nodeMapDirty = false
 		}
 
 		nodeID, _ = c.insertNode(key, value)
@@ -409,7 +435,7 @@ func (c *arenaRadix) Erase(key string) (value ValueType) {
 	pressure := c.samplePressure()
 
 	c.mu.Lock()
-	for sampledEpoch != c.reclaimEpoch.Load() {
+	for retries := 0; sampledEpoch != c.reclaimEpoch.Load() && retries < 2; retries++ {
 		c.mu.Unlock()
 		sampledEpoch = c.reclaimEpoch.Load()
 		pressure = c.samplePressure()
@@ -531,7 +557,7 @@ func (c *arenaRadix) UpdateSize(key string, sizeDelta uint64) error {
 	pressure := c.samplePressure()
 
 	c.mu.Lock()
-	for sampledEpoch != c.reclaimEpoch.Load() {
+	for retries := 0; sampledEpoch != c.reclaimEpoch.Load() && retries < 2; retries++ {
 		c.mu.Unlock()
 		sampledEpoch = c.reclaimEpoch.Load()
 		pressure = c.samplePressure()
@@ -615,7 +641,7 @@ func (c *arenaRadix) EraseEntriesWithGivenPrefix(prefix string) {
 	pressure := c.samplePressure()
 
 	c.mu.Lock()
-	for sampledEpoch != c.reclaimEpoch.Load() {
+	for retries := 0; sampledEpoch != c.reclaimEpoch.Load() && retries < 2; retries++ {
 		c.mu.Unlock()
 		sampledEpoch = c.reclaimEpoch.Load()
 		pressure = c.samplePressure()

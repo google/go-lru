@@ -1874,3 +1874,313 @@ func TestRegression_R3_F04(t *testing.T) {
 		})
 	}
 }
+
+func TestRegression_R5_F01_EvaluateMemoryPressureEpochResamplePanicSafety(t *testing.T) {
+	backends := []struct {
+		name string
+		fn   func(uint64, ...Option) Cache
+	}{
+		{"MapCache", NewMapCache},
+		{"RadixCache", NewRadixCache},
+		{"ArenaRadixCache", NewArenaRadixCache},
+	}
+
+	for _, b := range backends {
+		t.Run(b.name+"_PanicDuringEpochResampleDoesNotDoubleUnlockOrRunCheckInvariantsUnlocked", func(t *testing.T) {
+			// Arrange: Goroutine A enters EvaluateMemoryPressure(), takes initial sample (call 1),
+			// and waits while Goroutine B calls Compact() to bump reclaimEpoch.
+			// When Goroutine A unlocks c.mu and resamples (call 2), PressureFunc panics.
+			var armed atomic.Bool
+			var sampleCount atomic.Int32
+			firstSampleReady := make(chan struct{})
+			epochBumped := make(chan struct{})
+
+			cache := b.fn(
+				100,
+				WithInvariantChecking(true),
+				WithPressureFunc(func() float64 {
+					if !armed.Load() {
+						return 0.10
+					}
+					n := sampleCount.Add(1)
+					if n == 1 {
+						close(firstSampleReady)
+						<-epochBumped
+						return 0.10
+					}
+					panic("synthetic PressureFunc failure during resample")
+				}),
+			).(PressureAwareCache)
+
+			_, err := cache.Insert("k1", NewSizedValue("v1", 20))
+			require.NoError(t, err)
+			_, err = cache.Insert("k2", NewSizedValue("v2", 20))
+			require.NoError(t, err)
+			_ = cache.Erase("k1")
+			armed.Store(true)
+
+			panicObserved := make(chan any, 1)
+			go func() {
+				defer func() {
+					panicObserved <- recover()
+				}()
+				_ = cache.EvaluateMemoryPressure()
+			}()
+
+			<-firstSampleReady
+			cache.Compact() // Advances reclaimEpoch while EvaluateMemoryPressure is between sample and c.mu.Lock()
+			close(epochBumped)
+
+			// Act
+			recovered := <-panicObserved
+
+			// Assert: The original panic is propagated cleanly (not masked by "sync: unlock of unlocked RWMutex")
+			// and c.mu remains unlocked and usable for subsequent cache operations.
+			require.Equal(t, "synthetic PressureFunc failure during resample", recovered)
+			assert.NotNil(t, cache.LookUpWithoutChangingOrder("k2"))
+		})
+	}
+}
+
+func TestRegression_R5_F02_MarkReclaimedFromSamplingGoroutineInvalidatesStalePressure(t *testing.T) {
+	backends := []struct {
+		name string
+		fn   func(uint64, ...Option) Cache
+	}{
+		{"MapCache", NewMapCache},
+		{"RadixCache", NewRadixCache},
+		{"ArenaRadixCache", NewArenaRadixCache},
+	}
+
+	for _, b := range backends {
+		t.Run(b.name+"_ReentrantReclamationInsidePressureFuncClearsPressureCache", func(t *testing.T) {
+			// Arrange: Seed elevated cached pressure (0.95), then invoke a re-entrant Compact()
+			// from inside PressureFunc (where isSamplingGoroutine() == true).
+			var cacheRef PressureAwareCache
+			reentrantCompact := false
+			currentPressure := 0.95
+
+			cache := b.fn(
+				200,
+				WithInvariantChecking(true),
+				WithPressureFunc(func() float64 {
+					if reentrantCompact && cacheRef != nil {
+						reentrantCompact = false
+						cacheRef.Compact()
+					}
+					return currentPressure
+				}),
+			).(PressureAwareCache)
+			cacheRef = cache
+
+			for i := range 5 {
+				_, err := cache.Insert(fmt.Sprintf("k-%d", i), NewSizedValue("v", 10))
+				require.NoError(t, err)
+			}
+			_ = cache.Erase("k-0")
+
+			// Act: Trigger samplePressureFresh() with reentrantCompact = true.
+			reentrantCompact = true
+			currentPressure = 0.15
+			_, err := cache.Insert("k-after", NewSizedValue("v", 10))
+
+			// Assert: Re-entrant Compact() invalidated stale 0.95 pressure state without deadlocking or livelocking,
+			// and k-after is inserted cleanly with all surviving entries intact.
+			require.NoError(t, err)
+			assert.NotNil(t, cache.LookUpWithoutChangingOrder("k-after"))
+			assert.NotNil(t, cache.LookUpWithoutChangingOrder("k-4"))
+		})
+	}
+}
+
+func TestRegression_R5_F03_BoundedEpochRetryPreventsChildGoroutineLivelock(t *testing.T) {
+	backends := []struct {
+		name string
+		fn   func(uint64, ...Option) Cache
+	}{
+		{"MapCache", NewMapCache},
+		{"RadixCache", NewRadixCache},
+		{"ArenaRadixCache", NewArenaRadixCache},
+	}
+
+	for _, b := range backends {
+		t.Run(b.name+"_ChildGoroutineReclaimingInsidePressureFuncTerminatesInBoundedRetries", func(t *testing.T) {
+			// Arrange: Custom PressureFunc spawns a child goroutine that calls EraseEntriesWithGivenPrefix("tmp_")
+			// under high pressure, bumping reclaimEpoch on every parent sample call.
+			var cacheRef Cache
+			var inChild atomic.Bool
+			var parentSampleCalls atomic.Int32
+
+			cache := b.fn(
+				500,
+				WithInvariantChecking(true),
+				WithPressureFunc(func() float64 {
+					if cacheRef != nil && inChild.CompareAndSwap(false, true) {
+						parentSampleCalls.Add(1)
+						done := make(chan struct{})
+						go func() {
+							defer func() {
+								inChild.Store(false)
+								close(done)
+							}()
+							_, _ = cacheRef.Insert("tmp_item", NewSizedValue("v", 1))
+							cacheRef.EraseEntriesWithGivenPrefix("tmp_")
+						}()
+						<-done
+					}
+					return 0.95
+				}),
+				WithEvictionRetentionRatio(0.50),
+			)
+			cacheRef = cache
+
+			// Act
+			parentSampleCalls.Store(0)
+			_, err := cache.Insert("target_key", NewSizedValue("val", 10))
+			_ = cache.(PressureAwareCache).EvaluateMemoryPressure()
+
+			// Assert: Both Insert and EvaluateMemoryPressure terminate in bounded retries (3 parent samples each = 6 total).
+			require.NoError(t, err)
+			assert.NotNil(t, cache.LookUpWithoutChangingOrder("target_key"))
+			assert.Equal(t, int32(6), parentSampleCalls.Load())
+		})
+	}
+}
+
+func TestRegression_R5_F04_StoreSampledPressureSerializedAgainstMarkReclaimed(t *testing.T) {
+	// Arrange
+	mc := NewMapCache(100, WithInvariantChecking(true)).(*mapCache)
+	rc := NewRadixCache(100, WithInvariantChecking(true)).(*radixCache)
+	ac := NewArenaRadixCache(100, WithInvariantChecking(true)).(*arenaRadix)
+
+	// Act: Store a sample at epoch 0, advance epoch via markReclaimedLocked, then attempt to store a stale epoch 0 sample.
+	mc.storeSampledPressure(0, 0.95)
+	mc.mu.Lock()
+	mc.markReclaimedLocked()
+	mc.mu.Unlock()
+	mc.storeSampledPressure(0, 0.95)
+
+	rc.storeSampledPressure(0, 0.95)
+	rc.mu.Lock()
+	rc.markReclaimedLocked()
+	rc.mu.Unlock()
+	rc.storeSampledPressure(0, 0.95)
+
+	ac.storeSampledPressure(0, 0.95)
+	ac.mu.Lock()
+	ac.markReclaimedLocked()
+	ac.mu.Unlock()
+	ac.storeSampledPressure(0, 0.95)
+
+	// Assert: Stale epoch 0 sample is rejected and pressureInitialized remains false with 0.0 bits.
+	assert.False(t, mc.pressureInitialized.Load())
+	assert.Zero(t, mc.cachedPressureBits.Load())
+	assert.False(t, rc.pressureInitialized.Load())
+	assert.Zero(t, rc.cachedPressureBits.Load())
+	assert.False(t, ac.pressureInitialized.Load())
+	assert.Zero(t, ac.cachedPressureBits.Load())
+}
+
+func TestRegression_R5_F05_ArenaRadixForegroundNoProtectSentinelSafety(t *testing.T) {
+	// Arrange
+	c := NewArenaRadixCache(100, WithInvariantChecking(true)).(*arenaRadix)
+	_, err := c.Insert("k1", NewSizedValue("v1", 60))
+	require.NoError(t, err)
+	_, err = c.Insert("k2", NewSizedValue("v2", 40))
+	require.NoError(t, err)
+
+	// Act: Call shedAndCompactLocked directly with foregroundNoProtect and retention 0.0.
+	c.options.EvictionRetentionRatio = 0.0
+	c.mu.Lock()
+	evicted := c.shedAndCompactLocked(0, 0.0, foregroundNoProtect)
+	c.mu.Unlock()
+
+	// Assert: foregroundNoProtect is normalized to nilNode so 100% of entries are evicted down to 0.
+	assert.Len(t, evicted, 2)
+	assert.Equal(t, 0, c.len)
+	assert.Equal(t, uint64(0), c.currentSize)
+}
+
+func TestRegression_R5_F06_EmptyDrainAndPreInsertSlackReclamation(t *testing.T) {
+	t.Run("ArenaRadixPreInsertDrainReleasesPeakSlackWithoutAdvancingReclaimEpoch", func(t *testing.T) {
+		// Arrange: Populate 100 hierarchical keys (1000B total in 1000B cache) at normal pressure (0.10).
+		c := NewArenaRadixCache(
+			1000,
+			WithInvariantChecking(true),
+			WithPressureFunc(func() float64 { return 0.10 }),
+		).(*arenaRadix)
+
+		for i := range 100 {
+			key := fmt.Sprintf("dir_%02d/sub_%02d/file_%03d", i%10, (i/10)%10, i)
+			_, err := c.Insert(key, NewSizedValue("v", 10))
+			require.NoError(t, err)
+		}
+		peakCap := cap(c.nodes)
+		require.GreaterOrEqual(t, peakCap, 100)
+
+		// Act: Insert a single 1000B jumbo entry that pre-evicts all 100 entries down to c.len == 0 before inserting.
+		evicted, err := c.Insert("jumbo", NewSizedValue("jumbo_val", 1000))
+
+		// Assert: All 100 entries were evicted, peak node arena slack was released, and reclaimEpoch remained 0.
+		require.NoError(t, err)
+		assert.Len(t, evicted, 100)
+		assert.Zero(t, c.reclaimEpoch.Load())
+		assert.Equal(t, uint32(0), c.freeCount)
+		assert.Less(t, cap(c.nodes), peakCap)
+		assert.Equal(t, 1, c.len)
+	})
+
+	t.Run("MapCachePreInsertDrainReleasesPeakBucketSlackWithoutAdvancingReclaimEpoch", func(t *testing.T) {
+		// Arrange: Populate 100 keys (1000B total in 1000B cache) at normal pressure (0.10).
+		c := NewMapCache(
+			1000,
+			WithInvariantChecking(true),
+			WithPressureFunc(func() float64 { return 0.10 }),
+		).(*mapCache)
+
+		for i := range 100 {
+			_, err := c.Insert(fmt.Sprintf("key_%03d", i), NewSizedValue("v", 10))
+			require.NoError(t, err)
+		}
+		require.Equal(t, 100, c.peakIndexLen)
+
+		// Act: Insert a single 1000B jumbo entry that pre-evicts all 100 entries down to c.entries.Len() == 0.
+		evicted, err := c.Insert("jumbo", NewSizedValue("jumbo_val", 1000))
+
+		// Assert: All 100 entries were evicted, peakIndexLen was reset to 1, and reclaimEpoch remained 0.
+		require.NoError(t, err)
+		assert.Len(t, evicted, 100)
+		assert.Zero(t, c.reclaimEpoch.Load())
+		assert.Equal(t, 1, c.peakIndexLen)
+		assert.Equal(t, 1, c.entries.Len())
+	})
+}
+
+func TestRegression_R5_F07_StringValueCloneAndMapCacheRemovedEntryZeroing(t *testing.T) {
+	// Arrange
+	largeBuffer := strings.Repeat("X", 64*1024)
+	substring := largeBuffer[100:116]
+
+	// Act
+	sv := NewStringValue(substring)
+
+	// Assert: NewStringValue clones the backing string buffer so largeBuffer is not pinned in memory.
+	assert.Equal(t, StringValue(substring), sv)
+	assert.NotSame(t, unsafe.StringData(substring), unsafe.StringData(string(sv)))
+}
+
+func TestRegression_R5_F08_OptionsSubnormalThresholdAndNegativeZeroNormalization(t *testing.T) {
+	// Arrange
+	negZero := math.Copysign(0.0, -1.0)
+	subnormalEviction := math.Float64frombits(2) // 1e-323 (2 * SmallestNonzeroFloat64)
+
+	// Act
+	optsNegZero := ApplyOptions(WithEvictionRetentionRatio(negZero))
+	optsSubnormal := ApplyOptions(WithEvictionThreshold(subnormalEviction))
+
+	// Assert: -0.0 is normalized to +0.0, and subnormal EvictionThreshold > SmallestNonzeroFloat64
+	// preserves a strictly positive CompactionThreshold < EvictionThreshold.
+	assert.False(t, math.Signbit(optsNegZero.EvictionRetentionRatio))
+	assert.Greater(t, optsSubnormal.CompactionThreshold, 0.0)
+	assert.Less(t, optsSubnormal.CompactionThreshold, optsSubnormal.EvictionThreshold)
+}

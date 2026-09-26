@@ -65,6 +65,7 @@ type arenaRadix struct {
 	zeroSizeCount          int
 	lastReclaimedZeroCount int
 
+	pressureWriteMu         sync.Mutex
 	samplingPressure        atomic.Bool
 	fallbackSampling        atomic.Bool
 	pressureInitialized     atomic.Bool
@@ -188,7 +189,7 @@ func (c *arenaRadix) allocateNode() uint32 {
 		return id
 	}
 	id := uint32(len(c.nodes))
-	if id >= nilNode {
+	if id >= foregroundNoProtect {
 		panic("arena radix capacity exceeded limit")
 	}
 	c.nodes = append(c.nodes, arenaRadixNode{
@@ -578,10 +579,11 @@ func (c *arenaRadix) isSamplingGoroutine() bool {
 // markReclaimedLocked invalidates cached pre-reclamation pressure and increments reclaimEpoch.
 // Caller MUST hold c.mu.Lock().
 func (c *arenaRadix) markReclaimedLocked() {
-	if c.isSamplingGoroutine() {
-		return
+	c.pressureWriteMu.Lock()
+	defer c.pressureWriteMu.Unlock()
+	if !c.isSamplingGoroutine() {
+		c.reclaimEpoch.Add(1)
 	}
-	c.reclaimEpoch.Add(1)
 	c.pressureNeedsRefresh.Store(true)
 	c.pressureInitialized.Store(false)
 	c.lastSampledInitialized.Store(false)
@@ -620,22 +622,19 @@ func (c *arenaRadix) resetEmptyArenaLocked() {
 }
 
 func (c *arenaRadix) storeSampledPressure(epoch uint64, p float64) {
+	c.pressureWriteMu.Lock()
+	defer c.pressureWriteMu.Unlock()
 	if c.reclaimEpoch.Load() == epoch {
 		bits := math.Float64bits(p)
-		c.lastSampledPressureBits.Store(bits)
+		c.pressureInitialized.Store(false)
+		c.lastSampledInitialized.Store(false)
 		c.lastSampledEpoch.Store(epoch)
+		c.lastSampledPressureBits.Store(bits)
 		c.lastSampledInitialized.Store(true)
-		c.cachedPressureBits.Store(bits)
 		c.cachedPressureEpoch.Store(epoch)
+		c.cachedPressureBits.Store(bits)
 		c.pressureInitialized.Store(true)
 		c.pressureNeedsRefresh.Store(false)
-		if c.reclaimEpoch.Load() != epoch {
-			c.pressureNeedsRefresh.Store(true)
-			c.pressureInitialized.Store(false)
-			c.lastSampledInitialized.Store(false)
-			c.cachedPressureBits.Store(0)
-			c.lastSampledPressureBits.Store(0)
-		}
 	} else {
 		c.pressureNeedsRefresh.Store(true)
 	}
@@ -775,8 +774,8 @@ func computeTargetSize(maxSize uint64, retention float64) uint64 {
 		return maxSize
 	}
 	f := float64(maxSize) * retention
-	if f >= float64(math.MaxUint64) {
-		return math.MaxUint64
+	if f >= float64(maxSize) || f >= float64(math.MaxUint64) {
+		return maxSize
 	}
 	target := uint64(f)
 	if target == 0 && maxSize > 0 {
@@ -893,7 +892,7 @@ func (c *arenaRadix) compactLocked() {
 // Caller MUST hold c.mu.Lock().
 func (c *arenaRadix) shedAndCompactLocked(targetSize uint64, retention float64, protectedNodeID uint32) []ValueType {
 	autoCompactID := protectedNodeID
-	if protectedNodeID != nilNode && (protectedNodeID != c.head || c.nodes[protectedNodeID].prev != nilNode) {
+	if protectedNodeID == foregroundNoProtect || (protectedNodeID != nilNode && (protectedNodeID != c.head || c.nodes[protectedNodeID].prev != nilNode)) {
 		protectedNodeID = nilNode
 	}
 
@@ -955,6 +954,11 @@ func (c *arenaRadix) shedAndCompactLocked(targetSize uint64, retention float64, 
 		victimID = nextVictimID
 	}
 
+	if c.len == 0 {
+		c.resetEmptyArenaLocked()
+		return evicted
+	}
+
 	if retention > 0.0 && c.zeroSizeCount > 0 {
 		c.lastReclaimedZeroCount = c.zeroSizeCount
 	} else {
@@ -977,7 +981,7 @@ func (c *arenaRadix) shedAndCompactLocked(targetSize uint64, retention float64, 
 func (c *arenaRadix) maybeReclaimUnderPressureLocked(pressure float64, protectedNodeID uint32) []ValueType {
 	autoCompactID := protectedNodeID
 	shedProtectedID := protectedNodeID
-	if shedProtectedID != nilNode && (shedProtectedID != c.head || c.nodes[shedProtectedID].prev != nilNode || c.nodes[shedProtectedID].value == nil) {
+	if shedProtectedID == foregroundNoProtect || (shedProtectedID != nilNode && (shedProtectedID != c.head || c.nodes[shedProtectedID].prev != nilNode || c.nodes[shedProtectedID].value == nil)) {
 		shedProtectedID = nilNode
 	}
 	epochBefore := c.reclaimEpoch.Load()
@@ -1010,13 +1014,14 @@ func (c *arenaRadix) maybeReclaimUnderPressureLocked(pressure float64, protected
 		}
 	}
 	if autoCompactID != nilNode && autoCompactID != foregroundNoProtect && c.reclaimEpoch.Load() == epochBefore {
-		c.lastSampledPressureBits.Store(math.Float64bits(pressure))
-		c.lastSampledEpoch.Store(epochBefore)
-		c.lastSampledInitialized.Store(true)
-		if c.reclaimEpoch.Load() != epochBefore {
+		c.pressureWriteMu.Lock()
+		if c.reclaimEpoch.Load() == epochBefore {
 			c.lastSampledInitialized.Store(false)
-			c.lastSampledPressureBits.Store(0)
+			c.lastSampledEpoch.Store(epochBefore)
+			c.lastSampledPressureBits.Store(math.Float64bits(pressure))
+			c.lastSampledInitialized.Store(true)
 		}
+		c.pressureWriteMu.Unlock()
 	}
 	return evicted
 }

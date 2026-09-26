@@ -66,9 +66,10 @@ type Cache interface {
 
 	// UpdateSize adjusts the size accounting for an existing key by sizeDelta without altering its LRU position.
 	// Useful for entries whose size grows incrementally (e.g. sparse files).
-	// If the entry's updated size (existingSize + sizeDelta) exceeds maxSize, the entry itself is evicted
-	// immediately without evicting other entries. Otherwise, if total cache capacity is exceeded,
-	// least recently used (LRU) entries are evicted immediately to maintain capacity invariants.
+	// If the entry's updated size (existingSize + sizeDelta) exceeds maxSize (or cannot fit alongside
+	// entries more recent than key), the entry itself is evicted immediately without evicting older entries.
+	// Otherwise, if total cache capacity is exceeded, least recently used (LRU) entries are evicted
+	// immediately to maintain capacity invariants.
 	//
 	// Returns ErrEntryNotExist if key is not present in the cache.
 	// Returns ErrInvalidUpdateEntrySize if sizeDelta causes uint64 integer overflow.

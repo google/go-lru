@@ -255,18 +255,35 @@ func ApplyOptions(opts ...Option) Options {
 			// Caller raised CompactionThreshold above default EvictionThreshold; advance EvictionThreshold
 			// to preserve the Tier 1 compaction window.
 			options.EvictionThreshold = options.CompactionThreshold + (DefaultEvictionThreshold - DefaultCompactionThreshold)
-			if options.EvictionThreshold < options.CompactionThreshold {
-				options.EvictionThreshold = options.CompactionThreshold
+			if math.IsInf(options.EvictionThreshold, 1) {
+				options.EvictionThreshold = math.MaxFloat64
+			}
+			if options.EvictionThreshold <= options.CompactionThreshold {
+				if options.CompactionThreshold < math.MaxFloat64 {
+					options.EvictionThreshold = math.Nextafter(options.CompactionThreshold, math.MaxFloat64)
+				} else {
+					options.EvictionThreshold = options.CompactionThreshold
+				}
 			}
 		default:
 			// Scale CompactionThreshold proportionally below EvictionThreshold to preserve a non-empty Tier 1 window.
 			options.CompactionThreshold = options.EvictionThreshold * (DefaultCompactionThreshold / DefaultEvictionThreshold)
+			if options.CompactionThreshold == 0 && options.EvictionThreshold > math.SmallestNonzeroFloat64 {
+				options.CompactionThreshold = math.SmallestNonzeroFloat64
+			}
+			if options.CompactionThreshold >= options.EvictionThreshold && options.EvictionThreshold > math.SmallestNonzeroFloat64 &&
+				(!options.hasCustomCompactionThreshold || !options.hasCustomEvictionThreshold) {
+				options.CompactionThreshold = math.Nextafter(options.EvictionThreshold, 0)
+			}
 		}
 	}
-	if math.IsNaN(options.EvictionRetentionRatio) || math.IsInf(options.EvictionRetentionRatio, -1) || options.EvictionRetentionRatio < 0 {
+	switch {
+	case math.IsNaN(options.EvictionRetentionRatio) || math.IsInf(options.EvictionRetentionRatio, -1) || options.EvictionRetentionRatio < 0:
 		options.EvictionRetentionRatio = DefaultEvictionRetentionRatio
-	} else if math.IsInf(options.EvictionRetentionRatio, 1) || options.EvictionRetentionRatio > 1.0 {
+	case math.IsInf(options.EvictionRetentionRatio, 1) || options.EvictionRetentionRatio > 1.0:
 		options.EvictionRetentionRatio = 1.0
+	case options.EvictionRetentionRatio == 0:
+		options.EvictionRetentionRatio = 0.0
 	}
 	if options.PressureFunc == nil {
 		options.PressureFunc = DefaultRuntimePressureFunc(options.MemoryBudget)
