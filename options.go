@@ -12,13 +12,44 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-package lrus
+package lru
 
 import (
 	"math"
 	"runtime/metrics"
 	"sync"
 )
+
+// Backend identifies the underlying cache data structure engine constructed by New.
+type Backend uint8
+
+const (
+	// BackendMap selects the hash-map + doubly-linked list LRU engine (MapCache).
+	// This is the default backend when WithBackend is not specified.
+	BackendMap Backend = iota
+
+	// BackendRadix selects the pointer-based Left-Child Right-Sibling (LCRS) radix tree
+	// LRU engine (RadixCache), optimized for hierarchical keys and fast prefix eviction.
+	BackendRadix
+
+	// BackendArenaRadix selects the contiguous-slice 32-bit index arena-backed radix tree
+	// LRU engine (ArenaRadixCache) with two-tier memory-pressure reclamation.
+	BackendArenaRadix
+)
+
+// String returns the human-readable name of the cache backend.
+func (b Backend) String() string {
+	switch b {
+	case BackendMap:
+		return "MapCache"
+	case BackendRadix:
+		return "RadixCache"
+	case BackendArenaRadix:
+		return "ArenaRadixCache"
+	default:
+		return "UnknownBackend"
+	}
+}
 
 // Default thresholds for two-tier memory-pressure reclamation.
 const (
@@ -55,9 +86,15 @@ var metricsSamplePool = sync.Pool{
 }
 
 // Options contains configuration parameters for Cache instances.
-// Note: Memory-pressure reclamation options (PressureFunc, MemoryBudget, CompactionThreshold,
-// EvictionThreshold, EvictionRetentionRatio) are used by ArenaRadixCache.
+// Memory-pressure reclamation options (PressureFunc, MemoryBudget, CompactionThreshold,
+// EvictionThreshold, EvictionRetentionRatio) configure both automatic amortized foreground
+// reclamation (on Insert, Erase, UpdateSize, and EraseEntriesWithGivenPrefix) and explicit
+// EvaluateMemoryPressure() / Compact() calls across ArenaRadixCache, MapCache, and RadixCache.
 type Options struct {
+	// Backend selects the underlying cache engine when calling New.
+	// Defaults to BackendMap.
+	Backend Backend
+
 	// EnableInvariantChecking enables internal data structure integrity and invariant validation.
 	// When enabled, cache operations execute comprehensive validation checks (e.g. bidirectional pointer
 	// consistency, tree structure validity, size accounting parity) and panic if corruption is detected.
@@ -96,6 +133,14 @@ type Options struct {
 
 // Option is a functional option for configuring a Cache instance.
 type Option func(*Options)
+
+// WithBackend configures the cache engine backend constructed by New.
+// Supported backends: BackendMap (default), BackendRadix, BackendArenaRadix.
+func WithBackend(backend Backend) Option {
+	return func(o *Options) {
+		o.Backend = backend
+	}
+}
 
 // WithInvariantChecking returns an Option that enables or disables internal invariant checking.
 func WithInvariantChecking(enabled bool) Option {
@@ -182,6 +227,7 @@ func DefaultRuntimePressureFunc(memoryBudget uint64) PressureFunc {
 // ApplyOptions parses and applies the provided slice of Option functions onto a default Options configuration.
 func ApplyOptions(opts ...Option) Options {
 	options := Options{
+		Backend:                BackendMap,
 		CompactionThreshold:    DefaultCompactionThreshold,
 		EvictionThreshold:      DefaultEvictionThreshold,
 		EvictionRetentionRatio: DefaultEvictionRetentionRatio,
@@ -191,6 +237,9 @@ func ApplyOptions(opts ...Option) Options {
 			opt(&options)
 		}
 	}
+	if options.Backend != BackendMap && options.Backend != BackendRadix && options.Backend != BackendArenaRadix {
+		options.Backend = BackendMap
+	}
 	if math.IsNaN(options.CompactionThreshold) || math.IsInf(options.CompactionThreshold, 0) || options.CompactionThreshold <= 0 {
 		options.CompactionThreshold = DefaultCompactionThreshold
 		options.hasCustomCompactionThreshold = false
@@ -199,27 +248,42 @@ func ApplyOptions(opts ...Option) Options {
 		options.EvictionThreshold = DefaultEvictionThreshold
 		options.hasCustomEvictionThreshold = false
 	}
-	if options.CompactionThreshold > options.EvictionThreshold {
+	if options.CompactionThreshold > options.EvictionThreshold ||
+		(options.CompactionThreshold == options.EvictionThreshold && options.hasCustomCompactionThreshold != options.hasCustomEvictionThreshold) {
 		switch {
 		case options.hasCustomCompactionThreshold && !options.hasCustomEvictionThreshold:
 			// Caller raised CompactionThreshold above default EvictionThreshold; advance EvictionThreshold
 			// to preserve the Tier 1 compaction window.
-			options.EvictionThreshold = math.Min(1.0, options.CompactionThreshold+(DefaultEvictionThreshold-DefaultCompactionThreshold))
-			if options.EvictionThreshold < options.CompactionThreshold {
-				options.EvictionThreshold = options.CompactionThreshold
+			options.EvictionThreshold = options.CompactionThreshold + (DefaultEvictionThreshold - DefaultCompactionThreshold)
+			if math.IsInf(options.EvictionThreshold, 1) {
+				options.EvictionThreshold = math.MaxFloat64
 			}
-		case !options.hasCustomCompactionThreshold && options.hasCustomEvictionThreshold:
-			// Caller lowered EvictionThreshold below default CompactionThreshold; scale CompactionThreshold
-			// proportionally to preserve the Tier 1 compaction window.
-			options.CompactionThreshold = options.EvictionThreshold * (DefaultCompactionThreshold / DefaultEvictionThreshold)
+			if options.EvictionThreshold <= options.CompactionThreshold {
+				if options.CompactionThreshold < math.MaxFloat64 {
+					options.EvictionThreshold = math.Nextafter(options.CompactionThreshold, math.MaxFloat64)
+				} else {
+					options.EvictionThreshold = options.CompactionThreshold
+				}
+			}
 		default:
-			options.CompactionThreshold = options.EvictionThreshold
+			// Scale CompactionThreshold proportionally below EvictionThreshold to preserve a non-empty Tier 1 window.
+			options.CompactionThreshold = options.EvictionThreshold * (DefaultCompactionThreshold / DefaultEvictionThreshold)
+			if options.CompactionThreshold == 0 && options.EvictionThreshold > math.SmallestNonzeroFloat64 {
+				options.CompactionThreshold = math.SmallestNonzeroFloat64
+			}
+			if options.CompactionThreshold >= options.EvictionThreshold && options.EvictionThreshold > math.SmallestNonzeroFloat64 &&
+				(!options.hasCustomCompactionThreshold || !options.hasCustomEvictionThreshold) {
+				options.CompactionThreshold = math.Nextafter(options.EvictionThreshold, 0)
+			}
 		}
 	}
-	if math.IsNaN(options.EvictionRetentionRatio) || math.IsInf(options.EvictionRetentionRatio, -1) || options.EvictionRetentionRatio < 0 {
+	switch {
+	case math.IsNaN(options.EvictionRetentionRatio) || math.IsInf(options.EvictionRetentionRatio, -1) || options.EvictionRetentionRatio < 0:
 		options.EvictionRetentionRatio = DefaultEvictionRetentionRatio
-	} else if math.IsInf(options.EvictionRetentionRatio, 1) || options.EvictionRetentionRatio > 1.0 {
+	case math.IsInf(options.EvictionRetentionRatio, 1) || options.EvictionRetentionRatio > 1.0:
 		options.EvictionRetentionRatio = 1.0
+	case options.EvictionRetentionRatio == 0:
+		options.EvictionRetentionRatio = 0.0
 	}
 	if options.PressureFunc == nil {
 		options.PressureFunc = DefaultRuntimePressureFunc(options.MemoryBudget)

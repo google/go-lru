@@ -1,4 +1,4 @@
-module github.com/googlecloudplatform/gcsfuse/v3/internal/cache/lru
+module github.com/google/go-lru
 
 go 1.26
 

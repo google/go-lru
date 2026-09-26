@@ -12,18 +12,17 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-package lrus
+package lru
 
 import (
-	"errors"
 	"fmt"
 	"testing"
+
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
-const (
-	testMaxSize        = 50
-	testOperationCount = 100
-)
+const testMaxSize = 50
 
 type testData struct {
 	value    int64
@@ -39,585 +38,727 @@ func setupCacheTest(t *testing.T) Cache {
 	return NewMapCache(testMaxSize, WithInvariantChecking(true))
 }
 
-// insertAndAssert inserts key, val into the cache and asserts expected eviction list and error.
-func insertAndAssert(t *testing.T, cache Cache, key string, val ValueType, evictedValues []int64, expectedError error) {
+func assertEvictedValues(t *testing.T, evicted []ValueType, expectedValues []int64) {
 	t.Helper()
-	ret, err := cache.Insert(key, val)
-
-	if expectedError != nil {
-		if !errors.Is(err, expectedError) {
-			t.Fatalf("expected error %v, got %v", expectedError, err)
-		}
-	} else if err != nil {
-		t.Fatalf("unexpected error: %v", err)
+	if len(expectedValues) == 0 {
+		assert.Empty(t, evicted)
+		return
 	}
-
-	if len(evictedValues) != len(ret) {
-		t.Fatalf("eviction count mismatch: expected %d, got %d", len(evictedValues), len(ret))
-	}
-	for i, evicted := range ret {
-		td, ok := evicted.(testData)
-		if !ok {
-			t.Fatalf("evicted value at index %d is not testData: %T", i, evicted)
-		}
-		if td.value != evictedValues[i] {
-			t.Errorf("evicted value at index %d: expected %d, got %d", i, evictedValues[i], td.value)
-		}
+	require.Len(t, evicted, len(expectedValues))
+	for i, exp := range expectedValues {
+		td, ok := evicted[i].(testData)
+		require.True(t, ok, "evicted value at index %d is not testData: %T", i, evicted[i])
+		assert.Equal(t, exp, td.value)
 	}
 }
 
 func TestLookUpInEmptyCache(t *testing.T) {
+	// Arrange
 	cache := setupCacheTest(t)
-	if val := cache.LookUp(""); val != nil {
-		t.Errorf("expected nil, got %v", val)
-	}
-	if val := cache.LookUp("taco"); val != nil {
-		t.Errorf("expected nil, got %v", val)
-	}
+
+	// Act
+	valEmpty := cache.LookUp("")
+	valTaco := cache.LookUp("taco")
+
+	// Assert
+	assert.Nil(t, valEmpty)
+	assert.Nil(t, valTaco)
 }
 
 func TestInsertNilValue(t *testing.T) {
+	// Arrange
 	cache := setupCacheTest(t)
-	insertAndAssert(t, cache, "taco", nil, nil, ErrInvalidEntry)
+
+	// Act
+	evicted, err := cache.Insert("taco", nil)
+
+	// Assert
+	require.ErrorIs(t, err, ErrInvalidEntry)
+	assertEvictedValues(t, evicted, nil)
 }
 
 func TestLookUpUnknownKey(t *testing.T) {
+	// Arrange
 	cache := setupCacheTest(t)
-	insertAndAssert(t, cache, "burrito", testData{value: 23, dataSize: 4}, nil, nil)
-	insertAndAssert(t, cache, "taco", testData{value: 23, dataSize: 8}, nil, nil)
+	evicted, err := cache.Insert("burrito", testData{value: 23, dataSize: 4})
+	require.NoError(t, err)
+	assertEvictedValues(t, evicted, nil)
 
-	if val := cache.LookUp(""); val != nil {
-		t.Errorf("expected nil, got %v", val)
-	}
-	if val := cache.LookUp("enchilada"); val != nil {
-		t.Errorf("expected nil, got %v", val)
-	}
+	evicted, err = cache.Insert("taco", testData{value: 23, dataSize: 8})
+	require.NoError(t, err)
+	assertEvictedValues(t, evicted, nil)
+
+	// Act
+	valEmpty := cache.LookUp("")
+	valEnchilada := cache.LookUp("enchilada")
+
+	// Assert
+	assert.Nil(t, valEmpty)
+	assert.Nil(t, valEnchilada)
 }
 
 func TestFillUpToCapacity(t *testing.T) {
+	// Arrange
 	cache := setupCacheTest(t)
-	insertAndAssert(t, cache, "burrito", testData{value: 23, dataSize: 4}, nil, nil)
-	insertAndAssert(t, cache, "taco", testData{value: 26, dataSize: 20}, nil, nil)
-	insertAndAssert(t, cache, "enchilada", testData{value: 28, dataSize: 26}, nil, nil)
 
-	if val := cache.LookUp("burrito"); val == nil || val.(testData).value != 23 {
-		t.Errorf("burrito: expected 23, got %v", val)
-	}
-	if val := cache.LookUp("taco"); val == nil || val.(testData).value != 26 {
-		t.Errorf("taco: expected 26, got %v", val)
-	}
-	if val := cache.LookUp("enchilada"); val == nil || val.(testData).value != 28 {
-		t.Errorf("enchilada: expected 28, got %v", val)
-	}
+	// Act
+	evicted1, err1 := cache.Insert("burrito", testData{value: 23, dataSize: 4})
+	evicted2, err2 := cache.Insert("taco", testData{value: 26, dataSize: 20})
+	evicted3, err3 := cache.Insert("enchilada", testData{value: 28, dataSize: 26})
+
+	// Assert
+	require.NoError(t, err1)
+	assertEvictedValues(t, evicted1, nil)
+	require.NoError(t, err2)
+	assertEvictedValues(t, evicted2, nil)
+	require.NoError(t, err3)
+	assertEvictedValues(t, evicted3, nil)
+
+	assert.Equal(t, testData{value: 23, dataSize: 4}, cache.LookUp("burrito"))
+	assert.Equal(t, testData{value: 26, dataSize: 20}, cache.LookUp("taco"))
+	assert.Equal(t, testData{value: 28, dataSize: 26}, cache.LookUp("enchilada"))
 }
 
 func TestExpiresLeastRecentlyUsed(t *testing.T) {
+	// Arrange
 	cache := setupCacheTest(t)
-	insertAndAssert(t, cache, "burrito", testData{value: 23, dataSize: 4}, nil, nil)
+	evicted, err := cache.Insert("burrito", testData{value: 23, dataSize: 4})
+	require.NoError(t, err)
+	assertEvictedValues(t, evicted, nil)
 
 	// Least recent.
-	insertAndAssert(t, cache, "taco", testData{value: 26, dataSize: 20}, nil, nil)
+	evicted, err = cache.Insert("taco", testData{value: 26, dataSize: 20})
+	require.NoError(t, err)
+	assertEvictedValues(t, evicted, nil)
 
 	// Second most recent.
-	insertAndAssert(t, cache, "enchilada", testData{value: 28, dataSize: 26}, nil, nil)
+	evicted, err = cache.Insert("enchilada", testData{value: 28, dataSize: 26})
+	require.NoError(t, err)
+	assertEvictedValues(t, evicted, nil)
 
-	if val := cache.LookUp("burrito"); val == nil || val.(testData).value != 23 {
-		t.Errorf("burrito: expected 23, got %v", val)
-	} // burrito is now most recent
+	// Promote burrito to MRU.
+	assert.Equal(t, testData{value: 23, dataSize: 4}, cache.LookUp("burrito"))
 
-	// Insert another, requiring eviction of taco (size 20) to fit queso (size 5).
-	insertAndAssert(t, cache, "queso", testData{value: 34, dataSize: 5}, []int64{26}, nil)
+	// Act: Insert another, requiring eviction of taco (size 20) to fit queso (size 5).
+	evicted, err = cache.Insert("queso", testData{value: 34, dataSize: 5})
 
-	// See what's left.
-	if val := cache.LookUp("taco"); val != nil {
-		t.Errorf("expected taco to be evicted, got %v", val)
-	}
-	if val := cache.LookUp("burrito"); val == nil || val.(testData).value != 23 {
-		t.Errorf("burrito: expected 23, got %v", val)
-	}
-	if val := cache.LookUp("enchilada"); val == nil || val.(testData).value != 28 {
-		t.Errorf("enchilada: expected 28, got %v", val)
-	}
-	if val := cache.LookUp("queso"); val == nil || val.(testData).value != 34 {
-		t.Errorf("queso: expected 34, got %v", val)
-	}
+	// Assert
+	require.NoError(t, err)
+	assertEvictedValues(t, evicted, []int64{26})
+	assert.Nil(t, cache.LookUp("taco"))
+	assert.Equal(t, testData{value: 23, dataSize: 4}, cache.LookUp("burrito"))
+	assert.Equal(t, testData{value: 28, dataSize: 26}, cache.LookUp("enchilada"))
+	assert.Equal(t, testData{value: 34, dataSize: 5}, cache.LookUp("queso"))
 }
 
 func TestOverwrite(t *testing.T) {
+	// Arrange
 	cache := setupCacheTest(t)
-	insertAndAssert(t, cache, "burrito", testData{value: 23, dataSize: 4}, nil, nil)
-	insertAndAssert(t, cache, "taco", testData{value: 26, dataSize: 20}, nil, nil)
-	insertAndAssert(t, cache, "enchilada", testData{value: 28, dataSize: 20}, nil, nil)
-	insertAndAssert(t, cache, "burrito", testData{value: 33, dataSize: 6}, nil, nil)
+	evicted, err := cache.Insert("burrito", testData{value: 23, dataSize: 4})
+	require.NoError(t, err)
+	assertEvictedValues(t, evicted, nil)
 
-	// Increase the DataSize while modifying, so eviction of taco should happen.
-	insertAndAssert(t, cache, "burrito", testData{value: 33, dataSize: 12}, []int64{26}, nil)
+	evicted, err = cache.Insert("taco", testData{value: 26, dataSize: 20})
+	require.NoError(t, err)
+	assertEvictedValues(t, evicted, nil)
 
-	if val := cache.LookUp("taco"); val != nil {
-		t.Errorf("expected taco to be evicted, got %v", val)
-	}
-	if val := cache.LookUp("burrito"); val == nil || val.(testData).value != 33 {
-		t.Errorf("burrito: expected 33, got %v", val)
-	}
-	if val := cache.LookUp("enchilada"); val == nil || val.(testData).value != 28 {
-		t.Errorf("enchilada: expected 28, got %v", val)
-	}
+	evicted, err = cache.Insert("enchilada", testData{value: 28, dataSize: 20})
+	require.NoError(t, err)
+	assertEvictedValues(t, evicted, nil)
+
+	evicted, err = cache.Insert("burrito", testData{value: 33, dataSize: 6})
+	require.NoError(t, err)
+	assertEvictedValues(t, evicted, nil)
+
+	// Act: Increase the DataSize while modifying, so eviction of taco should happen.
+	evicted, err = cache.Insert("burrito", testData{value: 33, dataSize: 12})
+
+	// Assert
+	require.NoError(t, err)
+	assertEvictedValues(t, evicted, []int64{26})
+	assert.Nil(t, cache.LookUp("taco"))
+	assert.Equal(t, testData{value: 33, dataSize: 12}, cache.LookUp("burrito"))
+	assert.Equal(t, testData{value: 28, dataSize: 20}, cache.LookUp("enchilada"))
 }
 
 func TestMultipleEviction(t *testing.T) {
+	// Arrange
 	cache := setupCacheTest(t)
-	insertAndAssert(t, cache, "burrito", testData{value: 23, dataSize: 4}, nil, nil)
-	insertAndAssert(t, cache, "taco", testData{value: 26, dataSize: 20}, nil, nil)
-	insertAndAssert(t, cache, "enchilada", testData{value: 28, dataSize: 20}, nil, nil)
+	evicted, err := cache.Insert("burrito", testData{value: 23, dataSize: 4})
+	require.NoError(t, err)
+	assertEvictedValues(t, evicted, nil)
 
-	// Inserting large entry requires evicting burrito, taco, and enchilada in oldest-first order.
-	insertAndAssert(t, cache, "large_data", testData{value: 33, dataSize: 45}, []int64{23, 26, 28}, nil)
+	evicted, err = cache.Insert("taco", testData{value: 26, dataSize: 20})
+	require.NoError(t, err)
+	assertEvictedValues(t, evicted, nil)
 
-	if val := cache.LookUp("taco"); val != nil {
-		t.Errorf("expected taco to be evicted, got %v", val)
-	}
-	if val := cache.LookUp("burrito"); val != nil {
-		t.Errorf("expected burrito to be evicted, got %v", val)
-	}
-	if val := cache.LookUp("enchilada"); val != nil {
-		t.Errorf("expected enchilada to be evicted, got %v", val)
-	}
-	if val := cache.LookUp("large_data"); val == nil || val.(testData).value != 33 {
-		t.Errorf("large_data: expected 33, got %v", val)
-	}
+	evicted, err = cache.Insert("enchilada", testData{value: 28, dataSize: 20})
+	require.NoError(t, err)
+	assertEvictedValues(t, evicted, nil)
+
+	// Act: Inserting large entry requires evicting burrito, taco, and enchilada in oldest-first order.
+	evicted, err = cache.Insert("large_data", testData{value: 33, dataSize: 45})
+
+	// Assert
+	require.NoError(t, err)
+	assertEvictedValues(t, evicted, []int64{23, 26, 28})
+	assert.Nil(t, cache.LookUp("taco"))
+	assert.Nil(t, cache.LookUp("burrito"))
+	assert.Nil(t, cache.LookUp("enchilada"))
+	assert.Equal(t, testData{value: 33, dataSize: 45}, cache.LookUp("large_data"))
 }
 
 func TestWhenEntrySizeMoreThanCacheMaxSize(t *testing.T) {
+	// Arrange
 	cache := setupCacheTest(t)
-	insertAndAssert(t, cache, "burrito", testData{value: 23, dataSize: 4}, nil, nil)
+	evicted, err := cache.Insert("burrito", testData{value: 23, dataSize: 4})
+	require.NoError(t, err)
+	assertEvictedValues(t, evicted, nil)
 
-	// Insert entry with size greater than maxSize of cache.
-	insertAndAssert(t, cache, "taco", testData{value: 26, dataSize: testMaxSize + 1}, nil, ErrInvalidEntrySize)
+	// Act: Insert entry with size greater than maxSize of cache.
+	evicted, err = cache.Insert("taco", testData{value: 26, dataSize: testMaxSize + 1})
 
-	if val := cache.LookUp("burrito"); val == nil || val.(testData).value != 23 {
-		t.Errorf("burrito: expected 23, got %v", val)
-	}
+	// Assert
+	require.ErrorIs(t, err, ErrInvalidEntrySize)
+	assertEvictedValues(t, evicted, nil)
+	assert.Equal(t, testData{value: 23, dataSize: 4}, cache.LookUp("burrito"))
 }
 
 func TestEraseWhenKeyPresent(t *testing.T) {
+	// Arrange
 	cache := setupCacheTest(t)
-	insertAndAssert(t, cache, "burrito", testData{value: 23, dataSize: 4}, nil, nil)
+	evicted, err := cache.Insert("burrito", testData{value: 23, dataSize: 4})
+	require.NoError(t, err)
+	assertEvictedValues(t, evicted, nil)
 
+	// Act
 	deletedEntry := cache.Erase("burrito")
-	if deletedEntry == nil || deletedEntry.(testData).value != 23 {
-		t.Errorf("expected erased value 23, got %v", deletedEntry)
-	}
-	if val := cache.LookUp("burrito"); val != nil {
-		t.Errorf("expected nil after erase, got %v", val)
-	}
+
+	// Assert
+	assert.Equal(t, testData{value: 23, dataSize: 4}, deletedEntry)
+	assert.Nil(t, cache.LookUp("burrito"))
 }
 
 func TestEraseCacheWithGivenPrefix(t *testing.T) {
+	// Arrange
 	cache := setupCacheTest(t)
-	insertAndAssert(t, cache, "a", testData{value: 23, dataSize: 4}, nil, nil)
-	insertAndAssert(t, cache, "a/b", testData{value: 26, dataSize: 5}, nil, nil)
-	insertAndAssert(t, cache, "a/b/d", testData{value: 22, dataSize: 6}, nil, nil)
-	insertAndAssert(t, cache, "a/c", testData{value: 20, dataSize: 6}, nil, nil)
-	insertAndAssert(t, cache, "b", testData{value: 21, dataSize: 2}, nil, nil)
+	_, err := cache.Insert("a", testData{value: 23, dataSize: 4})
+	require.NoError(t, err)
+	_, err = cache.Insert("a/b", testData{value: 26, dataSize: 5})
+	require.NoError(t, err)
+	_, err = cache.Insert("a/b/d", testData{value: 22, dataSize: 6})
+	require.NoError(t, err)
+	_, err = cache.Insert("a/c", testData{value: 20, dataSize: 6})
+	require.NoError(t, err)
+	_, err = cache.Insert("b", testData{value: 21, dataSize: 2})
+	require.NoError(t, err)
 
+	// Act
 	cache.EraseEntriesWithGivenPrefix("a")
 
-	if val := cache.LookUp("a"); val != nil {
-		t.Errorf("expected nil for a, got %v", val)
-	}
-	if val := cache.LookUp("a/b"); val != nil {
-		t.Errorf("expected nil for a/b, got %v", val)
-	}
-	if val := cache.LookUp("a/b/d"); val != nil {
-		t.Errorf("expected nil for a/b/d, got %v", val)
-	}
-	if val := cache.LookUp("a/c"); val != nil {
-		t.Errorf("expected nil for a/c, got %v", val)
-	}
-	if val := cache.LookUp("b"); val == nil || val.Size() != 2 {
-		t.Errorf("expected b size 2, got %v", val)
-	}
+	// Assert
+	assert.Nil(t, cache.LookUp("a"))
+	assert.Nil(t, cache.LookUp("a/b"))
+	assert.Nil(t, cache.LookUp("a/b/d"))
+	assert.Nil(t, cache.LookUp("a/c"))
+	valB := cache.LookUp("b")
+	require.NotNil(t, valB)
+	assert.Equal(t, uint64(2), valB.Size())
 }
 
 func TestEraseCacheWhereNoEntriesExistWithGivenPrefix(t *testing.T) {
+	// Arrange
 	cache := setupCacheTest(t)
-	insertAndAssert(t, cache, "a", testData{value: 23, dataSize: 4}, nil, nil)
-	insertAndAssert(t, cache, "a/b", testData{value: 26, dataSize: 5}, nil, nil)
-	insertAndAssert(t, cache, "b", testData{value: 21, dataSize: 2}, nil, nil)
+	_, err := cache.Insert("a", testData{value: 23, dataSize: 4})
+	require.NoError(t, err)
+	_, err = cache.Insert("a/b", testData{value: 26, dataSize: 5})
+	require.NoError(t, err)
+	_, err = cache.Insert("b", testData{value: 21, dataSize: 2})
+	require.NoError(t, err)
 
+	// Act
 	cache.EraseEntriesWithGivenPrefix("c")
 
-	if val := cache.LookUp("a"); val == nil || val.Size() != 4 {
-		t.Errorf("expected a size 4, got %v", val)
-	}
-	if val := cache.LookUp("a/b"); val == nil || val.Size() != 5 {
-		t.Errorf("expected a/b size 5, got %v", val)
-	}
-	if val := cache.LookUp("b"); val == nil || val.Size() != 2 {
-		t.Errorf("expected b size 2, got %v", val)
-	}
+	// Assert
+	valA := cache.LookUp("a")
+	require.NotNil(t, valA)
+	assert.Equal(t, uint64(4), valA.Size())
+
+	valAB := cache.LookUp("a/b")
+	require.NotNil(t, valAB)
+	assert.Equal(t, uint64(5), valAB.Size())
+
+	valB := cache.LookUp("b")
+	require.NotNil(t, valB)
+	assert.Equal(t, uint64(2), valB.Size())
 }
 
 func TestEraseCacheWithGivenPrefixWithSomeEntriesEvictedDueToCacheSize(t *testing.T) {
+	// Arrange
 	cache := setupCacheTest(t)
-	insertAndAssert(t, cache, "a", testData{value: 23, dataSize: 20}, nil, nil)
-	insertAndAssert(t, cache, "a/b", testData{value: 26, dataSize: 10}, nil, nil)
-	insertAndAssert(t, cache, "a/b/d", testData{value: 22, dataSize: 5}, nil, nil)
-	insertAndAssert(t, cache, "a/c", testData{value: 20, dataSize: 10}, nil, nil)
-	insertAndAssert(t, cache, "b", testData{value: 21, dataSize: 15}, []int64{23}, nil)
+	_, err := cache.Insert("a", testData{value: 23, dataSize: 20})
+	require.NoError(t, err)
+	_, err = cache.Insert("a/b", testData{value: 26, dataSize: 10})
+	require.NoError(t, err)
+	_, err = cache.Insert("a/b/d", testData{value: 22, dataSize: 5})
+	require.NoError(t, err)
+	_, err = cache.Insert("a/c", testData{value: 20, dataSize: 10})
+	require.NoError(t, err)
+	evicted, err := cache.Insert("b", testData{value: 21, dataSize: 15})
+	require.NoError(t, err)
+	assertEvictedValues(t, evicted, []int64{23})
 
-	// As entry "a" was already evicted by the insertion of "b", only three entries will be removed.
+	// Act: As entry "a" was already evicted by the insertion of "b", only three entries will be removed.
 	cache.EraseEntriesWithGivenPrefix("a")
 
-	if val := cache.LookUp("a"); val != nil {
-		t.Errorf("expected nil for a, got %v", val)
-	}
-	if val := cache.LookUp("a/b"); val != nil {
-		t.Errorf("expected nil for a/b, got %v", val)
-	}
-	if val := cache.LookUp("a/b/d"); val != nil {
-		t.Errorf("expected nil for a/b/d, got %v", val)
-	}
-	if val := cache.LookUp("a/c"); val != nil {
-		t.Errorf("expected nil for a/c, got %v", val)
-	}
-	if val := cache.LookUp("b"); val == nil || val.Size() != 15 {
-		t.Errorf("expected b size 15, got %v", val)
-	}
+	// Assert
+	assert.Nil(t, cache.LookUp("a"))
+	assert.Nil(t, cache.LookUp("a/b"))
+	assert.Nil(t, cache.LookUp("a/b/d"))
+	assert.Nil(t, cache.LookUp("a/c"))
+	valB := cache.LookUp("b")
+	require.NotNil(t, valB)
+	assert.Equal(t, uint64(15), valB.Size())
 }
 
 func TestEraseCacheWithEmptyPrefix(t *testing.T) {
+	// Arrange
 	cache := setupCacheTest(t)
-	insertAndAssert(t, cache, "a", testData{value: 1, dataSize: 10}, nil, nil)
-	insertAndAssert(t, cache, "b", testData{value: 2, dataSize: 10}, nil, nil)
-	insertAndAssert(t, cache, "c", testData{value: 3, dataSize: 10}, nil, nil)
+	_, err := cache.Insert("a", testData{value: 1, dataSize: 10})
+	require.NoError(t, err)
+	_, err = cache.Insert("b", testData{value: 2, dataSize: 10})
+	require.NoError(t, err)
+	_, err = cache.Insert("c", testData{value: 3, dataSize: 10})
+	require.NoError(t, err)
 
+	// Act
 	cache.EraseEntriesWithGivenPrefix("")
 
-	if val := cache.LookUp("a"); val != nil {
-		t.Errorf("expected nil for a, got %v", val)
-	}
-	if val := cache.LookUp("b"); val != nil {
-		t.Errorf("expected nil for b, got %v", val)
-	}
-	if val := cache.LookUp("c"); val != nil {
-		t.Errorf("expected nil for c, got %v", val)
-	}
+	// Assert
+	assert.Nil(t, cache.LookUp("a"))
+	assert.Nil(t, cache.LookUp("b"))
+	assert.Nil(t, cache.LookUp("c"))
 }
 
 func TestEraseWhenKeyNotPresent(t *testing.T) {
+	// Arrange
 	cache := setupCacheTest(t)
-	insertAndAssert(t, cache, "burrito", testData{value: 23, dataSize: 4}, nil, nil)
+	_, err := cache.Insert("burrito", testData{value: 23, dataSize: 4})
+	require.NoError(t, err)
 
+	// Act
 	deletedEntry := cache.Erase("taco")
-	if deletedEntry != nil {
-		t.Errorf("expected nil when erasing non-existent key, got %v", deletedEntry)
-	}
 
-	if val := cache.LookUp("burrito"); val == nil || val.(testData).value != 23 {
-		t.Errorf("burrito: expected 23, got %v", val)
-	}
+	// Assert
+	assert.Nil(t, deletedEntry)
+	assert.Equal(t, testData{value: 23, dataSize: 4}, cache.LookUp("burrito"))
 }
 
 func TestUpdateWhenKeyPresent(t *testing.T) {
+	// Arrange
 	cache := setupCacheTest(t)
 	key := "burrito"
 	data := testData{value: 23, dataSize: 4}
-	insertAndAssert(t, cache, key, data, nil, nil)
+	_, err := cache.Insert(key, data)
+	require.NoError(t, err)
 	newData := testData{value: 2, dataSize: 4}
 
-	err := cache.UpdateWithoutChangingOrder(key, newData)
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	if val := cache.LookUp(key); val == nil || val.(testData).value != 2 {
-		t.Errorf("expected updated value 2, got %v", val)
-	}
+	// Act
+	err = cache.UpdateWithoutChangingOrder(key, newData)
+
+	// Assert
+	require.NoError(t, err)
+	assert.Equal(t, newData, cache.LookUp(key))
 }
 
 func TestUpdateWhenKeyNotPresent(t *testing.T) {
+	// Arrange
 	cache := setupCacheTest(t)
 	key := "burrito"
 	data := testData{value: 23, dataSize: 4}
 
+	// Act
 	err := cache.UpdateWithoutChangingOrder(key, data)
-	if !errors.Is(err, ErrEntryNotExist) {
-		t.Errorf("expected ErrEntryNotExist, got %v", err)
-	}
+
+	// Assert
+	require.ErrorIs(t, err, ErrEntryNotExist)
 }
 
 func TestUpdateNilValue(t *testing.T) {
+	// Arrange
 	cache := setupCacheTest(t)
 	key := "burrito"
 	data := testData{value: 23, dataSize: 4}
-	insertAndAssert(t, cache, key, data, nil, nil)
+	_, err := cache.Insert(key, data)
+	require.NoError(t, err)
 
-	err := cache.UpdateWithoutChangingOrder(key, nil)
-	if !errors.Is(err, ErrInvalidEntry) {
-		t.Errorf("expected ErrInvalidEntry, got %v", err)
-	}
+	// Act
+	err = cache.UpdateWithoutChangingOrder(key, nil)
+
+	// Assert
+	require.ErrorIs(t, err, ErrInvalidEntry)
 }
 
 func TestUpdateWhenSizeIsDifferent(t *testing.T) {
+	// Arrange
 	cache := setupCacheTest(t)
 	key := "burrito"
 	data := testData{value: 23, dataSize: 4}
-	insertAndAssert(t, cache, key, data, nil, nil)
+	_, err := cache.Insert(key, data)
+	require.NoError(t, err)
 	newData := testData{value: 2, dataSize: 3}
 
-	err := cache.UpdateWithoutChangingOrder(key, newData)
-	if !errors.Is(err, ErrInvalidUpdateEntrySize) {
-		t.Errorf("expected ErrInvalidUpdateEntrySize, got %v", err)
-	}
+	// Act
+	err = cache.UpdateWithoutChangingOrder(key, newData)
+
+	// Assert
+	require.ErrorIs(t, err, ErrInvalidUpdateEntrySize)
 }
 
 func TestUpdateNotChangeOrder(t *testing.T) {
+	// Arrange
 	cache := setupCacheTest(t)
 	key1 := "burrito1"
 	data1 := testData{value: 23, dataSize: 10}
-	insertAndAssert(t, cache, key1, data1, nil, nil)
+	_, err := cache.Insert(key1, data1)
+	require.NoError(t, err)
+
 	key2 := "burrito2"
 	data2 := testData{value: 2, dataSize: 40}
-	insertAndAssert(t, cache, key2, data2, nil, nil)
+	_, err = cache.Insert(key2, data2)
+	require.NoError(t, err)
 
+	// Act
 	newData := testData{value: 7, dataSize: 10}
-	err := cache.UpdateWithoutChangingOrder(key1, newData)
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
+	err = cache.UpdateWithoutChangingOrder(key1, newData)
+	require.NoError(t, err)
 
 	// Inserting again should evict key1 because key1 was updated without changing order (still LRU).
 	key3 := "burrito3"
 	data3 := testData{value: 3, dataSize: 5}
-	insertAndAssert(t, cache, key3, data3, []int64{7}, nil)
+	evicted, err := cache.Insert(key3, data3)
+
+	// Assert
+	require.NoError(t, err)
+	assertEvictedValues(t, evicted, []int64{7})
 }
 
 func TestLookUpWithoutChangingOrder_WhenKeyPresent(t *testing.T) {
+	// Arrange
 	cache := setupCacheTest(t)
 	key := "burrito"
 	data := testData{value: 23, dataSize: 4}
-	insertAndAssert(t, cache, key, data, nil, nil)
+	_, err := cache.Insert(key, data)
+	require.NoError(t, err)
 
+	// Act
 	value := cache.LookUpWithoutChangingOrder(key)
-	if value == nil || value.(testData).value != 23 {
-		t.Errorf("expected 23, got %v", value)
-	}
+
+	// Assert
+	assert.Equal(t, data, value)
 }
 
 func TestLookUpWithoutChangingOrder_WhenKeyNotPresent(t *testing.T) {
+	// Arrange
 	cache := setupCacheTest(t)
 	key := "burrito"
 
+	// Act
 	value := cache.LookUpWithoutChangingOrder(key)
-	if value != nil {
-		t.Errorf("expected nil, got %v", value)
-	}
+
+	// Assert
+	assert.Nil(t, value)
 }
 
 func TestLookUpWithoutChangingOrder_NotChangeOrder(t *testing.T) {
+	// Arrange
 	cache := setupCacheTest(t)
 	key1 := "burrito1"
 	data1 := testData{value: 23, dataSize: 10}
-	insertAndAssert(t, cache, key1, data1, nil, nil)
+	_, err := cache.Insert(key1, data1)
+	require.NoError(t, err)
+
 	key2 := "burrito2"
 	data2 := testData{value: 2, dataSize: 40}
-	insertAndAssert(t, cache, key2, data2, nil, nil)
+	_, err = cache.Insert(key2, data2)
+	require.NoError(t, err)
 
+	// Act
 	value := cache.LookUpWithoutChangingOrder(key1)
-	if value == nil || value.(testData).value != 23 {
-		t.Errorf("expected 23, got %v", value)
-	}
+	assert.Equal(t, data1, value)
 
 	// Inserting again should evict key1 because key1 was looked up without changing order.
 	key3 := "burrito3"
 	data3 := testData{value: 3, dataSize: 5}
-	insertAndAssert(t, cache, key3, data3, []int64{23}, nil)
+	evicted, err := cache.Insert(key3, data3)
+
+	// Assert
+	require.NoError(t, err)
+	assertEvictedValues(t, evicted, []int64{23})
 }
 
 func TestUpdateSize_Success(t *testing.T) {
+	// Arrange
 	cache := setupCacheTest(t)
-	insertAndAssert(t, cache, "file1", testData{value: 10, dataSize: 10}, nil, nil)
-	insertAndAssert(t, cache, "file2", testData{value: 20, dataSize: 20}, nil, nil)
+	_, err := cache.Insert("file1", testData{value: 10, dataSize: 10})
+	require.NoError(t, err)
+	_, err = cache.Insert("file2", testData{value: 20, dataSize: 20})
+	require.NoError(t, err)
 
-	err := cache.UpdateSize("file1", 10)
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
+	// Act
+	err = cache.UpdateSize("file1", 10)
+	require.NoError(t, err)
 
 	// Order should be preserved: file1 is still LRU.
 	// Inserting 20 more units (total size was 10+10+20 = 40, now 40+20 = 60 > 50) evicts file1.
-	insertAndAssert(t, cache, "file3", testData{value: 30, dataSize: 20}, []int64{10}, nil)
+	evicted, err := cache.Insert("file3", testData{value: 30, dataSize: 20})
+
+	// Assert
+	require.NoError(t, err)
+	assertEvictedValues(t, evicted, []int64{10})
 }
 
 func TestUpdateSize_NonExistentKey(t *testing.T) {
+	// Arrange
 	cache := setupCacheTest(t)
+
+	// Act
 	err := cache.UpdateSize("nonexistent", 10)
-	if !errors.Is(err, ErrEntryNotExist) {
-		t.Errorf("expected ErrEntryNotExist, got %v", err)
-	}
+
+	// Assert
+	require.ErrorIs(t, err, ErrEntryNotExist)
 }
 
 func TestUpdateSize_ExceedsMaxSize_Evicts(t *testing.T) {
+	// Arrange
 	cache := setupCacheTest(t) // maxSize = 50
-	insertAndAssert(t, cache, "key1", testData{value: 1, dataSize: 20}, nil, nil)
-	insertAndAssert(t, cache, "key2", testData{value: 2, dataSize: 25}, nil, nil)
+	_, err := cache.Insert("key1", testData{value: 1, dataSize: 20})
+	require.NoError(t, err)
+	_, err = cache.Insert("key2", testData{value: 2, dataSize: 25})
+	require.NoError(t, err)
 
-	// currentSize was 45. Increasing key2 size by 10 makes currentSize = 55 > 50.
+	// Act: currentSize was 45. Increasing key2 size by 10 makes currentSize = 55 > 50.
 	// key1 (LRU) must be evicted immediately by UpdateSize to maintain the size invariant.
-	err := cache.UpdateSize("key2", 10)
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
+	err = cache.UpdateSize("key2", 10)
 
-	if val := cache.LookUp("key1"); val != nil {
-		t.Errorf("expected key1 to be evicted, got %v", val)
-	}
-	if val := cache.LookUp("key2"); val == nil || val.(testData).value != 2 {
-		t.Errorf("expected key2 to be present with value 2, got %v", val)
-	}
+	// Assert
+	require.NoError(t, err)
+	assert.Nil(t, cache.LookUp("key1"))
+	assert.Equal(t, testData{value: 2, dataSize: 25}, cache.LookUp("key2"))
 }
 
 func TestNewAlias(t *testing.T) {
+	// Arrange
 	c := New(100)
-	if c == nil {
-		t.Fatal("expected New to return non-nil Cache")
-	}
-	_, err := c.Insert("k", testData{value: 1, dataSize: 10})
-	if err != nil {
-		t.Fatalf("unexpected error on Insert: %v", err)
-	}
-	if val := c.LookUp("k"); val == nil || val.(testData).value != 1 {
-		t.Errorf("expected value 1, got %v", val)
-	}
+	require.NotNil(t, c)
+
+	// Act
+	evicted, err := c.Insert("k", testData{value: 1, dataSize: 10})
+
+	// Assert
+	require.NoError(t, err)
+	assertEvictedValues(t, evicted, nil)
+	assert.Equal(t, testData{value: 1, dataSize: 10}, c.LookUp("k"))
 }
 
 func TestCheckInvariants_InvalidMaxSizePanic(t *testing.T) {
 	t.Run("DefaultOptions", func(t *testing.T) {
-		defer func() {
-			if r := recover(); r == nil {
-				t.Errorf("expected panic on zero maxSize with default options")
-			}
-		}()
-		_ = NewMapCache(0)
+		// Arrange, Act & Assert
+		assert.Panics(t, func() {
+			_ = NewMapCache(0)
+		})
 	})
 
 	t.Run("InvariantsEnabled", func(t *testing.T) {
-		defer func() {
-			if r := recover(); r == nil {
-				t.Errorf("expected panic on zero maxSize with invariant checking enabled")
-			}
-		}()
-		_ = NewMapCache(0, WithInvariantChecking(true))
+		// Arrange, Act & Assert
+		assert.Panics(t, func() {
+			_ = NewMapCache(0, WithInvariantChecking(true))
+		})
 	})
 
 	t.Run("InvariantsDisabled", func(t *testing.T) {
-		defer func() {
-			if r := recover(); r == nil {
-				t.Errorf("expected panic on zero maxSize with invariant checking disabled")
-			}
-		}()
-		_ = NewMapCache(0, WithInvariantChecking(false))
+		// Arrange, Act & Assert
+		assert.Panics(t, func() {
+			_ = NewMapCache(0, WithInvariantChecking(false))
+		})
 	})
 
 	t.Run("NewAliasDefaultOptions", func(t *testing.T) {
-		defer func() {
-			if r := recover(); r == nil {
-				t.Errorf("expected panic on New(0) with default options")
-			}
-		}()
-		_ = New(0)
+		// Arrange, Act & Assert
+		assert.Panics(t, func() {
+			_ = New(0)
+		})
 	})
 }
 
 func TestCheckInvariants_PanicOnCorruption(t *testing.T) {
 	t.Run("CurrentSizeExceedsMaxSize", func(t *testing.T) {
+		// Arrange
 		c := NewMapCache(10).(*mapCache)
 		c.currentSize = 20
-		defer func() {
-			if r := recover(); r == nil {
-				t.Errorf("expected panic on currentSize > maxSize")
-			}
-		}()
-		c.checkInvariants()
+
+		// Act & Assert
+		assert.Panics(t, func() {
+			c.checkInvariants()
+		})
 	})
 
 	t.Run("LengthMismatch", func(t *testing.T) {
+		// Arrange
 		c := NewMapCache(10).(*mapCache)
 		c.index["dummy"] = nil
-		defer func() {
-			if r := recover(); r == nil {
-				t.Errorf("expected panic on length mismatch")
-			}
-		}()
-		c.checkInvariants()
+
+		// Act & Assert
+		assert.Panics(t, func() {
+			c.checkInvariants()
+		})
 	})
 
 	t.Run("KeyMismatch", func(t *testing.T) {
+		// Arrange
 		c := NewMapCache(50).(*mapCache)
-		e := c.entries.PushFront(entry{key: "correctKey", value: testData{1, 5}})
+		e := c.entries.PushFront(&entry{key: "correctKey", value: testData{1, 5}, size: 5})
 		c.index["wrongKey"] = e
-		defer func() {
-			if r := recover(); r == nil {
-				t.Errorf("expected panic on key mismatch")
-			}
-		}()
-		c.checkInvariants()
+		c.currentSize = 5
+
+		// Act & Assert
+		assert.Panics(t, func() {
+			c.checkInvariants()
+		})
 	})
 
 	t.Run("InvalidElementType", func(t *testing.T) {
+		// Arrange
 		c := NewMapCache(50).(*mapCache)
 		e := c.entries.PushFront("not-an-entry-struct")
 		c.index["someKey"] = e
-		defer func() {
-			if r := recover(); r == nil {
-				t.Errorf("expected panic on invalid element type")
-			}
-		}()
-		c.checkInvariants()
+
+		// Act & Assert
+		assert.Panics(t, func() {
+			c.checkInvariants()
+		})
 	})
 
 	t.Run("SizeSumMismatch", func(t *testing.T) {
+		// Arrange
 		c := NewMapCache(500).(*mapCache)
-		_, _ = c.Insert("k1", testData{value: 1, dataSize: 10})
-		c.currentSize += 1
-		defer func() {
-			if r := recover(); r == nil {
-				t.Errorf("expected panic on size sum mismatch")
-			}
-		}()
-		c.checkInvariants()
+		_, err := c.Insert("k1", testData{value: 1, dataSize: 10})
+		require.NoError(t, err)
+		c.currentSize++
+
+		// Act & Assert
+		assert.Panics(t, func() {
+			c.checkInvariants()
+		})
 	})
 }
 
 func TestMapCache_EraseEntriesWithGivenPrefix_EmptyPrefixFastPath(t *testing.T) {
+	// Arrange
 	c := NewMapCache(1000, WithInvariantChecking(true)).(*mapCache)
-
 	for i := 0; i < 20; i++ {
 		key := fmt.Sprintf("entry_%d", i)
 		_, err := c.Insert(key, testData{value: int64(i), dataSize: 10})
-		if err != nil {
-			t.Fatalf("Insert failed: %v", err)
-		}
+		require.NoError(t, err)
 	}
-	if c.currentSize != 200 {
-		t.Fatalf("expected currentSize 200, got %d", c.currentSize)
-	}
+	require.Equal(t, uint64(200), c.currentSize)
 
+	// Act
 	c.EraseEntriesWithGivenPrefix("")
 
-	if c.currentSize != 0 {
-		t.Errorf("expected currentSize 0 after empty prefix erase, got %d", c.currentSize)
-	}
-	if c.entries.Len() != 0 {
-		t.Errorf("expected entries.Len() 0, got %d", c.entries.Len())
-	}
-	if len(c.index) != 0 {
-		t.Errorf("expected len(index) 0, got %d", len(c.index))
-	}
+	// Assert
+	assert.Equal(t, uint64(0), c.currentSize)
+	assert.Equal(t, 0, c.entries.Len())
+	assert.Empty(t, c.index)
 
-	// Erasing empty prefix on an already empty cache must be a safe no-op.
+	// Act & Assert: Erasing empty prefix on an already empty cache must be a safe no-op.
 	c.EraseEntriesWithGivenPrefix("")
-	if c.currentSize != 0 || c.entries.Len() != 0 || len(c.index) != 0 {
-		t.Errorf("expected empty cache state after erasing empty cache")
+	assert.Equal(t, uint64(0), c.currentSize)
+	assert.Equal(t, 0, c.entries.Len())
+	assert.Empty(t, c.index)
+}
+
+func TestMapCache_Compact(t *testing.T) {
+	// Arrange
+	c := NewMapCache(1000, WithInvariantChecking(true)).(*mapCache)
+	for i := 0; i < 20; i++ {
+		_, err := c.Insert(fmt.Sprintf("entry_%d", i), testData{value: int64(i), dataSize: 10})
+		require.NoError(t, err)
 	}
+	require.False(t, c.dirtyIndex)
+
+	// Act & Assert 1: Clean Compact is a zero-allocation no-op (F07)
+	allocs := testing.AllocsPerRun(20, func() {
+		c.Compact()
+	})
+	assert.InDelta(t, 0.0, allocs, 1e-9)
+
+	// Arrange 2: Delete half the entries to mark dirtyIndex
+	for i := 0; i < 10; i++ {
+		erased := c.Erase(fmt.Sprintf("entry_%d", i))
+		require.NotNil(t, erased)
+	}
+	require.True(t, c.dirtyIndex)
+
+	// Act 2: Compact dirty index
+	c.Compact()
+
+	// Assert 2
+	assert.False(t, c.dirtyIndex)
+	assert.Equal(t, uint64(100), c.currentSize)
+	assert.Equal(t, 10, c.entries.Len())
+	assert.Len(t, c.index, 10)
+	for i := 10; i < 20; i++ {
+		assert.Equal(t, testData{value: int64(i), dataSize: 10}, c.LookUp(fmt.Sprintf("entry_%d", i)))
+	}
+}
+
+func TestMapCache_EvaluateMemoryPressure(t *testing.T) {
+	// Arrange
+	currentPressure := 0.10
+	c := NewMapCache(
+		100,
+		WithInvariantChecking(true),
+		WithPressureFunc(func() float64 { return currentPressure }),
+		WithCompactionThreshold(0.75),
+		WithEvictionThreshold(0.90),
+		WithEvictionRetentionRatio(0.50),
+	).(*mapCache)
+
+	for i := 0; i < 10; i++ {
+		_, err := c.Insert(fmt.Sprintf("k%d", i), testData{value: int64(i), dataSize: 10})
+		require.NoError(t, err)
+	}
+	_ = c.Erase("k0")
+	_ = c.Erase("k1")
+	require.True(t, c.dirtyIndex)
+	require.Equal(t, uint64(80), c.currentSize)
+
+	// Act & Assert 1: Below CompactionThreshold (0.50 < 0.75) does nothing
+	currentPressure = 0.50
+	evicted := c.EvaluateMemoryPressure()
+	assert.Empty(t, evicted)
+	assert.True(t, c.dirtyIndex)
+	assert.Equal(t, uint64(80), c.currentSize)
+
+	// Act & Assert 2: Tier 1 CompactionThreshold (0.80 in [0.75, 0.90)) compacts without evicting
+	currentPressure = 0.80
+	evicted = c.EvaluateMemoryPressure()
+	assert.Empty(t, evicted)
+	assert.False(t, c.dirtyIndex)
+	assert.Equal(t, uint64(80), c.currentSize)
+
+	// Act & Assert 3: Tier 2 EvictionThreshold (0.95 >= 0.90) sheds down to targetSize = 50 and compacts
+	currentPressure = 0.95
+	evicted = c.EvaluateMemoryPressure()
+	assertEvictedValues(t, evicted, []int64{2, 3, 4})
+	assert.False(t, c.dirtyIndex)
+	assert.Equal(t, uint64(50), c.currentSize)
+
+	// Act & Assert 4: Repeated EvaluateMemoryPressure when clean and at targetSize is a no-op (F07)
+	epochBefore := c.reclaimEpoch.Load()
+	evicted = c.EvaluateMemoryPressure()
+	assert.Empty(t, evicted)
+	assert.False(t, c.dirtyIndex)
+	assert.Equal(t, epochBefore, c.reclaimEpoch.Load())
 }

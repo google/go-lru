@@ -1,3 +1,32 @@
+# Compiled test binaries and build outputs
 *.test
 *.out
+*.exe
+*.dll
+*.so
+*.dylib
+
+# Coverage and profiling artifacts
+coverage.txt
+coverage.html
+*.prof
+*.pprof
+benchmark-*.txt
+benchstat-*.txt
+bench*.txt
+
+# Agent workspaces and review/sentinel artifacts
 .agents/
+BRIEFING.md
+BRIEFING_ARCHIVE.md
+ORIGINAL_REQUEST.md
+REVIEW_REPORT.md
+handoff.md
+
+# Editor and OS scratch files
+.DS_Store
+.idea/
+.vscode/
+*.swp
+*.swo
+*~

@@ -12,10 +12,11 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-package lrus
+package lru
 
 import (
 	"math"
+	"runtime"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -51,20 +52,80 @@ type arenaRadix struct {
 	freeHead  uint32
 	freeCount uint32
 
-	nodeMap map[uint64]uint32
+	nodeMap            map[uint64]uint32
+	expectedNodeMapLen int
+	nodeMapDirty       bool
 
 	root uint32
 
 	head uint32
 	tail uint32
 
-	len int
+	len                    int
+	zeroSizeCount          int
+	lastReclaimedZeroCount int
 
-	samplingPressure     atomic.Bool
-	pressureNeedsRefresh atomic.Bool
-	pressureSampleSeq    atomic.Uint64
-	cachedPressureBits   atomic.Uint64
-	reclaimEpoch         atomic.Uint64
+	pressureWriteMu         sync.Mutex
+	samplingPressure        atomic.Bool
+	fallbackSampling        atomic.Bool
+	pressureInitialized     atomic.Bool
+	lastSampledInitialized  atomic.Bool
+	pressureNeedsRefresh    atomic.Bool
+	overflowSamplingCount   atomic.Int32
+	samplingGID             atomic.Uint64
+	fallbackGID             atomic.Uint64
+	overflowSamplingGIDs    sync.Map
+	pressureSampleSeq       atomic.Uint64
+	cachedPressureBits      atomic.Uint64
+	cachedPressureEpoch     atomic.Uint64
+	lastSampledPressureBits atomic.Uint64
+	lastSampledEpoch        atomic.Uint64
+	reclaimEpoch            atomic.Uint64
+}
+
+var goroutineIDBufPool = sync.Pool{
+	New: func() any {
+		return new([64]byte)
+	},
+}
+
+func currentGoroutineID() uint64 {
+	bufPtr := goroutineIDBufPool.Get().(*[64]byte)
+	n := runtime.Stack(bufPtr[:], false)
+	const prefix = "goroutine "
+	var id uint64
+	if n > len(prefix) {
+		for i := len(prefix); i < n; i++ {
+			b := bufPtr[i]
+			if b < '0' || b > '9' {
+				break
+			}
+			id = id*10 + uint64(b-'0')
+		}
+	}
+	goroutineIDBufPool.Put(bufPtr)
+	return id
+}
+
+var byteStrings [256]string
+
+func init() {
+	for i := range 256 {
+		byteStrings[i] = string(byte(i))
+	}
+}
+
+// clonePrefix returns an independent copy of s that never shares s's underlying backing array,
+// using preallocated 1-byte strings for single-character prefixes to avoid heap allocations.
+func clonePrefix(s string) string {
+	switch len(s) {
+	case 0:
+		return ""
+	case 1:
+		return byteStrings[s[0]]
+	default:
+		return strings.Clone(s)
+	}
 }
 
 // FNV-1a 64-bit hashing constants.
@@ -75,7 +136,11 @@ const (
 
 // hashString computes the 64-bit FNV-1a hash of string s.
 func hashString(s string) uint64 {
-	h := offset64
+	return hashStringCont(offset64, s)
+}
+
+// hashStringCont continues a 64-bit FNV-1a hash calculation from h over string s.
+func hashStringCont(h uint64, s string) uint64 {
 	for i := 0; i < len(s); i++ {
 		h ^= uint64(s[i])
 		h *= prime64
@@ -84,7 +149,8 @@ func hashString(s string) uint64 {
 }
 
 // hashNodeKey computes the 64-bit FNV-1a hash of the full key for nodeID
-// by walking the ancestor chain with a stack-allocated buffer (0 heap allocations).
+// by walking the ancestor chain. Uses a 64-level stack buffer for common depths
+// and seamlessly handles arbitrary depths > 64.
 func (c *arenaRadix) hashNodeKey(nodeID uint32) uint64 {
 	var stackBuf [64]uint32
 	path := stackBuf[:0]
@@ -93,11 +159,7 @@ func (c *arenaRadix) hashNodeKey(nodeID uint32) uint64 {
 	}
 	h := offset64
 	for i := len(path) - 1; i >= 0; i-- {
-		prefix := c.nodes[path[i]].prefix
-		for j := 0; j < len(prefix); j++ {
-			h ^= uint64(prefix[j])
-			h *= prime64
-		}
+		h = hashStringCont(h, c.nodes[path[i]].prefix)
 	}
 	return h
 }
@@ -127,7 +189,7 @@ func (c *arenaRadix) allocateNode() uint32 {
 		return id
 	}
 	id := uint32(len(c.nodes))
-	if id >= nilNode {
+	if id >= foregroundNoProtect {
 		panic("arena radix capacity exceeded limit")
 	}
 	c.nodes = append(c.nodes, arenaRadixNode{
@@ -203,6 +265,7 @@ func (c *arenaRadix) replaceChild(nID uint32, oldChildID uint32, newChildID uint
 		if *pcurr != oldChildID {
 			continue
 		}
+		c.nodes[newChildID].parent = nID
 		c.nodes[newChildID].sibling = c.nodes[oldChildID].sibling
 		*pcurr = newChildID
 		c.nodes[oldChildID].sibling = nilNode
@@ -231,7 +294,7 @@ func (c *arenaRadix) insertNode(key string, value ValueType) (uint32, ValueType)
 		childID := c.getChild(nodeID, search[0])
 		if childID == nilNode {
 			newLeafID := c.allocateNode()
-			c.nodes[newLeafID].prefix = strings.Clone(search)
+			c.nodes[newLeafID].prefix = clonePrefix(search)
 			c.nodes[newLeafID].value = value
 			c.addChild(nodeID, newLeafID)
 			return newLeafID, nil
@@ -245,13 +308,16 @@ func (c *arenaRadix) insertNode(key string, value ValueType) (uint32, ValueType)
 			continue
 		}
 
+		// Clone both split prefix halves so surviving intermediate routing nodes never pin
+		// the underlying backing arrays of large evicted leaf keys.
+		oldPrefix := c.nodes[childID].prefix
 		splitNodeID := c.allocateNode()
-		c.nodes[splitNodeID].prefix = strings.Clone(c.nodes[childID].prefix[:lcp])
+		c.nodes[splitNodeID].prefix = clonePrefix(oldPrefix[:lcp])
 		c.nodes[splitNodeID].parent = nodeID
 
 		c.replaceChild(nodeID, childID, splitNodeID)
 
-		c.nodes[childID].prefix = strings.Clone(c.nodes[childID].prefix[lcp:])
+		c.nodes[childID].prefix = clonePrefix(oldPrefix[lcp:])
 		c.addChild(splitNodeID, childID)
 
 		if lcp == len(search) {
@@ -261,7 +327,7 @@ func (c *arenaRadix) insertNode(key string, value ValueType) (uint32, ValueType)
 		}
 
 		newLeafID := c.allocateNode()
-		c.nodes[newLeafID].prefix = strings.Clone(search[lcp:])
+		c.nodes[newLeafID].prefix = clonePrefix(search[lcp:])
 		c.nodes[newLeafID].value = value
 		c.addChild(splitNodeID, newLeafID)
 		return newLeafID, nil
@@ -291,13 +357,22 @@ func (c *arenaRadix) verifyKey(nodeID uint32, key string) bool {
 }
 
 // getNodeKey finds a value-bearing node index for key using O(1) FNV-1a hash lookup with zero-alloc verification,
-// falling back to top-down trie traversal.
+// falling back to top-down trie traversal only when a hash collision or dirty nodeMap state exists.
 func (c *arenaRadix) getNodeKey(key string) (uint32, bool) {
-	nodeID, ok := c.nodeMap[hashString(key)]
-	if ok && c.nodes[nodeID].value != nil {
-		if c.verifyKey(nodeID, key) {
+	return c.getNodeKeyWithHash(key, hashString(key))
+}
+
+func (c *arenaRadix) getNodeKeyWithHash(key string, keyHash uint64) (uint32, bool) {
+	nodeID, ok := c.nodeMap[keyHash]
+	if ok {
+		if nodeID < uint32(len(c.nodes)) && c.nodes[nodeID].value != nil && c.verifyKey(nodeID, key) {
 			return nodeID, true
 		}
+	} else if len(c.nodeMap) == c.len {
+		// By Invariant 6 and the Pigeonhole Principle, when len(c.nodeMap) == c.len,
+		// there is an exact 1:1 bijection between c.nodeMap and all live value-bearing nodes,
+		// so a map miss is a guaranteed cache miss.
+		return nilNode, false
 	}
 
 	curr := c.root
@@ -441,16 +516,28 @@ func (c *arenaRadix) evictOne() ValueType {
 	return c.eraseInternal(nodeID)
 }
 
+const foregroundNoProtect uint32 = nilNode - 1
+
 // eraseInternal handles unlinking from LRU, cleaning up nodeMap, and deleting from the tree.
 func (c *arenaRadix) eraseInternal(nodeID uint32) ValueType {
 	deletedEntry := c.nodes[nodeID].value
+	if deletedEntry != nil && c.nodes[nodeID].size == 0 && c.zeroSizeCount > 0 {
+		c.zeroSizeCount--
+		if c.zeroSizeCount < c.lastReclaimedZeroCount {
+			c.lastReclaimedZeroCount = c.zeroSizeCount
+		}
+	}
 	c.currentSize -= c.nodes[nodeID].size
 	c.nodes[nodeID].size = 0
 
 	// Prevent hash collision cross-deletions with 0 heap string allocations.
 	hash := c.hashNodeKey(nodeID)
-	if c.nodeMap[hash] == nodeID {
+	if mappedID, ok := c.nodeMap[hash]; ok && mappedID == nodeID {
 		delete(c.nodeMap, hash)
+		c.nodeMapDirty = true
+		if c.expectedNodeMapLen > 0 {
+			c.expectedNodeMapLen--
+		}
 	}
 
 	c.remove(nodeID)
@@ -459,22 +546,201 @@ func (c *arenaRadix) eraseInternal(nodeID uint32) ValueType {
 	return deletedEntry
 }
 
-// samplePressureFresh reads normalized memory pressure lock-free outside c.mu.Lock()
-// with an atomic re-entrancy guard that prevents infinite mutual recursion if a
-// custom PressureFunc calls back into cache methods, while returning the latest
-// cached pressure reading to concurrent goroutines instead of a false 0.0.
-func (c *arenaRadix) samplePressureFresh() float64 {
-	if !c.samplingPressure.CompareAndSwap(false, true) {
-		return math.Float64frombits(c.cachedPressureBits.Load())
+func (c *arenaRadix) hasOverflowSamplingGID(gid uint64) bool {
+	if gid == 0 || c.overflowSamplingCount.Load() <= 0 {
+		return false
 	}
-	defer c.samplingPressure.Store(false)
+	_, ok := c.overflowSamplingGIDs.Load(gid)
+	return ok
+}
 
+func (c *arenaRadix) isCurrentGoroutineSampling(gid uint64) bool {
+	if gid == 0 {
+		return false
+	}
+	return c.samplingGID.Load() == gid ||
+		c.fallbackGID.Load() == gid ||
+		c.hasOverflowSamplingGID(gid)
+}
+
+func (c *arenaRadix) isSamplingGoroutine() bool {
+	if !c.options.hasCustomPressureFunc {
+		return false
+	}
+	sGID := c.samplingGID.Load()
+	fGID := c.fallbackGID.Load()
+	oCount := c.overflowSamplingCount.Load()
+	if sGID == 0 && fGID == 0 && oCount <= 0 {
+		return false
+	}
+	return c.isCurrentGoroutineSampling(currentGoroutineID())
+}
+
+// markReclaimedLocked invalidates cached pre-reclamation pressure and increments reclaimEpoch.
+// Caller MUST hold c.mu.Lock().
+func (c *arenaRadix) markReclaimedLocked() {
+	c.pressureWriteMu.Lock()
+	defer c.pressureWriteMu.Unlock()
+	if !c.isSamplingGoroutine() {
+		c.reclaimEpoch.Add(1)
+	}
+	c.pressureNeedsRefresh.Store(true)
+	c.pressureInitialized.Store(false)
+	c.lastSampledInitialized.Store(false)
+	c.cachedPressureBits.Store(0)
+	c.lastSampledPressureBits.Store(0)
+}
+
+func (c *arenaRadix) hasElevatedPressureToInvalidate(pressure float64) bool {
+	thresh := c.options.CompactionThreshold
+	return pressure >= thresh ||
+		math.Float64frombits(c.cachedPressureBits.Load()) >= thresh ||
+		math.Float64frombits(c.lastSampledPressureBits.Load()) >= thresh ||
+		c.pressureNeedsRefresh.Load() ||
+		c.samplingPressure.Load() ||
+		c.fallbackSampling.Load() ||
+		c.overflowSamplingCount.Load() > 0
+}
+
+// resetEmptyArenaLocked releases peak arena slice and hash-map allocations when the cache transitions to empty.
+// Caller MUST hold c.mu.Lock().
+func (c *arenaRadix) resetEmptyArenaLocked() {
+	c.nodes = nil
+	c.freeHead = nilNode
+	c.freeCount = 0
+	c.root = c.allocateNode()
+	c.head = nilNode
+	c.tail = nilNode
+	c.currentSize = 0
+	c.len = 0
+	c.zeroSizeCount = 0
+	c.lastReclaimedZeroCount = 0
+	c.nodeMap = make(map[uint64]uint32)
+	c.expectedNodeMapLen = 0
+	c.nodeMapDirty = false
+	c.markReclaimedLocked()
+}
+
+func (c *arenaRadix) storeSampledPressure(epoch uint64, p float64) {
+	c.pressureWriteMu.Lock()
+	defer c.pressureWriteMu.Unlock()
+	if c.reclaimEpoch.Load() == epoch {
+		bits := math.Float64bits(p)
+		c.pressureInitialized.Store(false)
+		c.lastSampledInitialized.Store(false)
+		c.lastSampledEpoch.Store(epoch)
+		c.lastSampledPressureBits.Store(bits)
+		c.lastSampledInitialized.Store(true)
+		c.cachedPressureEpoch.Store(epoch)
+		c.cachedPressureBits.Store(bits)
+		c.pressureInitialized.Store(true)
+		c.pressureNeedsRefresh.Store(false)
+	} else {
+		c.pressureNeedsRefresh.Store(true)
+	}
+}
+
+// samplePressureFresh reads normalized memory pressure lock-free outside c.mu.Lock()
+// with a goroutine-aware re-entrancy guard that prevents infinite mutual recursion if a
+// custom PressureFunc calls back into cache methods, while returning accurate pressure
+// readings to concurrent goroutines without fabricating false critical pressure.
+func (c *arenaRadix) samplePressureFresh() float64 {
+	if c.options.PressureFunc == nil {
+		return 0.0
+	}
+	if c.isSamplingGoroutine() {
+		return 0.0
+	}
+	if !c.samplingPressure.CompareAndSwap(false, true) {
+		var gid uint64
+		if c.options.hasCustomPressureFunc {
+			gid = currentGoroutineID()
+			if c.isCurrentGoroutineSampling(gid) {
+				return 0.0
+			}
+		}
+		if epoch := c.reclaimEpoch.Load(); c.pressureInitialized.Load() && c.cachedPressureEpoch.Load() == epoch {
+			bits := c.cachedPressureBits.Load()
+			if c.pressureInitialized.Load() && c.cachedPressureEpoch.Load() == epoch && c.reclaimEpoch.Load() == epoch {
+				return math.Float64frombits(bits)
+			}
+		}
+		if epoch := c.reclaimEpoch.Load(); c.lastSampledInitialized.Load() && c.lastSampledEpoch.Load() == epoch {
+			bits := c.lastSampledPressureBits.Load()
+			if c.lastSampledInitialized.Load() && c.lastSampledEpoch.Load() == epoch && c.reclaimEpoch.Load() == epoch {
+				return math.Float64frombits(bits)
+			}
+		}
+		for range 100 {
+			epoch := c.reclaimEpoch.Load()
+			if !c.samplingPressure.Load() ||
+				(c.pressureInitialized.Load() && c.cachedPressureEpoch.Load() == epoch) ||
+				(c.lastSampledInitialized.Load() && c.lastSampledEpoch.Load() == epoch) {
+				break
+			}
+			runtime.Gosched()
+		}
+		if epoch := c.reclaimEpoch.Load(); c.pressureInitialized.Load() && c.cachedPressureEpoch.Load() == epoch {
+			bits := c.cachedPressureBits.Load()
+			if c.pressureInitialized.Load() && c.cachedPressureEpoch.Load() == epoch && c.reclaimEpoch.Load() == epoch {
+				return math.Float64frombits(bits)
+			}
+		}
+		if epoch := c.reclaimEpoch.Load(); c.lastSampledInitialized.Load() && c.lastSampledEpoch.Load() == epoch {
+			bits := c.lastSampledPressureBits.Load()
+			if c.lastSampledInitialized.Load() && c.lastSampledEpoch.Load() == epoch && c.reclaimEpoch.Load() == epoch {
+				return math.Float64frombits(bits)
+			}
+		}
+		if c.options.hasCustomPressureFunc && c.isCurrentGoroutineSampling(gid) {
+			return 0.0
+		}
+		if c.fallbackSampling.CompareAndSwap(false, true) {
+			if c.options.hasCustomPressureFunc {
+				c.fallbackGID.Store(gid)
+				defer func() {
+					c.fallbackGID.Store(0)
+					c.fallbackSampling.Store(false)
+				}()
+			} else {
+				defer c.fallbackSampling.Store(false)
+			}
+		} else {
+			if c.options.hasCustomPressureFunc {
+				c.overflowSamplingGIDs.Store(gid, struct{}{})
+			}
+			c.overflowSamplingCount.Add(1)
+			defer func() {
+				if c.options.hasCustomPressureFunc {
+					c.overflowSamplingGIDs.Delete(gid)
+				}
+				c.overflowSamplingCount.Add(-1)
+			}()
+		}
+		epoch := c.reclaimEpoch.Load()
+		p := c.options.PressureFunc()
+		if math.IsNaN(p) || p < 0.0 {
+			p = 0.0
+		}
+		c.storeSampledPressure(epoch, p)
+		return p
+	}
+	if c.options.hasCustomPressureFunc {
+		c.samplingGID.Store(currentGoroutineID())
+		defer func() {
+			c.samplingGID.Store(0)
+			c.samplingPressure.Store(false)
+		}()
+	} else {
+		defer c.samplingPressure.Store(false)
+	}
+
+	epoch := c.reclaimEpoch.Load()
 	p := c.options.PressureFunc()
 	if math.IsNaN(p) || p < 0.0 {
 		p = 0.0
 	}
-	c.cachedPressureBits.Store(math.Float64bits(p))
-	c.pressureNeedsRefresh.Store(false)
+	c.storeSampledPressure(epoch, p)
 	return p
 }
 
@@ -486,11 +752,16 @@ func (c *arenaRadix) samplePressure() float64 {
 	if c.options.hasCustomPressureFunc {
 		return c.samplePressureFresh()
 	}
+	epoch := c.reclaimEpoch.Load()
 	seq := c.pressureSampleSeq.Add(1)
-	if (seq&255) == 1 || c.pressureNeedsRefresh.CompareAndSwap(true, false) {
+	if (seq&255) == 1 || !c.pressureInitialized.Load() || c.pressureNeedsRefresh.Load() || c.cachedPressureEpoch.Load() != epoch {
 		return c.samplePressureFresh()
 	}
-	return math.Float64frombits(c.cachedPressureBits.Load())
+	bits := c.cachedPressureBits.Load()
+	if !c.pressureInitialized.Load() || c.pressureNeedsRefresh.Load() || c.cachedPressureEpoch.Load() != epoch || c.reclaimEpoch.Load() != epoch {
+		return c.samplePressureFresh()
+	}
+	return math.Float64frombits(bits)
 }
 
 // computeTargetSize safely computes uint64(float64(maxSize) * retention) without
@@ -503,8 +774,8 @@ func computeTargetSize(maxSize uint64, retention float64) uint64 {
 		return maxSize
 	}
 	f := float64(maxSize) * retention
-	if f >= float64(math.MaxUint64) {
-		return math.MaxUint64
+	if f >= float64(maxSize) || f >= float64(math.MaxUint64) {
+		return maxSize
 	}
 	target := uint64(f)
 	if target == 0 && maxSize > 0 {
@@ -516,10 +787,11 @@ func computeTargetSize(maxSize uint64, retention float64) uint64 {
 // shouldAutoCompactLocked determines whether an automatic compaction should run.
 // Explicit EvaluateMemoryPressure calls (protectedNodeID == nilNode) compact whenever any
 // free slots, slice slack, or unhealed hash-collision slots exist. Inline foreground mutations
-// require at least 25% of arena slots to be on the free-list so O(N) compaction is amortized to O(1) per write.
+// (protectedNodeID != nilNode) only count recycled free-list fragmentation (>= 25% of len(c.nodes))
+// so Go's geometric slice growth capacity slack never triggers O(N^2) compaction thrashing.
 func (c *arenaRadix) shouldAutoCompactLocked(protectedNodeID uint32) bool {
 	if protectedNodeID == nilNode {
-		return c.freeHead != nilNode || len(c.nodes) < cap(c.nodes) || len(c.nodeMap) < c.len
+		return c.freeHead != nilNode || len(c.nodes) < cap(c.nodes) || c.nodeMapDirty || len(c.nodeMap) < c.expectedNodeMapLen
 	}
 	return c.freeHead != nilNode && uint64(c.freeCount)*4 >= uint64(len(c.nodes))
 }
@@ -532,7 +804,7 @@ func (c *arenaRadix) shouldAutoCompactLocked(protectedNodeID uint32) bool {
 func (c *arenaRadix) compactLocked() {
 	// Fast-path: when no nodes are on the free-list, node indices are already contiguous [0..len-1].
 	if c.freeHead == nilNode {
-		if len(c.nodes) == cap(c.nodes) && len(c.nodeMap) >= c.len {
+		if len(c.nodes) == cap(c.nodes) && !c.nodeMapDirty && len(c.nodeMap) >= c.expectedNodeMapLen {
 			return
 		}
 		if len(c.nodes) < cap(c.nodes) {
@@ -540,7 +812,7 @@ func (c *arenaRadix) compactLocked() {
 			copy(newNodes, c.nodes)
 			c.nodes = newNodes
 		}
-		if len(c.nodeMap) < c.len {
+		if c.nodeMapDirty || len(c.nodeMap) < c.expectedNodeMapLen {
 			newNodeMap := make(map[uint64]uint32, c.len)
 			for id := uint32(0); id < uint32(len(c.nodes)); id++ {
 				if c.nodes[id].value != nil {
@@ -548,9 +820,10 @@ func (c *arenaRadix) compactLocked() {
 				}
 			}
 			c.nodeMap = newNodeMap
+			c.expectedNodeMapLen = len(newNodeMap)
+			c.nodeMapDirty = false
 		}
-		c.pressureNeedsRefresh.Store(true)
-		c.reclaimEpoch.Add(1)
+		c.markReclaimedLocked()
 		return
 	}
 
@@ -607,88 +880,148 @@ func (c *arenaRadix) compactLocked() {
 	c.freeCount = 0
 	c.nodes = newNodes
 	c.nodeMap = newNodeMap
-	c.pressureNeedsRefresh.Store(true)
-	c.reclaimEpoch.Add(1)
+	c.expectedNodeMapLen = len(newNodeMap)
+	c.nodeMapDirty = false
+	c.markReclaimedLocked()
 }
 
-// shedAndCompactLocked evicts least-recently-used entries strictly from c.tail until
-// c.currentSize <= targetSize (or until the cache is completely empty when retention == 0.0),
-// always protecting protectedNodeID (the newly inserted/updated entry during foreground writes),
+// shedAndCompactLocked evicts least-recently-used entries strictly from c.tail in a single O(N) pass
+// until c.currentSize <= targetSize (and proportionally sheds zero-size entries down to targetZeroCount),
+// protecting protectedNodeID only when it resides at the MRU head (c.head),
 // then performs lossless arena and map compaction if fragmentation warrants it.
 // Caller MUST hold c.mu.Lock().
 func (c *arenaRadix) shedAndCompactLocked(targetSize uint64, retention float64, protectedNodeID uint32) []ValueType {
+	autoCompactID := protectedNodeID
+	if protectedNodeID == foregroundNoProtect || (protectedNodeID != nilNode && (protectedNodeID != c.head || c.nodes[protectedNodeID].prev != nilNode)) {
+		protectedNodeID = nilNode
+	}
+
 	effectiveTarget := targetSize
 	if protectedNodeID != nilNode && retention > 0.0 && c.nodes[protectedNodeID].size > effectiveTarget {
-		if math.MaxUint64-c.nodes[protectedNodeID].size >= targetSize && c.nodes[protectedNodeID].size+targetSize <= c.maxSize {
-			effectiveTarget = c.nodes[protectedNodeID].size + targetSize
-		} else {
-			effectiveTarget = c.nodes[protectedNodeID].size
-		}
+		effectiveTarget = c.nodes[protectedNodeID].size
 	}
 
 	targetLen := 0
-	if c.currentSize == 0 && c.len > 0 && retention > 0.0 {
-		targetLen = int(float64(c.len) * retention)
-		if protectedNodeID != nilNode && targetLen < 1 {
-			targetLen = 1
+	targetZeroCount := 0
+	if retention > 0.0 {
+		if c.len > 0 {
+			targetLen = int(float64(c.len) * retention)
+			if protectedNodeID != nilNode && targetLen < 1 {
+				targetLen = 1
+			}
+		}
+		if c.zeroSizeCount > 0 {
+			targetZeroCount = int(float64(c.zeroSizeCount) * retention)
+			if protectedNodeID != nilNode && c.nodes[protectedNodeID].size == 0 && targetZeroCount < 1 {
+				targetZeroCount = 1
+			}
+			if c.lastReclaimedZeroCount > targetZeroCount {
+				targetZeroCount = c.lastReclaimedZeroCount
+			}
 		}
 	}
 
+	needFullFlush := retention == 0.0
 	var evicted []ValueType
-	for c.tail != nilNode {
-		needByteShed := c.currentSize > effectiveTarget
-		needZeroSizeShed := c.currentSize == 0 && c.len > targetLen
-		needFullFlush := retention == 0.0
-		if !needByteShed && !needZeroSizeShed && !needFullFlush {
+	victimID := c.tail
+	for victimID != nilNode {
+		needByteShed := c.currentSize > effectiveTarget || needFullFlush
+		needZeroShed := !needFullFlush && c.zeroSizeCount > targetZeroCount && c.len > targetLen
+		if !needByteShed && !needZeroShed {
 			break
 		}
-		if protectedNodeID != nilNode && c.tail == protectedNodeID {
+		switch {
+		case needFullFlush || (needByteShed && needZeroShed):
+			for victimID != nilNode && victimID == protectedNodeID {
+				victimID = c.nodes[victimID].prev
+			}
+		case needByteShed:
+			for victimID != nilNode && (victimID == protectedNodeID || c.nodes[victimID].size == 0) {
+				victimID = c.nodes[victimID].prev
+			}
+		default:
+			for victimID != nilNode && (victimID == protectedNodeID || c.nodes[victimID].size > 0) {
+				victimID = c.nodes[victimID].prev
+			}
+		}
+		if victimID == nilNode {
 			break
 		}
-		if val := c.evictOne(); val != nil {
+		nextVictimID := c.nodes[victimID].prev
+		if val := c.eraseInternal(victimID); val != nil {
 			evicted = append(evicted, val)
 		}
+		victimID = nextVictimID
 	}
 
-	c.pressureNeedsRefresh.Store(true)
-	c.reclaimEpoch.Add(1)
-	if c.shouldAutoCompactLocked(protectedNodeID) {
+	if c.len == 0 {
+		c.resetEmptyArenaLocked()
+		return evicted
+	}
+
+	if retention > 0.0 && c.zeroSizeCount > 0 {
+		c.lastReclaimedZeroCount = c.zeroSizeCount
+	} else {
+		c.lastReclaimedZeroCount = 0
+	}
+
+	c.markReclaimedLocked()
+	if c.shouldAutoCompactLocked(autoCompactID) {
 		c.compactLocked()
 	}
 	return evicted
 }
 
-// maybeCompactUnderPressureLocked executes lossless Tier 1 arena/map compaction
-// when pressure >= CompactionThreshold and freed slots exceed the fragmentation threshold.
-// Caller MUST hold c.mu.Lock().
-func (c *arenaRadix) maybeCompactUnderPressureLocked(pressure float64) {
-	if pressure >= c.options.CompactionThreshold && c.shouldAutoCompactLocked(c.root) {
-		c.compactLocked()
-	}
-}
-
 // maybeReclaimUnderPressureLocked evaluates the sampled pressure against configured thresholds:
 //   - If pressure >= EvictionThreshold (Tier 2 Critical Pressure): evict from LRU tail down to
-//     c.maxSize * EvictionRetentionRatio (always preserving protectedNodeID), then compact if needed.
+//     c.maxSize * EvictionRetentionRatio (preserving protectedNodeID if at MRU head), then compact if needed.
 //   - Else if pressure >= CompactionThreshold (Tier 1 Moderate Pressure): perform lossless arena and map compaction.
 //
 // Caller MUST hold c.mu.Lock().
 func (c *arenaRadix) maybeReclaimUnderPressureLocked(pressure float64, protectedNodeID uint32) []ValueType {
+	autoCompactID := protectedNodeID
+	shedProtectedID := protectedNodeID
+	if shedProtectedID == foregroundNoProtect || (shedProtectedID != nilNode && (shedProtectedID != c.head || c.nodes[shedProtectedID].prev != nilNode || c.nodes[shedProtectedID].value == nil)) {
+		shedProtectedID = nilNode
+	}
+	epochBefore := c.reclaimEpoch.Load()
+	var evicted []ValueType
 	if pressure >= c.options.EvictionThreshold {
 		retention := c.options.EvictionRetentionRatio
 		targetSize := computeTargetSize(c.maxSize, retention)
-		if c.currentSize > targetSize || (c.currentSize == 0 && c.len > 0) || (retention == 0.0 && c.tail != nilNode) {
-			return c.shedAndCompactLocked(targetSize, retention, protectedNodeID)
+		targetLen := int(float64(c.len) * retention)
+		if shedProtectedID != nilNode && retention > 0.0 && targetLen < 1 {
+			targetLen = 1
 		}
-		if c.shouldAutoCompactLocked(protectedNodeID) {
+		targetZeroCount := int(float64(c.zeroSizeCount) * retention)
+		if shedProtectedID != nilNode && retention > 0.0 && c.nodes[shedProtectedID].size == 0 && targetZeroCount < 1 {
+			targetZeroCount = 1
+		}
+		if retention > 0.0 && c.lastReclaimedZeroCount > targetZeroCount {
+			targetZeroCount = c.lastReclaimedZeroCount
+		}
+		if c.currentSize > targetSize || (c.zeroSizeCount > targetZeroCount && c.len > targetLen) || (retention == 0.0 && c.tail != nilNode) {
+			evicted = c.shedAndCompactLocked(targetSize, retention, autoCompactID)
+		} else if c.shouldAutoCompactLocked(autoCompactID) {
 			c.compactLocked()
 		}
-		return nil
-	}
-	if pressure >= c.options.CompactionThreshold {
-		if c.shouldAutoCompactLocked(protectedNodeID) {
-			c.compactLocked()
+	} else {
+		c.lastReclaimedZeroCount = 0
+		if pressure >= c.options.CompactionThreshold {
+			if c.shouldAutoCompactLocked(autoCompactID) {
+				c.compactLocked()
+			}
 		}
 	}
-	return nil
+	if autoCompactID != nilNode && autoCompactID != foregroundNoProtect && c.reclaimEpoch.Load() == epochBefore {
+		c.pressureWriteMu.Lock()
+		if c.reclaimEpoch.Load() == epochBefore {
+			c.lastSampledInitialized.Store(false)
+			c.lastSampledEpoch.Store(epochBefore)
+			c.lastSampledPressureBits.Store(math.Float64bits(pressure))
+			c.lastSampledInitialized.Store(true)
+		}
+		c.pressureWriteMu.Unlock()
+	}
+	return evicted
 }
