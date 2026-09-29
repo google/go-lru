@@ -12,13 +12,44 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-package lrus
+package lru
 
 import (
 	"math"
 	"runtime/metrics"
 	"sync"
 )
+
+// Backend identifies the underlying cache data structure engine constructed by New.
+type Backend uint8
+
+const (
+	// BackendMap selects the hash-map + doubly-linked list LRU engine (MapCache).
+	// This is the default backend when WithBackend is not specified.
+	BackendMap Backend = iota
+
+	// BackendRadix selects the pointer-based Left-Child Right-Sibling (LCRS) radix tree
+	// LRU engine (RadixCache), optimized for hierarchical keys and fast prefix eviction.
+	BackendRadix
+
+	// BackendArenaRadix selects the contiguous-slice 32-bit index arena-backed radix tree
+	// LRU engine (ArenaRadixCache) with two-tier memory-pressure reclamation.
+	BackendArenaRadix
+)
+
+// String returns the human-readable name of the cache backend.
+func (b Backend) String() string {
+	switch b {
+	case BackendMap:
+		return "MapCache"
+	case BackendRadix:
+		return "RadixCache"
+	case BackendArenaRadix:
+		return "ArenaRadixCache"
+	default:
+		return "UnknownBackend"
+	}
+}
 
 // Default thresholds for two-tier memory-pressure reclamation.
 const (
@@ -40,24 +71,40 @@ const (
 // indicate moderate pressure, and values >= EvictionThreshold indicate critical pressure.
 type PressureFunc func() float64
 
-// metricsSamplePool pools 5-element runtime/metrics sample arrays so DefaultRuntimePressureFunc
-// executes with 0 heap allocations per call (avoiding slice escape to heap in metrics.Read).
-var metricsSamplePool = sync.Pool{
+// gomemlimitSamplePool pools 1-element runtime/metrics sample arrays so DefaultRuntimePressureFunc(0)
+// can check /gc/gomemlimit:bytes without acquiring runtime.metricsLock or sweeping per-P heap stats
+// when GOMEMLIMIT is unbounded.
+var gomemlimitSamplePool = sync.Pool{
 	New: func() any {
-		return &[5]metrics.Sample{
-			{Name: "/memory/classes/total:bytes"},
-			{Name: "/memory/classes/heap/released:bytes"},
-			{Name: "/memory/classes/heap/free:bytes"},
-			{Name: "/memory/classes/heap/objects:bytes"},
+		return &[1]metrics.Sample{
 			{Name: "/gc/gomemlimit:bytes"},
 		}
 	},
 }
 
+// metricsSamplePool pools 4-element runtime/metrics sample arrays so DefaultRuntimePressureFunc
+// executes with 0 heap allocations per call (avoiding slice escape to heap in metrics.Read).
+var metricsSamplePool = sync.Pool{
+	New: func() any {
+		return &[4]metrics.Sample{
+			{Name: "/memory/classes/total:bytes"},
+			{Name: "/memory/classes/heap/released:bytes"},
+			{Name: "/memory/classes/heap/free:bytes"},
+			{Name: "/memory/classes/heap/objects:bytes"},
+		}
+	},
+}
+
 // Options contains configuration parameters for Cache instances.
-// Note: Memory-pressure reclamation options (PressureFunc, MemoryBudget, CompactionThreshold,
-// EvictionThreshold, EvictionRetentionRatio) are used by ArenaRadixCache.
+// Memory-pressure reclamation options (PressureFunc, MemoryBudget, CompactionThreshold,
+// EvictionThreshold, EvictionRetentionRatio) configure both automatic amortized foreground
+// reclamation (on Insert, Erase, UpdateSize, and EraseEntriesWithGivenPrefix) and explicit
+// EvaluateMemoryPressure() / Compact() calls across ArenaRadixCache, MapCache, and RadixCache.
 type Options struct {
+	// Backend selects the underlying cache engine when calling New.
+	// Defaults to BackendMap.
+	Backend Backend
+
 	// EnableInvariantChecking enables internal data structure integrity and invariant validation.
 	// When enabled, cache operations execute comprehensive validation checks (e.g. bidirectional pointer
 	// consistency, tree structure validity, size accounting parity) and panic if corruption is detected.
@@ -82,11 +129,13 @@ type Options struct {
 	// If CompactionThreshold > EvictionThreshold, thresholds are reconciled to preserve ordering.
 	CompactionThreshold          float64
 	hasCustomCompactionThreshold bool
+	customCompactionBits         uint64
 
 	// EvictionThreshold specifies the normalized pressure threshold for Tier 2 LRU shedding + compaction.
 	// Defaults to DefaultEvictionThreshold (0.90) if <= 0, NaN, or Inf.
 	EvictionThreshold          float64
 	hasCustomEvictionThreshold bool
+	customEvictionBits         uint64
 
 	// EvictionRetentionRatio specifies the fraction [0.0, 1.0] of cache maxSize to retain
 	// when Critical Pressure (EvictionThreshold) is reached.
@@ -96,6 +145,14 @@ type Options struct {
 
 // Option is a functional option for configuring a Cache instance.
 type Option func(*Options)
+
+// WithBackend configures the cache engine backend constructed by New.
+// Supported backends: BackendMap (default), BackendRadix, BackendArenaRadix.
+func WithBackend(backend Backend) Option {
+	return func(o *Options) {
+		o.Backend = backend
+	}
+}
 
 // WithInvariantChecking returns an Option that enables or disables internal invariant checking.
 func WithInvariantChecking(enabled bool) Option {
@@ -121,18 +178,34 @@ func WithMemoryBudget(bytes uint64) Option {
 }
 
 // WithCompactionThreshold configures the Moderate Pressure threshold for lossless arena/map compaction.
+// Passing a non-positive, NaN, or infinite value resets CompactionThreshold to DefaultCompactionThreshold.
 func WithCompactionThreshold(threshold float64) Option {
 	return func(o *Options) {
+		if math.IsNaN(threshold) || math.IsInf(threshold, 0) || threshold <= 0 {
+			o.CompactionThreshold = DefaultCompactionThreshold
+			o.hasCustomCompactionThreshold = false
+			o.customCompactionBits = 0
+			return
+		}
 		o.CompactionThreshold = threshold
 		o.hasCustomCompactionThreshold = true
+		o.customCompactionBits = math.Float64bits(threshold)
 	}
 }
 
 // WithEvictionThreshold configures the Critical Pressure threshold for proactive LRU shedding.
+// Passing a non-positive, NaN, or infinite value resets EvictionThreshold to DefaultEvictionThreshold.
 func WithEvictionThreshold(threshold float64) Option {
 	return func(o *Options) {
+		if math.IsNaN(threshold) || math.IsInf(threshold, 0) || threshold <= 0 {
+			o.EvictionThreshold = DefaultEvictionThreshold
+			o.hasCustomEvictionThreshold = false
+			o.customEvictionBits = 0
+			return
+		}
 		o.EvictionThreshold = threshold
 		o.hasCustomEvictionThreshold = true
+		o.customEvictionBits = math.Float64bits(threshold)
 	}
 }
 
@@ -149,23 +222,26 @@ func WithEvictionRetentionRatio(ratio float64) Option {
 // against memoryBudget (if > 0) or /gc/gomemlimit:bytes (if configured < math.MaxInt64).
 func DefaultRuntimePressureFunc(memoryBudget uint64) PressureFunc {
 	return func() float64 {
-		samples := metricsSamplePool.Get().(*[5]metrics.Sample)
+		limitBytes := memoryBudget
+		if limitBytes == 0 {
+			limitSample := gomemlimitSamplePool.Get().(*[1]metrics.Sample)
+			metrics.Read(limitSample[:])
+			gomemlimit := limitSample[0].Value.Uint64()
+			gomemlimitSamplePool.Put(limitSample)
+			if gomemlimit == 0 || gomemlimit >= uint64(math.MaxInt64) {
+				return 0.0
+			}
+			limitBytes = gomemlimit
+		}
+
+		samples := metricsSamplePool.Get().(*[4]metrics.Sample)
 		metrics.Read(samples[:])
 
 		totalBytes := samples[0].Value.Uint64()
 		releasedBytes := samples[1].Value.Uint64()
 		heapFreeBytes := samples[2].Value.Uint64()
 		heapObjectsBytes := samples[3].Value.Uint64()
-		gomemlimit := samples[4].Value.Uint64()
 		metricsSamplePool.Put(samples)
-
-		limitBytes := memoryBudget
-		if limitBytes == 0 {
-			if gomemlimit == 0 || gomemlimit >= uint64(math.MaxInt64) {
-				return 0.0
-			}
-			limitBytes = gomemlimit
-		}
 
 		var usedBytes uint64
 		reclaimedOrFree := releasedBytes + heapFreeBytes
@@ -182,14 +258,25 @@ func DefaultRuntimePressureFunc(memoryBudget uint64) PressureFunc {
 // ApplyOptions parses and applies the provided slice of Option functions onto a default Options configuration.
 func ApplyOptions(opts ...Option) Options {
 	options := Options{
+		Backend:                BackendMap,
 		CompactionThreshold:    DefaultCompactionThreshold,
 		EvictionThreshold:      DefaultEvictionThreshold,
 		EvictionRetentionRatio: DefaultEvictionRetentionRatio,
 	}
+
 	for _, opt := range opts {
 		if opt != nil {
 			opt(&options)
 		}
+	}
+	if options.Backend != BackendMap && options.Backend != BackendRadix && options.Backend != BackendArenaRadix {
+		options.Backend = BackendMap
+	}
+	if options.hasCustomCompactionThreshold && math.Float64bits(options.CompactionThreshold) != options.customCompactionBits {
+		options.hasCustomCompactionThreshold = false
+	}
+	if options.hasCustomEvictionThreshold && math.Float64bits(options.EvictionThreshold) != options.customEvictionBits {
+		options.hasCustomEvictionThreshold = false
 	}
 	if math.IsNaN(options.CompactionThreshold) || math.IsInf(options.CompactionThreshold, 0) || options.CompactionThreshold <= 0 {
 		options.CompactionThreshold = DefaultCompactionThreshold
@@ -199,27 +286,40 @@ func ApplyOptions(opts ...Option) Options {
 		options.EvictionThreshold = DefaultEvictionThreshold
 		options.hasCustomEvictionThreshold = false
 	}
-	if options.CompactionThreshold > options.EvictionThreshold {
-		switch {
-		case options.hasCustomCompactionThreshold && !options.hasCustomEvictionThreshold:
-			// Caller raised CompactionThreshold above default EvictionThreshold; advance EvictionThreshold
+	if options.CompactionThreshold > options.EvictionThreshold ||
+		(options.CompactionThreshold == options.EvictionThreshold && options.hasCustomCompactionThreshold != options.hasCustomEvictionThreshold) {
+		if options.hasCustomCompactionThreshold && !options.hasCustomEvictionThreshold && options.EvictionThreshold == DefaultEvictionThreshold {
+			// Caller raised CompactionThreshold at or above default EvictionThreshold; advance EvictionThreshold
 			// to preserve the Tier 1 compaction window.
-			options.EvictionThreshold = math.Min(1.0, options.CompactionThreshold+(DefaultEvictionThreshold-DefaultCompactionThreshold))
-			if options.EvictionThreshold < options.CompactionThreshold {
-				options.EvictionThreshold = options.CompactionThreshold
+			options.EvictionThreshold = options.CompactionThreshold + (DefaultEvictionThreshold - DefaultCompactionThreshold)
+			if math.IsInf(options.EvictionThreshold, 1) {
+				options.EvictionThreshold = math.MaxFloat64
 			}
-		case !options.hasCustomCompactionThreshold && options.hasCustomEvictionThreshold:
-			// Caller lowered EvictionThreshold below default CompactionThreshold; scale CompactionThreshold
-			// proportionally to preserve the Tier 1 compaction window.
+			if options.EvictionThreshold <= options.CompactionThreshold {
+				if options.CompactionThreshold < math.MaxFloat64 {
+					options.EvictionThreshold = math.Nextafter(options.CompactionThreshold, math.MaxFloat64)
+				} else {
+					options.EvictionThreshold = options.CompactionThreshold
+				}
+			}
+		} else {
+			// Scale CompactionThreshold proportionally below EvictionThreshold to preserve a non-empty Tier 1 window.
 			options.CompactionThreshold = options.EvictionThreshold * (DefaultCompactionThreshold / DefaultEvictionThreshold)
-		default:
-			options.CompactionThreshold = options.EvictionThreshold
+			if options.CompactionThreshold == 0 {
+				options.CompactionThreshold = math.SmallestNonzeroFloat64
+			}
+			if options.CompactionThreshold >= options.EvictionThreshold && options.EvictionThreshold > math.SmallestNonzeroFloat64 {
+				options.CompactionThreshold = math.Nextafter(options.EvictionThreshold, 0)
+			}
 		}
 	}
-	if math.IsNaN(options.EvictionRetentionRatio) || math.IsInf(options.EvictionRetentionRatio, -1) || options.EvictionRetentionRatio < 0 {
+	switch {
+	case math.IsNaN(options.EvictionRetentionRatio) || math.IsInf(options.EvictionRetentionRatio, -1) || options.EvictionRetentionRatio < 0:
 		options.EvictionRetentionRatio = DefaultEvictionRetentionRatio
-	} else if math.IsInf(options.EvictionRetentionRatio, 1) || options.EvictionRetentionRatio > 1.0 {
+	case math.IsInf(options.EvictionRetentionRatio, 1) || options.EvictionRetentionRatio > 1.0:
 		options.EvictionRetentionRatio = 1.0
+	case options.EvictionRetentionRatio == 0:
+		options.EvictionRetentionRatio = 0.0
 	}
 	if options.PressureFunc == nil {
 		options.PressureFunc = DefaultRuntimePressureFunc(options.MemoryBudget)

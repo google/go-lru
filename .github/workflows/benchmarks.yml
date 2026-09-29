@@ -1,0 +1,95 @@
+name: Benchmarks & Resource Usage
+
+on:
+  push:
+    branches:
+      - main
+      - master
+      - "feat/**"
+  pull_request:
+    branches:
+      - main
+      - master
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: benchmarks-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  benchmark:
+    name: Throughput, Memory & Arena Footprint
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout PR / head commit
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Go
+        uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Install benchstat
+        run: go install golang.org/x/perf/cmd/benchstat@latest
+
+      - name: Run Performance & Memory Allocation Benchmarks (Head)
+        run: |
+          go test -run=^$ -bench=. -benchmem -benchtime=10ms -count=6 ./... | tee benchmark-head.txt
+
+      - name: Run Base Branch Benchmarks for Regression Comparison (PR only)
+        if: github.event_name == 'pull_request'
+        continue-on-error: true
+        run: |
+          HEAD_SHA=$(git rev-parse HEAD)
+          trap 'git checkout "$HEAD_SHA"' EXIT
+          git checkout "${{ github.event.pull_request.base.sha }}"
+          go test -run=^$ -bench=. -benchmem -benchtime=10ms -count=6 ./... | tee benchmark-base.txt
+          git checkout "$HEAD_SHA"
+          trap - EXIT
+          sed -i 's|^pkg: .*|pkg: github.com/google/go-lru|' benchmark-base.txt
+          benchstat benchmark-base.txt benchmark-head.txt | tee benchstat-comparison.txt
+
+      - name: Publish Benchmark & Resource Footprint Summary
+        run: |
+          {
+            echo "## 📊 Performance & Resource Usage Summary"
+            echo ""
+            echo "| Benchmark | Iterations | Throughput (\`ns/op\`) | Memory (\`B/op\`) | Allocations (\`allocs/op\`) | Additional Resource Metrics |"
+            echo "|---|---:|---:|---:|---:|---|"
+            awk '/^Benchmark_/ && !seen[$1]++ {
+              bench=$1; iters=$2; ns=$3 " " $4;
+              b_op="-"; allocs="-"; extra="";
+              for (i=5; i<=NF; i++) {
+                if ($(i+1) == "B/op") { b_op = $i " B/op"; i++; }
+                else if ($(i+1) == "allocs/op") { allocs = $i " allocs/op"; i++; }
+                else if (i < NF) { extra = extra $i " " $(i+1) " "; i++; }
+              }
+              printf "| \`%s\` | %s | %s | %s | %s | %s |\n", bench, iters, ns, b_op, allocs, extra
+            }' benchmark-head.txt
+            echo ""
+            if [ -f benchstat-comparison.txt ]; then
+              echo "### 🔍 PR vs. Base Regression Comparison (\`benchstat\`)"
+              echo ""
+              echo '```text'
+              cat benchstat-comparison.txt
+              echo '```'
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload Benchmark Artifacts
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: benchmark-results
+          path: |
+            benchmark-head.txt
+            benchmark-base.txt
+            benchstat-comparison.txt
+          if-no-files-found: ignore
+          retention-days: 30
