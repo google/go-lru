@@ -12,13 +12,12 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-package lrus
+package lru
 
 import (
 	"math"
 	"strings"
 	"sync"
-	"sync/atomic"
 )
 
 // nilNode represents the sentinel null reference for 32-bit node indices.
@@ -45,13 +44,13 @@ type arenaRadix struct {
 	maxSize     uint64
 	currentSize uint64
 	mu          sync.RWMutex
-	options     Options
 
 	nodes     []arenaRadixNode
 	freeHead  uint32
 	freeCount uint32
 
-	nodeMap map[uint64]uint32
+	nodeMap      map[uint64]uint32
+	nodeMapDirty bool
 
 	root uint32
 
@@ -60,11 +59,7 @@ type arenaRadix struct {
 
 	len int
 
-	samplingPressure     atomic.Bool
-	pressureNeedsRefresh atomic.Bool
-	pressureSampleSeq    atomic.Uint64
-	cachedPressureBits   atomic.Uint64
-	reclaimEpoch         atomic.Uint64
+	pressureState
 }
 
 // FNV-1a 64-bit hashing constants.
@@ -75,7 +70,11 @@ const (
 
 // hashString computes the 64-bit FNV-1a hash of string s.
 func hashString(s string) uint64 {
-	h := offset64
+	return hashStringCont(offset64, s)
+}
+
+// hashStringCont continues a 64-bit FNV-1a hash calculation from h over string s.
+func hashStringCont(h uint64, s string) uint64 {
 	for i := 0; i < len(s); i++ {
 		h ^= uint64(s[i])
 		h *= prime64
@@ -84,7 +83,8 @@ func hashString(s string) uint64 {
 }
 
 // hashNodeKey computes the 64-bit FNV-1a hash of the full key for nodeID
-// by walking the ancestor chain with a stack-allocated buffer (0 heap allocations).
+// by walking the ancestor chain. Uses a 64-level stack buffer for common depths
+// and seamlessly handles arbitrary depths > 64.
 func (c *arenaRadix) hashNodeKey(nodeID uint32) uint64 {
 	var stackBuf [64]uint32
 	path := stackBuf[:0]
@@ -93,22 +93,9 @@ func (c *arenaRadix) hashNodeKey(nodeID uint32) uint64 {
 	}
 	h := offset64
 	for i := len(path) - 1; i >= 0; i-- {
-		prefix := c.nodes[path[i]].prefix
-		for j := 0; j < len(prefix); j++ {
-			h ^= uint64(prefix[j])
-			h *= prime64
-		}
+		h = hashStringCont(h, c.nodes[path[i]].prefix)
 	}
 	return h
-}
-
-// longestCommonPrefix finds the length of the longest common prefix of a and b.
-func (c *arenaRadix) longestCommonPrefix(a, b string) int {
-	i := 0
-	for i < len(a) && i < len(b) && a[i] == b[i] {
-		i++
-	}
-	return i
 }
 
 // allocateNode allocates a node index from the free-list or appends to the arena slice.
@@ -127,7 +114,7 @@ func (c *arenaRadix) allocateNode() uint32 {
 		return id
 	}
 	id := uint32(len(c.nodes))
-	if id >= nilNode {
+	if id >= foregroundNoProtect {
 		panic("arena radix capacity exceeded limit")
 	}
 	c.nodes = append(c.nodes, arenaRadixNode{
@@ -203,6 +190,7 @@ func (c *arenaRadix) replaceChild(nID uint32, oldChildID uint32, newChildID uint
 		if *pcurr != oldChildID {
 			continue
 		}
+		c.nodes[newChildID].parent = nID
 		c.nodes[newChildID].sibling = c.nodes[oldChildID].sibling
 		*pcurr = newChildID
 		c.nodes[oldChildID].sibling = nilNode
@@ -212,10 +200,10 @@ func (c *arenaRadix) replaceChild(nID uint32, oldChildID uint32, newChildID uint
 	panic("replaceChild: requested child not found in sibling list")
 }
 
-// insertNode inserts key-value into the radix trie and returns the node index and any previous value.
-func (c *arenaRadix) insertNode(key string, value ValueType) (uint32, ValueType) {
+// insertNode inserts key-value into the radix trie and returns the node index.
+func (c *arenaRadix) insertNode(key string, value ValueType) uint32 {
 	if value == nil {
-		return nilNode, nil
+		return nilNode
 	}
 
 	nodeID := c.root
@@ -223,21 +211,20 @@ func (c *arenaRadix) insertNode(key string, value ValueType) (uint32, ValueType)
 
 	for {
 		if len(search) == 0 {
-			oldValue := c.nodes[nodeID].value
 			c.nodes[nodeID].value = value
-			return nodeID, oldValue
+			return nodeID
 		}
 
 		childID := c.getChild(nodeID, search[0])
 		if childID == nilNode {
 			newLeafID := c.allocateNode()
-			c.nodes[newLeafID].prefix = strings.Clone(search)
+			c.nodes[newLeafID].prefix = clonePrefix(search)
 			c.nodes[newLeafID].value = value
 			c.addChild(nodeID, newLeafID)
-			return newLeafID, nil
+			return newLeafID
 		}
 
-		lcp := c.longestCommonPrefix(search, c.nodes[childID].prefix)
+		lcp := longestCommonPrefix(search, c.nodes[childID].prefix)
 
 		if lcp == len(c.nodes[childID].prefix) {
 			search = search[lcp:]
@@ -245,26 +232,28 @@ func (c *arenaRadix) insertNode(key string, value ValueType) (uint32, ValueType)
 			continue
 		}
 
+		// Clone both split prefix halves so surviving intermediate routing nodes never pin
+		// the underlying backing arrays of large evicted leaf keys.
+		oldPrefix := c.nodes[childID].prefix
 		splitNodeID := c.allocateNode()
-		c.nodes[splitNodeID].prefix = strings.Clone(c.nodes[childID].prefix[:lcp])
+		c.nodes[splitNodeID].prefix = clonePrefix(oldPrefix[:lcp])
 		c.nodes[splitNodeID].parent = nodeID
 
 		c.replaceChild(nodeID, childID, splitNodeID)
 
-		c.nodes[childID].prefix = strings.Clone(c.nodes[childID].prefix[lcp:])
+		c.nodes[childID].prefix = clonePrefix(oldPrefix[lcp:])
 		c.addChild(splitNodeID, childID)
 
 		if lcp == len(search) {
-			oldValue := c.nodes[splitNodeID].value
 			c.nodes[splitNodeID].value = value
-			return splitNodeID, oldValue
+			return splitNodeID
 		}
 
 		newLeafID := c.allocateNode()
-		c.nodes[newLeafID].prefix = strings.Clone(search[lcp:])
+		c.nodes[newLeafID].prefix = clonePrefix(search[lcp:])
 		c.nodes[newLeafID].value = value
 		c.addChild(splitNodeID, newLeafID)
-		return newLeafID, nil
+		return newLeafID
 	}
 }
 
@@ -290,16 +279,7 @@ func (c *arenaRadix) verifyKey(nodeID uint32, key string) bool {
 	return end == 0 && curr == c.root
 }
 
-// getNodeKey finds a value-bearing node index for key using O(1) FNV-1a hash lookup with zero-alloc verification,
-// falling back to top-down trie traversal.
-func (c *arenaRadix) getNodeKey(key string) (uint32, bool) {
-	nodeID, ok := c.nodeMap[hashString(key)]
-	if ok && c.nodes[nodeID].value != nil {
-		if c.verifyKey(nodeID, key) {
-			return nodeID, true
-		}
-	}
-
+func (c *arenaRadix) findNodeByTrieWalk(key string) (uint32, bool) {
 	curr := c.root
 	search := key
 
@@ -326,6 +306,52 @@ func (c *arenaRadix) getNodeKey(key string) (uint32, bool) {
 	}
 
 	return nilNode, false
+}
+
+// getNodeKey finds a value-bearing node index for key using O(1) FNV-1a hash lookup with zero-alloc verification,
+// falling back to top-down trie traversal only when a hash collision or dirty nodeMap state exists.
+// It does not mutate c.nodeMap, making it safe under RLock.
+func (c *arenaRadix) getNodeKey(key string) (uint32, bool) {
+	return c.lookupNodeKeyWithHash(key, hashString(key))
+}
+
+// lookupNodeKeyWithHash finds a value-bearing node index for key using a precomputed FNV-1a hash
+// without mutating c.nodeMap.
+func (c *arenaRadix) lookupNodeKeyWithHash(key string, keyHash uint64) (uint32, bool) {
+	nodeID, ok := c.nodeMap[keyHash]
+	if ok {
+		if nodeID < uint32(len(c.nodes)) && c.nodes[nodeID].value != nil && c.verifyKey(nodeID, key) {
+			return nodeID, true
+		}
+	} else if len(c.nodeMap) == c.len {
+		// By Invariant 6 and the Pigeonhole Principle, when len(c.nodeMap) == c.len,
+		// there is an exact 1:1 bijection between c.nodeMap and all live value-bearing nodes,
+		// so a map miss is a guaranteed cache miss.
+		return nilNode, false
+	}
+	return c.findNodeByTrieWalk(key)
+}
+
+// getNodeKeyWithHash finds a value-bearing node index for key under exclusive write lock,
+// healing c.nodeMap[keyHash] if resolved via the slow-path trie walk.
+func (c *arenaRadix) getNodeKeyWithHash(key string, keyHash uint64) (uint32, bool) {
+	nodeID, ok := c.nodeMap[keyHash]
+	if ok {
+		if nodeID < uint32(len(c.nodes)) && c.nodes[nodeID].value != nil && c.verifyKey(nodeID, key) {
+			return nodeID, true
+		}
+	} else if len(c.nodeMap) == c.len {
+		// By Invariant 6 and the Pigeonhole Principle, when len(c.nodeMap) == c.len,
+		// there is an exact 1:1 bijection between c.nodeMap and all live value-bearing nodes,
+		// so a map miss is a guaranteed cache miss.
+		return nilNode, false
+	}
+
+	curr, found := c.findNodeByTrieWalk(key)
+	if found {
+		c.nodeMap[keyHash] = curr
+	}
+	return curr, found
 }
 
 // deleteNode clears the value at nodeID and compresses the parent path if needed.
@@ -362,8 +388,7 @@ func (c *arenaRadix) compressPathUpwards(currID uint32) {
 			c.replaceChild(parentID, currID, onlyChildID)
 
 			c.freeNode(currID)
-			currID = parentID
-			continue
+			return
 		}
 		break
 	}
@@ -441,15 +466,27 @@ func (c *arenaRadix) evictOne() ValueType {
 	return c.eraseInternal(nodeID)
 }
 
+const foregroundNoProtect uint32 = nilNode - 1
+
+func (c *arenaRadix) isDirtyLocked() bool {
+	return c.freeHead != nilNode || len(c.nodes) < cap(c.nodes) || c.nodeMapDirty
+}
+
 // eraseInternal handles unlinking from LRU, cleaning up nodeMap, and deleting from the tree.
 func (c *arenaRadix) eraseInternal(nodeID uint32) ValueType {
+	return c.eraseInternalWithHash(nodeID, c.hashNodeKey(nodeID))
+}
+
+func (c *arenaRadix) eraseInternalWithHash(nodeID uint32, hash uint64) ValueType {
 	deletedEntry := c.nodes[nodeID].value
+	if deletedEntry != nil {
+		c.onEntryDeleted(c.nodes[nodeID].size)
+		c.nodeMapDirty = true
+	}
 	c.currentSize -= c.nodes[nodeID].size
 	c.nodes[nodeID].size = 0
 
-	// Prevent hash collision cross-deletions with 0 heap string allocations.
-	hash := c.hashNodeKey(nodeID)
-	if c.nodeMap[hash] == nodeID {
+	if mappedID, ok := c.nodeMap[hash]; ok && mappedID == nodeID {
 		delete(c.nodeMap, hash)
 	}
 
@@ -459,88 +496,71 @@ func (c *arenaRadix) eraseInternal(nodeID uint32) ValueType {
 	return deletedEntry
 }
 
-// samplePressureFresh reads normalized memory pressure lock-free outside c.mu.Lock()
-// with an atomic re-entrancy guard that prevents infinite mutual recursion if a
-// custom PressureFunc calls back into cache methods, while returning the latest
-// cached pressure reading to concurrent goroutines instead of a false 0.0.
-func (c *arenaRadix) samplePressureFresh() float64 {
-	if !c.samplingPressure.CompareAndSwap(false, true) {
-		return math.Float64frombits(c.cachedPressureBits.Load())
-	}
-	defer c.samplingPressure.Store(false)
+func (c *arenaRadix) clearEmptyArenaStateLocked() {
+	c.freeHead = nilNode
+	c.freeCount = 0
 
-	p := c.options.PressureFunc()
-	if math.IsNaN(p) || p < 0.0 {
-		p = 0.0
+	if cap(c.nodes) == 1 {
+		c.nodes = c.nodes[:1]
+		c.nodes[0] = arenaRadixNode{parent: nilNode, child: nilNode, sibling: nilNode, prev: nilNode, next: nilNode}
+		c.root = 0
+	} else {
+		clear(c.nodes)
+		c.nodes = make([]arenaRadixNode, 1)
+		c.nodes[0] = arenaRadixNode{parent: nilNode, child: nilNode, sibling: nilNode, prev: nilNode, next: nilNode}
+		c.root = 0
 	}
-	c.cachedPressureBits.Store(math.Float64bits(p))
-	c.pressureNeedsRefresh.Store(false)
-	return p
+
+	c.head = nilNode
+	c.tail = nilNode
+	c.currentSize = 0
+	c.len = 0
+	if c.nodeMap != nil && c.peakEntryLen <= 8 && c.deletedSinceCompact < 64 {
+		clear(c.nodeMap)
+	} else {
+		c.nodeMap = make(map[uint64]uint32)
+	}
+	c.nodeMapDirty = false
+	c.resetWatermarks()
 }
 
-// samplePressure returns the current memory pressure for foreground cache operations.
-// Custom PressureFunc callbacks are invoked on every call; the default runtime/metrics
-// probe is amortized across a 256-operation window (and immediately refreshed after any
-// reclamation/compaction cycle) to eliminate runtime.metricsLock contention on hot-path writes.
-func (c *arenaRadix) samplePressure() float64 {
-	if c.options.hasCustomPressureFunc {
-		return c.samplePressureFresh()
-	}
-	seq := c.pressureSampleSeq.Add(1)
-	if (seq&255) == 1 || c.pressureNeedsRefresh.CompareAndSwap(true, false) {
-		return c.samplePressureFresh()
-	}
-	return math.Float64frombits(c.cachedPressureBits.Load())
-}
-
-// computeTargetSize safely computes uint64(float64(maxSize) * retention) without
-// float64-to-uint64 overflow at math.MaxUint64 or zero-truncation when maxSize == 1 and retention > 0.
-func computeTargetSize(maxSize uint64, retention float64) uint64 {
-	if retention <= 0.0 {
-		return 0
-	}
-	if retention >= 1.0 {
-		return maxSize
-	}
-	f := float64(maxSize) * retention
-	if f >= float64(math.MaxUint64) {
-		return math.MaxUint64
-	}
-	target := uint64(f)
-	if target == 0 && maxSize > 0 {
-		return 1
-	}
-	return target
+// resetEmptyArenaLocked releases peak arena slice and hash-map allocations when the cache transitions to empty.
+// Caller MUST hold c.mu.Lock().
+func (c *arenaRadix) resetEmptyArenaLocked() {
+	c.clearEmptyArenaStateLocked()
+	c.markReclaimedLocked()
 }
 
 // shouldAutoCompactLocked determines whether an automatic compaction should run.
 // Explicit EvaluateMemoryPressure calls (protectedNodeID == nilNode) compact whenever any
 // free slots, slice slack, or unhealed hash-collision slots exist. Inline foreground mutations
-// require at least 25% of arena slots to be on the free-list so O(N) compaction is amortized to O(1) per write.
+// (protectedNodeID != nilNode) only count recycled free-list fragmentation (>= 25% of len(c.nodes))
+// so Go's geometric slice growth capacity slack never triggers O(N^2) compaction thrashing.
 func (c *arenaRadix) shouldAutoCompactLocked(protectedNodeID uint32) bool {
 	if protectedNodeID == nilNode {
-		return c.freeHead != nilNode || len(c.nodes) < cap(c.nodes) || len(c.nodeMap) < c.len
+		return c.isDirtyLocked()
 	}
-	return c.freeHead != nilNode && uint64(c.freeCount)*4 >= uint64(len(c.nodes))
+	if c.freeHead != nilNode && c.peakEntryLen > 8 && len(c.nodes) > 8 && c.freeCount >= 2 && uint64(c.freeCount)*4 >= uint64(len(c.nodes)) {
+		return true
+	}
+	return c.shouldAutoCompactEntryCounts(c.nodeMapDirty, false, c.len)
 }
 
-// compactLocked performs lossless O(N) compaction of the node arena slice and hash lookup map.
-// It eliminates all free-list slots so len(c.nodes) == cap(c.nodes) == liveCount and c.freeHead == nilNode,
-// remaps all 8 uint32 index pointers (root, head, tail, parent, child, sibling, prev, next),
-// and reallocates c.nodeMap to eliminate Go map bucket slack while preserving 100% of live entries and LRU order.
+// compactDataStructuresLocked performs the physical slice and map compaction without updating
+// the reclamation epoch, returning true if any backing structure was reallocated.
 // Caller MUST hold c.mu.Lock().
-func (c *arenaRadix) compactLocked() {
+func (c *arenaRadix) compactDataStructuresLocked() bool {
 	// Fast-path: when no nodes are on the free-list, node indices are already contiguous [0..len-1].
 	if c.freeHead == nilNode {
-		if len(c.nodes) == cap(c.nodes) && len(c.nodeMap) >= c.len {
-			return
+		if len(c.nodes) == cap(c.nodes) && !c.nodeMapDirty {
+			return false
 		}
 		if len(c.nodes) < cap(c.nodes) {
 			newNodes := make([]arenaRadixNode, len(c.nodes))
 			copy(newNodes, c.nodes)
 			c.nodes = newNodes
 		}
-		if len(c.nodeMap) < c.len {
+		if c.nodeMapDirty {
 			newNodeMap := make(map[uint64]uint32, c.len)
 			for id := uint32(0); id < uint32(len(c.nodes)); id++ {
 				if c.nodes[id].value != nil {
@@ -548,10 +568,10 @@ func (c *arenaRadix) compactLocked() {
 				}
 			}
 			c.nodeMap = newNodeMap
+			c.nodeMapDirty = false
 		}
-		c.pressureNeedsRefresh.Store(true)
-		c.reclaimEpoch.Add(1)
-		return
+		c.onCompacted(c.len)
+		return true
 	}
 
 	oldLen := uint32(len(c.nodes))
@@ -607,88 +627,113 @@ func (c *arenaRadix) compactLocked() {
 	c.freeCount = 0
 	c.nodes = newNodes
 	c.nodeMap = newNodeMap
-	c.pressureNeedsRefresh.Store(true)
-	c.reclaimEpoch.Add(1)
+	c.nodeMapDirty = false
+	c.onCompacted(c.len)
+	return true
 }
 
-// shedAndCompactLocked evicts least-recently-used entries strictly from c.tail until
-// c.currentSize <= targetSize (or until the cache is completely empty when retention == 0.0),
-// always protecting protectedNodeID (the newly inserted/updated entry during foreground writes),
+// compactLocked performs lossless O(N) compaction of the node arena slice and hash lookup map.
+// It eliminates all free-list slots so len(c.nodes) == cap(c.nodes) == liveCount and c.freeHead == nilNode,
+// remaps all 8 uint32 index pointers (root, head, tail, parent, child, sibling, prev, next),
+// and reallocates c.nodeMap to eliminate Go map bucket slack while preserving 100% of live entries and LRU order.
+// Caller MUST hold c.mu.Lock().
+func (c *arenaRadix) compactLocked() {
+	if c.compactDataStructuresLocked() {
+		c.markReclaimedLocked()
+	}
+}
+
+// shedAndCompactLocked evicts least-recently-used entries strictly from c.tail in a single O(N) pass
+// until c.currentSize <= targetSize (and proportionally sheds zero-size entries down to targetZeroCount),
+// protecting protectedNodeID only when it resides at the MRU head (c.head),
 // then performs lossless arena and map compaction if fragmentation warrants it.
 // Caller MUST hold c.mu.Lock().
 func (c *arenaRadix) shedAndCompactLocked(targetSize uint64, retention float64, protectedNodeID uint32) []ValueType {
-	effectiveTarget := targetSize
-	if protectedNodeID != nilNode && retention > 0.0 && c.nodes[protectedNodeID].size > effectiveTarget {
-		if math.MaxUint64-c.nodes[protectedNodeID].size >= targetSize && c.nodes[protectedNodeID].size+targetSize <= c.maxSize {
-			effectiveTarget = c.nodes[protectedNodeID].size + targetSize
-		} else {
-			effectiveTarget = c.nodes[protectedNodeID].size
-		}
+	autoCompactID := protectedNodeID
+	if protectedNodeID == foregroundNoProtect || (protectedNodeID != nilNode && (protectedNodeID != c.head || c.nodes[protectedNodeID].prev != nilNode || c.nodes[protectedNodeID].value == nil)) {
+		protectedNodeID = nilNode
 	}
 
-	targetLen := 0
-	if c.currentSize == 0 && c.len > 0 && retention > 0.0 {
-		targetLen = int(float64(c.len) * retention)
-		if protectedNodeID != nilNode && targetLen < 1 {
-			targetLen = 1
-		}
+	var protectedSize uint64
+	hasProtected := protectedNodeID != nilNode
+	if hasProtected {
+		protectedSize = c.nodes[protectedNodeID].size
 	}
+	effectiveTarget, targetLen, targetZeroCount, unprotectedZeroTarget := c.computeShedTargets(targetSize, retention, c.len, hasProtected, protectedSize)
 
+	needFullFlush := retention == 0.0
 	var evicted []ValueType
-	for c.tail != nilNode {
-		needByteShed := c.currentSize > effectiveTarget
-		needZeroSizeShed := c.currentSize == 0 && c.len > targetLen
-		needFullFlush := retention == 0.0
-		if !needByteShed && !needZeroSizeShed && !needFullFlush {
+	victimID := c.tail
+	for victimID != nilNode {
+		needByteShed := c.currentSize > effectiveTarget || needFullFlush
+		needZeroShed := !needFullFlush && c.zeroSizeCount > targetZeroCount && c.len > targetLen
+		if !needByteShed && !needZeroShed {
 			break
 		}
-		if protectedNodeID != nilNode && c.tail == protectedNodeID {
+		switch {
+		case needFullFlush || (needByteShed && c.zeroSizeCount > targetZeroCount):
+			for victimID != nilNode && victimID == protectedNodeID {
+				victimID = c.nodes[victimID].prev
+			}
+		case needByteShed:
+			for victimID != nilNode && (victimID == protectedNodeID || c.nodes[victimID].size == 0) {
+				victimID = c.nodes[victimID].prev
+			}
+		default:
+			for victimID != nilNode && (victimID == protectedNodeID || c.nodes[victimID].size > 0) {
+				victimID = c.nodes[victimID].prev
+			}
+		}
+		if victimID == nilNode {
 			break
 		}
-		if val := c.evictOne(); val != nil {
+		nextVictimID := c.nodes[victimID].prev
+		if val := c.eraseInternal(victimID); val != nil {
 			evicted = append(evicted, val)
 		}
+		victimID = nextVictimID
 	}
 
-	c.pressureNeedsRefresh.Store(true)
-	c.reclaimEpoch.Add(1)
-	if c.shouldAutoCompactLocked(protectedNodeID) {
-		c.compactLocked()
+	if len(evicted) > 0 && c.len == 0 {
+		c.resetEmptyArenaLocked()
+		return evicted
+	}
+
+	if len(evicted) > 0 {
+		c.updateZeroWatermarkAfterShed(retention, c.len, !hasProtected || effectiveTarget <= targetSize, unprotectedZeroTarget, targetLen)
+	}
+	compacted := false
+	if c.shouldAutoCompactLocked(autoCompactID) {
+		compacted = c.compactDataStructuresLocked()
+	}
+	if len(evicted) > 0 || compacted {
+		c.markReclaimedLocked()
 	}
 	return evicted
 }
 
-// maybeCompactUnderPressureLocked executes lossless Tier 1 arena/map compaction
-// when pressure >= CompactionThreshold and freed slots exceed the fragmentation threshold.
-// Caller MUST hold c.mu.Lock().
-func (c *arenaRadix) maybeCompactUnderPressureLocked(pressure float64) {
-	if pressure >= c.options.CompactionThreshold && c.shouldAutoCompactLocked(c.root) {
-		c.compactLocked()
-	}
-}
-
 // maybeReclaimUnderPressureLocked evaluates the sampled pressure against configured thresholds:
 //   - If pressure >= EvictionThreshold (Tier 2 Critical Pressure): evict from LRU tail down to
-//     c.maxSize * EvictionRetentionRatio (always preserving protectedNodeID), then compact if needed.
+//     c.maxSize * EvictionRetentionRatio (preserving protectedNodeID if at MRU head), then compact if needed.
 //   - Else if pressure >= CompactionThreshold (Tier 1 Moderate Pressure): perform lossless arena and map compaction.
 //
 // Caller MUST hold c.mu.Lock().
 func (c *arenaRadix) maybeReclaimUnderPressureLocked(pressure float64, protectedNodeID uint32) []ValueType {
+	if c.isSamplingGoroutine() {
+		return nil
+	}
+	var evicted []ValueType
 	if pressure >= c.options.EvictionThreshold {
 		retention := c.options.EvictionRetentionRatio
 		targetSize := computeTargetSize(c.maxSize, retention)
-		if c.currentSize > targetSize || (c.currentSize == 0 && c.len > 0) || (retention == 0.0 && c.tail != nilNode) {
-			return c.shedAndCompactLocked(targetSize, retention, protectedNodeID)
-		}
-		if c.shouldAutoCompactLocked(protectedNodeID) {
-			c.compactLocked()
-		}
-		return nil
-	}
-	if pressure >= c.options.CompactionThreshold {
-		if c.shouldAutoCompactLocked(protectedNodeID) {
-			c.compactLocked()
+		evicted = c.shedAndCompactLocked(targetSize, retention, protectedNodeID)
+	} else {
+		c.resetZeroWatermarkBelowTier2(pressure)
+		if pressure >= c.options.CompactionThreshold {
+			if c.shouldAutoCompactLocked(protectedNodeID) {
+				c.compactLocked()
+			}
 		}
 	}
-	return nil
+	return evicted
 }

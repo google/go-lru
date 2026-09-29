@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-package lrus
+package lru
 
 import (
 	"math"
@@ -33,38 +33,38 @@ func (v testValue) Size() uint64 {
 }
 
 func TestValueTypeInterface(t *testing.T) {
+	// Arrange
 	var val ValueType = testValue{size: 42}
-	if val.Size() != 42 {
-		t.Errorf("expected size 42, got %d", val.Size())
-	}
+
+	// Act
+	size := val.Size()
+
+	// Assert
+	assert.Equal(t, uint64(42), size)
 }
 
 func TestOptions_Default(t *testing.T) {
+	// Arrange & Act
 	opts := ApplyOptions()
-	if opts.EnableInvariantChecking {
-		t.Errorf("expected EnableInvariantChecking to be false by default, got true")
-	}
+
+	// Assert
+	assert.False(t, opts.EnableInvariantChecking)
 }
 
 func TestOptions_WithInvariantChecking(t *testing.T) {
+	// Arrange & Act
 	optsTrue := ApplyOptions(WithInvariantChecking(true))
-	if !optsTrue.EnableInvariantChecking {
-		t.Errorf("expected EnableInvariantChecking to be true, got false")
-	}
-
 	optsFalse := ApplyOptions(WithInvariantChecking(false))
-	if optsFalse.EnableInvariantChecking {
-		t.Errorf("expected EnableInvariantChecking to be false, got true")
-	}
-
-	// Chained options and nil resilience.
 	optsChained := ApplyOptions(nil, WithInvariantChecking(false), nil, WithInvariantChecking(true))
-	if !optsChained.EnableInvariantChecking {
-		t.Errorf("expected EnableInvariantChecking to be true after chained options, got false")
-	}
+
+	// Assert
+	assert.True(t, optsTrue.EnableInvariantChecking)
+	assert.False(t, optsFalse.EnableInvariantChecking)
+	assert.True(t, optsChained.EnableInvariantChecking)
 }
 
 func TestSentinelErrors(t *testing.T) {
+	// Arrange
 	tests := []struct {
 		err      error
 		expected string
@@ -87,62 +87,51 @@ func TestSentinelErrors(t *testing.T) {
 		},
 	}
 
+	// Act & Assert
 	for _, tc := range tests {
-		if tc.err == nil {
-			t.Errorf("expected non-nil error")
-		} else if tc.err.Error() != tc.expected {
-			t.Errorf("expected error message %q, got %q", tc.expected, tc.err.Error())
-		}
+		require.Error(t, tc.err)
+		assert.EqualError(t, tc.err, tc.expected)
 	}
 }
 
 func TestConstructors_Validation(t *testing.T) {
-	constructors := []struct {
+	// Arrange
+	constructors := append(allBackends(), struct {
 		name string
 		fn   func(uint64, ...Option) Cache
-	}{
-		{"NewMapCache", NewMapCache},
-		{"New", New},
-		{"NewRadixCache", NewRadixCache},
-		{"NewArenaRadixCache", NewArenaRadixCache},
-	}
+	}{"New", New})
 
+	// Act & Assert
 	for _, c := range constructors {
-		t.Run(c.name+"/ZeroMaxSize_DefaultOptions", func(t *testing.T) {
-			defer func() {
-				r := recover()
-				if r == nil {
-					t.Fatalf("[%s] expected panic on maxSize == 0 with default options, got none", c.name)
-				}
-			}()
-			_ = c.fn(0)
-		})
+		t.Run(c.name, func(t *testing.T) {
+			t.Run("ZeroMaxSize_DefaultOptions", func(t *testing.T) {
+				// Arrange, Act & Assert
+				assert.Panics(t, func() {
+					_ = c.fn(0)
+				})
+			})
 
-		t.Run(c.name+"/ZeroMaxSize_InvariantsDisabled", func(t *testing.T) {
-			defer func() {
-				r := recover()
-				if r == nil {
-					t.Fatalf("[%s] expected panic on maxSize == 0 with invariants disabled, got none", c.name)
-				}
-			}()
-			_ = c.fn(0, WithInvariantChecking(false))
-		})
+			t.Run("ZeroMaxSize_InvariantsDisabled", func(t *testing.T) {
+				// Arrange, Act & Assert
+				assert.Panics(t, func() {
+					_ = c.fn(0, WithInvariantChecking(false))
+				})
+			})
 
-		t.Run(c.name+"/ZeroMaxSize_InvariantsEnabled", func(t *testing.T) {
-			defer func() {
-				r := recover()
-				if r == nil {
-					t.Fatalf("[%s] expected panic on maxSize == 0 with invariants enabled, got none", c.name)
-				}
-			}()
-			_ = c.fn(0, WithInvariantChecking(true))
-		})
+			t.Run("ZeroMaxSize_InvariantsEnabled", func(t *testing.T) {
+				// Arrange, Act & Assert
+				assert.Panics(t, func() {
+					_ = c.fn(0, WithInvariantChecking(true))
+				})
+			})
 
-		t.Run(c.name+"/PositiveBoundary_MaxSize1", func(t *testing.T) {
-			cache := c.fn(1)
-			if cache == nil {
-				t.Fatalf("[%s] expected non-nil cache for maxSize == 1", c.name)
-			}
+			t.Run("PositiveBoundary_MaxSize1", func(t *testing.T) {
+				// Arrange & Act
+				cache := c.fn(1)
+
+				// Assert
+				require.NotNil(t, cache)
+			})
 		})
 	}
 }
@@ -152,19 +141,23 @@ func TestOptions_MemoryPressureDefaults(t *testing.T) {
 	opts := ApplyOptions()
 
 	// Assert
-	assert.Equal(t, 0.75, DefaultCompactionThreshold)
-	assert.Equal(t, 0.90, DefaultEvictionThreshold)
-	assert.Equal(t, 0.50, DefaultEvictionRetentionRatio)
-	assert.Equal(t, DefaultCompactionThreshold, opts.CompactionThreshold)
-	assert.Equal(t, DefaultEvictionThreshold, opts.EvictionThreshold)
-	assert.Equal(t, DefaultEvictionRetentionRatio, opts.EvictionRetentionRatio)
+	assert.InDelta(t, 0.75, DefaultCompactionThreshold, 1e-9)
+	assert.InDelta(t, 0.90, DefaultEvictionThreshold, 1e-9)
+	assert.InDelta(t, 0.50, DefaultEvictionRetentionRatio, 1e-9)
+	assert.InDelta(t, DefaultCompactionThreshold, opts.CompactionThreshold, 1e-9)
+	assert.InDelta(t, DefaultEvictionThreshold, opts.EvictionThreshold, 1e-9)
+	assert.InDelta(t, DefaultEvictionRetentionRatio, opts.EvictionRetentionRatio, 1e-9)
 	require.NotNil(t, opts.PressureFunc)
-	assert.False(t, opts.hasCustomPressureFunc)
+	assert.GreaterOrEqual(t, opts.PressureFunc(), 0.0)
 }
 
 func TestOptions_MemoryPressureCustomAndValidation(t *testing.T) {
 	// Arrange
-	customFn := func() float64 { return 0.88 }
+	var customCalls int
+	customFn := func() float64 {
+		customCalls++
+		return 0.88
+	}
 
 	// Act
 	opts := ApplyOptions(
@@ -181,53 +174,41 @@ func TestOptions_MemoryPressureCustomAndValidation(t *testing.T) {
 		WithEvictionRetentionRatio(1.5),
 	)
 	optsNegativeRetention := ApplyOptions(WithEvictionRetentionRatio(-0.25))
-	optsInverted := ApplyOptions(
-		WithCompactionThreshold(0.85),
-		WithEvictionThreshold(0.70),
-	)
 	optsNaNAndInf := ApplyOptions(
 		WithCompactionThreshold(math.NaN()),
 		WithEvictionThreshold(math.Inf(1)),
 		WithEvictionRetentionRatio(math.NaN()),
 	)
-
-	// Assert
-	assert.Equal(t, uint64(256*1024*1024), opts.MemoryBudget)
-	assert.Equal(t, 0.60, opts.CompactionThreshold)
-	assert.Equal(t, 0.85, opts.EvictionThreshold)
-	assert.Equal(t, 0.35, opts.EvictionRetentionRatio)
-	require.NotNil(t, opts.PressureFunc)
-	assert.True(t, opts.hasCustomPressureFunc)
-	assert.Equal(t, 0.88, opts.PressureFunc())
-
-	assert.Equal(t, 0.0, optsZeroRetention.EvictionRetentionRatio)
-
-	assert.Equal(t, DefaultCompactionThreshold, optsClamped.CompactionThreshold)
-	assert.Equal(t, DefaultEvictionThreshold, optsClamped.EvictionThreshold)
-	assert.Equal(t, 1.0, optsClamped.EvictionRetentionRatio)
-
-	assert.Equal(t, DefaultEvictionRetentionRatio, optsNegativeRetention.EvictionRetentionRatio)
-
-	assert.Equal(t, 0.70, optsInverted.CompactionThreshold)
-	assert.Equal(t, 0.70, optsInverted.EvictionThreshold)
-
-	assert.Equal(t, DefaultCompactionThreshold, optsNaNAndInf.CompactionThreshold)
-	assert.Equal(t, DefaultEvictionThreshold, optsNaNAndInf.EvictionThreshold)
-	assert.Equal(t, DefaultEvictionRetentionRatio, optsNaNAndInf.EvictionRetentionRatio)
-
-	// F8: Single threshold customization preserves Tier 1 compaction window.
-	optsHighCompactionOnly := ApplyOptions(WithCompactionThreshold(0.92))
-	assert.Equal(t, 0.92, optsHighCompactionOnly.CompactionThreshold)
-	assert.Greater(t, optsHighCompactionOnly.EvictionThreshold, optsHighCompactionOnly.CompactionThreshold)
-
-	optsLowEvictionOnly := ApplyOptions(WithEvictionThreshold(0.60))
-	assert.Equal(t, 0.60, optsLowEvictionOnly.EvictionThreshold)
-	assert.Less(t, optsLowEvictionOnly.CompactionThreshold, optsLowEvictionOnly.EvictionThreshold)
-
 	optsDirectStructPressure := ApplyOptions(func(o *Options) {
 		o.PressureFunc = customFn
 	})
-	assert.True(t, optsDirectStructPressure.hasCustomPressureFunc)
+
+	// Assert
+	assert.Equal(t, uint64(256*1024*1024), opts.MemoryBudget)
+	assert.InDelta(t, 0.60, opts.CompactionThreshold, 1e-9)
+	assert.InDelta(t, 0.85, opts.EvictionThreshold, 1e-9)
+	assert.InDelta(t, 0.35, opts.EvictionRetentionRatio, 1e-9)
+	require.NotNil(t, opts.PressureFunc)
+	assert.InDelta(t, 0.88, opts.PressureFunc(), 1e-9)
+
+	assert.InDelta(t, 0.0, optsZeroRetention.EvictionRetentionRatio, 1e-9)
+
+	assert.InDelta(t, DefaultCompactionThreshold, optsClamped.CompactionThreshold, 1e-9)
+	assert.InDelta(t, DefaultEvictionThreshold, optsClamped.EvictionThreshold, 1e-9)
+	assert.InDelta(t, 1.0, optsClamped.EvictionRetentionRatio, 1e-9)
+
+	assert.InDelta(t, DefaultEvictionRetentionRatio, optsNegativeRetention.EvictionRetentionRatio, 1e-9)
+
+	assert.InDelta(t, DefaultCompactionThreshold, optsNaNAndInf.CompactionThreshold, 1e-9)
+	assert.InDelta(t, DefaultEvictionThreshold, optsNaNAndInf.EvictionThreshold, 1e-9)
+	assert.InDelta(t, DefaultEvictionRetentionRatio, optsNaNAndInf.EvictionRetentionRatio, 1e-9)
+
+	require.NotNil(t, optsDirectStructPressure.PressureFunc)
+	callsBefore := customCalls
+	c := NewMapCache(100, func(o *Options) { o.PressureFunc = customFn })
+	_, err := c.Insert("k", NewSizedValue("v", 10))
+	require.NoError(t, err)
+	assert.Greater(t, customCalls, callsBefore)
 }
 
 func TestDefaultRuntimePressureFunc(t *testing.T) {
@@ -235,10 +216,13 @@ func TestDefaultRuntimePressureFunc(t *testing.T) {
 	prevLimit := debug.SetMemoryLimit(-1)
 	defer debug.SetMemoryLimit(prevLimit)
 
-	// Act & Assert 1: Unbounded GOMEMLIMIT (math.MaxInt64) with MemoryBudget == 0 returns 0.0.
+	// Act & Assert 1: Unbounded GOMEMLIMIT (math.MaxInt64) with MemoryBudget == 0 returns 0.0 in 0 allocs.
 	debug.SetMemoryLimit(math.MaxInt64)
 	probeUnbounded := DefaultRuntimePressureFunc(0)
-	assert.Equal(t, 0.0, probeUnbounded())
+	assert.InDelta(t, 0.0, probeUnbounded(), 1e-9)
+	assert.InDelta(t, 0.0, testing.AllocsPerRun(50, func() {
+		_ = probeUnbounded()
+	}), 1e-9)
 
 	// Act & Assert 2: Configured 1 GiB GOMEMLIMIT returns positive normalized pressure in (0.0, 1.0).
 	const oneGiB = int64(1 << 30)
@@ -259,7 +243,7 @@ func TestDefaultRuntimePressureFunc(t *testing.T) {
 	allocsPerRun := testing.AllocsPerRun(50, func() {
 		_ = probeBudget512MB()
 	})
-	assert.Equal(t, 0.0, allocsPerRun)
+	assert.InDelta(t, 0.0, allocsPerRun, 1e-9)
 
 	// Act & Assert 4: Concurrent race-free reads across 16 goroutines.
 	var wg sync.WaitGroup
@@ -273,4 +257,332 @@ func TestDefaultRuntimePressureFunc(t *testing.T) {
 		}()
 	}
 	wg.Wait()
+}
+
+func TestOptions_ThresholdReconciliationAndEdgeCases(t *testing.T) {
+	subnormal2 := math.Float64frombits(2) // 2 * math.SmallestNonzeroFloat64
+	compactionOneULPBelowEviction := math.Nextafter(DefaultEvictionThreshold, 0)
+	compactionOneULPBelowDefault := math.Nextafter(DefaultCompactionThreshold, 0)
+
+	tests := []struct {
+		name           string
+		opts           []Option
+		wantCompaction float64
+		wantEviction   float64
+		exactBits      bool
+		wantStrictLess bool
+	}{
+		{
+			name:           "SmallestNonzeroFloat64SingleEvictionThreshold",
+			opts:           []Option{WithEvictionThreshold(math.SmallestNonzeroFloat64)},
+			wantCompaction: math.SmallestNonzeroFloat64,
+			wantEviction:   math.SmallestNonzeroFloat64,
+			exactBits:      true,
+		},
+		{
+			name:           "SmallestNonzeroFloat64InvertedWithCompactionThreshold",
+			opts:           []Option{WithCompactionThreshold(0.50), WithEvictionThreshold(math.SmallestNonzeroFloat64)},
+			wantCompaction: math.SmallestNonzeroFloat64,
+			wantEviction:   math.SmallestNonzeroFloat64,
+			exactBits:      true,
+		},
+		{
+			name:           "SmallestNonzeroFloat64CompactionThresholdOnly",
+			opts:           []Option{WithCompactionThreshold(math.SmallestNonzeroFloat64)},
+			wantCompaction: math.SmallestNonzeroFloat64,
+			wantEviction:   DefaultEvictionThreshold,
+			exactBits:      true,
+		},
+		{
+			name:           "MaxFloat64CompactionThresholdClampsEvictionThresholdWithoutInf",
+			opts:           []Option{WithCompactionThreshold(math.MaxFloat64)},
+			wantCompaction: math.MaxFloat64,
+			wantEviction:   math.MaxFloat64,
+			exactBits:      true,
+		},
+		{
+			name:           "SubnormalEvictionThresholdSingleOptionMaintainsStrictInequality",
+			opts:           []Option{WithEvictionThreshold(subnormal2)},
+			wantCompaction: math.SmallestNonzeroFloat64,
+			wantEviction:   subnormal2,
+			exactBits:      true,
+			wantStrictLess: true,
+		},
+		{
+			name:           "SubnormalEvictionThresholdInvertedWithCompactionMaintainsStrictInequality",
+			opts:           []Option{WithCompactionThreshold(0.50), WithEvictionThreshold(subnormal2)},
+			wantCompaction: math.SmallestNonzeroFloat64,
+			wantEviction:   subnormal2,
+			exactBits:      true,
+			wantStrictLess: true,
+		},
+		{
+			name:           "OneULPBelowDefaultEvictionThresholdPreservedBitForBit",
+			opts:           []Option{WithCompactionThreshold(compactionOneULPBelowEviction)},
+			wantCompaction: compactionOneULPBelowEviction,
+			wantEviction:   DefaultEvictionThreshold,
+			exactBits:      true,
+			wantStrictLess: true,
+		},
+		{
+			name:           "OneULPBelowDefaultCompactionThresholdPreservedBitForBit",
+			opts:           []Option{WithCompactionThreshold(compactionOneULPBelowDefault)},
+			wantCompaction: compactionOneULPBelowDefault,
+			wantEviction:   DefaultEvictionThreshold,
+			exactBits:      true,
+			wantStrictLess: true,
+		},
+		{
+			name:           "WithCompactionThreshold95AdvancesEvictionThresholdTo110",
+			opts:           []Option{WithCompactionThreshold(0.95)},
+			wantCompaction: 0.95,
+			wantEviction:   1.10,
+		},
+		{
+			name:           "WithCompactionThreshold100AdvancesEvictionThresholdTo115",
+			opts:           []Option{WithCompactionThreshold(1.0)},
+			wantCompaction: 1.0,
+			wantEviction:   1.15,
+		},
+		{
+			name:           "WithLowEvictionThreshold60ScalesCompactionBelow60",
+			opts:           []Option{WithEvictionThreshold(0.60)},
+			wantCompaction: 0.60 * (DefaultCompactionThreshold / DefaultEvictionThreshold),
+			wantEviction:   0.60,
+			wantStrictLess: true,
+		},
+		{
+			name: "InvertedCompaction85AndEviction70ScalesCompactionBelow70",
+			opts: []Option{
+				WithCompactionThreshold(0.85),
+				WithEvictionThreshold(0.70),
+			},
+			wantCompaction: 0.70 * (DefaultCompactionThreshold / DefaultEvictionThreshold),
+			wantEviction:   0.70,
+			wantStrictLess: true,
+		},
+		{
+			name: "ExplicitEqualThresholdsAt90PreservesEquality",
+			opts: []Option{
+				WithCompactionThreshold(DefaultEvictionThreshold),
+				WithEvictionThreshold(DefaultEvictionThreshold),
+			},
+			wantCompaction: 0.90,
+			wantEviction:   0.90,
+		},
+		{
+			name: "ExplicitEqualThresholdsAt75PreservesEquality",
+			opts: []Option{
+				WithCompactionThreshold(DefaultCompactionThreshold),
+				WithEvictionThreshold(DefaultCompactionThreshold),
+			},
+			wantCompaction: 0.75,
+			wantEviction:   0.75,
+		},
+		{
+			name: "ResetCompactionThresholdToZeroBeforeEviction75ScalesDefaultCompaction",
+			opts: []Option{
+				WithCompactionThreshold(0.80),
+				WithCompactionThreshold(0),
+				WithEvictionThreshold(0.75),
+			},
+			wantCompaction: 0.625,
+			wantEviction:   0.75,
+		},
+		{
+			name:           "DirectStructCompactionMutationDoesNotPinAndScalesBackToDefault",
+			opts:           []Option{func(o *Options) { o.CompactionThreshold = 0.95 }},
+			wantCompaction: DefaultCompactionThreshold,
+			wantEviction:   DefaultEvictionThreshold,
+		},
+		{
+			name: "WithEvictionPinAndDirectCompactionStructMutationScalesBelowPinnedEviction",
+			opts: []Option{
+				WithEvictionThreshold(DefaultEvictionThreshold),
+				func(o *Options) { o.CompactionThreshold = 0.95 },
+			},
+			wantCompaction: DefaultCompactionThreshold,
+			wantEviction:   DefaultEvictionThreshold,
+		},
+		{
+			name: "MultiOptionExplicitDefaultEvictionBeforeCompaction95ScalesToDefault",
+			opts: []Option{
+				WithEvictionThreshold(DefaultEvictionThreshold),
+				WithCompactionThreshold(0.95),
+			},
+			wantCompaction: 0.75,
+			wantEviction:   0.90,
+		},
+		{
+			name: "MultiOptionExplicitDefaultEvictionAfterCompaction95ScalesToDefault",
+			opts: []Option{
+				WithCompactionThreshold(0.95),
+				WithEvictionThreshold(DefaultEvictionThreshold),
+			},
+			wantCompaction: 0.75,
+			wantEviction:   0.90,
+		},
+		{
+			name: "MultiOptionEviction90OverriddenBy80WithCompaction95ScalesBelow80",
+			opts: []Option{
+				WithEvictionThreshold(DefaultEvictionThreshold),
+				WithEvictionThreshold(0.80),
+				WithCompactionThreshold(0.95),
+			},
+			wantCompaction: 0.80 * (DefaultCompactionThreshold / DefaultEvictionThreshold),
+			wantEviction:   0.80,
+		},
+		{
+			name: "MultiOptionEviction80OverriddenBy90WithCompaction95ScalesBelow90",
+			opts: []Option{
+				WithEvictionThreshold(0.80),
+				WithEvictionThreshold(DefaultEvictionThreshold),
+				WithCompactionThreshold(0.95),
+			},
+			wantCompaction: 0.75,
+			wantEviction:   0.90,
+		},
+		{
+			name: "MultiStepOptionToDefaultCompactionPreservesEqualityWithEviction75",
+			opts: []Option{
+				WithCompactionThreshold(0.60),
+				WithEvictionThreshold(DefaultCompactionThreshold),
+				WithCompactionThreshold(DefaultCompactionThreshold),
+			},
+			wantCompaction: 0.75,
+			wantEviction:   0.75,
+		},
+		{
+			name: "EqualThresholdsAfterEarlierEvictionResetPreservesEquality",
+			opts: []Option{
+				WithEvictionThreshold(0.80),
+				WithEvictionThreshold(0),
+				func(o *Options) {
+					WithCompactionThreshold(0.90)(o)
+					WithEvictionThreshold(0.90)(o)
+				},
+			},
+			wantCompaction: 0.90,
+			wantEviction:   0.90,
+		},
+		{
+			name: "WithCompaction80FollowedByDirectEvictionMutation60ScalesCompactionBelow60",
+			opts: []Option{
+				WithCompactionThreshold(0.80),
+				func(o *Options) { o.EvictionThreshold = 0.60 },
+			},
+			wantCompaction: 0.60 * (DefaultCompactionThreshold / DefaultEvictionThreshold),
+			wantEviction:   0.60,
+		},
+		{
+			name: "WithCompaction80FollowedByDirectCompactionMutation95ScalesBelowDefaultEviction",
+			opts: []Option{
+				WithCompactionThreshold(0.80),
+				func(o *Options) { o.CompactionThreshold = 0.95 },
+			},
+			wantCompaction: DefaultCompactionThreshold,
+			wantEviction:   DefaultEvictionThreshold,
+		},
+		{
+			name: "WithEviction80FollowedByDirectEvictionMutationToDefaultAdvancesWithCompaction95",
+			opts: []Option{
+				WithEvictionThreshold(0.80),
+				func(o *Options) { o.EvictionThreshold = DefaultEvictionThreshold },
+				WithCompactionThreshold(0.95),
+			},
+			wantCompaction: 0.95,
+			wantEviction:   1.10,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got := ApplyOptions(tc.opts...)
+			assert.Greater(t, got.CompactionThreshold, 0.0)
+			assert.False(t, math.IsInf(got.EvictionThreshold, 0))
+			if tc.exactBits {
+				assert.Equal(t, math.Float64bits(tc.wantCompaction), math.Float64bits(got.CompactionThreshold))
+				assert.Equal(t, math.Float64bits(tc.wantEviction), math.Float64bits(got.EvictionThreshold))
+			} else {
+				assert.InDelta(t, tc.wantCompaction, got.CompactionThreshold, 1e-9)
+				assert.InDelta(t, tc.wantEviction, got.EvictionThreshold, 1e-9)
+			}
+			if tc.wantStrictLess {
+				assert.Less(t, got.CompactionThreshold, got.EvictionThreshold)
+			}
+		})
+	}
+
+	t.Run("NegativeZeroRetentionRatioNormalizedToPositiveZero", func(t *testing.T) {
+		optsNegZero := ApplyOptions(WithEvictionRetentionRatio(math.Copysign(0.0, -1.0)))
+		assert.False(t, math.Signbit(optsNegZero.EvictionRetentionRatio))
+		assert.Equal(t, uint64(0), math.Float64bits(optsNegZero.EvictionRetentionRatio))
+	})
+}
+
+func TestOptions_CustomAndConditionalOptionClosures(t *testing.T) {
+	t.Run("StatefulClosuresExecutedExactlyOnceAndObserveExactDefaults", func(t *testing.T) {
+		// Arrange
+		invocations := 0
+		var observedCompaction, observedEviction float64
+		statefulOpt := func(o *Options) {
+			invocations++
+			observedCompaction = o.CompactionThreshold
+			observedEviction = o.EvictionThreshold
+			WithCompactionThreshold(o.CompactionThreshold + 0.20)(o)
+		}
+
+		// Act
+		got := ApplyOptions(statefulOpt)
+
+		// Assert
+		assert.Equal(t, 1, invocations)
+		assert.Equal(t, math.Float64bits(DefaultCompactionThreshold), math.Float64bits(observedCompaction))
+		assert.Equal(t, math.Float64bits(DefaultEvictionThreshold), math.Float64bits(observedEviction))
+		assert.InDelta(t, 0.95, got.CompactionThreshold, 1e-9)
+		assert.InDelta(t, 1.10, got.EvictionThreshold, 1e-9)
+	})
+
+	t.Run("RelativeOptionSettingCompactionEqualToEvictionPreservesEquality", func(t *testing.T) {
+		// Arrange
+		matchEvictionOpt := func(o *Options) {
+			WithEvictionThreshold(DefaultEvictionThreshold)(o)
+			WithCompactionThreshold(o.EvictionThreshold)(o)
+		}
+
+		// Act
+		got := ApplyOptions(matchEvictionOpt)
+
+		// Assert
+		assert.InDelta(t, 0.90, got.CompactionThreshold, 1e-9)
+		assert.InDelta(t, 0.90, got.EvictionThreshold, 1e-9)
+	})
+
+	t.Run("TakenAndUntakenConditionalBranchesPinOnlyWhenExecuted", func(t *testing.T) {
+		// Arrange
+		conditionalPinEviction := func(o *Options) {
+			if o.EnableInvariantChecking {
+				WithEvictionThreshold(DefaultEvictionThreshold)(o)
+			}
+		}
+		combinedUntakenBranch := func(o *Options) {
+			WithCompactionThreshold(0.95)(o)
+			if o.MemoryBudget > 0 {
+				WithEvictionThreshold(DefaultEvictionThreshold)(o)
+			}
+		}
+
+		// Act
+		gotUntaken := ApplyOptions(conditionalPinEviction, WithCompactionThreshold(0.95))
+		gotTaken := ApplyOptions(WithInvariantChecking(true), conditionalPinEviction, WithCompactionThreshold(0.95))
+		gotCombinedUntaken := ApplyOptions(combinedUntakenBranch)
+
+		// Assert
+		assert.InDelta(t, 0.95, gotUntaken.CompactionThreshold, 1e-9)
+		assert.InDelta(t, 1.10, gotUntaken.EvictionThreshold, 1e-9)
+		assert.InDelta(t, 0.75, gotTaken.CompactionThreshold, 1e-9)
+		assert.InDelta(t, 0.90, gotTaken.EvictionThreshold, 1e-9)
+		assert.InDelta(t, 0.95, gotCombinedUntaken.CompactionThreshold, 1e-9)
+		assert.InDelta(t, 1.10, gotCombinedUntaken.EvictionThreshold, 1e-9)
+	})
 }

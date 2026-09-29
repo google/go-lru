@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-// Package lrus provides high-performance, concurrent, zero-dependency LRU cache implementations
+// Package lru provides high-performance, concurrent, zero-dependency LRU cache implementations
 // adapted from Google Cloud Storage FUSE (GCSFuse).
 //
 // The package defines a unified Cache interface satisfied by three specialized engines:
@@ -23,7 +23,7 @@
 //     and prefixes retain standard Go GC properties.
 //
 // All cache constructors require maxSize > 0 and unconditionally panic if maxSize == 0.
-package lrus
+package lru
 
 // ValueType represents an entry stored in a Cache that reports its logical or memory size.
 // The cache uses Size() to calculate total capacity and trigger LRU eviction when capacity is exceeded.
@@ -66,8 +66,10 @@ type Cache interface {
 
 	// UpdateSize adjusts the size accounting for an existing key by sizeDelta without altering its LRU position.
 	// Useful for entries whose size grows incrementally (e.g. sparse files).
-	// If the cache capacity is exceeded as a result of the size adjustment, least recently used (LRU) entries
-	// are evicted immediately to maintain capacity invariants.
+	// If the entry's updated size (existingSize + sizeDelta) exceeds maxSize (or cannot fit alongside
+	// entries more recent than key), the entry itself is evicted immediately without evicting older entries.
+	// Otherwise, if total cache capacity is exceeded, least recently used (LRU) entries are evicted
+	// immediately to maintain capacity invariants.
 	//
 	// Returns ErrEntryNotExist if key is not present in the cache.
 	// Returns ErrInvalidUpdateEntrySize if sizeDelta causes uint64 integer overflow.
@@ -78,16 +80,43 @@ type Cache interface {
 	EraseEntriesWithGivenPrefix(prefix string)
 }
 
-// PressureAwareCache extends Cache with explicit arena compaction and memory-pressure reclamation.
-// ArenaRadixCache implements this interface.
+// PressureAwareCache extends Cache with explicit arena/map compaction and memory-pressure reclamation.
+// All three cache backends (MapCache, RadixCache, and ArenaRadixCache) implement this interface
+// and perform both automatic amortized foreground reclamation (on Insert, Erase, UpdateSize,
+// and EraseEntriesWithGivenPrefix) and explicit reclamation via EvaluateMemoryPressure() and Compact().
 type PressureAwareCache interface {
 	Cache
 
-	// Compact performs lossless compaction of the internal node arena and lookup index.
+	// Compact performs lossless compaction of the internal node arena and/or lookup index.
 	Compact()
 
 	// EvaluateMemoryPressure samples the configured memory-pressure probe and executes
 	// Tier 1 (lossless compaction) or Tier 2 (LRU tail shedding + compaction) reclamation,
 	// returning any values evicted during Tier 2 shedding.
 	EvaluateMemoryPressure() []ValueType
+}
+
+// New creates and returns a new LRU Cache bounded by maxSize.
+// By default, New constructs a MapCache (BackendMap). Callers can select an alternative
+// engine via WithBackend(BackendRadix) or WithBackend(BackendArenaRadix), or invoke
+// NewMapCache, NewRadixCache, or NewArenaRadixCache directly.
+//
+// All returned Cache instances also implement PressureAwareCache.
+//
+// maxSize must be greater than zero; otherwise New panics.
+func New(maxSize uint64, opts ...Option) Cache {
+	if maxSize == 0 {
+		panic("maxSize must be greater than zero")
+	}
+	options := ApplyOptions(opts...)
+	switch options.Backend {
+	case BackendRadix:
+		return newRadixCacheWithOptions(maxSize, options)
+	case BackendArenaRadix:
+		return newArenaRadixCacheWithOptions(maxSize, options)
+	case BackendMap:
+		fallthrough
+	default:
+		return newMapCacheWithOptions(maxSize, options)
+	}
 }
