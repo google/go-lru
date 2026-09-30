@@ -58,7 +58,7 @@ func main() {
 
 	// 5. Fast O(prefix + subtree) prefix eviction and individual key erasure.
 	cache.EraseEntriesWithGivenPrefix("bucket/dirA/")
-	_ = cache.Erase("bucket/dirB/inode-42")
+	_, _ = cache.Erase("bucket/dirB/inode-42")
 }
 ```
 

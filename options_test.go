@@ -15,11 +15,13 @@
 package lru
 
 import (
+	"fmt"
 	"math"
 	"runtime/debug"
 	"strings"
 	"sync"
 	"testing"
+	"unsafe"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -784,4 +786,79 @@ func TestOptions_CustomAndConditionalOptionClosures(t *testing.T) {
 		assert.InDelta(t, 0.95, gotCombinedUntaken.CompactionThreshold, 1e-9)
 		assert.InDelta(t, 1.10, gotCombinedUntaken.EvictionThreshold, 1e-9)
 	})
+}
+
+func TestGenericCache_ScalarValueTypesAndCompactNodeLayout(t *testing.T) {
+	testGenericCacheWithScalar(t, byte(1), byte(2))
+	testGenericCacheWithScalar(t, uint16(1), uint16(2))
+	testGenericCacheWithScalar(t, uint32(1), uint32(2))
+
+	if unsafe.Sizeof(uintptr(0)) == 8 {
+		assert.Equal(t, uintptr(72), unsafe.Sizeof(radixNode[byte]{}))
+		assert.Equal(t, uintptr(72), unsafe.Sizeof(radixNode[uint16]{}))
+		assert.Equal(t, uintptr(72), unsafe.Sizeof(radixNode[uint32]{}))
+		assert.Equal(t, uintptr(80), unsafe.Sizeof(radixNode[uint64]{}))
+		assert.Equal(t, uintptr(48), unsafe.Sizeof(arenaRadixNode[byte]{}))
+		assert.Equal(t, uintptr(48), unsafe.Sizeof(arenaRadixNode[uint16]{}))
+		assert.Equal(t, uintptr(56), unsafe.Sizeof(arenaRadixNode[uint32]{}))
+		assert.Equal(t, uintptr(56), unsafe.Sizeof(arenaRadixNode[uint64]{}))
+	}
+}
+
+func testGenericCacheWithScalar[V any](t *testing.T, val1, val2 V) {
+	t.Helper()
+	backends := []Backend{BackendMap, BackendRadix, BackendArenaRadix}
+	for _, backend := range backends {
+		t.Run(fmt.Sprintf("%T/%s", val1, backend), func(t *testing.T) {
+			c1 := New[V](10, WithBackend(backend), WithInvariantChecking(true))
+			exerciseScalarCache(t, c1, val1, val2)
+
+			c2 := New[V](10, WithBackend(backend), WithInvariantChecking(true), WithWeigher(func(_ string, _ V) uint64 {
+				return 1
+			}))
+			exerciseScalarCache(t, c2, val1, val2)
+		})
+	}
+}
+
+func exerciseScalarCache[V any](t *testing.T, c Cache[V], val1, val2 V) {
+	t.Helper()
+	evicted, err := c.Insert("key1", val1)
+	require.NoError(t, err)
+	assert.Empty(t, evicted)
+
+	evicted, err = c.Insert("key2", val2)
+	require.NoError(t, err)
+	assert.Empty(t, evicted)
+
+	v, ok := c.LookUp("key1")
+	require.True(t, ok)
+	assert.Equal(t, val1, v)
+
+	v, ok = c.LookUpWithoutChangingOrder("key2")
+	require.True(t, ok)
+	assert.Equal(t, val2, v)
+
+	require.NoError(t, c.UpdateWithoutChangingOrder("key1", val2))
+
+	v, ok = c.LookUp("key1")
+	require.True(t, ok)
+	assert.Equal(t, val2, v)
+
+	v, ok = c.Erase("key1")
+	require.True(t, ok)
+	assert.Equal(t, val2, v)
+
+	_, ok = c.LookUp("key1")
+	assert.False(t, ok)
+
+	_, err = c.Insert("prefix/1", val1)
+	require.NoError(t, err)
+	_, err = c.Insert("prefix/2", val2)
+	require.NoError(t, err)
+
+	c.EraseEntriesWithGivenPrefix("prefix/")
+
+	_, ok = c.LookUp("prefix/1")
+	assert.False(t, ok)
 }

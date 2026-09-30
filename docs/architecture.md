@@ -39,7 +39,7 @@ This document details the internal data structures, concurrency models, and memo
 - **Path Compression**: When an internal node loses children after `Erase` or eviction, `compressPathUpwards` merges single-child routing nodes with their parent to keep tree depth minimal.
 
 ### 2.3 `ArenaRadixCache` (`arena_radix.go`, `arena_radix_lru.go`)
-`ArenaRadixCache` eliminates per-node heap objects and pointer-graph scanning by storing all nodes in a contiguous slice `[]arenaRadixNode[V]` (`64 bytes` per node for 8-byte `V`) indexed by 32-bit integers (`uint32`, with `nilNode = math.MaxUint32`).
+`ArenaRadixCache` eliminates per-node heap objects and pointer-graph scanning by storing all nodes in a contiguous slice `[]arenaRadixNode[V]` (`56 bytes per node for 8-byte V, 64 bytes for 16-byte V`) indexed by 32-bit integers (`uint32`, with `nilNode = math.MaxUint32`).
 - **Intrusive O(1) Free-List**: Erased or evicted node slots are pushed onto an intrusive singly-linked free-list (`freeHead`, linked via `next` index with `parent = nilNode`, `child = nilNode`, `sibling = nilNode`, `prev = nilNode`, `hasValue = false`) and recycled on subsequent insertions with zero heap allocations.
 - **O(1) 64-Bit FNV-1a Lookup Accelerator**:
   - `nodeMap map[uint64]uint32` maps the 64-bit FNV-1a hash of full keys directly to their arena node index.

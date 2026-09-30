@@ -26,7 +26,6 @@ import (
 // allocations on branching and embeds intrusive doubly-linked list pointers for LRU eviction tracking.
 type radixNode[V any] struct {
 	prefix  string
-	value   V
 	size    uint64
 	parent  *radixNode[V]
 	child   *radixNode[V]
@@ -36,6 +35,7 @@ type radixNode[V any] struct {
 	prev     *radixNode[V]
 	next     *radixNode[V]
 	hasValue bool
+	value    V
 }
 
 // radixCache encapsulates a compressed prefix tree (radix trie) with an intrusive

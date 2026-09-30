@@ -29,7 +29,6 @@ const nilNode uint32 = math.MaxUint32
 // traversal during GC cycles, while stored values and prefixes retain standard Go GC properties.
 type arenaRadixNode[V any] struct {
 	prefix   string // Edge label component
-	value    V      // Value stored at this node
 	size     uint64 // Tracked size of the value stored at this node
 	parent   uint32 // Arena slice index of parent node
 	child    uint32 // Arena slice index of first child (LCRS)
@@ -37,6 +36,7 @@ type arenaRadixNode[V any] struct {
 	prev     uint32 // Arena slice index of previous node in intrusive LRU list
 	next     uint32 // Arena slice index of next node in intrusive LRU list (or free-list)
 	hasValue bool   // True if this node stores a live cache entry value
+	value    V      // Value stored at this node
 }
 
 // arenaRadix implements the Cache[V] and PressureAwareCache[V] interfaces using a contiguous arena-backed
