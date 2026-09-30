@@ -15,7 +15,6 @@
 package lru_test
 
 import (
-	"errors"
 	"fmt"
 	"math/rand"
 	"sync"
@@ -32,21 +31,29 @@ type concValue struct {
 	size uint64
 }
 
-func (v concValue) Size() uint64 {
+var concWeigher = lru.WithWeigher(func(_ string, v concValue) uint64 {
 	return v.size
-}
+})
 
 func allEngines() []struct {
 	name        string
-	constructor func(maxSize uint64, opts ...lru.Option) lru.Cache
+	constructor func(maxSize uint64, opts ...lru.Option) lru.Cache[concValue]
 } {
+	wrap := func(fn func(uint64, ...lru.Option) lru.Cache[concValue]) func(uint64, ...lru.Option) lru.Cache[concValue] {
+		return func(maxSize uint64, opts ...lru.Option) lru.Cache[concValue] {
+			allOpts := make([]lru.Option, 0, len(opts)+1)
+			allOpts = append(allOpts, concWeigher)
+			allOpts = append(allOpts, opts...)
+			return fn(maxSize, allOpts...)
+		}
+	}
 	return []struct {
 		name        string
-		constructor func(maxSize uint64, opts ...lru.Option) lru.Cache
+		constructor func(maxSize uint64, opts ...lru.Option) lru.Cache[concValue]
 	}{
-		{"MapCache", lru.NewMapCache},
-		{"RadixCache", lru.NewRadixCache},
-		{"ArenaRadixCache", lru.NewArenaRadixCache},
+		{"MapCache", wrap(lru.NewMapCache[concValue])},
+		{"RadixCache", wrap(lru.NewRadixCache[concValue])},
+		{"ArenaRadixCache", wrap(lru.NewArenaRadixCache[concValue])},
 	}
 }
 
@@ -93,21 +100,22 @@ func TestConcurrency_MixedOperations(t *testing.T) {
 								assert.ErrorIs(t, err, lru.ErrInvalidEntrySize)
 							}
 						case op < 55:
-							_ = cache.LookUp(key)
+							_, _ = cache.LookUp(key)
 						case op < 70:
-							_ = cache.LookUpWithoutChangingOrder(key)
+							_, _ = cache.LookUpWithoutChangingOrder(key)
 						case op < 80:
 							err := cache.UpdateWithoutChangingOrder(key, concValue{id: key + "_upd", size: 10})
 							if err != nil {
-								assert.True(t, errors.Is(err, lru.ErrEntryNotExist) || errors.Is(err, lru.ErrInvalidUpdateEntrySize))
+								assert.ErrorIs(t, err, lru.ErrEntryNotExist)
 							}
 						case op < 88:
-							err := cache.UpdateSize(key, 0)
+							sz := uint64(5 + (kIdx%3)*10) // 5, 15, or 25 (shrinks or grows weight)
+							err := cache.UpdateWithoutChangingOrder(key, concValue{id: key + "_sz", size: sz})
 							if err != nil {
 								assert.ErrorIs(t, err, lru.ErrEntryNotExist)
 							}
 						case op < 95:
-							_ = cache.Erase(key)
+							_, _ = cache.Erase(key)
 						default:
 							prefix := fmt.Sprintf("dir_%02d/", dirIdx)
 							cache.EraseEntriesWithGivenPrefix(prefix)
@@ -121,7 +129,9 @@ func TestConcurrency_MixedOperations(t *testing.T) {
 			// Assert
 			_, err := cache.Insert("post_conc_check", concValue{id: "post_conc_check", size: 10})
 			require.NoError(t, err)
-			assert.NotNil(t, cache.LookUp("post_conc_check"))
+			val, ok := cache.LookUp("post_conc_check")
+			assert.True(t, ok)
+			assert.Equal(t, "post_conc_check", val.id)
 		})
 	}
 }
@@ -175,15 +185,18 @@ func TestConcurrency_PrefixErasureAtomicity(t *testing.T) {
 			// Assert
 			for i := range 20 {
 				kTarget := fmt.Sprintf("/target/init_%d", i)
-				assert.Nil(t, cache.LookUp(kTarget))
+				_, okTarget := cache.LookUp(kTarget)
+				assert.False(t, okTarget)
 				kKeep := fmt.Sprintf("/keep/init_%d", i)
-				assert.NotNil(t, cache.LookUp(kKeep))
+				_, okKeep := cache.LookUp(kKeep)
+				assert.True(t, okKeep)
 			}
 
 			for w := range numWriters {
 				for op := range opsPerWriter {
 					key := fmt.Sprintf("/target/w%d_%d", w, op)
-					assert.Nil(t, cache.LookUp(key))
+					_, ok := cache.LookUp(key)
+					assert.False(t, ok)
 				}
 			}
 		})
@@ -222,8 +235,8 @@ func TestConcurrency_ParallelReadersWithoutChangingOrder(t *testing.T) {
 						if i%2 == 1 {
 							targetKey = fmt.Sprintf("key_%04d", (readerID*17+i)%totalKeys)
 						}
-						val := cache.LookUpWithoutChangingOrder(targetKey)
-						if !assert.NotNil(t, val) {
+						_, ok := cache.LookUpWithoutChangingOrder(targetKey)
+						if !assert.True(t, ok) {
 							return
 						}
 					}
@@ -244,7 +257,7 @@ func TestConcurrency_ParallelReadersWithoutChangingOrder(t *testing.T) {
 			// Assert
 			require.NoError(t, err)
 			require.Len(t, evicted, 1)
-			assert.Equal(t, "key_0000", evicted[0].(concValue).id)
+			assert.Equal(t, "key_0000", evicted[0].id)
 		})
 	}
 }
@@ -323,7 +336,7 @@ func TestConcurrency_MemoryPressureCompactionAndEviction(t *testing.T) {
 				lru.WithEvictionRetentionRatio(0.50),
 			)
 
-			reclaimer, ok := cache.(lru.PressureAwareCache)
+			reclaimer, ok := cache.(lru.PressureAwareCache[concValue])
 			require.True(t, ok, "expected %s to implement PressureAwareCache", eng.name)
 
 			// Act
@@ -359,21 +372,22 @@ func TestConcurrency_MemoryPressureCompactionAndEviction(t *testing.T) {
 								assert.ErrorIs(t, err, lru.ErrInvalidEntrySize)
 							}
 						case op < 50:
-							_ = cache.LookUp(key)
+							_, _ = cache.LookUp(key)
 						case op < 68:
-							_ = cache.LookUpWithoutChangingOrder(key)
+							_, _ = cache.LookUpWithoutChangingOrder(key)
 						case op < 76:
 							err := cache.UpdateWithoutChangingOrder(key, concValue{id: key + "_u", size: 10})
 							if err != nil {
-								assert.True(t, errors.Is(err, lru.ErrEntryNotExist) || errors.Is(err, lru.ErrInvalidUpdateEntrySize))
+								assert.ErrorIs(t, err, lru.ErrEntryNotExist)
 							}
 						case op < 84:
-							err := cache.UpdateSize(key, 5)
+							sz := uint64(5 + (step%2)*10) // 5 or 15
+							err := cache.UpdateWithoutChangingOrder(key, concValue{id: key + "_sz", size: sz})
 							if err != nil {
 								assert.ErrorIs(t, err, lru.ErrEntryNotExist)
 							}
 						case op < 90:
-							_ = cache.Erase(key)
+							_, _ = cache.Erase(key)
 						case op < 95:
 							prefix := fmt.Sprintf("mp_dir_%02d/", dirIdx)
 							cache.EraseEntriesWithGivenPrefix(prefix)

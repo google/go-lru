@@ -24,37 +24,44 @@ import (
 // radixNode represents a node in the compressed radix tree (trie).
 // It uses a Left-Child Right-Sibling (LCRS) representation to eliminate dynamic slice/map
 // allocations on branching and embeds intrusive doubly-linked list pointers for LRU eviction tracking.
-type radixNode struct {
+type radixNode[V any] struct {
 	prefix  string
-	value   ValueType
+	value   V
 	size    uint64
-	parent  *radixNode
-	child   *radixNode
-	sibling *radixNode
+	parent  *radixNode[V]
+	child   *radixNode[V]
+	sibling *radixNode[V]
 
 	// LRU intrusive doubly-linked list pointers.
-	prev *radixNode
-	next *radixNode
+	prev     *radixNode[V]
+	next     *radixNode[V]
+	hasValue bool
 }
 
 // radixCache encapsulates a compressed prefix tree (radix trie) with an intrusive
-// doubly-linked LRU list, implementing the Cache interface.
-type radixCache struct {
-	// maxSize specifies the maximum allowable sum of entry sizes.
+// doubly-linked LRU list, implementing the Cache[V] interface.
+type radixCache[V any] struct {
+	// maxSize specifies the maximum allowable sum of entry weights/sizes.
 	maxSize uint64
 
-	// currentSize is the current sum of sizes of all stored entries.
+	// currentSize is the current sum of weights/sizes of all stored entries.
 	currentSize uint64
 
 	// root is the root node of the radix trie.
-	root *radixNode
+	root *radixNode[V]
 
 	// head and tail point to the MRU (head) and LRU (tail) nodes in the eviction list.
-	head *radixNode
-	tail *radixNode
+	head *radixNode[V]
+	tail *radixNode[V]
 
 	// len is the number of value-bearing entries currently tracked in the LRU list.
 	len int
+
+	// weigher computes the weight of a cache entry, or is nil when using the default unit weight of 1.
+	weigher func(key string, value V) uint64
+
+	// noProtectNode is a sentinel node pointer indicating a foreground mutation with no protected head node.
+	noProtectNode radixNode[V]
 
 	// mu synchronizes concurrent access to all cache data structures.
 	mu sync.RWMutex
@@ -62,21 +69,20 @@ type radixCache struct {
 	pressureState
 }
 
-var foregroundNoProtectNode radixNode
-
-// NewRadixCache creates a new RadixCache instance bounded by maxSize (in bytes).
+// NewRadixCache creates a new RadixCache[V] instance bounded by maxSize.
 // maxSize must be greater than zero; otherwise NewRadixCache panics.
-func NewRadixCache(maxSize uint64, opts ...Option) Cache {
+func NewRadixCache[V any](maxSize uint64, opts ...Option) Cache[V] {
 	if maxSize == 0 {
 		panic("maxSize must be greater than zero")
 	}
-	return newRadixCacheWithOptions(maxSize, ApplyOptions(opts...))
+	return newRadixCacheWithOptions[V](maxSize, ApplyOptions(opts...))
 }
 
-func newRadixCacheWithOptions(maxSize uint64, options Options) Cache {
-	c := &radixCache{
+func newRadixCacheWithOptions[V any](maxSize uint64, options Options) Cache[V] {
+	c := &radixCache[V]{
 		maxSize:       maxSize,
-		root:          &radixNode{},
+		root:          &radixNode[V]{},
+		weigher:       resolveWeigher[V](options),
 		pressureState: pressureState{options: options},
 	}
 
@@ -87,7 +93,14 @@ func newRadixCacheWithOptions(maxSize uint64, options Options) Cache {
 	return c
 }
 
-func (c *radixCache) checkInvariants() {
+func (c *radixCache[V]) weigh(key string, value V) uint64 {
+	if c.weigher != nil {
+		return c.weigher(key, value)
+	}
+	return 1
+}
+
+func (c *radixCache[V]) checkInvariants() {
 	// INVARIANT 1: maxSize > 0
 	if c.maxSize == 0 {
 		panic("radixCache invariant violation: maxSize must be greater than 0")
@@ -102,7 +115,7 @@ func (c *radixCache) checkInvariants() {
 	lruCount := 0
 	zeroCount := 0
 	var sumSize uint64
-	var prevNode *radixNode
+	var prevNode *radixNode[V]
 
 	for curr := c.head; curr != nil; curr = curr.next {
 		lruCount++
@@ -113,7 +126,7 @@ func (c *radixCache) checkInvariants() {
 		if curr.size == 0 {
 			zeroCount++
 		}
-		if curr.value == nil {
+		if !curr.hasValue {
 			panic(fmt.Sprintf("radixCache invariant violation: unexpected nil value in LRU list for prefix '%s'", curr.prefix))
 		}
 
@@ -183,7 +196,7 @@ func (c *radixCache) checkInvariants() {
 	var treeSumSize uint64
 	curr := c.root
 	for curr != nil {
-		if curr.value != nil {
+		if curr.hasValue {
 			treeCount++
 			if math.MaxUint64-treeSumSize < curr.size {
 				panic("radixCache invariant violation: treeSumSize uint64 overflow")
@@ -204,7 +217,7 @@ func (c *radixCache) checkInvariants() {
 		}
 
 		// Validate child pointers and sibling ordering
-		var prevSibling *radixNode
+		var prevSibling *radixNode[V]
 		for ch := curr.child; ch != nil; ch = ch.sibling {
 			if ch.parent != curr {
 				panic(fmt.Sprintf("radixCache invariant violation: child with prefix '%s' has incorrect parent pointer", ch.prefix))
@@ -219,7 +232,7 @@ func (c *radixCache) checkInvariants() {
 		}
 
 		// Validate tree compactness: non-root routing nodes without a value must have >= 2 children.
-		if curr != c.root && curr.value == nil {
+		if curr != c.root && !curr.hasValue {
 			if curr.child == nil || curr.child.sibling == nil {
 				panic(fmt.Sprintf("radixCache invariant violation: intermediate routing node with prefix '%s' has fewer than 2 children", curr.prefix))
 			}
@@ -252,7 +265,7 @@ func (c *radixCache) checkInvariants() {
 
 // getChild finds a child node whose prefix starts with byte b.
 // Takes advantage of sorted sibling order for early-exit termination.
-func (n *radixNode) getChild(b byte) *radixNode {
+func (n *radixNode[V]) getChild(b byte) *radixNode[V] {
 	for curr := n.child; curr != nil; curr = curr.sibling {
 		if curr.prefix[0] == b {
 			return curr
@@ -266,7 +279,7 @@ func (n *radixNode) getChild(b byte) *radixNode {
 }
 
 // addChild adds a child node, maintaining sorted order by the first byte of prefix.
-func (n *radixNode) addChild(newChild *radixNode) {
+func (n *radixNode[V]) addChild(newChild *radixNode[V]) {
 	newChild.parent = n
 	pcurr := &n.child
 	for *pcurr != nil && (*pcurr).prefix[0] < newChild.prefix[0] {
@@ -277,7 +290,7 @@ func (n *radixNode) addChild(newChild *radixNode) {
 }
 
 // removeChild directly removes a child node by pointer reference from the sibling list.
-func (n *radixNode) removeChild(childToRemove *radixNode) {
+func (n *radixNode[V]) removeChild(childToRemove *radixNode[V]) {
 	for pcurr := &n.child; *pcurr != nil; pcurr = &(*pcurr).sibling {
 		if *pcurr == childToRemove {
 			*pcurr = childToRemove.sibling
@@ -291,7 +304,7 @@ func (n *radixNode) removeChild(childToRemove *radixNode) {
 
 // replaceChild finds oldChild in the sibling linked list and substitutes it with newChild,
 // preserving the remainder of the sibling chain.
-func (n *radixNode) replaceChild(oldChild, newChild *radixNode) {
+func (n *radixNode[V]) replaceChild(oldChild, newChild *radixNode[V]) {
 	for pcurr := &n.child; *pcurr != nil; pcurr = &(*pcurr).sibling {
 		if *pcurr == oldChild {
 			newChild.parent = n
@@ -307,26 +320,24 @@ func (n *radixNode) replaceChild(oldChild, newChild *radixNode) {
 }
 
 // insertNode inserts a new key into the radix tree and returns the leaf node.
-func (c *radixCache) insertNode(key string, value ValueType) *radixNode {
-	if value == nil {
-		return nil
-	}
-
+func (c *radixCache[V]) insertNode(key string, value V) *radixNode[V] {
 	node := c.root
 	search := key
 
 	for {
 		if len(search) == 0 {
 			node.value = value
+			node.hasValue = true
 			return node
 		}
 
 		child := node.getChild(search[0])
 		if child == nil {
 			// Clone the substring to prevent memory leaks from sliced string headers pinning large backing arrays
-			newLeaf := &radixNode{
-				prefix: clonePrefix(search),
-				value:  value,
+			newLeaf := &radixNode[V]{
+				prefix:   clonePrefix(search),
+				value:    value,
+				hasValue: true,
 			}
 			node.addChild(newLeaf)
 			return newLeaf
@@ -343,7 +354,7 @@ func (c *radixCache) insertNode(key string, value ValueType) *radixNode {
 		// Clone both split prefix halves so surviving intermediate routing nodes never pin
 		// the underlying backing arrays of large evicted leaf keys.
 		oldPrefix := child.prefix
-		splitNode := &radixNode{
+		splitNode := &radixNode[V]{
 			prefix: clonePrefix(oldPrefix[:lcp]),
 			parent: node,
 		}
@@ -356,26 +367,28 @@ func (c *radixCache) insertNode(key string, value ValueType) *radixNode {
 
 		if lcp == len(search) {
 			splitNode.value = value
+			splitNode.hasValue = true
 			return splitNode
 		}
 
-		newLeaf := &radixNode{
-			prefix: clonePrefix(search[lcp:]),
-			value:  value,
+		newLeaf := &radixNode[V]{
+			prefix:   clonePrefix(search[lcp:]),
+			value:    value,
+			hasValue: true,
 		}
 		splitNode.addChild(newLeaf)
 		return newLeaf
 	}
 }
 
-// getNode finds a node by key. Returns the node and true if found with a non-nil value.
-func (c *radixCache) getNode(key string) (*radixNode, bool) {
+// getNode finds a node by key. Returns the node and true if found with a value.
+func (c *radixCache[V]) getNode(key string) (*radixNode[V], bool) {
 	node := c.root
 	search := key
 
 	for {
 		if len(search) == 0 {
-			if node.value != nil {
+			if node.hasValue {
 				return node, true
 			}
 			return nil, false
@@ -397,19 +410,21 @@ func (c *radixCache) getNode(key string) (*radixNode, bool) {
 }
 
 // deleteNode clears a node's value and compresses the path upwards.
-func (c *radixCache) deleteNode(node *radixNode) {
-	if node == nil || node.value == nil {
+func (c *radixCache[V]) deleteNode(node *radixNode[V]) {
+	if node == nil || !node.hasValue {
 		return
 	}
 
-	node.value = nil
+	var zero V
+	node.value = zero
+	node.hasValue = false
 	c.compressPathUpwards(node)
 }
 
 // compressPathUpwards walks up the tree from curr, pruning empty leaves and compressing single-child routing nodes.
-func (c *radixCache) compressPathUpwards(curr *radixNode) {
+func (c *radixCache[V]) compressPathUpwards(curr *radixNode[V]) {
 	for curr != nil && curr != c.root {
-		if curr.value != nil {
+		if curr.hasValue {
 			break
 		}
 
@@ -440,7 +455,7 @@ func (c *radixCache) compressPathUpwards(curr *radixNode) {
 // --- LRU Linked List Methods ---
 
 // moveToFront moves an existing node in the LRU list to the MRU (head) position.
-func (c *radixCache) moveToFront(node *radixNode) {
+func (c *radixCache[V]) moveToFront(node *radixNode[V]) {
 	if c.head == node {
 		return
 	}
@@ -462,7 +477,7 @@ func (c *radixCache) moveToFront(node *radixNode) {
 }
 
 // pushFront inserts a newly allocated or value-bearing node at the MRU (head) position.
-func (c *radixCache) pushFront(node *radixNode) {
+func (c *radixCache[V]) pushFront(node *radixNode[V]) {
 	node.prev = nil
 	node.next = c.head
 	if c.head != nil {
@@ -476,7 +491,7 @@ func (c *radixCache) pushFront(node *radixNode) {
 }
 
 // remove unlinks a node from the LRU doubly-linked list.
-func (c *radixCache) remove(node *radixNode) {
+func (c *radixCache[V]) remove(node *radixNode[V]) {
 	if c.head != node && node.prev == nil {
 		return
 	}
@@ -496,49 +511,54 @@ func (c *radixCache) remove(node *radixNode) {
 }
 
 // eraseInternal removes an entry from both the LRU list and radix trie without acquiring locks.
-// It returns the deleted ValueType.
-func (c *radixCache) eraseInternal(node *radixNode) ValueType {
-	deletedEntry := node.value
-	if deletedEntry != nil {
-		c.onEntryDeleted(node.size)
+// It returns the deleted value and true if the node held a value.
+func (c *radixCache[V]) eraseInternal(node *radixNode[V]) (V, bool) {
+	if node == nil || !node.hasValue {
+		var zero V
+		return zero, false
 	}
+	deletedEntry := node.value
+	c.onEntryDeleted(node.size)
 	c.currentSize -= node.size
 	node.size = 0
 
 	c.remove(node)
 	c.deleteNode(node)
 
-	return deletedEntry
+	return deletedEntry, true
 }
 
-func (c *radixCache) clearEmptyTreeStateLocked() {
+func (c *radixCache[V]) clearEmptyTreeStateLocked() {
 	c.resetWatermarks()
 }
 
-func (c *radixCache) resetEmptyTreeLocked() {
+func (c *radixCache[V]) resetEmptyTreeLocked() {
 	c.clearEmptyTreeStateLocked()
 	c.markReclaimedLocked()
 }
 
 // evictOne removes and returns the least recently used entry (c.tail).
-func (c *radixCache) evictOne() ValueType {
+func (c *radixCache[V]) evictOne() (V, bool) {
 	node := c.tail
 	if node == nil {
-		return nil
+		var zero V
+		return zero, false
 	}
 	return c.eraseInternal(node)
 }
 
 // sweepAndUnlink iteratively cleans up all value-bearing nodes in a detached subtree (O(1) space).
-func (c *radixCache) sweepAndUnlink(node *radixNode) {
+func (c *radixCache[V]) sweepAndUnlink(node *radixNode[V]) {
+	var zero V
 	curr := node
 	for curr != nil {
-		if curr.value != nil {
+		if curr.hasValue {
 			c.onEntryDeleted(curr.size)
 			c.currentSize -= curr.size
 			curr.size = 0
 			c.remove(curr)
-			curr.value = nil
+			curr.value = zero
+			curr.hasValue = false
 		}
 
 		if curr.child != nil {
@@ -573,21 +593,21 @@ func (c *radixCache) sweepAndUnlink(node *radixNode) {
 // Cache Interface Implementation
 // ============================================================================
 
-func (c *radixCache) unlock() {
+func (c *radixCache[V]) unlock() {
 	if c.options.EnableInvariantChecking {
 		c.checkInvariants()
 	}
 	c.mu.Unlock()
 }
 
-func (c *radixCache) rUnlock() {
+func (c *radixCache[V]) rUnlock() {
 	if c.options.EnableInvariantChecking {
 		c.checkInvariants()
 	}
 	c.mu.RUnlock()
 }
 
-func (c *radixCache) finishDeleteReclaimLocked(sizeBefore, sampledEpoch uint64, pressure float64) {
+func (c *radixCache[V]) finishDeleteReclaimLocked(sizeBefore, sampledEpoch uint64, pressure float64) {
 	if c.len == 0 {
 		hadSlack := c.hasEmptyDeleteSlack(false)
 		c.clearEmptyTreeStateLocked()
@@ -601,13 +621,13 @@ func (c *radixCache) finishDeleteReclaimLocked(sizeBefore, sampledEpoch uint64, 
 		c.compactDataStructuresLocked()
 		reclaimedSingleSurvivor = true
 	}
-	c.maybeReclaimUnderPressureLocked(pressure, &foregroundNoProtectNode)
+	c.maybeReclaimUnderPressureLocked(pressure, &c.noProtectNode)
 	if (reclaimedSingleSurvivor || c.currentSize < sizeBefore) && c.reclaimEpoch.Load() == sampledEpoch && c.hasElevatedPressureToInvalidate(pressure) {
 		c.markReclaimedLocked()
 	}
 }
 
-func (c *radixCache) finishMutationReclaimLocked(evictedValues []ValueType, protectedNode *radixNode, reclaimedPre bool, sizeBefore, sampledEpoch uint64, pressure float64) []ValueType {
+func (c *radixCache[V]) finishMutationReclaimLocked(evictedValues []V, protectedNode *radixNode[V], reclaimedPre bool, sizeBefore, sampledEpoch uint64, pressure float64) []V {
 	evictedByPressure := c.maybeReclaimUnderPressureLocked(pressure, protectedNode)
 	if len(evictedValues) == 0 {
 		evictedValues = evictedByPressure
@@ -628,14 +648,9 @@ func (c *radixCache) finishMutationReclaimLocked(evictedValues []ValueType, prot
 // If the key exists, its value is updated and moved to MRU.
 // If capacity is exceeded, excess LRU entries are evicted and returned.
 //
-// Returns ErrInvalidEntry if value is nil.
-// Returns ErrInvalidEntrySize if value.Size() exceeds maxSize.
-func (c *radixCache) Insert(key string, value ValueType) ([]ValueType, error) {
-	if value == nil {
-		return nil, ErrInvalidEntry
-	}
-
-	valueSize := value.Size()
+// Returns ErrInvalidEntrySize if the entry's weight exceeds maxSize.
+func (c *radixCache[V]) Insert(key string, value V) ([]V, error) {
+	valueSize := c.weigh(key, value)
 	if valueSize > c.maxSize {
 		return nil, ErrInvalidEntrySize
 	}
@@ -643,7 +658,7 @@ func (c *radixCache) Insert(key string, value ValueType) ([]ValueType, error) {
 	sampledEpoch, pressure := c.lockWithPressure(&c.mu, false)
 	defer c.unlock()
 
-	var evictedValues []ValueType
+	var evictedValues []V
 	sizeBefore := c.currentSize
 	reclaimedPreInsert := false
 	evictedPreInsert := false
@@ -654,19 +669,20 @@ func (c *radixCache) Insert(key string, value ValueType) ([]ValueType, error) {
 		c.moveToFront(node)
 		c.currentSize -= node.size
 		for valueSize > c.maxSize-c.currentSize && c.tail != nil && c.tail != node {
-			if evicted := c.evictOne(); evicted != nil {
+			if evicted, ok := c.evictOne(); ok {
 				evictedValues = append(evictedValues, evicted)
 				evictedPreInsert = true
 			}
 		}
 		node.value = value
+		node.hasValue = true
 		node.size = valueSize
 		c.currentSize += valueSize
 		reclaimedPreInsert = c.shouldReclaimSingleSurvivorOnMutation(c.len, c.deletedSinceCompact > 0, false, evictedPreInsert, c.currentSize, sizeBefore, pressure)
 	} else {
 		// Evict from the LRU tail before inserting into the trie to avoid redundant node splits and merges.
 		for valueSize > c.maxSize-c.currentSize && c.tail != nil {
-			if evicted := c.evictOne(); evicted != nil {
+			if evicted, ok := c.evictOne(); ok {
 				evictedValues = append(evictedValues, evicted)
 				evictedPreInsert = true
 			}
@@ -688,86 +704,63 @@ func (c *radixCache) Insert(key string, value ValueType) ([]ValueType, error) {
 	return evictedValues, nil
 }
 
-// Erase removes the entry associated with key, returning its value (or nil if not found).
-func (c *radixCache) Erase(key string) (value ValueType) {
+// Erase removes the entry associated with key, returning its value and true (or the zero value of V and false if not found).
+func (c *radixCache[V]) Erase(key string) (value V, ok bool) {
 	sampledEpoch, pressure := c.lockWithPressure(&c.mu, false)
 	defer c.unlock()
 
-	node, ok := c.getNode(key)
-	if !ok {
-		return nil
+	node, found := c.getNode(key)
+	if !found {
+		return value, false
 	}
 
 	sizeBefore := c.currentSize
-	deleted := c.eraseInternal(node)
+	deleted, erased := c.eraseInternal(node)
+	if !erased {
+		return value, false
+	}
 	c.finishDeleteReclaimLocked(sizeBefore, sampledEpoch, pressure)
-	return deleted
+	return deleted, true
 }
 
 // LookUp retrieves the value for key and promotes it to the MRU position.
-// Returns nil if key is not found.
-func (c *radixCache) LookUp(key string) (value ValueType) {
+// Returns the zero value of V and false if key is not found.
+func (c *radixCache[V]) LookUp(key string) (value V, ok bool) {
 	c.mu.Lock()
 	defer c.unlock()
 
-	node, ok := c.getNode(key)
-	if !ok {
-		return nil
+	node, found := c.getNode(key)
+	if !found {
+		return value, false
 	}
 	c.moveToFront(node)
 
-	return node.value
+	return node.value, true
 }
 
 // LookUpWithoutChangingOrder retrieves the value for key without modifying its LRU position.
-// Returns nil if key is not found.
-func (c *radixCache) LookUpWithoutChangingOrder(key string) (value ValueType) {
+// Returns the zero value of V and false if key is not found.
+func (c *radixCache[V]) LookUpWithoutChangingOrder(key string) (value V, ok bool) {
 	c.mu.RLock()
 	defer c.rUnlock()
 
-	node, ok := c.getNode(key)
-	if !ok {
-		return nil
+	node, found := c.getNode(key)
+	if !found {
+		return value, false
 	}
 
-	return node.value
+	return node.value, true
 }
 
-// UpdateWithoutChangingOrder updates the value of an existing key without modifying its LRU order.
-//
-// Returns ErrInvalidEntry if value is nil.
-// Returns ErrEntryNotExist if key does not exist.
-// Returns ErrInvalidUpdateEntrySize if value.Size() does not match the existing entry's size.
-func (c *radixCache) UpdateWithoutChangingOrder(key string, value ValueType) error {
-	if value == nil {
-		return ErrInvalidEntry
-	}
-
-	valueSize := value.Size()
-
-	c.mu.Lock()
-	defer c.unlock()
-
-	node, ok := c.getNode(key)
-	if !ok {
-		return ErrEntryNotExist
-	}
-
-	if valueSize != node.size {
-		return ErrInvalidUpdateEntrySize
-	}
-
-	node.value = value
-	return nil
-}
-
-// UpdateSize updates the size accounting for an existing key by sizeDelta and evicts excess entries if needed.
-// If node.size + sizeDelta exceeds maxSize (or cannot fit alongside entries more recent than node),
-// only node itself is evicted without evicting older entries.
+// UpdateWithoutChangingOrder updates the value of an existing key and recomputes its weight
+// without modifying its LRU order.
+// If the entry's new weight exceeds maxSize (or cannot fit alongside entries more recent than node),
+// only node itself is evicted without evicting older entries. Otherwise, excess LRU entries are evicted if needed.
 //
 // Returns ErrEntryNotExist if key does not exist.
-// Returns ErrInvalidUpdateEntrySize if sizeDelta causes uint64 integer overflow.
-func (c *radixCache) UpdateSize(key string, sizeDelta uint64) error {
+func (c *radixCache[V]) UpdateWithoutChangingOrder(key string, value V) error {
+	newSize := c.weigh(key, value)
+
 	sampledEpoch, pressure := c.lockWithPressure(&c.mu, false)
 	defer c.unlock()
 
@@ -776,74 +769,85 @@ func (c *radixCache) UpdateSize(key string, sizeDelta uint64) error {
 		return ErrEntryNotExist
 	}
 
-	if math.MaxUint64-node.size < sizeDelta {
-		return ErrInvalidUpdateEntrySize
-	}
+	oldSize := node.size
 
-	if node.size+sizeDelta > c.maxSize {
+	if newSize > c.maxSize {
 		sizeBefore := c.currentSize
 		c.eraseInternal(node)
 		c.finishDeleteReclaimLocked(sizeBefore, sampledEpoch, pressure)
 		return nil
 	}
 
-	avail := c.maxSize - c.currentSize
-	if sizeDelta > avail {
-		maxNewer := c.maxSize - (node.size + sizeDelta)
-		var newerSize uint64
-		headCurr := c.head
-		tailCurr := c.tail
-		canFit := false
-		for {
-			if headCurr == node {
-				canFit = newerSize <= maxNewer
-				break
-			}
-			if headCurr != nil {
-				newerSize += headCurr.size
-				if newerSize > maxNewer {
-					canFit = false
-					break
-				}
-				headCurr = headCurr.next
-			}
-			if tailCurr == nil || tailCurr == node {
-				canFit = sizeDelta <= avail
-				break
-			}
-			avail += tailCurr.size
-			if sizeDelta <= avail {
-				canFit = true
-				break
-			}
-			tailCurr = tailCurr.prev
-		}
-		if !canFit {
-			sizeBefore := c.currentSize
-			c.eraseInternal(node)
-			c.finishDeleteReclaimLocked(sizeBefore, sampledEpoch, pressure)
-			return nil
-		}
-	}
-
 	sizeBefore := c.currentSize
 	evictedAny := false
 	reclaimedPreUpdate := false
-	for sizeDelta > c.maxSize-c.currentSize && c.tail != nil {
-		if c.tail == node {
-			break
+
+	if newSize > oldSize {
+		sizeDelta := newSize - oldSize
+		avail := c.maxSize - c.currentSize
+		if sizeDelta > avail {
+			maxNewer := c.maxSize - newSize
+			var newerSize uint64
+			headCurr := c.head
+			tailCurr := c.tail
+			canFit := false
+			for {
+				if headCurr == node {
+					canFit = newerSize <= maxNewer
+					break
+				}
+				if headCurr != nil {
+					newerSize += headCurr.size
+					if newerSize > maxNewer {
+						canFit = false
+						break
+					}
+					headCurr = headCurr.next
+				}
+				if tailCurr == nil || tailCurr == node {
+					canFit = sizeDelta <= avail
+					break
+				}
+				avail += tailCurr.size
+				if sizeDelta <= avail {
+					canFit = true
+					break
+				}
+				tailCurr = tailCurr.prev
+			}
+			if !canFit {
+				c.eraseInternal(node)
+				c.finishDeleteReclaimLocked(sizeBefore, sampledEpoch, pressure)
+				return nil
+			}
 		}
-		c.evictOne()
-		evictedAny = true
+
+		for sizeDelta > c.maxSize-c.currentSize && c.tail != nil {
+			if c.tail == node {
+				break
+			}
+			c.evictOne()
+			evictedAny = true
+		}
+
+		c.onEntrySizeUpdated(oldSize, newSize)
+		node.value = value
+		node.hasValue = true
+		node.size = newSize
+		c.currentSize += sizeDelta
+	} else {
+		sizeDiff := oldSize - newSize
+		c.onEntrySizeUpdated(oldSize, newSize)
+		node.value = value
+		node.hasValue = true
+		node.size = newSize
+		c.currentSize -= sizeDiff
 	}
 
-	c.onEntrySizeUpdated(node.size, node.size+sizeDelta)
-	node.size += sizeDelta
-	c.currentSize += sizeDelta
 	reclaimedPreUpdate = c.shouldReclaimSingleSurvivorOnMutation(c.len, c.deletedSinceCompact > 0, false, evictedAny, c.currentSize, sizeBefore, pressure)
 
-	protectedNode := &foregroundNoProtectNode
-	if node == c.head {
+	protectedNode := &c.noProtectNode
+	if node == c.head && node.hasValue {
 		protectedNode = node
 	}
 	c.finishMutationReclaimLocked(nil, protectedNode, reclaimedPreUpdate, sizeBefore, sampledEpoch, pressure)
@@ -853,12 +857,12 @@ func (c *radixCache) UpdateSize(key string, sizeDelta uint64) error {
 
 // EraseEntriesWithGivenPrefix deletes all entries whose keys start with prefix.
 // Prunes subtrees in O(prefix_length + subtree_size) time and sweeps detached nodes.
-func (c *radixCache) EraseEntriesWithGivenPrefix(prefix string) {
+func (c *radixCache[V]) EraseEntriesWithGivenPrefix(prefix string) {
 	if prefix == "" {
 		c.mu.Lock()
 		defer c.unlock()
 
-		hadEntries := c.len > 0 || (c.root != nil && (c.root.value != nil || c.root.child != nil))
+		hadEntries := c.len > 0 || (c.root != nil && (c.root.hasValue || c.root.child != nil))
 		hadDirtySlack := c.deletedSinceCompact > 0 || c.peakEntryLen > 8
 		if !hadEntries && !hadDirtySlack && c.peakEntryLen == 0 {
 			return
@@ -867,7 +871,7 @@ func (c *radixCache) EraseEntriesWithGivenPrefix(prefix string) {
 		if c.root != nil {
 			c.sweepAndUnlink(c.root)
 		} else {
-			c.root = &radixNode{}
+			c.root = &radixNode[V]{}
 		}
 		c.head = nil
 		c.tail = nil
@@ -914,13 +918,13 @@ func (c *radixCache) EraseEntriesWithGivenPrefix(prefix string) {
 }
 
 // Compact satisfies PressureAwareCache on radixCache (pointer-based nodes are reclaimed directly by Go GC upon deletion).
-func (c *radixCache) Compact() {
+func (c *radixCache[V]) Compact() {
 	c.mu.Lock()
 	defer c.unlock()
 	c.compactLocked()
 }
 
-func (c *radixCache) compactDataStructuresLocked() bool {
+func (c *radixCache[V]) compactDataStructuresLocked() bool {
 	if c.deletedSinceCompact == 0 && c.peakEntryLen <= c.len {
 		return false
 	}
@@ -928,19 +932,19 @@ func (c *radixCache) compactDataStructuresLocked() bool {
 	return true
 }
 
-func (c *radixCache) compactLocked() {
+func (c *radixCache[V]) compactLocked() {
 	if c.compactDataStructuresLocked() {
 		c.markReclaimedLocked()
 	}
 }
 
-func (c *radixCache) shouldAutoCompactLocked(protectedNode *radixNode) bool {
+func (c *radixCache[V]) shouldAutoCompactLocked(protectedNode *radixNode[V]) bool {
 	return c.shouldAutoCompactEntryCounts(c.deletedSinceCompact > 0, protectedNode == nil, c.len)
 }
 
-func (c *radixCache) shedAndCompactLocked(targetSize uint64, retention float64, protectedNode *radixNode) []ValueType {
+func (c *radixCache[V]) shedAndCompactLocked(targetSize uint64, retention float64, protectedNode *radixNode[V]) []V {
 	autoCompactNode := protectedNode
-	if protectedNode != nil && (protectedNode != c.head || protectedNode.prev != nil) {
+	if protectedNode != nil && (protectedNode != c.head || protectedNode.prev != nil || !protectedNode.hasValue) {
 		protectedNode = nil
 	}
 
@@ -952,7 +956,7 @@ func (c *radixCache) shedAndCompactLocked(targetSize uint64, retention float64, 
 	effectiveTarget, targetLen, targetZeroCount, unprotectedZeroTarget := c.computeShedTargets(targetSize, retention, c.len, hasProtected, protectedSize)
 
 	needFullFlush := retention == 0.0
-	var evicted []ValueType
+	var evicted []V
 	victim := c.tail
 	for victim != nil {
 		needByteShed := c.currentSize > effectiveTarget || needFullFlush
@@ -978,7 +982,7 @@ func (c *radixCache) shedAndCompactLocked(targetSize uint64, retention float64, 
 			break
 		}
 		nextVictim := victim.prev
-		if val := c.eraseInternal(victim); val != nil {
+		if val, ok := c.eraseInternal(victim); ok {
 			evicted = append(evicted, val)
 		}
 		victim = nextVictim
@@ -1002,11 +1006,11 @@ func (c *radixCache) shedAndCompactLocked(targetSize uint64, retention float64, 
 	return evicted
 }
 
-func (c *radixCache) maybeReclaimUnderPressureLocked(pressure float64, protectedNode *radixNode) []ValueType {
+func (c *radixCache[V]) maybeReclaimUnderPressureLocked(pressure float64, protectedNode *radixNode[V]) []V {
 	if c.isSamplingGoroutine() {
 		return nil
 	}
-	var evicted []ValueType
+	var evicted []V
 	if pressure >= c.options.EvictionThreshold {
 		retention := c.options.EvictionRetentionRatio
 		targetSize := computeTargetSize(c.maxSize, retention)
@@ -1024,7 +1028,7 @@ func (c *radixCache) maybeReclaimUnderPressureLocked(pressure float64, protected
 
 // EvaluateMemoryPressure samples the configured memory-pressure probe and sheds LRU tail entries
 // down to maxSize * EvictionRetentionRatio if critical pressure is reached.
-func (c *radixCache) EvaluateMemoryPressure() []ValueType {
+func (c *radixCache[V]) EvaluateMemoryPressure() []V {
 	_, pressure := c.lockWithPressure(&c.mu, true)
 	defer c.unlock()
 

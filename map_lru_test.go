@@ -29,16 +29,16 @@ type testData struct {
 	dataSize uint64
 }
 
-func (td testData) Size() uint64 {
+var testDataWeigher = WithWeigher(func(_ string, td testData) uint64 {
 	return td.dataSize
-}
+})
 
-func setupCacheTest(t *testing.T) Cache {
+func setupCacheTest(t *testing.T) Cache[testData] {
 	t.Helper()
-	return NewMapCache(testMaxSize, WithInvariantChecking(true))
+	return NewMapCache[testData](testMaxSize, WithInvariantChecking(true), testDataWeigher)
 }
 
-func assertEvictedValues(t *testing.T, evicted []ValueType, expectedValues []int64) {
+func assertEvictedValues(t *testing.T, evicted []testData, expectedValues []int64) {
 	t.Helper()
 	if len(expectedValues) == 0 {
 		assert.Empty(t, evicted)
@@ -46,9 +46,7 @@ func assertEvictedValues(t *testing.T, evicted []ValueType, expectedValues []int
 	}
 	require.Len(t, evicted, len(expectedValues))
 	for i, exp := range expectedValues {
-		td, ok := evicted[i].(testData)
-		require.True(t, ok, "evicted value at index %d is not testData: %T", i, evicted[i])
-		assert.Equal(t, exp, td.value)
+		assert.Equal(t, exp, evicted[i].value)
 	}
 }
 
@@ -57,24 +55,31 @@ func TestMapCache_LookUpInEmptyCache(t *testing.T) {
 	cache := setupCacheTest(t)
 
 	// Act
-	valEmpty := cache.LookUp("")
-	valTaco := cache.LookUp("taco")
+	valEmpty, okEmpty := cache.LookUp("")
+	valTaco, okTaco := cache.LookUp("taco")
 
 	// Assert
-	assert.Nil(t, valEmpty)
-	assert.Nil(t, valTaco)
+	assert.False(t, okEmpty)
+	assert.Equal(t, testData{}, valEmpty)
+	assert.False(t, okTaco)
+	assert.Equal(t, testData{}, valTaco)
 }
 
-func TestMapCache_InsertNilValue(t *testing.T) {
+func TestMapCache_InsertZeroAndNilSliceValue(t *testing.T) {
 	// Arrange
-	cache := setupCacheTest(t)
+	cache := NewMapCache[[]byte](testMaxSize, WithInvariantChecking(true), WithWeigher(func(_ string, b []byte) uint64 {
+		return uint64(len(b))
+	}))
 
-	// Act
+	// Act: nil slice is a valid value in a generic cache.
 	evicted, err := cache.Insert("taco", nil)
 
 	// Assert
-	require.ErrorIs(t, err, ErrInvalidEntry)
-	assertEvictedValues(t, evicted, nil)
+	require.NoError(t, err)
+	assert.Empty(t, evicted)
+	val, ok := cache.LookUp("taco")
+	assert.True(t, ok)
+	assert.Nil(t, val)
 }
 
 func TestMapCache_LookUpUnknownKey(t *testing.T) {
@@ -89,12 +94,14 @@ func TestMapCache_LookUpUnknownKey(t *testing.T) {
 	assertEvictedValues(t, evicted, nil)
 
 	// Act
-	valEmpty := cache.LookUp("")
-	valEnchilada := cache.LookUp("enchilada")
+	valEmpty, okEmpty := cache.LookUp("")
+	valEnchilada, okEnchilada := cache.LookUp("enchilada")
 
 	// Assert
-	assert.Nil(t, valEmpty)
-	assert.Nil(t, valEnchilada)
+	assert.False(t, okEmpty)
+	assert.Equal(t, testData{}, valEmpty)
+	assert.False(t, okEnchilada)
+	assert.Equal(t, testData{}, valEnchilada)
 }
 
 func TestMapCache_FillUpToCapacity(t *testing.T) {
@@ -114,9 +121,15 @@ func TestMapCache_FillUpToCapacity(t *testing.T) {
 	require.NoError(t, err3)
 	assertEvictedValues(t, evicted3, nil)
 
-	assert.Equal(t, testData{value: 23, dataSize: 4}, cache.LookUp("burrito"))
-	assert.Equal(t, testData{value: 26, dataSize: 20}, cache.LookUp("taco"))
-	assert.Equal(t, testData{value: 28, dataSize: 26}, cache.LookUp("enchilada"))
+	val, ok := cache.LookUp("burrito")
+	assert.True(t, ok)
+	assert.Equal(t, testData{value: 23, dataSize: 4}, val)
+	val, ok = cache.LookUp("taco")
+	assert.True(t, ok)
+	assert.Equal(t, testData{value: 26, dataSize: 20}, val)
+	val, ok = cache.LookUp("enchilada")
+	assert.True(t, ok)
+	assert.Equal(t, testData{value: 28, dataSize: 26}, val)
 }
 
 func TestMapCache_ExpiresLeastRecentlyUsed(t *testing.T) {
@@ -137,7 +150,9 @@ func TestMapCache_ExpiresLeastRecentlyUsed(t *testing.T) {
 	assertEvictedValues(t, evicted, nil)
 
 	// Promote burrito to MRU.
-	assert.Equal(t, testData{value: 23, dataSize: 4}, cache.LookUp("burrito"))
+	val, ok := cache.LookUp("burrito")
+	assert.True(t, ok)
+	assert.Equal(t, testData{value: 23, dataSize: 4}, val)
 
 	// Act: Insert another, requiring eviction of taco (size 20) to fit queso (size 5).
 	evicted, err = cache.Insert("queso", testData{value: 34, dataSize: 5})
@@ -145,10 +160,17 @@ func TestMapCache_ExpiresLeastRecentlyUsed(t *testing.T) {
 	// Assert
 	require.NoError(t, err)
 	assertEvictedValues(t, evicted, []int64{26})
-	assert.Nil(t, cache.LookUp("taco"))
-	assert.Equal(t, testData{value: 23, dataSize: 4}, cache.LookUp("burrito"))
-	assert.Equal(t, testData{value: 28, dataSize: 26}, cache.LookUp("enchilada"))
-	assert.Equal(t, testData{value: 34, dataSize: 5}, cache.LookUp("queso"))
+	_, ok = cache.LookUp("taco")
+	assert.False(t, ok)
+	val, ok = cache.LookUp("burrito")
+	assert.True(t, ok)
+	assert.Equal(t, testData{value: 23, dataSize: 4}, val)
+	val, ok = cache.LookUp("enchilada")
+	assert.True(t, ok)
+	assert.Equal(t, testData{value: 28, dataSize: 26}, val)
+	val, ok = cache.LookUp("queso")
+	assert.True(t, ok)
+	assert.Equal(t, testData{value: 34, dataSize: 5}, val)
 }
 
 func TestMapCache_Overwrite(t *testing.T) {
@@ -176,9 +198,14 @@ func TestMapCache_Overwrite(t *testing.T) {
 	// Assert
 	require.NoError(t, err)
 	assertEvictedValues(t, evicted, []int64{26})
-	assert.Nil(t, cache.LookUp("taco"))
-	assert.Equal(t, testData{value: 33, dataSize: 12}, cache.LookUp("burrito"))
-	assert.Equal(t, testData{value: 28, dataSize: 20}, cache.LookUp("enchilada"))
+	_, ok := cache.LookUp("taco")
+	assert.False(t, ok)
+	val, ok := cache.LookUp("burrito")
+	assert.True(t, ok)
+	assert.Equal(t, testData{value: 33, dataSize: 12}, val)
+	val, ok = cache.LookUp("enchilada")
+	assert.True(t, ok)
+	assert.Equal(t, testData{value: 28, dataSize: 20}, val)
 }
 
 func TestMapCache_MultipleEviction(t *testing.T) {
@@ -202,10 +229,15 @@ func TestMapCache_MultipleEviction(t *testing.T) {
 	// Assert
 	require.NoError(t, err)
 	assertEvictedValues(t, evicted, []int64{23, 26, 28})
-	assert.Nil(t, cache.LookUp("taco"))
-	assert.Nil(t, cache.LookUp("burrito"))
-	assert.Nil(t, cache.LookUp("enchilada"))
-	assert.Equal(t, testData{value: 33, dataSize: 45}, cache.LookUp("large_data"))
+	_, ok := cache.LookUp("taco")
+	assert.False(t, ok)
+	_, ok = cache.LookUp("burrito")
+	assert.False(t, ok)
+	_, ok = cache.LookUp("enchilada")
+	assert.False(t, ok)
+	val, ok := cache.LookUp("large_data")
+	assert.True(t, ok)
+	assert.Equal(t, testData{value: 33, dataSize: 45}, val)
 }
 
 func TestMapCache_WhenEntrySizeMoreThanCacheMaxSize(t *testing.T) {
@@ -221,7 +253,9 @@ func TestMapCache_WhenEntrySizeMoreThanCacheMaxSize(t *testing.T) {
 	// Assert
 	require.ErrorIs(t, err, ErrInvalidEntrySize)
 	assertEvictedValues(t, evicted, nil)
-	assert.Equal(t, testData{value: 23, dataSize: 4}, cache.LookUp("burrito"))
+	val, ok := cache.LookUp("burrito")
+	assert.True(t, ok)
+	assert.Equal(t, testData{value: 23, dataSize: 4}, val)
 }
 
 func TestMapCache_EraseWhenKeyPresent(t *testing.T) {
@@ -232,11 +266,13 @@ func TestMapCache_EraseWhenKeyPresent(t *testing.T) {
 	assertEvictedValues(t, evicted, nil)
 
 	// Act
-	deletedEntry := cache.Erase("burrito")
+	deletedEntry, ok := cache.Erase("burrito")
 
 	// Assert
+	assert.True(t, ok)
 	assert.Equal(t, testData{value: 23, dataSize: 4}, deletedEntry)
-	assert.Nil(t, cache.LookUp("burrito"))
+	_, ok = cache.LookUp("burrito")
+	assert.False(t, ok)
 }
 
 func TestMapCache_EraseCacheWithGivenPrefix(t *testing.T) {
@@ -257,13 +293,17 @@ func TestMapCache_EraseCacheWithGivenPrefix(t *testing.T) {
 	cache.EraseEntriesWithGivenPrefix("a")
 
 	// Assert
-	assert.Nil(t, cache.LookUp("a"))
-	assert.Nil(t, cache.LookUp("a/b"))
-	assert.Nil(t, cache.LookUp("a/b/d"))
-	assert.Nil(t, cache.LookUp("a/c"))
-	valB := cache.LookUp("b")
-	require.NotNil(t, valB)
-	assert.Equal(t, uint64(2), valB.Size())
+	_, ok := cache.LookUp("a")
+	assert.False(t, ok)
+	_, ok = cache.LookUp("a/b")
+	assert.False(t, ok)
+	_, ok = cache.LookUp("a/b/d")
+	assert.False(t, ok)
+	_, ok = cache.LookUp("a/c")
+	assert.False(t, ok)
+	valB, ok := cache.LookUp("b")
+	require.True(t, ok)
+	assert.Equal(t, uint64(2), valB.dataSize)
 }
 
 func TestMapCache_EraseCacheWhereNoEntriesExistWithGivenPrefix(t *testing.T) {
@@ -280,17 +320,17 @@ func TestMapCache_EraseCacheWhereNoEntriesExistWithGivenPrefix(t *testing.T) {
 	cache.EraseEntriesWithGivenPrefix("c")
 
 	// Assert
-	valA := cache.LookUp("a")
-	require.NotNil(t, valA)
-	assert.Equal(t, uint64(4), valA.Size())
+	valA, ok := cache.LookUp("a")
+	require.True(t, ok)
+	assert.Equal(t, uint64(4), valA.dataSize)
 
-	valAB := cache.LookUp("a/b")
-	require.NotNil(t, valAB)
-	assert.Equal(t, uint64(5), valAB.Size())
+	valAB, ok := cache.LookUp("a/b")
+	require.True(t, ok)
+	assert.Equal(t, uint64(5), valAB.dataSize)
 
-	valB := cache.LookUp("b")
-	require.NotNil(t, valB)
-	assert.Equal(t, uint64(2), valB.Size())
+	valB, ok := cache.LookUp("b")
+	require.True(t, ok)
+	assert.Equal(t, uint64(2), valB.dataSize)
 }
 
 func TestMapCache_EraseCacheWithGivenPrefixWithSomeEntriesEvictedDueToCacheSize(t *testing.T) {
@@ -312,13 +352,17 @@ func TestMapCache_EraseCacheWithGivenPrefixWithSomeEntriesEvictedDueToCacheSize(
 	cache.EraseEntriesWithGivenPrefix("a")
 
 	// Assert
-	assert.Nil(t, cache.LookUp("a"))
-	assert.Nil(t, cache.LookUp("a/b"))
-	assert.Nil(t, cache.LookUp("a/b/d"))
-	assert.Nil(t, cache.LookUp("a/c"))
-	valB := cache.LookUp("b")
-	require.NotNil(t, valB)
-	assert.Equal(t, uint64(15), valB.Size())
+	_, ok := cache.LookUp("a")
+	assert.False(t, ok)
+	_, ok = cache.LookUp("a/b")
+	assert.False(t, ok)
+	_, ok = cache.LookUp("a/b/d")
+	assert.False(t, ok)
+	_, ok = cache.LookUp("a/c")
+	assert.False(t, ok)
+	valB, ok := cache.LookUp("b")
+	require.True(t, ok)
+	assert.Equal(t, uint64(15), valB.dataSize)
 }
 
 func TestMapCache_EraseCacheWithEmptyPrefix(t *testing.T) {
@@ -335,9 +379,12 @@ func TestMapCache_EraseCacheWithEmptyPrefix(t *testing.T) {
 	cache.EraseEntriesWithGivenPrefix("")
 
 	// Assert
-	assert.Nil(t, cache.LookUp("a"))
-	assert.Nil(t, cache.LookUp("b"))
-	assert.Nil(t, cache.LookUp("c"))
+	_, ok := cache.LookUp("a")
+	assert.False(t, ok)
+	_, ok = cache.LookUp("b")
+	assert.False(t, ok)
+	_, ok = cache.LookUp("c")
+	assert.False(t, ok)
 }
 
 func TestMapCache_EraseWhenKeyNotPresent(t *testing.T) {
@@ -347,11 +394,14 @@ func TestMapCache_EraseWhenKeyNotPresent(t *testing.T) {
 	require.NoError(t, err)
 
 	// Act
-	deletedEntry := cache.Erase("taco")
+	deletedEntry, ok := cache.Erase("taco")
 
 	// Assert
-	assert.Nil(t, deletedEntry)
-	assert.Equal(t, testData{value: 23, dataSize: 4}, cache.LookUp("burrito"))
+	assert.False(t, ok)
+	assert.Equal(t, testData{}, deletedEntry)
+	val, ok := cache.LookUp("burrito")
+	assert.True(t, ok)
+	assert.Equal(t, testData{value: 23, dataSize: 4}, val)
 }
 
 func TestMapCache_UpdateWhenKeyPresent(t *testing.T) {
@@ -368,7 +418,9 @@ func TestMapCache_UpdateWhenKeyPresent(t *testing.T) {
 
 	// Assert
 	require.NoError(t, err)
-	assert.Equal(t, newData, cache.LookUp(key))
+	val, ok := cache.LookUp(key)
+	assert.True(t, ok)
+	assert.Equal(t, newData, val)
 }
 
 func TestMapCache_UpdateWhenKeyNotPresent(t *testing.T) {
@@ -384,35 +436,27 @@ func TestMapCache_UpdateWhenKeyNotPresent(t *testing.T) {
 	require.ErrorIs(t, err, ErrEntryNotExist)
 }
 
-func TestMapCache_UpdateNilValue(t *testing.T) {
+func TestMapCache_UpdateWhenSizeShrinks(t *testing.T) {
 	// Arrange
 	cache := setupCacheTest(t)
-	key := "burrito"
-	data := testData{value: 23, dataSize: 4}
-	_, err := cache.Insert(key, data)
+	_, err := cache.Insert("burrito", testData{value: 23, dataSize: 30})
+	require.NoError(t, err)
+	_, err = cache.Insert("taco", testData{value: 26, dataSize: 20})
 	require.NoError(t, err)
 
-	// Act
-	err = cache.UpdateWithoutChangingOrder(key, nil)
-
-	// Assert
-	require.ErrorIs(t, err, ErrInvalidEntry)
-}
-
-func TestMapCache_UpdateWhenSizeIsDifferent(t *testing.T) {
-	// Arrange
-	cache := setupCacheTest(t)
-	key := "burrito"
-	data := testData{value: 23, dataSize: 4}
-	_, err := cache.Insert(key, data)
+	// Act: Shrink burrito from 30 to 10 (total size 50 -> 30).
+	newData := testData{value: 99, dataSize: 10}
+	err = cache.UpdateWithoutChangingOrder("burrito", newData)
 	require.NoError(t, err)
-	newData := testData{value: 2, dataSize: 3}
 
-	// Act
-	err = cache.UpdateWithoutChangingOrder(key, newData)
+	// Inserting 20 more units now fits without eviction because total size is 30+20=50.
+	evicted, err := cache.Insert("enchilada", testData{value: 28, dataSize: 20})
+	require.NoError(t, err)
+	assertEvictedValues(t, evicted, nil)
 
-	// Assert
-	require.ErrorIs(t, err, ErrInvalidUpdateEntrySize)
+	val, ok := cache.LookUpWithoutChangingOrder("burrito")
+	assert.True(t, ok)
+	assert.Equal(t, newData, val)
 }
 
 func TestMapCache_UpdateNotChangeOrder(t *testing.T) {
@@ -452,9 +496,10 @@ func TestMapCache_LookUpWithoutChangingOrder_WhenKeyPresent(t *testing.T) {
 	require.NoError(t, err)
 
 	// Act
-	value := cache.LookUpWithoutChangingOrder(key)
+	value, ok := cache.LookUpWithoutChangingOrder(key)
 
 	// Assert
+	assert.True(t, ok)
 	assert.Equal(t, data, value)
 }
 
@@ -464,10 +509,11 @@ func TestMapCache_LookUpWithoutChangingOrder_WhenKeyNotPresent(t *testing.T) {
 	key := "burrito"
 
 	// Act
-	value := cache.LookUpWithoutChangingOrder(key)
+	value, ok := cache.LookUpWithoutChangingOrder(key)
 
 	// Assert
-	assert.Nil(t, value)
+	assert.False(t, ok)
+	assert.Equal(t, testData{}, value)
 }
 
 func TestMapCache_LookUpWithoutChangingOrder_NotChangeOrder(t *testing.T) {
@@ -484,7 +530,8 @@ func TestMapCache_LookUpWithoutChangingOrder_NotChangeOrder(t *testing.T) {
 	require.NoError(t, err)
 
 	// Act
-	value := cache.LookUpWithoutChangingOrder(key1)
+	value, ok := cache.LookUpWithoutChangingOrder(key1)
+	assert.True(t, ok)
 	assert.Equal(t, data1, value)
 
 	// Inserting again should evict key1 because key1 was looked up without changing order.
@@ -497,7 +544,7 @@ func TestMapCache_LookUpWithoutChangingOrder_NotChangeOrder(t *testing.T) {
 	assertEvictedValues(t, evicted, []int64{23})
 }
 
-func TestMapCache_UpdateSize_Success(t *testing.T) {
+func TestMapCache_UpdateGrowSize_Success(t *testing.T) {
 	// Arrange
 	cache := setupCacheTest(t)
 	_, err := cache.Insert("file1", testData{value: 10, dataSize: 10})
@@ -505,31 +552,35 @@ func TestMapCache_UpdateSize_Success(t *testing.T) {
 	_, err = cache.Insert("file2", testData{value: 20, dataSize: 20})
 	require.NoError(t, err)
 
-	// Act
-	err = cache.UpdateSize("file1", 10)
+	// Act: Grow file1 from 10 to 20 without changing order.
+	err = cache.UpdateWithoutChangingOrder("file1", testData{value: 15, dataSize: 20})
 	require.NoError(t, err)
 
 	// Order should be preserved: file1 is still LRU.
-	// Inserting 20 more units (total size was 10+10+20 = 40, now 40+20 = 60 > 50) evicts file1.
+	// Inserting 20 more units (total size was 20+20 = 40, now 40+20 = 60 > 50) evicts file1.
 	evicted, err := cache.Insert("file3", testData{value: 30, dataSize: 20})
 
 	// Assert
 	require.NoError(t, err)
-	assertEvictedValues(t, evicted, []int64{10})
+	assertEvictedValues(t, evicted, []int64{15})
 }
 
-func TestMapCache_UpdateSize_NonExistentKey(t *testing.T) {
+func TestMapCache_UpdateGrowSize_ExceedsMaxSize_SelfEvicts(t *testing.T) {
 	// Arrange
 	cache := setupCacheTest(t)
+	_, err := cache.Insert("file1", testData{value: 10, dataSize: 10})
+	require.NoError(t, err)
 
 	// Act
-	err := cache.UpdateSize("nonexistent", 10)
+	err = cache.UpdateWithoutChangingOrder("file1", testData{value: 99, dataSize: testMaxSize + 1})
 
-	// Assert
-	require.ErrorIs(t, err, ErrEntryNotExist)
+	// Assert: Exceeding maxSize self-evicts the entry and returns nil.
+	require.NoError(t, err)
+	_, ok := cache.LookUpWithoutChangingOrder("file1")
+	assert.False(t, ok)
 }
 
-func TestMapCache_UpdateSize_ExceedsMaxSize_Evicts(t *testing.T) {
+func TestMapCache_UpdateGrowSize_EvictsOlderAndSelf(t *testing.T) {
 	// Arrange
 	cache := setupCacheTest(t) // maxSize = 50
 	_, err := cache.Insert("key1", testData{value: 1, dataSize: 20})
@@ -537,14 +588,30 @@ func TestMapCache_UpdateSize_ExceedsMaxSize_Evicts(t *testing.T) {
 	_, err = cache.Insert("key2", testData{value: 2, dataSize: 25})
 	require.NoError(t, err)
 
-	// Act: currentSize was 45. Increasing key2 size by 10 makes currentSize = 55 > 50.
-	// key1 (LRU) must be evicted immediately by UpdateSize to maintain the size invariant.
-	err = cache.UpdateSize("key2", 10)
+	// Act 1: Increasing key2 size from 25 to 35 makes total 55 > 50.
+	// key1 (LRU) must be evicted immediately to maintain the size invariant.
+	err = cache.UpdateWithoutChangingOrder("key2", testData{value: 22, dataSize: 35})
 
-	// Assert
+	// Assert 1
 	require.NoError(t, err)
-	assert.Nil(t, cache.LookUp("key1"))
-	assert.Equal(t, testData{value: 2, dataSize: 25}, cache.LookUp("key2"))
+	_, ok := cache.LookUp("key1")
+	assert.False(t, ok)
+	val, ok := cache.LookUp("key2")
+	assert.True(t, ok)
+	assert.Equal(t, testData{value: 22, dataSize: 35}, val)
+
+	// Arrange 2: Insert key3 (size 15), so key2 (size 35) is now LRU tail and key3 is MRU.
+	_, err = cache.Insert("key3", testData{value: 3, dataSize: 15})
+	require.NoError(t, err)
+
+	// Act 2: Grow key2 (at LRU tail) from 35 to 40 -> total 55 > 50 -> key2 evicts itself!
+	err = cache.UpdateWithoutChangingOrder("key2", testData{value: 222, dataSize: 40})
+	require.NoError(t, err)
+	_, ok = cache.LookUp("key2")
+	assert.False(t, ok)
+	val3, ok := cache.LookUp("key3")
+	assert.True(t, ok)
+	assert.Equal(t, testData{value: 3, dataSize: 15}, val3)
 }
 
 // TestMapCache_CheckInvariants_PanicOnCorruption verifies that mapCache.checkInvariants() detects and panics
@@ -559,7 +626,7 @@ func TestMapCache_UpdateSize_ExceedsMaxSize_Evicts(t *testing.T) {
 func TestMapCache_CheckInvariants_PanicOnCorruption(t *testing.T) {
 	t.Run("CurrentSizeExceedsMaxSize", func(t *testing.T) {
 		// Arrange
-		c := NewMapCache(10).(*mapCache)
+		c := NewMapCache[testData](10, testDataWeigher).(*mapCache[testData])
 		c.currentSize = 20
 
 		// Act & Assert
@@ -570,7 +637,7 @@ func TestMapCache_CheckInvariants_PanicOnCorruption(t *testing.T) {
 
 	t.Run("LengthMismatch", func(t *testing.T) {
 		// Arrange
-		c := NewMapCache(10).(*mapCache)
+		c := NewMapCache[testData](10, testDataWeigher).(*mapCache[testData])
 		c.index["dummy"] = nil
 
 		// Act & Assert
@@ -581,8 +648,8 @@ func TestMapCache_CheckInvariants_PanicOnCorruption(t *testing.T) {
 
 	t.Run("KeyMismatch", func(t *testing.T) {
 		// Arrange
-		c := NewMapCache(50).(*mapCache)
-		e := c.entries.PushFront(&entry{key: "correctKey", value: testData{1, 5}, size: 5})
+		c := NewMapCache[testData](50, testDataWeigher).(*mapCache[testData])
+		e := c.entries.PushFront(&entry[testData]{key: "correctKey", value: testData{1, 5}, size: 5})
 		c.index["wrongKey"] = e
 		c.currentSize = 5
 
@@ -594,7 +661,7 @@ func TestMapCache_CheckInvariants_PanicOnCorruption(t *testing.T) {
 
 	t.Run("InvalidElementType", func(t *testing.T) {
 		// Arrange
-		c := NewMapCache(50).(*mapCache)
+		c := NewMapCache[testData](50, testDataWeigher).(*mapCache[testData])
 		e := c.entries.PushFront("not-an-entry-struct")
 		c.index["someKey"] = e
 
@@ -606,10 +673,10 @@ func TestMapCache_CheckInvariants_PanicOnCorruption(t *testing.T) {
 
 	t.Run("ValueTypeEntryInsteadOfPointer", func(t *testing.T) {
 		// Arrange
-		c := NewMapCache(100, WithInvariantChecking(true)).(*mapCache)
-		el := c.entries.PushFront(entry{
+		c := NewMapCache[testData](100, WithInvariantChecking(true), testDataWeigher).(*mapCache[testData])
+		el := c.entries.PushFront(entry[testData]{
 			key:   "bad_value_type",
-			value: NewSizedValue("v", 5),
+			value: testData{value: 1, dataSize: 5},
 			size:  5,
 		})
 		c.index["bad_value_type"] = el
@@ -623,8 +690,8 @@ func TestMapCache_CheckInvariants_PanicOnCorruption(t *testing.T) {
 
 	t.Run("ZeroSizeCountMismatch", func(t *testing.T) {
 		// Arrange
-		c := NewMapCache(100).(*mapCache)
-		_, err := c.Insert("z", NewStringValue(""))
+		c := NewMapCache[testData](100, testDataWeigher).(*mapCache[testData])
+		_, err := c.Insert("z", testData{value: 0, dataSize: 0})
 		require.NoError(t, err)
 		c.zeroSizeCount = 0
 
@@ -636,7 +703,7 @@ func TestMapCache_CheckInvariants_PanicOnCorruption(t *testing.T) {
 
 	t.Run("SizeSumMismatch", func(t *testing.T) {
 		// Arrange
-		c := NewMapCache(500).(*mapCache)
+		c := NewMapCache[testData](500, testDataWeigher).(*mapCache[testData])
 		_, err := c.Insert("k1", testData{value: 1, dataSize: 10})
 		require.NoError(t, err)
 		c.currentSize++
@@ -651,7 +718,7 @@ func TestMapCache_CheckInvariants_PanicOnCorruption(t *testing.T) {
 func TestMapCache_Compact(t *testing.T) {
 	// Arrange
 	probe := newPressureProbe(0.10)
-	c := NewMapCache(1000, WithInvariantChecking(true), probe.Option()).(PressureAwareCache)
+	c := NewMapCache[testData](1000, WithInvariantChecking(true), testDataWeigher, probe.Option()).(PressureAwareCache[testData])
 	for i := 0; i < 20; i++ {
 		_, err := c.Insert(fmt.Sprintf("entry_%d", i), testData{value: int64(i), dataSize: 10})
 		require.NoError(t, err)
@@ -662,8 +729,8 @@ func TestMapCache_Compact(t *testing.T) {
 
 	// Arrange 2: Delete half the entries to dirty the index
 	for i := 0; i < 10; i++ {
-		erased := c.Erase(fmt.Sprintf("entry_%d", i))
-		require.NotNil(t, erased)
+		_, ok := c.Erase(fmt.Sprintf("entry_%d", i))
+		require.True(t, ok)
 	}
 
 	// Act 2: Compact dirty index (re-allocates map once and advances reclaimEpoch, then subsequent Compact is zero-alloc)
@@ -672,35 +739,41 @@ func TestMapCache_Compact(t *testing.T) {
 	// Assert 2
 	assertAlreadyCompacted(t, c, probe)
 	for i := 0; i < 10; i++ {
-		assert.Nil(t, c.LookUpWithoutChangingOrder(fmt.Sprintf("entry_%d", i)))
+		_, ok := c.LookUpWithoutChangingOrder(fmt.Sprintf("entry_%d", i))
+		assert.False(t, ok)
 	}
 	for i := 10; i < 20; i++ {
-		assert.Equal(t, testData{value: int64(i), dataSize: 10}, c.LookUp(fmt.Sprintf("entry_%d", i)))
+		val, ok := c.LookUp(fmt.Sprintf("entry_%d", i))
+		assert.True(t, ok)
+		assert.Equal(t, testData{value: int64(i), dataSize: 10}, val)
 	}
 }
 
 func TestMapCache_EvaluateMemoryPressure(t *testing.T) {
 	// Arrange
 	probe := newPressureProbe(0.10)
-	c := NewMapCache(
+	c := NewMapCache[testData](
 		100,
 		WithInvariantChecking(true),
+		testDataWeigher,
 		probe.Option(),
 		WithCompactionThreshold(0.75),
 		WithEvictionThreshold(0.90),
 		WithEvictionRetentionRatio(0.50),
-	).(PressureAwareCache)
+	).(PressureAwareCache[testData])
 
 	for i := 0; i < 10; i++ {
 		_, err := c.Insert(fmt.Sprintf("k%d", i), testData{value: int64(i), dataSize: 10})
 		require.NoError(t, err)
 	}
-	require.NotNil(t, c.Erase("k0"))
-	require.NotNil(t, c.Erase("k1"))
+	_, ok := c.Erase("k0")
+	require.True(t, ok)
+	_, ok = c.Erase("k1")
+	require.True(t, ok)
 
 	// Act & Assert 1: Below CompactionThreshold (0.50 < 0.75) does nothing
 	probe.Set(0.50)
-	var evicted []ValueType
+	var evicted []testData
 	advancedBelow := probe.ObserveEpochAdvance(t, c, func() {
 		evicted = c.EvaluateMemoryPressure()
 	})
@@ -716,7 +789,8 @@ func TestMapCache_EvaluateMemoryPressure(t *testing.T) {
 	assert.True(t, advancedTier1)
 	assertAlreadyCompacted(t, c, probe)
 	for i := 2; i < 10; i++ {
-		assert.NotNil(t, c.LookUpWithoutChangingOrder(fmt.Sprintf("k%d", i)))
+		_, ok := c.LookUpWithoutChangingOrder(fmt.Sprintf("k%d", i))
+		assert.True(t, ok)
 	}
 
 	// Act & Assert 3: Tier 2 EvictionThreshold (0.95 >= 0.90) sheds down to targetSize = 50 and compacts
@@ -728,10 +802,12 @@ func TestMapCache_EvaluateMemoryPressure(t *testing.T) {
 	assert.True(t, advancedTier2)
 	assertAlreadyCompacted(t, c, probe)
 	for i := 2; i < 5; i++ {
-		assert.Nil(t, c.LookUpWithoutChangingOrder(fmt.Sprintf("k%d", i)))
+		_, ok := c.LookUpWithoutChangingOrder(fmt.Sprintf("k%d", i))
+		assert.False(t, ok)
 	}
 	for i := 5; i < 10; i++ {
-		assert.NotNil(t, c.LookUpWithoutChangingOrder(fmt.Sprintf("k%d", i)))
+		_, ok := c.LookUpWithoutChangingOrder(fmt.Sprintf("k%d", i))
+		assert.True(t, ok)
 	}
 
 	// Act & Assert 4: Repeated EvaluateMemoryPressure when clean and at targetSize is a no-op

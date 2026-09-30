@@ -23,7 +23,7 @@ All reference benchmarks were collected on an **Intel Xeon CPU @ 2.60GHz (96 vCP
 
 > ¹ **Existing-key overwrite `Insert`** (when the working set fits within `maxSize`) updates the entry in place with **0 B, 0 allocs/op** across `MapCache`, `RadixCache`, and `ArenaRadixCache`. By contrast, `Benchmark_Insert_*` configures `capacity := uint64(len(keys) * 5)` (50,000 B for a 10,000-key × 10 B working set, holding 5,000 of the 10,000 keys), exercising **50%-capacity turnover `Insert`** where every `Insert` after warmup is a new-key insert paired with an LRU tail eviction: `MapCache` and `RadixCache` perform **3 allocs/op** (`strings.Clone` + `*list.Element`/`*entry` or `*radixNode` + evicted `Entry`), whereas `ArenaRadixCache` performs **2 allocs/op** (`strings.Clone` + evicted `Entry`, with **0 node allocations** thanks to intrusive free-list node recycling).
 >
-> ² `UpdateWithoutChangingOrder` performs **0 internal heap allocations** across all three backends (`MapCache`, `RadixCache`, and `ArenaRadixCache`); any `16 B, 1 alloc/op` reported by `Benchmark_Update_*` when passing `benchValue(10)` by value comes from Go boxing the caller's `benchValue` into the `ValueType` interface parameter inside the benchmark harness.
+> ² `UpdateWithoutChangingOrder` performs **0 heap allocations** across all three backends (`MapCache`, `RadixCache`, and `ArenaRadixCache`), storing the generic value `V` directly in the node/entry without interface boxing.
 
 ### Key Takeaways
 - **`MapCache`** achieves the lowest single-key point lookup (~50 ns) and insertion (~98 ns in-place overwrite; ~383–466 ns under 50%-capacity turnover) latency when keys are flat and prefix operations are rare.
