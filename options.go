@@ -17,6 +17,7 @@ package lru
 import (
 	"fmt"
 	"math"
+	"reflect"
 	"runtime/metrics"
 	"sync"
 )
@@ -110,7 +111,10 @@ type Options struct {
 	Backend Backend
 
 	// Weigher holds the optional entry weigher function configured via WithWeigher.
-	// When nil, every entry defaults to a weight of 1.
+	// When nil (or a typed-nil function), every entry defaults to a weight of 1.
+	// Prefer a typed Weigher[V] / func(string, V) uint64 matching Cache[V] for zero-allocation
+	// weighing; a type-erased Weigher[any] / func(string, any) uint64 is also accepted but boxes
+	// non-pointer concrete V values into any on each Insert and UpdateWithoutChangingOrder.
 	Weigher any
 
 	// EnableInvariantChecking enables internal data structure integrity and invariant validation.
@@ -165,6 +169,11 @@ func WithBackend(backend Backend) Option {
 // WithWeigher configures a custom function to compute the logical or byte weight of each cache entry
 // on Insert and UpdateWithoutChangingOrder.
 // If not configured (or if fn is nil), every entry defaults to a weight of 1.
+//
+// For zero heap allocations on hot paths, pass a function whose value parameter type V matches
+// the target Cache[V]. A type-erased WithWeigher[any] is also supported for shared Options across
+// caches, but binding a Weigher[any] / func(string, any) uint64 to a concrete non-pointer Cache[V]
+// (V != any) boxes V into any on every Insert and UpdateWithoutChangingOrder call.
 func WithWeigher[V any](fn func(key string, value V) uint64) Option {
 	return func(o *Options) {
 		if fn == nil {
@@ -201,7 +210,10 @@ func resolveWeigher[V any](options Options) func(string, V) uint64 {
 			return fnAny(k, v)
 		}
 	}
-	panic(fmt.Sprintf("lru: WithWeigher function type %T does not match cache value type %T", options.Weigher, (*V)(nil)))
+	if v := reflect.ValueOf(options.Weigher); v.IsValid() && v.Kind() == reflect.Func && v.IsNil() {
+		return nil
+	}
+	panic(fmt.Sprintf("lru: WithWeigher function type %T does not match cache value type %s", options.Weigher, reflect.TypeFor[V]()))
 }
 
 // WithInvariantChecking returns an Option that enables or disables internal invariant checking.
@@ -370,6 +382,11 @@ func ApplyOptions(opts ...Option) Options {
 		options.EvictionRetentionRatio = 1.0
 	case options.EvictionRetentionRatio == 0:
 		options.EvictionRetentionRatio = 0.0
+	}
+	if options.Weigher != nil {
+		if v := reflect.ValueOf(options.Weigher); v.IsValid() && v.Kind() == reflect.Func && v.IsNil() {
+			options.Weigher = nil
+		}
 	}
 	if options.PressureFunc == nil {
 		options.PressureFunc = DefaultRuntimePressureFunc(options.MemoryBudget)

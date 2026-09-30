@@ -82,13 +82,18 @@ func generateBenchmarkKeys(prefixCount, itemsPerPrefix, depth int) (keys []strin
 
 func runBenchmarkInsert(b *testing.B, constructor func(uint64, ...lru.Option) lru.Cache[benchValue], depth int) {
 	b.Helper()
+	runBenchmarkInsertWithOptions(b, constructor, depth, 5, benchWeigher)
+}
+
+func runBenchmarkInsertWithOptions(b *testing.B, constructor func(uint64, ...lru.Option) lru.Cache[benchValue], depth int, capMultiplier uint64, opts ...lru.Option) {
+	b.Helper()
 	const prefixCount = 100
 	const itemsPerPrefix = 100
 	keys, _, _ := generateBenchmarkKeys(prefixCount, itemsPerPrefix, depth)
 	data := benchValue{val: 1, dataSize: 10}
-	capacity := uint64(len(keys) * 5)
+	capacity := uint64(len(keys)) * capMultiplier
 
-	cache := constructor(capacity, benchWeigher)
+	cache := constructor(capacity, opts...)
 
 	b.ReportAllocs()
 	b.ResetTimer()
@@ -119,6 +124,18 @@ func Benchmark_Insert_ArenaRadixCache(b *testing.B) {
 	b.Run("Flat", func(b *testing.B) { runBenchmarkInsert(b, lru.NewArenaRadixCache[benchValue], 0) })
 	b.Run("Nested_Depth2", func(b *testing.B) { runBenchmarkInsert(b, lru.NewArenaRadixCache[benchValue], 2) })
 	b.Run("DeeplyNested_Depth10", func(b *testing.B) { runBenchmarkInsert(b, lru.NewArenaRadixCache[benchValue], 10) })
+}
+
+func Benchmark_Insert_UnitWeight_Map(b *testing.B) {
+	runBenchmarkInsertWithOptions(b, lru.NewMapCache[benchValue], 2, 1)
+}
+
+func Benchmark_Insert_UnitWeight_Radix(b *testing.B) {
+	runBenchmarkInsertWithOptions(b, lru.NewRadixCache[benchValue], 2, 1)
+}
+
+func Benchmark_Insert_UnitWeight_ArenaRadix(b *testing.B) {
+	runBenchmarkInsertWithOptions(b, lru.NewArenaRadixCache[benchValue], 2, 1)
 }
 
 // ============================================================================
@@ -221,6 +238,11 @@ func Benchmark_LookUpWithoutChangingOrder_ArenaRadixCache(b *testing.B) {
 
 func runBenchmarkUpdate(b *testing.B, constructor func(uint64, ...lru.Option) lru.Cache[benchValue]) {
 	b.Helper()
+	runBenchmarkUpdateWithOptions(b, constructor, benchWeigher)
+}
+
+func runBenchmarkUpdateWithOptions(b *testing.B, constructor func(uint64, ...lru.Option) lru.Cache[benchValue], opts ...lru.Option) {
+	b.Helper()
 	const numKeys = 10000
 	keys := make([]string, numKeys)
 	for i := range numKeys {
@@ -229,7 +251,7 @@ func runBenchmarkUpdate(b *testing.B, constructor func(uint64, ...lru.Option) lr
 	data := benchValue{val: 1, dataSize: 10}
 	updatedData := benchValue{val: 2, dataSize: 10}
 
-	cache := constructor(uint64(numKeys*100), benchWeigher)
+	cache := constructor(uint64(numKeys*100), opts...)
 	for _, key := range keys {
 		_, _ = cache.Insert(key, data)
 	}
@@ -251,6 +273,18 @@ func Benchmark_Update_MapCache(b *testing.B)   { runBenchmarkUpdate(b, lru.NewMa
 func Benchmark_Update_RadixCache(b *testing.B) { runBenchmarkUpdate(b, lru.NewRadixCache[benchValue]) }
 func Benchmark_Update_ArenaRadixCache(b *testing.B) {
 	runBenchmarkUpdate(b, lru.NewArenaRadixCache[benchValue])
+}
+
+func Benchmark_Update_UnitWeight_Map(b *testing.B) {
+	runBenchmarkUpdateWithOptions(b, lru.NewMapCache[benchValue])
+}
+
+func Benchmark_Update_UnitWeight_Radix(b *testing.B) {
+	runBenchmarkUpdateWithOptions(b, lru.NewRadixCache[benchValue])
+}
+
+func Benchmark_Update_UnitWeight_ArenaRadix(b *testing.B) {
+	runBenchmarkUpdateWithOptions(b, lru.NewArenaRadixCache[benchValue])
 }
 
 // ============================================================================

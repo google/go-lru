@@ -876,6 +876,46 @@ func TestArenaRadixCache_CheckInvariants_PanicScenarios(t *testing.T) {
 			c.checkInvariants()
 		})
 	})
+
+	t.Run("RoutingNodeRetainsNonZeroValue", func(t *testing.T) {
+		// Arrange
+		c := NewArenaRadixCache[testData](50, testDataWeigher).(*arenaRadix[testData])
+		_, err := c.Insert("ab", testData{value: 1, dataSize: 10})
+		require.NoError(t, err)
+		_, err = c.Insert("ac", testData{value: 2, dataSize: 10})
+		require.NoError(t, err)
+		routingID := c.nodes[c.root].child
+		require.NotEqual(t, nilNode, routingID)
+		require.False(t, c.nodes[routingID].hasValue)
+
+		// Act
+		c.nodes[routingID].value = testData{value: 99, dataSize: 10}
+
+		// Assert
+		assert.Panics(t, func() {
+			c.checkInvariants()
+		})
+	})
+
+	t.Run("FreeListNodeRetainsNonZeroValue", func(t *testing.T) {
+		// Arrange
+		c := NewArenaRadixCache[testData](50, testDataWeigher).(*arenaRadix[testData])
+		_, err := c.Insert("k1", testData{value: 1, dataSize: 10})
+		require.NoError(t, err)
+		_, err = c.Insert("k2", testData{value: 2, dataSize: 10})
+		require.NoError(t, err)
+		_, ok := c.Erase("k1")
+		require.True(t, ok)
+		require.NotEqual(t, nilNode, c.freeHead)
+
+		// Act
+		c.nodes[c.freeHead].value = testData{value: 99, dataSize: 10}
+
+		// Assert
+		assert.Panics(t, func() {
+			c.checkInvariants()
+		})
+	})
 }
 
 func TestArenaRadixCache_ModeratePressureLosslessCompaction(t *testing.T) {
@@ -1529,6 +1569,54 @@ func TestArenaRadixCache_FNV1aHashCollisionAndNodeMapHealing(t *testing.T) {
 		require.True(t, ok)
 	})
 
+	t.Run("UpdateWithoutChangingOrderTier2SheddingRestoresCollidingPeerInNodeMap", func(t *testing.T) {
+		// Arrange: Populate 5 entries (peakEntryLen == 5 <= 8, currentSize = 560B > targetSize = 500B)
+		// with keyA (100B) at the LRU tail and keyB (115B) at the MRU head. When Tier 2 pressure (0.95)
+		// sheds only the updated tail node keyA (deletedSinceCompact = 1, deletedSinceCompact*4 = 4 < 5),
+		// full compaction does not run and nodeMap[hA] must be restored to surviving peer idB.
+		hA := hashString(keyA)
+		hB := hashString(keyB)
+		pressure := 0.10
+		c := NewArenaRadixCache[testData](
+			1000,
+			testDataWeigher,
+			WithEvictionThreshold(0.90),
+			WithEvictionRetentionRatio(0.50),
+			WithPressureFunc(func() float64 { return pressure }),
+		).(*arenaRadix[testData])
+
+		_, err := c.Insert(keyA, testData{value: 1, dataSize: 100})
+		require.NoError(t, err)
+		for i := range 3 {
+			_, err = c.Insert(fmt.Sprintf("mid-%d", i), testData{value: int64(i + 10), dataSize: 115})
+			require.NoError(t, err)
+		}
+		_, err = c.Insert(keyB, testData{value: 2, dataSize: 115})
+		require.NoError(t, err)
+
+		idB := c.nodeMap[hB]
+		c.nodeMap[hA] = idB
+
+		// Act: Raise pressure to Tier 2 (0.95) and update non-head entry keyA in place.
+		pressure = 0.95
+		err = c.UpdateWithoutChangingOrder(keyA, testData{value: 11, dataSize: 100})
+
+		// Assert: keyA was shed by Tier 2 without full compaction, and nodeMap[hA] was restored to idB.
+		require.NoError(t, err)
+		assert.True(t, c.nodeMapDirty)
+		assert.Equal(t, idB, c.nodeMap[hA], "Tier 2 shedding of updated tail node must restore colliding live peer in nodeMap")
+		delete(c.nodeMap, hA)
+		assert.Len(t, c.nodeMap, c.len)
+		c.checkInvariants()
+		_, ok := c.LookUpWithoutChangingOrder(keyA)
+		assert.False(t, ok)
+		_, ok = c.LookUpWithoutChangingOrder("missing-key")
+		assert.False(t, ok)
+		valB, ok := c.LookUpWithoutChangingOrder(keyB)
+		require.True(t, ok)
+		assert.Equal(t, int64(2), valB.value)
+	})
+
 	t.Run("DisplacedNodeMapSlotOnEraseStillTriggersChurnCompactionAndPreservesPeers", func(t *testing.T) {
 		// Arrange: Keep keyB as the surviving entry while inserting and erasing two batches of 32 keys
 		// whose nodeMap slots were displaced by simulated hash collisions. Because peak live entries stays
@@ -1605,10 +1693,10 @@ func TestArenaRadixCache_DeepHierarchyOver64LevelsAndRoutingPrefixCloning(t *tes
 		}
 
 		// Act 1: Compact the 80-level tree (exercises hashNodeKey with > 64 segments) and confirm a second Compact is a no-op.
-		assert.True(t, probe.ObserveEpochAdvance(t, c, func() {
+		assert.True(t, observeEpochAdvance(t, probe, c, func() {
 			c.Compact()
 		}))
-		assert.False(t, probe.ObserveEpochAdvance(t, c, func() {
+		assert.False(t, observeEpochAdvance(t, probe, c, func() {
 			c.Compact()
 		}))
 		for i := 1; i <= depth; i++ {

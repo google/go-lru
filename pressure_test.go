@@ -354,7 +354,7 @@ func TestPressure_ForegroundMutations(t *testing.T) {
 				// and there are no older entries or dirty index buckets, 0 evictions and 0 compactions occur.
 				var evicted []testData
 				var err error
-				advanced := probe.ObserveEpochAdvance(t, cache, func() {
+				advanced := observeEpochAdvance(t, probe, cache, func() {
 					evicted, err = cache.Insert("protected_jumbo", testData{value: 1, dataSize: 800})
 				})
 
@@ -402,7 +402,7 @@ func TestPressure_ForegroundMutations(t *testing.T) {
 				require.NoError(t, err)
 
 				// Act: Erase a 0B entry, prefix-erase a 0B entry, and self-evict a 0B entry via UpdateWithoutChangingOrder (+10B when avail == 0).
-				advanced := probe.ObserveEpochAdvance(t, cache, func() {
+				advanced := observeEpochAdvance(t, probe, cache, func() {
 					_, _ = cache.Erase("z_erase")
 					cache.EraseEntriesWithGivenPrefix("z_prefix/")
 					err = cache.UpdateWithoutChangingOrder("z_self_evict", testData{value: 1, dataSize: 10})
@@ -429,7 +429,7 @@ func TestPressure_ForegroundMutations(t *testing.T) {
 				require.NoError(t, err)
 
 				// Act: Grow "target" by +80B (to 100B). This evicts "small" (10B), so net currentSize increases from 30B to 100B.
-				advanced := probe.ObserveEpochAdvance(t, cache, func() {
+				advanced := observeEpochAdvance(t, probe, cache, func() {
 					err = cache.UpdateWithoutChangingOrder("target", testData{value: 1, dataSize: 100})
 				})
 
@@ -574,7 +574,7 @@ func TestPressure_EraseEmptyPrefixInvalidationAndEmptyNoOp(t *testing.T) {
 				probe.Set(0.10)
 
 				// Act: EraseEntriesWithGivenPrefix("") on a non-empty cache must advance the reclamation epoch and invalidate cached pressure.
-				advanced := probe.ObserveEpochAdvance(t, c, func() {
+				advanced := observeEpochAdvance(t, probe, c, func() {
 					c.EraseEntriesWithGivenPrefix("")
 				})
 

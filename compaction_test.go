@@ -45,7 +45,7 @@ func testGoroutineID() uint64 {
 }
 
 // assertAlreadyCompacted verifies that pac.Compact() allocates 0 heap objects on its very first invocation,
-// and when a pressureProbe is provided, also verifies via !probe.ObserveEpochAdvance(tb, pac, compactOnce)
+// and when a pressureProbe is provided, also verifies via !observeEpochAdvance(tb, probe, pac, compactOnce)
 // that the first Compact() call itself did not advance reclaimEpoch (deterministically verifying RadixCache
 // was already compacted too).
 func assertAlreadyCompacted[V any](tb testing.TB, pac PressureAwareCache[V], probes ...*pressureProbe) {
@@ -61,7 +61,7 @@ func assertAlreadyCompacted[V any](tb testing.TB, pac PressureAwareCache[V], pro
 	hasProbe := false
 	for _, probe := range probes {
 		if probe != nil {
-			assert.False(tb, probe.ObserveEpochAdvance(tb, pac, compactOnce), "expected cache to already be compacted (first Compact call must not advance reclaimEpoch)")
+			assert.False(tb, observeEpochAdvance(tb, probe, pac, compactOnce), "expected cache to already be compacted (first Compact call must not advance reclaimEpoch)")
 			hasProbe = true
 		}
 	}
@@ -72,7 +72,7 @@ func assertAlreadyCompacted[V any](tb testing.TB, pac PressureAwareCache[V], pro
 }
 
 // pressureProbe provides a public-API PressureFunc callback that allows tests to dynamically
-// update simulated memory pressure and observe via ObserveEpochAdvance whether an
+// update simulated memory pressure and observe via observeEpochAdvance whether an
 // operation advanced the cache's reclamation epoch.
 type pressureProbe struct {
 	pressureBits atomic.Uint64
@@ -117,10 +117,10 @@ func (p *pressureProbe) PressureFunc() float64 {
 	return math.Float64frombits(p.pressureBits.Load())
 }
 
-// ObserveEpochAdvance executes op() while a background EvaluateMemoryPressure() call
+// observeEpochAdvance executes op() while a background EvaluateMemoryPressure() call
 // holds a pre-operation epoch snapshot inside PressureFunc, returning true if and only if op()
 // advanced the cache's reclamation epoch (causing lockWithPressure to re-sample PressureFunc).
-func (p *pressureProbe) ObserveEpochAdvance(tb testing.TB, pac any, op func()) bool {
+func observeEpochAdvance[V any](tb testing.TB, p *pressureProbe, pac PressureAwareCache[V], op func()) bool {
 	tb.Helper()
 
 	bgEntered := make(chan struct{})
@@ -137,16 +137,7 @@ func (p *pressureProbe) ObserveEpochAdvance(tb testing.TB, pac any, op func()) b
 		p.bgRelease = bgRelease
 		p.mu.Unlock()
 
-		switch c := pac.(type) {
-		case PressureAwareCache[testData]:
-			_ = c.EvaluateMemoryPressure()
-		case PressureAwareCache[string]:
-			_ = c.EvaluateMemoryPressure()
-		case PressureAwareCache[int]:
-			_ = c.EvaluateMemoryPressure()
-		default:
-			panic(fmt.Sprintf("unsupported PressureAwareCache type %T", pac))
-		}
+		_ = pac.EvaluateMemoryPressure()
 
 		p.mu.Lock()
 		p.hookActive = false
@@ -285,7 +276,7 @@ func TestCompaction_EmptyDrainAndPreInsertSlackReclamation(t *testing.T) {
 				probe.Set(0.80)
 				var evicted []testData
 				var err error
-				advanced := probe.ObserveEpochAdvance(t, pac, func() {
+				advanced := observeEpochAdvance(t, probe, pac, func() {
 					evicted, err = pac.Insert("jumbo", testData{value: 999, dataSize: 1000})
 				})
 
@@ -317,7 +308,7 @@ func TestCompaction_EmptyDrainAndPreInsertSlackReclamation(t *testing.T) {
 
 				// Act: Insert "k3" (50B), which pre-evicts "k1" (60B) so net currentSize decreases from 100B to 90B.
 				var evicted []testData
-				advanced := probe.ObserveEpochAdvance(t, pac, func() {
+				advanced := observeEpochAdvance(t, probe, pac, func() {
 					evicted, err = pac.Insert("k3", testData{value: 3, dataSize: 50})
 				})
 
@@ -597,7 +588,7 @@ func TestCompaction_CrossBackendParityOnSingleSurvivorAndShrinkageWatermarks(t *
 
 				// Act: Raise pressure to Tier 1 (0.80) and erase "z-068", draining from 70 peak entries to 1 survivor.
 				probe.Set(0.80)
-				advanced := probe.ObserveEpochAdvance(t, pac, func() {
+				advanced := observeEpochAdvance(t, probe, pac, func() {
 					_, ok := pac.Erase("z-068")
 					require.True(t, ok)
 				})
@@ -650,7 +641,7 @@ func TestCompaction_CrossBackendParityOnSingleSurvivorAndShrinkageWatermarks(t *
 
 				// Erase "p-069" under Tier 1 pressure, leaving only 1 zero-size entry ("z-063") from 70 peak entries.
 				probe.Set(0.80)
-				advanced := probe.ObserveEpochAdvance(t, pac, func() {
+				advanced := observeEpochAdvance(t, probe, pac, func() {
 					_, ok := pac.Erase("p-069")
 					require.True(t, ok)
 				})
@@ -702,7 +693,7 @@ func TestCompaction_CrossBackendParityOnSingleSurvivorAndShrinkageWatermarks(t *
 				}
 
 				probe.Set(0.80)
-				advanced := probe.ObserveEpochAdvance(t, pac, func() {
+				advanced := observeEpochAdvance(t, probe, pac, func() {
 					_, ok := pac.Erase("k-063")
 					require.True(t, ok)
 				})
@@ -739,7 +730,7 @@ func TestCompaction_CrossBackendParityOnSingleSurvivorAndShrinkageWatermarks(t *
 
 				// Act: Raise pressure to Tier 1 (0.80) and call EvaluateMemoryPressure().
 				probe.Set(0.80)
-				advanced := probe.ObserveEpochAdvance(t, pac, func() {
+				advanced := observeEpochAdvance(t, probe, pac, func() {
 					pac.EvaluateMemoryPressure()
 				})
 
@@ -770,7 +761,7 @@ func TestCompaction_CrossBackendParityOnSingleSurvivorAndShrinkageWatermarks(t *
 				// Act
 				probe.Set(0.95)
 				var evicted []testData
-				advanced := probe.ObserveEpochAdvance(t, pac, func() {
+				advanced := observeEpochAdvance(t, probe, pac, func() {
 					evicted = pac.EvaluateMemoryPressure()
 				})
 
@@ -779,7 +770,7 @@ func TestCompaction_CrossBackendParityOnSingleSurvivorAndShrinkageWatermarks(t *
 				assert.True(t, advanced)
 				assertAlreadyCompacted(t, pac, probe)
 
-				advancedRepeat := probe.ObserveEpochAdvance(t, pac, func() {
+				advancedRepeat := observeEpochAdvance(t, probe, pac, func() {
 					assert.Empty(t, pac.EvaluateMemoryPressure())
 				})
 				assert.False(t, advancedRepeat)
@@ -810,7 +801,7 @@ func TestCompaction_CrossBackendParityOnSingleSurvivorAndShrinkageWatermarks(t *
 				probe.Set(0.80)
 
 				// Act 1: 5th deletion under Tier 1 pressure reaches exact 25% shrinkage from peak (20 -> 15).
-				advancedFifth := probe.ObserveEpochAdvance(t, pac, func() {
+				advancedFifth := observeEpochAdvance(t, probe, pac, func() {
 					_, ok := pac.Erase("k04")
 					require.True(t, ok)
 				})
@@ -821,7 +812,7 @@ func TestCompaction_CrossBackendParityOnSingleSurvivorAndShrinkageWatermarks(t *
 
 				// Act 2: Erase 1 more zero-byte key ("k05", 15 -> 14, 1/15 < 25% shrinkage) at Tier 1 pressure;
 				// because watermarks were reset to 15 on the 5th deletion, it does not re-compact.
-				advancedSixth := probe.ObserveEpochAdvance(t, pac, func() {
+				advancedSixth := observeEpochAdvance(t, probe, pac, func() {
 					_, ok := pac.Erase("k05")
 					require.True(t, ok)
 				})
@@ -845,7 +836,7 @@ func TestCompaction_CrossBackendParityOnSingleSurvivorAndShrinkageWatermarks(t *
 
 				// Act: Under Tier 1 pressure (0.80), erase 2 zero-byte keys ("a/1", "a/2") while observing epoch advancement.
 				probe.Set(0.80)
-				advanced := probe.ObserveEpochAdvance(t, pac, func() {
+				advanced := observeEpochAdvance(t, probe, pac, func() {
 					_, ok := pac.Erase("a/1")
 					require.True(t, ok)
 					_, ok = pac.Erase("a/2")
@@ -885,14 +876,14 @@ func TestCompaction_CrossBackendParityOnSingleSurvivorAndShrinkageWatermarks(t *
 
 					// Act 1: Erase the 6th of 20 entries (30% >= 25% shrinkage) under Tier 1 pressure (0.80).
 					probe.Set(0.80)
-					advancedInline := probe.ObserveEpochAdvance(t, pac, func() {
+					advancedInline := observeEpochAdvance(t, probe, pac, func() {
 						_, ok := pac.Erase("k/05")
 						require.True(t, ok)
 					})
 					assert.True(t, advancedInline)
 					assertAlreadyCompacted(t, pac, probe)
 
-					advancedFollowUp := probe.ObserveEpochAdvance(t, pac, func() {
+					advancedFollowUp := observeEpochAdvance(t, probe, pac, func() {
 						pac.EvaluateMemoryPressure()
 					})
 					assert.False(t, advancedFollowUp)
@@ -903,13 +894,13 @@ func TestCompaction_CrossBackendParityOnSingleSurvivorAndShrinkageWatermarks(t *
 					require.True(t, ok)
 
 					probe.Set(0.80)
-					advancedExplicit := probe.ObserveEpochAdvance(t, pac, func() {
+					advancedExplicit := observeEpochAdvance(t, probe, pac, func() {
 						pac.EvaluateMemoryPressure()
 					})
 					assert.True(t, advancedExplicit)
 					assertAlreadyCompacted(t, pac, probe)
 
-					advancedSecondEval := probe.ObserveEpochAdvance(t, pac, func() {
+					advancedSecondEval := observeEpochAdvance(t, probe, pac, func() {
 						pac.EvaluateMemoryPressure()
 					})
 					assert.False(t, advancedSecondEval)
@@ -935,13 +926,13 @@ func TestCompaction_CrossBackendParityOnSingleSurvivorAndShrinkageWatermarks(t *
 
 					// Act: Spike pressure to Tier 2 (0.95) and call EvaluateMemoryPressure() while currentSize (140B) <= targetSize (500B).
 					probe.Set(0.95)
-					advanced := probe.ObserveEpochAdvance(t, pac, func() {
+					advanced := observeEpochAdvance(t, probe, pac, func() {
 						pac.EvaluateMemoryPressure()
 					})
 					assert.True(t, advanced)
 					assertAlreadyCompacted(t, pac, probe)
 
-					advancedRepeat := probe.ObserveEpochAdvance(t, pac, func() {
+					advancedRepeat := observeEpochAdvance(t, probe, pac, func() {
 						pac.EvaluateMemoryPressure()
 					})
 					assert.False(t, advancedRepeat)
@@ -965,14 +956,14 @@ func TestCompaction_PreReclaimSlackAndEpochConsistencyAcrossMutations(t *testing
 
 				// Act
 				probe.Set(0.80)
-				advancedInsert := probe.ObserveEpochAdvance(t, pac, func() {
+				advancedInsert := observeEpochAdvance(t, probe, pac, func() {
 					_, err := pac.Insert("big", testData{value: 999, dataSize: 990})
 					require.NoError(t, err)
 				})
 				assert.True(t, advancedInsert)
 				assertAlreadyCompacted(t, pac, probe)
 
-				advancedEval := probe.ObserveEpochAdvance(t, pac, func() {
+				advancedEval := observeEpochAdvance(t, probe, pac, func() {
 					pac.EvaluateMemoryPressure()
 				})
 				assert.False(t, advancedEval)
@@ -1000,14 +991,14 @@ func TestCompaction_PreReclaimSlackAndEpochConsistencyAcrossMutations(t *testing
 					_, err = cachePrefixEmpty.Insert("z1", testData{value: 1, dataSize: 0})
 					require.NoError(t, err)
 
-					advancedErase := probeErase.ObserveEpochAdvance(t, cacheErase, func() {
+					advancedErase := observeEpochAdvance(t, probeErase, cacheErase, func() {
 						_, ok := cacheErase.Erase("z1")
 						require.True(t, ok)
 					})
-					advancedSelfEvict := probeSelfEvict.ObserveEpochAdvance(t, cacheSelfEvict, func() {
+					advancedSelfEvict := observeEpochAdvance(t, probeSelfEvict, cacheSelfEvict, func() {
 						require.NoError(t, cacheSelfEvict.UpdateWithoutChangingOrder("z1", testData{value: 11, dataSize: 10}))
 					})
-					advancedPrefixEmpty := probePrefixEmpty.ObserveEpochAdvance(t, cachePrefixEmpty, func() {
+					advancedPrefixEmpty := observeEpochAdvance(t, probePrefixEmpty, cachePrefixEmpty, func() {
 						cachePrefixEmpty.EraseEntriesWithGivenPrefix("")
 					})
 
@@ -1067,7 +1058,7 @@ func TestCompaction_PreReclaimSlackAndEpochConsistencyAcrossMutations(t *testing
 					pac := b.fn(100, WithInvariantChecking(true), probe.Option()).(PressureAwareCache[testData])
 
 					assertAlreadyCompacted(t, pac, probe)
-					advancedFreshEval := probe.ObserveEpochAdvance(t, pac, func() {
+					advancedFreshEval := observeEpochAdvance(t, probe, pac, func() {
 						pac.EvaluateMemoryPressure()
 					})
 					assert.False(t, advancedFreshEval)
@@ -1079,13 +1070,13 @@ func TestCompaction_PreReclaimSlackAndEpochConsistencyAcrossMutations(t *testing
 						require.NoError(t, err)
 					}
 					probe.Set(0.80)
-					advancedClear := probe.ObserveEpochAdvance(t, pac, func() {
+					advancedClear := observeEpochAdvance(t, probe, pac, func() {
 						pac.EraseEntriesWithGivenPrefix("")
 					})
 					assert.True(t, advancedClear)
 					assertAlreadyCompacted(t, pac, probe)
 
-					advancedPostClearEval := probe.ObserveEpochAdvance(t, pac, func() {
+					advancedPostClearEval := observeEpochAdvance(t, probe, pac, func() {
 						pac.EvaluateMemoryPressure()
 					})
 					assert.False(t, advancedPostClearEval)
@@ -1100,7 +1091,7 @@ func TestCompaction_PreReclaimSlackAndEpochConsistencyAcrossMutations(t *testing
 					}
 
 					probe.Set(0.80)
-					advanced := probe.ObserveEpochAdvance(t, pac, func() {
+					advanced := observeEpochAdvance(t, probe, pac, func() {
 						pac.EraseEntriesWithGivenPrefix("z/")
 					})
 					assert.True(t, advanced)
@@ -1131,7 +1122,7 @@ func TestCompaction_PreReclaimSlackAndEpochConsistencyAcrossMutations(t *testing
 				require.NoError(t, err)
 
 				probe.Set(0.95)
-				advancedInsert := probe.ObserveEpochAdvance(t, pac, func() {
+				advancedInsert := observeEpochAdvance(t, probe, pac, func() {
 					_, err = pac.Insert("jumbo", testData{value: 999, dataSize: 995})
 					require.NoError(t, err)
 				})
@@ -1139,7 +1130,7 @@ func TestCompaction_PreReclaimSlackAndEpochConsistencyAcrossMutations(t *testing
 				assertAlreadyCompacted(t, pac, probe)
 
 				probe.Set(0.80)
-				advancedEval := probe.ObserveEpochAdvance(t, pac, func() {
+				advancedEval := observeEpochAdvance(t, probe, pac, func() {
 					pac.EvaluateMemoryPressure()
 				})
 				assert.False(t, advancedEval)
@@ -1166,11 +1157,11 @@ func TestCompaction_PreReclaimSlackAndEpochConsistencyAcrossMutations(t *testing
 					probeOverwrite.Set(0.80)
 					probeUpdate.Set(0.80)
 
-					advancedOverwrite := probeOverwrite.ObserveEpochAdvance(t, cacheOverwrite, func() {
+					advancedOverwrite := observeEpochAdvance(t, probeOverwrite, cacheOverwrite, func() {
 						_, err := cacheOverwrite.Insert("a", testData{value: 11, dataSize: 90})
 						require.NoError(t, err)
 					})
-					advancedUpdate := probeUpdate.ObserveEpochAdvance(t, cacheUpdateSize, func() {
+					advancedUpdate := observeEpochAdvance(t, probeUpdate, cacheUpdateSize, func() {
 						require.NoError(t, cacheUpdateSize.UpdateWithoutChangingOrder("a", testData{value: 11, dataSize: 90}))
 					})
 					assert.True(t, advancedOverwrite)
@@ -1178,10 +1169,10 @@ func TestCompaction_PreReclaimSlackAndEpochConsistencyAcrossMutations(t *testing
 					assertAlreadyCompacted(t, cacheOverwrite, probeOverwrite)
 					assertAlreadyCompacted(t, cacheUpdateSize, probeUpdate)
 
-					advancedEvalOverwrite := probeOverwrite.ObserveEpochAdvance(t, cacheOverwrite, func() {
+					advancedEvalOverwrite := observeEpochAdvance(t, probeOverwrite, cacheOverwrite, func() {
 						cacheOverwrite.EvaluateMemoryPressure()
 					})
-					advancedEvalUpdate := probeUpdate.ObserveEpochAdvance(t, cacheUpdateSize, func() {
+					advancedEvalUpdate := observeEpochAdvance(t, probeUpdate, cacheUpdateSize, func() {
 						cacheUpdateSize.EvaluateMemoryPressure()
 					})
 					assert.False(t, advancedEvalOverwrite)
@@ -1223,7 +1214,7 @@ func TestCompaction_PreReclaimSlackAndEpochConsistencyAcrossMutations(t *testing
 						assertAlreadyCompacted(t, item.pac, item.probe)
 
 						item.probe.Set(0.80)
-						advancedEval := item.probe.ObserveEpochAdvance(t, item.pac, func() {
+						advancedEval := observeEpochAdvance(t, item.probe, item.pac, func() {
 							item.pac.EvaluateMemoryPressure()
 						})
 						assert.False(t, advancedEval)
@@ -1264,7 +1255,7 @@ func TestCompaction_PreReclaimSlackAndEpochConsistencyAcrossMutations(t *testing
 				assertAlreadyCompacted(t, pac, probe)
 
 				probe.Set(0.80)
-				advancedEval := probe.ObserveEpochAdvance(t, pac, func() {
+				advancedEval := observeEpochAdvance(t, probe, pac, func() {
 					pac.EvaluateMemoryPressure()
 				})
 				assert.False(t, advancedEval)
@@ -1294,7 +1285,7 @@ func TestCompaction_NetByteReductionBelowChurnFloor(t *testing.T) {
 				probe.Set(0.80)
 				var evicted []testData
 				var err error
-				advancedInsert := probe.ObserveEpochAdvance(t, pac, func() {
+				advancedInsert := observeEpochAdvance(t, probe, pac, func() {
 					evicted, err = pac.Insert("new-large", testData{value: 99, dataSize: 95})
 				})
 				require.NoError(t, err)
@@ -1302,7 +1293,7 @@ func TestCompaction_NetByteReductionBelowChurnFloor(t *testing.T) {
 				assert.True(t, advancedInsert)
 				assertAlreadyCompacted(t, pac, probe)
 
-				advancedEval := probe.ObserveEpochAdvance(t, pac, func() {
+				advancedEval := observeEpochAdvance(t, probe, pac, func() {
 					pac.EvaluateMemoryPressure()
 				})
 				assert.False(t, advancedEval)
@@ -1331,11 +1322,11 @@ func TestCompaction_NetByteReductionBelowChurnFloor(t *testing.T) {
 				probeInsert.Set(0.80)
 				probeUpdate.Set(0.80)
 
-				advancedInsert := probeInsert.ObserveEpochAdvance(t, cacheInsert, func() {
+				advancedInsert := observeEpochAdvance(t, probeInsert, cacheInsert, func() {
 					_, err := cacheInsert.Insert("new", testData{value: 5, dataSize: 50})
 					require.NoError(t, err)
 				})
-				advancedUpdate := probeUpdate.ObserveEpochAdvance(t, cacheUpdate, func() {
+				advancedUpdate := observeEpochAdvance(t, probeUpdate, cacheUpdate, func() {
 					require.NoError(t, cacheUpdate.UpdateWithoutChangingOrder("keep2", testData{value: 44, dataSize: 70}))
 				})
 
@@ -1345,10 +1336,10 @@ func TestCompaction_NetByteReductionBelowChurnFloor(t *testing.T) {
 				assertAlreadyCompacted(t, cacheInsert, probeInsert)
 				assertAlreadyCompacted(t, cacheUpdate, probeUpdate)
 
-				advancedEvalInsert := probeInsert.ObserveEpochAdvance(t, cacheInsert, func() {
+				advancedEvalInsert := observeEpochAdvance(t, probeInsert, cacheInsert, func() {
 					cacheInsert.EvaluateMemoryPressure()
 				})
-				advancedEvalUpdate := probeUpdate.ObserveEpochAdvance(t, cacheUpdate, func() {
+				advancedEvalUpdate := observeEpochAdvance(t, probeUpdate, cacheUpdate, func() {
 					cacheUpdate.EvaluateMemoryPressure()
 				})
 				assert.False(t, advancedEvalInsert)
@@ -1390,11 +1381,11 @@ func TestCompaction_NetByteReductionBelowChurnFloor(t *testing.T) {
 				probeInsert.Set(0.95)
 				probeUpdate.Set(0.95)
 
-				advancedInsert := probeInsert.ObserveEpochAdvance(t, cacheInsert, func() {
+				advancedInsert := observeEpochAdvance(t, probeInsert, cacheInsert, func() {
 					_, err := cacheInsert.Insert("new", testData{value: 5, dataSize: 50})
 					require.NoError(t, err)
 				})
-				advancedUpdate := probeUpdate.ObserveEpochAdvance(t, cacheUpdate, func() {
+				advancedUpdate := observeEpochAdvance(t, probeUpdate, cacheUpdate, func() {
 					require.NoError(t, cacheUpdate.UpdateWithoutChangingOrder("keep2", testData{value: 44, dataSize: 70}))
 				})
 				assert.True(t, advancedInsert)
@@ -1404,10 +1395,10 @@ func TestCompaction_NetByteReductionBelowChurnFloor(t *testing.T) {
 
 				probeInsert.Set(0.80)
 				probeUpdate.Set(0.80)
-				advancedEvalInsert := probeInsert.ObserveEpochAdvance(t, cacheInsert, func() {
+				advancedEvalInsert := observeEpochAdvance(t, probeInsert, cacheInsert, func() {
 					cacheInsert.EvaluateMemoryPressure()
 				})
-				advancedEvalUpdate := probeUpdate.ObserveEpochAdvance(t, cacheUpdate, func() {
+				advancedEvalUpdate := observeEpochAdvance(t, probeUpdate, cacheUpdate, func() {
 					cacheUpdate.EvaluateMemoryPressure()
 				})
 				assert.False(t, advancedEvalInsert)
@@ -1434,7 +1425,7 @@ func TestCompaction_NetByteReductionBelowChurnFloor(t *testing.T) {
 				}
 
 				probeLarge.Set(0.95)
-				advancedLargeInsert := probeLarge.ObserveEpochAdvance(t, cacheLarge, func() {
+				advancedLargeInsert := observeEpochAdvance(t, probeLarge, cacheLarge, func() {
 					evicted, err := cacheLarge.Insert("new-8", testData{value: 99, dataSize: 8})
 					require.NoError(t, err)
 					require.Len(t, evicted, 1)
@@ -1444,7 +1435,7 @@ func TestCompaction_NetByteReductionBelowChurnFloor(t *testing.T) {
 				// Because 1% eviction (< 25%) did not run O(N) compaction inline, an explicit Compact() reclaims the
 				// 1 deleted slot and advances reclaimEpoch.
 				probeLarge.Set(0.10)
-				advancedExplicitCompact := probeLarge.ObserveEpochAdvance(t, cacheLarge, func() {
+				advancedExplicitCompact := observeEpochAdvance(t, probeLarge, cacheLarge, func() {
 					cacheLarge.Compact()
 				})
 				assert.True(t, advancedExplicitCompact)
@@ -1470,7 +1461,7 @@ func TestCompaction_NetByteReductionBelowChurnFloor(t *testing.T) {
 					require.NoError(t, err)
 
 					probe.Set(pressure)
-					advanced := probe.ObserveEpochAdvance(t, pac, func() {
+					advanced := observeEpochAdvance(t, probe, pac, func() {
 						evicted, err := pac.Insert("k2", testData{value: 22, dataSize: 10})
 						require.NoError(t, err)
 						assert.Empty(t, evicted)
@@ -1496,7 +1487,7 @@ func TestCompaction_NetByteReductionBelowChurnFloor(t *testing.T) {
 				require.True(t, ok)
 
 				probeChurn.Set(0.80)
-				advancedChurn := probeChurn.ObserveEpochAdvance(t, cacheChurn, func() {
+				advancedChurn := observeEpochAdvance(t, probeChurn, cacheChurn, func() {
 					evicted, err := cacheChurn.Insert("k1", testData{value: 11, dataSize: 10})
 					require.NoError(t, err)
 					assert.Empty(t, evicted)
@@ -1519,7 +1510,7 @@ func TestCompaction_NetByteReductionBelowChurnFloor(t *testing.T) {
 				require.True(t, ok)
 
 				probeSingle.Set(0.80)
-				advancedSingle := probeSingle.ObserveEpochAdvance(t, cacheSingle, func() {
+				advancedSingle := observeEpochAdvance(t, probeSingle, cacheSingle, func() {
 					evicted, err := cacheSingle.Insert("k1", testData{value: 11, dataSize: 10})
 					require.NoError(t, err)
 					assert.Empty(t, evicted)
@@ -1552,7 +1543,7 @@ func TestCompaction_SteadyStateTurnoverAndShrinkageAutoCompaction(t *testing.T) 
 				}
 
 				// Act 1: Perform 30 steady-state capacity-turnover inserts (< 64 churn deletions).
-				advancedTurnover := probe.ObserveEpochAdvance(t, c, func() {
+				advancedTurnover := observeEpochAdvance(t, probe, c, func() {
 					for i := range 30 {
 						_, err := c.Insert(fmt.Sprintf("turn_%02d", i), testData{value: int64(i), dataSize: 10})
 						require.NoError(t, err)
@@ -1567,7 +1558,7 @@ func TestCompaction_SteadyStateTurnoverAndShrinkageAutoCompaction(t *testing.T) 
 				require.True(t, ok)
 				_, ok = c.Erase("turn_28")
 				require.True(t, ok)
-				advancedShrinkage := probe.ObserveEpochAdvance(t, c, func() {
+				advancedShrinkage := observeEpochAdvance(t, probe, c, func() {
 					_, ok := c.Erase("turn_29")
 					require.True(t, ok)
 				})
@@ -1605,7 +1596,7 @@ func TestCompaction_SteadyStateTurnoverAndShrinkageAutoCompaction(t *testing.T) 
 				// Act: Raise pressure to Tier 1 (0.80) and perform a write.
 				probe.Set(0.80)
 				var err error
-				advanced := probe.ObserveEpochAdvance(t, c, func() {
+				advanced := observeEpochAdvance(t, probe, c, func() {
 					_, err = c.Insert("trigger", testData{value: 999, dataSize: 10})
 				})
 
@@ -1614,6 +1605,36 @@ func TestCompaction_SteadyStateTurnoverAndShrinkageAutoCompaction(t *testing.T) 
 				assert.True(t, advanced)
 				assertAlreadyCompacted(t, c, probe)
 			})
+		})
+	}
+}
+
+func TestObserveEpochAdvance_ArbitraryValueType(t *testing.T) {
+	for _, b := range allBackends[uint64]() {
+		t.Run(b.name, func(t *testing.T) {
+			// Arrange: Instantiate a generic cache with a custom value type (uint64) not previously enumerated.
+			probe := newPressureProbe(0.10)
+			pac := b.fn(10, WithInvariantChecking(true), probe.Option()).(PressureAwareCache[uint64])
+			_, err := pac.Insert("k1", 42)
+			require.NoError(t, err)
+			_, ok := pac.Erase("k1")
+			require.True(t, ok)
+
+			// Act: Insert a new entry and compact via generic observeEpochAdvance[uint64] and assertAlreadyCompacted[uint64].
+			_, err = pac.Insert("k2", 100)
+			require.NoError(t, err)
+			_, err = pac.Insert("k3", 200)
+			require.NoError(t, err)
+			_, ok = pac.Erase("k2")
+			require.True(t, ok)
+
+			advanced := observeEpochAdvance(t, probe, pac, func() {
+				pac.Compact()
+			})
+
+			// Assert
+			assert.True(t, advanced)
+			assertAlreadyCompacted(t, pac, probe)
 		})
 	}
 }

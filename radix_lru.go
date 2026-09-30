@@ -17,6 +17,7 @@ package lru
 import (
 	"fmt"
 	"math"
+	"reflect"
 	"strings"
 	"sync"
 )
@@ -59,9 +60,6 @@ type radixCache[V any] struct {
 
 	// weigher computes the weight of a cache entry, or is nil when using the default unit weight of 1.
 	weigher func(key string, value V) uint64
-
-	// noProtectNode is a sentinel node pointer indicating a foreground mutation with no protected head node.
-	noProtectNode radixNode[V]
 
 	// mu synchronizes concurrent access to all cache data structures.
 	mu sync.RWMutex
@@ -127,7 +125,7 @@ func (c *radixCache[V]) checkInvariants() {
 			zeroCount++
 		}
 		if !curr.hasValue {
-			panic(fmt.Sprintf("radixCache invariant violation: unexpected nil value in LRU list for prefix '%s'", curr.prefix))
+			panic(fmt.Sprintf("radixCache invariant violation: unexpected hasValue=false in LRU list for prefix '%s'", curr.prefix))
 		}
 
 		// Bidirectional link validation
@@ -213,6 +211,9 @@ func (c *radixCache[V]) checkInvariants() {
 			}
 			if curr.prev != nil || curr.next != nil || c.head == curr || c.tail == curr {
 				panic(fmt.Sprintf("radixCache invariant violation: routing node with prefix '%s' has non-nil LRU pointers", curr.prefix))
+			}
+			if !reflect.ValueOf(&curr.value).Elem().IsZero() {
+				panic(fmt.Sprintf("radixCache invariant violation: routing node with prefix '%s' retains non-zero value", curr.prefix))
 			}
 		}
 
@@ -621,14 +622,14 @@ func (c *radixCache[V]) finishDeleteReclaimLocked(sizeBefore, sampledEpoch uint6
 		c.compactDataStructuresLocked()
 		reclaimedSingleSurvivor = true
 	}
-	c.maybeReclaimUnderPressureLocked(pressure, &c.noProtectNode)
+	c.maybeReclaimUnderPressureLocked(pressure, nil, false)
 	if (reclaimedSingleSurvivor || c.currentSize < sizeBefore) && c.reclaimEpoch.Load() == sampledEpoch && c.hasElevatedPressureToInvalidate(pressure) {
 		c.markReclaimedLocked()
 	}
 }
 
 func (c *radixCache[V]) finishMutationReclaimLocked(evictedValues []V, protectedNode *radixNode[V], reclaimedPre bool, sizeBefore, sampledEpoch uint64, pressure float64) []V {
-	evictedByPressure := c.maybeReclaimUnderPressureLocked(pressure, protectedNode)
+	evictedByPressure := c.maybeReclaimUnderPressureLocked(pressure, protectedNode, false)
 	if len(evictedValues) == 0 {
 		evictedValues = evictedByPressure
 	} else if len(evictedByPressure) > 0 {
@@ -782,7 +783,8 @@ func (c *radixCache[V]) UpdateWithoutChangingOrder(key string, value V) error {
 	evictedAny := false
 	reclaimedPreUpdate := false
 
-	if newSize > oldSize {
+	switch {
+	case newSize > oldSize:
 		sizeDelta := newSize - oldSize
 		avail := c.maxSize - c.currentSize
 		if sizeDelta > avail {
@@ -835,18 +837,21 @@ func (c *radixCache[V]) UpdateWithoutChangingOrder(key string, value V) error {
 		node.hasValue = true
 		node.size = newSize
 		c.currentSize += sizeDelta
-	} else {
+	case newSize < oldSize:
 		sizeDiff := oldSize - newSize
 		c.onEntrySizeUpdated(oldSize, newSize)
 		node.value = value
 		node.hasValue = true
 		node.size = newSize
 		c.currentSize -= sizeDiff
+	default:
+		node.value = value
+		node.hasValue = true
 	}
 
 	reclaimedPreUpdate = c.shouldReclaimSingleSurvivorOnMutation(c.len, c.deletedSinceCompact > 0, false, evictedAny, c.currentSize, sizeBefore, pressure)
 
-	protectedNode := &c.noProtectNode
+	var protectedNode *radixNode[V]
 	if node == c.head && node.hasValue {
 		protectedNode = node
 	}
@@ -938,12 +943,11 @@ func (c *radixCache[V]) compactLocked() {
 	}
 }
 
-func (c *radixCache[V]) shouldAutoCompactLocked(protectedNode *radixNode[V]) bool {
-	return c.shouldAutoCompactEntryCounts(c.deletedSinceCompact > 0, protectedNode == nil, c.len)
+func (c *radixCache[V]) shouldAutoCompactLocked(isBackground bool) bool {
+	return c.shouldAutoCompactEntryCounts(c.deletedSinceCompact > 0, isBackground, c.len)
 }
 
-func (c *radixCache[V]) shedAndCompactLocked(targetSize uint64, retention float64, protectedNode *radixNode[V]) []V {
-	autoCompactNode := protectedNode
+func (c *radixCache[V]) shedAndCompactLocked(targetSize uint64, retention float64, protectedNode *radixNode[V], isBackground bool) []V {
 	if protectedNode != nil && (protectedNode != c.head || protectedNode.prev != nil || !protectedNode.hasValue) {
 		protectedNode = nil
 	}
@@ -997,7 +1001,7 @@ func (c *radixCache[V]) shedAndCompactLocked(targetSize uint64, retention float6
 		c.updateZeroWatermarkAfterShed(retention, c.len, !hasProtected || effectiveTarget <= targetSize, unprotectedZeroTarget, targetLen)
 	}
 	compacted := false
-	if c.shouldAutoCompactLocked(autoCompactNode) {
+	if c.shouldAutoCompactLocked(isBackground) {
 		compacted = c.compactDataStructuresLocked()
 	}
 	if len(evicted) > 0 || compacted {
@@ -1006,7 +1010,7 @@ func (c *radixCache[V]) shedAndCompactLocked(targetSize uint64, retention float6
 	return evicted
 }
 
-func (c *radixCache[V]) maybeReclaimUnderPressureLocked(pressure float64, protectedNode *radixNode[V]) []V {
+func (c *radixCache[V]) maybeReclaimUnderPressureLocked(pressure float64, protectedNode *radixNode[V], isBackground bool) []V {
 	if c.isSamplingGoroutine() {
 		return nil
 	}
@@ -1014,11 +1018,11 @@ func (c *radixCache[V]) maybeReclaimUnderPressureLocked(pressure float64, protec
 	if pressure >= c.options.EvictionThreshold {
 		retention := c.options.EvictionRetentionRatio
 		targetSize := computeTargetSize(c.maxSize, retention)
-		evicted = c.shedAndCompactLocked(targetSize, retention, protectedNode)
+		evicted = c.shedAndCompactLocked(targetSize, retention, protectedNode, isBackground)
 	} else {
 		c.resetZeroWatermarkBelowTier2(pressure)
 		if pressure >= c.options.CompactionThreshold {
-			if c.shouldAutoCompactLocked(protectedNode) {
+			if c.shouldAutoCompactLocked(isBackground) {
 				c.compactLocked()
 			}
 		}
@@ -1032,5 +1036,5 @@ func (c *radixCache[V]) EvaluateMemoryPressure() []V {
 	_, pressure := c.lockWithPressure(&c.mu, true)
 	defer c.unlock()
 
-	return c.maybeReclaimUnderPressureLocked(pressure, nil)
+	return c.maybeReclaimUnderPressureLocked(pressure, nil, true)
 }

@@ -734,7 +734,7 @@ func TestMapCache_Compact(t *testing.T) {
 	}
 
 	// Act 2: Compact dirty index (re-allocates map once and advances reclaimEpoch, then subsequent Compact is zero-alloc)
-	assert.True(t, probe.ObserveEpochAdvance(t, c, c.Compact))
+	assert.True(t, observeEpochAdvance(t, probe, c, c.Compact))
 
 	// Assert 2
 	assertAlreadyCompacted(t, c, probe)
@@ -774,7 +774,7 @@ func TestMapCache_EvaluateMemoryPressure(t *testing.T) {
 	// Act & Assert 1: Below CompactionThreshold (0.50 < 0.75) does nothing
 	probe.Set(0.50)
 	var evicted []testData
-	advancedBelow := probe.ObserveEpochAdvance(t, c, func() {
+	advancedBelow := observeEpochAdvance(t, probe, c, func() {
 		evicted = c.EvaluateMemoryPressure()
 	})
 	assert.Empty(t, evicted)
@@ -782,7 +782,7 @@ func TestMapCache_EvaluateMemoryPressure(t *testing.T) {
 
 	// Act & Assert 2: Tier 1 CompactionThreshold (0.80 in [0.75, 0.90)) compacts without evicting
 	probe.Set(0.80)
-	advancedTier1 := probe.ObserveEpochAdvance(t, c, func() {
+	advancedTier1 := observeEpochAdvance(t, probe, c, func() {
 		evicted = c.EvaluateMemoryPressure()
 	})
 	assert.Empty(t, evicted)
@@ -795,7 +795,7 @@ func TestMapCache_EvaluateMemoryPressure(t *testing.T) {
 
 	// Act & Assert 3: Tier 2 EvictionThreshold (0.95 >= 0.90) sheds down to targetSize = 50 and compacts
 	probe.Set(0.95)
-	advancedTier2 := probe.ObserveEpochAdvance(t, c, func() {
+	advancedTier2 := observeEpochAdvance(t, probe, c, func() {
 		evicted = c.EvaluateMemoryPressure()
 	})
 	assertEvictedValues(t, evicted, []int64{2, 3, 4})
@@ -811,7 +811,7 @@ func TestMapCache_EvaluateMemoryPressure(t *testing.T) {
 	}
 
 	// Act & Assert 4: Repeated EvaluateMemoryPressure when clean and at targetSize is a no-op
-	advancedRepeat := probe.ObserveEpochAdvance(t, c, func() {
+	advancedRepeat := observeEpochAdvance(t, probe, c, func() {
 		evicted = c.EvaluateMemoryPressure()
 	})
 	assert.Empty(t, evicted)

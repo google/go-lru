@@ -444,7 +444,8 @@ func (c *mapCache[V]) UpdateWithoutChangingOrder(key string, value V) error {
 	evictedAny := false
 	reclaimedPreUpdate := false
 
-	if newSize > oldSize {
+	switch {
+	case newSize > oldSize:
 		sizeDelta := newSize - oldSize
 		avail := c.maxSize - c.currentSize
 		if sizeDelta > avail {
@@ -496,12 +497,14 @@ func (c *mapCache[V]) UpdateWithoutChangingOrder(key string, value V) error {
 		entryVal.value = value
 		entryVal.size = newSize
 		c.currentSize += sizeDelta
-	} else {
+	case newSize < oldSize:
 		sizeDiff := oldSize - newSize
 		c.onEntrySizeUpdated(oldSize, newSize)
 		entryVal.value = value
 		entryVal.size = newSize
 		c.currentSize -= sizeDiff
+	default:
+		entryVal.value = value
 	}
 
 	if c.shouldReclaimSingleSurvivorOnMutation(c.entries.Len(), c.dirtyIndex, false, evictedAny, c.currentSize, sizeBefore, pressure) {

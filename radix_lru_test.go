@@ -796,6 +796,25 @@ func TestRadixCache_CheckInvariants_PanicScenarios(t *testing.T) {
 			c.checkInvariants()
 		})
 	})
+
+	t.Run("RoutingNodeRetainsNonZeroValue", func(t *testing.T) {
+		// Arrange
+		c := NewRadixCache[testData](50, testDataWeigher).(*radixCache[testData])
+		_, err := c.Insert("ab", testData{value: 1, dataSize: 10})
+		require.NoError(t, err)
+		_, err = c.Insert("ac", testData{value: 2, dataSize: 10})
+		require.NoError(t, err)
+		require.NotNil(t, c.root.child)
+		require.False(t, c.root.child.hasValue)
+
+		// Act
+		c.root.child.value = testData{value: 99, dataSize: 10}
+
+		// Assert
+		assert.Panics(t, func() {
+			c.checkInvariants()
+		})
+	})
 }
 
 // TestRadixCache_RoutingPrefixDoesNotPinLargeKeyBackingArray verifies that splitting an edge

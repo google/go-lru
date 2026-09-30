@@ -17,6 +17,7 @@ package lru
 import (
 	"fmt"
 	"math"
+	"reflect"
 )
 
 // NewArenaRadixCache returns a new arena-backed radix LRU Cache[V] bounded by maxSize.
@@ -90,7 +91,7 @@ func (c *arenaRadix[V]) checkInvariants() {
 			zeroCount++
 		}
 		if !c.nodes[currID].hasValue {
-			panic(fmt.Sprintf("arenaRadix invariant violation: unexpected nil value in LRU list for prefix '%s'", c.nodes[currID].prefix))
+			panic(fmt.Sprintf("arenaRadix invariant violation: unexpected hasValue=false in LRU list for prefix '%s'", c.nodes[currID].prefix))
 		}
 
 		// Bidirectional link validation
@@ -192,6 +193,9 @@ func (c *arenaRadix[V]) checkInvariants() {
 			if c.nodes[currID].prev != nilNode || c.nodes[currID].next != nilNode || c.head == currID || c.tail == currID {
 				panic(fmt.Sprintf("arenaRadix invariant violation: routing node %d has non-nilNode LRU pointers", currID))
 			}
+			if !reflect.ValueOf(&c.nodes[currID].value).Elem().IsZero() {
+				panic(fmt.Sprintf("arenaRadix invariant violation: routing node %d with prefix '%s' retains non-zero value", currID, c.nodes[currID].prefix))
+			}
 		}
 
 		// Validate child pointers and sibling ordering
@@ -249,7 +253,7 @@ func (c *arenaRadix[V]) checkInvariants() {
 			panic(fmt.Sprintf("arenaRadix invariant violation: nodeMap contains out-of-bounds index %d (len=%d)", id, len(c.nodes)))
 		}
 		if !c.nodes[id].hasValue {
-			panic(fmt.Sprintf("arenaRadix invariant violation: nodeMap points to node %d with nil value", id))
+			panic(fmt.Sprintf("arenaRadix invariant violation: nodeMap points to node %d with hasValue=false", id))
 		}
 		if c.hashNodeKey(id) != h {
 			panic(fmt.Sprintf("arenaRadix invariant violation: nodeMap hash mismatch for node %d", id))
@@ -266,7 +270,10 @@ func (c *arenaRadix[V]) checkInvariants() {
 			panic("arenaRadix invariant violation: free-list contains root node")
 		}
 		if c.nodes[freeID].hasValue {
-			panic(fmt.Sprintf("arenaRadix invariant violation: free-list node %d has non-nil value", freeID))
+			panic(fmt.Sprintf("arenaRadix invariant violation: free-list node %d has hasValue=true", freeID))
+		}
+		if !reflect.ValueOf(&c.nodes[freeID].value).Elem().IsZero() {
+			panic(fmt.Sprintf("arenaRadix invariant violation: free-list node %d retains non-zero value", freeID))
 		}
 		if c.nodes[freeID].size != 0 {
 			panic(fmt.Sprintf("arenaRadix invariant violation: free-list node %d has non-zero size %d", freeID, c.nodes[freeID].size))
@@ -521,7 +528,8 @@ func (c *arenaRadix[V]) UpdateWithoutChangingOrder(key string, value V) error {
 	evictedAny := false
 	reclaimedPreUpdate := false
 
-	if newSize > oldSize {
+	switch {
+	case newSize > oldSize:
 		sizeDelta := newSize - oldSize
 		avail := c.maxSize - c.currentSize
 		if sizeDelta > avail {
@@ -574,16 +582,22 @@ func (c *arenaRadix[V]) UpdateWithoutChangingOrder(key string, value V) error {
 		c.nodes[nodeID].hasValue = true
 		c.nodes[nodeID].size = newSize
 		c.currentSize += sizeDelta
-	} else {
+	case newSize < oldSize:
 		sizeDiff := oldSize - newSize
 		c.onEntrySizeUpdated(oldSize, newSize)
 		c.nodes[nodeID].value = value
 		c.nodes[nodeID].hasValue = true
 		c.nodes[nodeID].size = newSize
 		c.currentSize -= sizeDiff
+	default:
+		c.nodes[nodeID].value = value
+		c.nodes[nodeID].hasValue = true
 	}
 
-	c.nodeMap[keyHash] = nodeID
+	prevMappedID, hadPrevMapped := c.nodeMap[keyHash]
+	if !hadPrevMapped || prevMappedID != nodeID {
+		c.nodeMap[keyHash] = nodeID
+	}
 	reclaimedPreUpdate = c.shouldReclaimSingleSurvivorOnMutation(c.len, c.freeCount > 0 || c.nodeMapDirty, c.freeCount >= 63, evictedAny, c.currentSize, sizeBefore, pressure)
 
 	protectedID := foregroundNoProtect
@@ -591,6 +605,10 @@ func (c *arenaRadix[V]) UpdateWithoutChangingOrder(key string, value V) error {
 		protectedID = nodeID
 	}
 	c.finishMutationReclaimLocked(nil, protectedID, reclaimedPreUpdate, sizeBefore, sampledEpoch, pressure)
+	if c.nodeMapDirty && (nodeID >= uint32(len(c.nodes)) || !c.nodes[nodeID].hasValue) &&
+		hadPrevMapped && prevMappedID != nodeID && prevMappedID < uint32(len(c.nodes)) && c.nodes[prevMappedID].hasValue {
+		c.nodeMap[keyHash] = prevMappedID
+	}
 	return nil
 }
 

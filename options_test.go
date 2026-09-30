@@ -69,25 +69,62 @@ func TestOptions_WithWeigher(t *testing.T) {
 	// Arrange
 	fn := func(k, v string) uint64 { return uint64(len(k) + len(v)) }
 	var typedWeigher Weigher[string] = fn
+	type customWeigher func(string, string) uint64
+	var typedNilFunc func(string, int) uint64
+	var typedNilWeigher Weigher[int]
+	var typedNilAnyFunc func(string, any) uint64
+	var typedNilAnyWeigher Weigher[any]
+	var typedNilCustom customWeigher
 
 	// Act
 	optsDefault := ApplyOptions()
 	optsCustom := ApplyOptions(WithWeigher(fn))
 	optsNil := ApplyOptions(WithWeigher(fn), WithWeigher[string](nil))
+	optsTypedNilDirect := ApplyOptions(func(o *Options) { o.Weigher = typedNilFunc })
+	optsTypedNilWeigherDirect := ApplyOptions(func(o *Options) { o.Weigher = typedNilWeigher })
+	optsTypedNilCustomDirect := ApplyOptions(func(o *Options) { o.Weigher = typedNilCustom })
 	optsTypedDirect := ApplyOptions(func(o *Options) { o.Weigher = typedWeigher })
 	optsAnyDirect := ApplyOptions(WithWeigher(func(k string, _ any) uint64 { return uint64(len(k)) }))
+	optsWeigherAnyDirect := ApplyOptions(func(o *Options) {
+		o.Weigher = Weigher[any](func(k string, _ any) uint64 { return uint64(len(k)) })
+	})
 
 	// Assert
 	assert.Nil(t, optsDefault.Weigher)
 	assert.NotNil(t, optsCustom.Weigher)
 	assert.Nil(t, optsNil.Weigher)
+	assert.Nil(t, optsTypedNilDirect.Weigher)
+	assert.Nil(t, optsTypedNilWeigherDirect.Weigher)
+	assert.Nil(t, optsTypedNilCustomDirect.Weigher)
+	assert.Nil(t, resolveWeigher[string](optsTypedNilDirect))
+	assert.Nil(t, resolveWeigher[string](Options{Weigher: typedNilFunc}))
+	assert.Nil(t, resolveWeigher[string](Options{Weigher: typedNilWeigher}))
+	assert.Nil(t, resolveWeigher[string](Options{Weigher: typedNilAnyFunc}))
+	assert.Nil(t, resolveWeigher[string](Options{Weigher: typedNilAnyWeigher}))
+	assert.Nil(t, resolveWeigher[string](Options{Weigher: typedNilCustom}))
 	assert.Equal(t, uint64(5), resolveWeigher[string](optsCustom)("ab", "cde"))
 	assert.Equal(t, uint64(5), resolveWeigher[string](optsTypedDirect)("ab", "cde"))
 	assert.Equal(t, uint64(2), resolveWeigher[string](optsAnyDirect)("ab", "cde"))
+	assert.Equal(t, uint64(2), resolveWeigher[string](optsWeigherAnyDirect)("ab", "cde"))
 
-	assert.Panics(t, func() {
-		_ = New[string](10, WithWeigher(func(_ string, v int) uint64 { return uint64(v) }))
-	})
+	assert.PanicsWithValue(t,
+		"lru: WithWeigher function type func(string, int) uint64 does not match cache value type string",
+		func() {
+			_ = New[string](10, WithWeigher(func(_ string, v int) uint64 { return uint64(v) }))
+		},
+	)
+	assert.PanicsWithValue(t,
+		"lru: WithWeigher function type func(string, int) uint64 does not match cache value type *lru.testData",
+		func() {
+			_ = New[*testData](10, WithWeigher(func(_ string, v int) uint64 { return uint64(v) }))
+		},
+	)
+	assert.PanicsWithValue(t,
+		"lru: WithWeigher function type func(string, int) uint64 does not match cache value type interface {}",
+		func() {
+			_ = New[any](10, WithWeigher(func(_ string, v int) uint64 { return uint64(v) }))
+		},
+	)
 }
 
 func TestOptions_Default(t *testing.T) {
@@ -342,7 +379,7 @@ func TestCache_CustomWeigher_AllBackends(t *testing.T) {
 
 				// Entry exceeding maxSize (20) returns ErrInvalidEntrySize without mutating state.
 				ev, err = cache.Insert("huge", strings.Repeat("z", 20))
-				assert.ErrorIs(t, err, ErrInvalidEntrySize)
+				require.ErrorIs(t, err, ErrInvalidEntrySize)
 				assert.Nil(t, ev)
 
 				v1, ok := cache.LookUpWithoutChangingOrder("k1")
@@ -802,6 +839,7 @@ func TestGenericCache_ScalarValueTypesAndCompactNodeLayout(t *testing.T) {
 		assert.Equal(t, uintptr(48), unsafe.Sizeof(arenaRadixNode[uint16]{}))
 		assert.Equal(t, uintptr(56), unsafe.Sizeof(arenaRadixNode[uint32]{}))
 		assert.Equal(t, uintptr(56), unsafe.Sizeof(arenaRadixNode[uint64]{}))
+		assert.Equal(t, unsafe.Sizeof(radixCache[byte]{}), unsafe.Sizeof(radixCache[[1024]byte]{}))
 	}
 }
 

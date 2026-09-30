@@ -15,7 +15,7 @@ This document details the internal data structures, concurrency models, and memo
 | **Max Entry Capacity** | Memory / Heap limited | Memory / Heap limited | **`2^32 - 2` total arena nodes** (`0..math.MaxUint32-2`; `nilNode = MaxUint32`, `foregroundNoProtect = MaxUint32-1`) |
 | **Point Lookup Latency** | **~50 ns/op** (`O(1)` Hash Map) | ~170 ns/op (`O(K)` Trie Descent) | **~100 ns/op** (`O(1)` FNV-1a Hash Map + Zero-Alloc Path Check) |
 | **Sequential Insert Latency** | ~98 ns/op in-place (~383 ns/op turnover) | ~175 ns/op in-place (~472 ns/op turnover) | ~270 ns/op in-place (~515 ns/op turnover, 0 node allocs) |
-| **Point Update Latency** | ~82 ns/op (0 allocs) | ~97 ns/op (0 allocs) | ~88 ns/op (0 allocs) |
+| **Point Update Latency** | ~71 ns/op (0 allocs) | ~121 ns/op (0 allocs) | ~124 ns/op (0 allocs) |
 | **Prefix Erase (100 items)** | ~151.2–219.9 µs (`O(N)` full scan) | **~2.25–2.50 µs** (**65.7x–88.0x faster**) | **~7.3–7.6 µs** (**20.7x–28.9x faster**) |
 | **Prefix Erase (50K/100K items)** | ~21.6 ms | **~1.05 ms** (**20.5x faster**) | **~5.1 ms** (**4.2x faster**) |
 | **Live Heap Memory** | ~135.9 B/entry at 1M (~163.0 `heap-B/entry` at 100K) | **~94.2 B/entry at 1M** (~96.0 `heap-B/entry` at 100K, **~30.7%–41.1% reduction**) | **~106.9 B/entry at 1M** (~111.2 `heap-B/entry` at 100K, **~21.4%–31.8% reduction**) |
@@ -65,7 +65,7 @@ When normalized memory pressure reaches `CompactionThreshold`:
 ### 3.3 Tier 2 — Critical Pressure (`pressure >= EvictionThreshold`, default `0.90`)
 When normalized memory pressure reaches `EvictionThreshold`:
 - `shedAndCompactLocked()` proactively evicts least-recently-used (`tail`) entries until `currentSize <= maxSize * EvictionRetentionRatio` (default `50%` of `maxSize`), and also proportionally sheds zero-size entries (`size == 0`) down to `EvictionRetentionRatio` (bounded by `targetLen` and `lastReclaimedZeroCount` / `lastReclaimedLen` watermarks so repeated evaluations at sustained critical pressure remain idempotent).
-- Foreground insertions pass the MRU head entry as a protected reference so the entry currently being inserted or overwritten is never self-evicted during inline pressure shedding, while foreground order-preserving updates (`UpdateWithoutChangingOrder`) pass an unprotected sentinel (`nil` / `&c.noProtectNode` / `foregroundNoProtect`) and protect the MRU head entry when `tail == head`.
+- Foreground insertions pass the MRU head entry as a protected reference so the entry currently being inserted or overwritten is never self-evicted during inline pressure shedding, while foreground order-preserving updates (`UpdateWithoutChangingOrder`) pass an unprotected sentinel (`nil` / `foregroundNoProtect`) and protect the MRU head entry when `tail == head`.
 - After shedding LRU entries, `compactDataStructuresLocked()` executes immediately to return both the evicted entries' backing structures and any prior map/tree/arena slack to the Go runtime heap.
 
 ---
