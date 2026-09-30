@@ -6,7 +6,7 @@
 [![License](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE)
 [![Zero Dependencies](https://img.shields.io/badge/dependencies-zero-brightgreen.svg)]()
 
-`package lru` (`github.com/google/go-lru`) is a high-concurrency, zero-dependency Go library providing size-aware Least Recently Used (LRU) cache implementations behind a unified `Cache` interface. Adapted and evolved from Google Cloud Storage FUSE ([GCSFuse](https://github.com/GoogleCloudPlatform/gcsfuse)), `go-lru` supports flat key-value caching (`MapCache`), hierarchical prefix-eviction trees (`RadixCache`), and arena-allocated `uint32`-indexed trees with two-tier memory-pressure reclamation (`ArenaRadixCache`).
+`package lru` (`github.com/google/go-lru`) is a high-concurrency, zero-dependency Go library providing size-aware Least Recently Used (LRU) cache implementations behind a unified `Cache` interface. `go-lru` supports flat key-value caching (`MapCache`), hierarchical prefix-eviction trees (`RadixCache`), and arena-allocated `uint32`-indexed trees with two-tier memory-pressure reclamation (`ArenaRadixCache`).
 
 ---
 

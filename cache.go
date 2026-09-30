@@ -12,8 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-// Package lru provides high-performance, concurrent, zero-dependency LRU cache implementations
-// adapted from Google Cloud Storage FUSE (GCSFuse).
+// Package lru provides high-performance, concurrent, zero-dependency LRU cache implementations.
 //
 // The package defines a unified Cache interface satisfied by three specialized engines:
 //   - MapCache: A standard doubly-linked list + map implementation with O(1) operations.

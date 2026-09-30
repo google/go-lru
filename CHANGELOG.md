@@ -12,7 +12,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 - **Standalone Module & Package Identity**: Published under `module github.com/google/go-lru` with idiomatic `package lru` import surface.
 - **Unified Constructor & Configurable Backends**:
   - `lru.New(maxSize uint64, opts ...Option) Cache` entry point supporting `lru.WithBackend(backend)` across `BackendMap` (default), `BackendRadix`, and `BackendArenaRadix`.
-  - Direct engine constructors `lru.NewMapCache`, `lru.NewRadixCache`, and `lru.NewArenaRadixCache`, adapted from Google Cloud Storage FUSE (`gcsfuse`) with differential state-machine tests, multi-goroutine race stress tests, and `WithInvariantChecking` runtime structural verification.
+  - Direct engine constructors `lru.NewMapCache`, `lru.NewRadixCache`, and `lru.NewArenaRadixCache`, with differential state-machine tests, multi-goroutine race stress tests, and `WithInvariantChecking` runtime structural verification.
 - **Ergonomic `ValueType` Wrappers (`values.go`)**:
   - `StringValue` (`NewStringValue`), `BytesValue` (`NewBytesValue`), and generic `SizedValue[T]` (`NewSizedValue[T]`, `NewValue[T]`) so callers can cache `string`, `[]byte`, and arbitrary types without boilerplate struct definitions.
 - **Two-Tier Memory-Pressure Reclamation (`PressureAwareCache`)**:
