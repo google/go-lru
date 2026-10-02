@@ -25,6 +25,57 @@ import (
 // Weigher calculates the logical or byte weight of a cache entry.
 type Weigher[V any] func(key string, value V) uint64
 
+// EvictionReason identifies why a cache entry or value was removed or displaced.
+type EvictionReason uint8
+
+const (
+	// EvictionReasonCapacity indicates an entry was evicted to respect maxSize capacity limits
+	// (LRU tail eviction during Put or Replace, or self-eviction of key during Replace when its
+	// updated weight exceeds maxSize or cannot fit alongside entries more recent than key).
+	EvictionReasonCapacity EvictionReason = iota
+
+	// EvictionReasonPressure indicates an entry was evicted during Tier 2 critical memory-pressure
+	// shedding (both explicit EvaluateMemoryPressure() calls and inline foreground pressure shedding
+	// during Put, Replace, Delete, or DeletePrefix).
+	EvictionReasonPressure
+
+	// EvictionReasonDeleted indicates an entry was explicitly removed via Delete(key) or
+	// DeletePrefix(prefix) (including DeletePrefix("")).
+	EvictionReasonDeleted
+
+	// EvictionReasonReplaced indicates an existing entry's displaced old value was overwritten in place
+	// when Put(key, value) or Replace(key, value) updated an existing key without evicting it.
+	EvictionReasonReplaced
+)
+
+// String returns the human-readable name of the eviction reason.
+func (r EvictionReason) String() string {
+	switch r {
+	case EvictionReasonCapacity:
+		return "Capacity"
+	case EvictionReasonPressure:
+		return "Pressure"
+	case EvictionReasonDeleted:
+		return "Deleted"
+	case EvictionReasonReplaced:
+		return "Replaced"
+	default:
+		return "UnknownEvictionReason"
+	}
+}
+
+// OnEvictValue is a callback invoked with the value and EvictionReason whenever a cache entry
+// is evicted, deleted, or has its value replaced.
+// The callback runs synchronously under the cache's exclusive write lock and must not re-enter
+// the same Cache instance.
+type OnEvictValue[V any] func(value V, reason EvictionReason)
+
+// OnEvictEntry is a callback invoked with the key, value, and EvictionReason whenever a cache entry
+// is evicted, deleted, or has its value replaced.
+// The callback runs synchronously under the cache's exclusive write lock and must not re-enter
+// the same Cache instance.
+type OnEvictEntry[V any] func(key string, value V, reason EvictionReason)
+
 // Backend identifies the underlying cache data structure engine constructed by New.
 type Backend uint8
 
@@ -116,6 +167,16 @@ type Options struct {
 	// weighing; a type-erased Weigher[any] / func(string, any) uint64 is also accepted but boxes
 	// non-pointer concrete V values into any on each Put and Replace.
 	Weigher any
+
+	// OnEvictValue holds the optional value eviction callback configured via WithOnEvictValue.
+	// Prefer a typed OnEvictValue[V] / func(V, EvictionReason) matching Cache[V] for zero-allocation
+	// invocation; a type-erased OnEvictValue[any] / func(any, EvictionReason) is also accepted.
+	OnEvictValue any
+
+	// OnEvictEntry holds the optional entry eviction callback configured via WithOnEvictEntry.
+	// Prefer a typed OnEvictEntry[V] / func(string, V, EvictionReason) matching Cache[V] for zero-allocation
+	// invocation; a type-erased OnEvictEntry[any] / func(string, any, EvictionReason) is also accepted.
+	OnEvictEntry any
 
 	// EnableInvariantChecking enables internal data structure integrity and invariant validation.
 	// When enabled, cache operations execute comprehensive validation checks (e.g. bidirectional pointer
@@ -214,6 +275,121 @@ func resolveWeigher[V any](options Options) func(string, V) uint64 {
 		return nil
 	}
 	panic(fmt.Sprintf("lru: WithWeigher function type %T does not match cache value type %s", options.Weigher, reflect.TypeFor[V]()))
+}
+
+// WithOnEvictValue configures a callback invoked whenever an entry's value is evicted (due to
+// capacity or critical memory pressure), explicitly deleted (via Delete or DeletePrefix), or
+// displaced in place (via Put or Replace).
+// Passing nil clears any previously configured OnEvictValue callback.
+//
+// The callback executes synchronously under the cache's exclusive write lock and must not invoke
+// methods on the same Cache instance (doing so will deadlock). When both WithOnEvictValue and
+// WithOnEvictEntry are configured, OnEvictValue is invoked before OnEvictEntry. Capacity and
+// pressure evictions invoke callbacks in LRU-to-MRU order; DeletePrefix invokes callbacks once
+// per removed entry in an unspecified order. Prefer WithOnEvictValue when the key is not needed,
+// as it avoids key reconstruction overhead on RadixCache and ArenaRadixCache.
+//
+// For zero heap allocations on hot paths, pass a function whose value parameter type V matches
+// the target Cache[V]. A type-erased WithOnEvictValue[any] is also supported for shared Options
+// across caches, but binding an OnEvictValue[any] / func(any, EvictionReason) to a concrete
+// non-pointer Cache[V] (V != any) boxes V into any on each invocation.
+func WithOnEvictValue[V any](fn func(value V, reason EvictionReason)) Option {
+	return func(o *Options) {
+		if fn == nil {
+			o.OnEvictValue = nil
+			return
+		}
+		o.OnEvictValue = fn
+	}
+}
+
+func resolveOnEvictValue[V any](options Options) func(V, EvictionReason) {
+	if options.OnEvictValue == nil {
+		return nil
+	}
+	if fn, ok := options.OnEvictValue.(func(V, EvictionReason)); ok {
+		return fn
+	}
+	if fn, ok := options.OnEvictValue.(OnEvictValue[V]); ok {
+		return fn
+	}
+	if fnAny, ok := options.OnEvictValue.(func(any, EvictionReason)); ok {
+		if fnAny == nil {
+			return nil
+		}
+		return func(v V, r EvictionReason) {
+			fnAny(v, r)
+		}
+	}
+	if fnAny, ok := options.OnEvictValue.(OnEvictValue[any]); ok {
+		if fnAny == nil {
+			return nil
+		}
+		return func(v V, r EvictionReason) {
+			fnAny(v, r)
+		}
+	}
+	if v := reflect.ValueOf(options.OnEvictValue); v.IsValid() && v.Kind() == reflect.Func && v.IsNil() {
+		return nil
+	}
+	panic(fmt.Sprintf("lru: WithOnEvictValue function type %T does not match cache value type %s", options.OnEvictValue, reflect.TypeFor[V]()))
+}
+
+// WithOnEvictEntry configures a callback invoked with the entry's key, value, and EvictionReason
+// whenever an entry is evicted (due to capacity or critical memory pressure), explicitly deleted
+// (via Delete or DeletePrefix), or displaced in place (via Put or Replace).
+// Passing nil clears any previously configured OnEvictEntry callback.
+//
+// The callback executes synchronously under the cache's exclusive write lock and must not invoke
+// methods on the same Cache instance (doing so will deadlock). When both WithOnEvictValue and
+// WithOnEvictEntry are configured, OnEvictValue is invoked before OnEvictEntry. Capacity and
+// pressure evictions invoke callbacks in LRU-to-MRU order; DeletePrefix invokes callbacks once
+// per removed entry in an unspecified order.
+//
+// For zero heap allocations on hot paths, pass a function whose value parameter type V matches
+// the target Cache[V]. A type-erased WithOnEvictEntry[any] is also supported for shared Options
+// across caches, but binding an OnEvictEntry[any] / func(string, any, EvictionReason) to a concrete
+// non-pointer Cache[V] (V != any) boxes V into any on each invocation.
+func WithOnEvictEntry[V any](fn func(key string, value V, reason EvictionReason)) Option {
+	return func(o *Options) {
+		if fn == nil {
+			o.OnEvictEntry = nil
+			return
+		}
+		o.OnEvictEntry = fn
+	}
+}
+
+func resolveOnEvictEntry[V any](options Options) func(string, V, EvictionReason) {
+	if options.OnEvictEntry == nil {
+		return nil
+	}
+	if fn, ok := options.OnEvictEntry.(func(string, V, EvictionReason)); ok {
+		return fn
+	}
+	if fn, ok := options.OnEvictEntry.(OnEvictEntry[V]); ok {
+		return fn
+	}
+	if fnAny, ok := options.OnEvictEntry.(func(string, any, EvictionReason)); ok {
+		if fnAny == nil {
+			return nil
+		}
+		return func(k string, v V, r EvictionReason) {
+			fnAny(k, v, r)
+		}
+	}
+	if fnAny, ok := options.OnEvictEntry.(OnEvictEntry[any]); ok {
+		if fnAny == nil {
+			return nil
+		}
+		return func(k string, v V, r EvictionReason) {
+			fnAny(k, v, r)
+		}
+	}
+	if v := reflect.ValueOf(options.OnEvictEntry); v.IsValid() && v.Kind() == reflect.Func && v.IsNil() {
+		return nil
+	}
+	panic(fmt.Sprintf("lru: WithOnEvictEntry function type %T does not match cache value type %s", options.OnEvictEntry, reflect.TypeFor[V]()))
 }
 
 // WithInvariantChecking returns an Option that enables or disables internal invariant checking.
@@ -386,6 +562,16 @@ func ApplyOptions(opts ...Option) Options {
 	if options.Weigher != nil {
 		if v := reflect.ValueOf(options.Weigher); v.IsValid() && v.Kind() == reflect.Func && v.IsNil() {
 			options.Weigher = nil
+		}
+	}
+	if options.OnEvictValue != nil {
+		if v := reflect.ValueOf(options.OnEvictValue); v.IsValid() && v.Kind() == reflect.Func && v.IsNil() {
+			options.OnEvictValue = nil
+		}
+	}
+	if options.OnEvictEntry != nil {
+		if v := reflect.ValueOf(options.OnEvictEntry); v.IsValid() && v.Kind() == reflect.Func && v.IsNil() {
+			options.OnEvictEntry = nil
 		}
 	}
 	if options.PressureFunc == nil {

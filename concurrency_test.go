@@ -407,3 +407,143 @@ func TestConcurrency_MemoryPressureCompactionAndEviction(t *testing.T) {
 		})
 	}
 }
+
+// TestConcurrency_EvictionCallbacksUnderRace verifies that WithOnEvictValue and
+// WithOnEvictEntry callbacks execute free of data races under concurrent mixed
+// operations and oscillating memory pressure across all three backends.
+func TestConcurrency_EvictionCallbacksUnderRace(t *testing.T) {
+	// Arrange
+	engines := allEngines()
+
+	for _, eng := range engines {
+		t.Run(eng.name, func(t *testing.T) {
+			const (
+				numGoroutines = 16
+				opsPerWorker  = 300
+				numKeys       = 120
+				capacity      = 400
+			)
+
+			var pressureBits atomic.Uint64
+			setPressure := func(p float64) {
+				pressureBits.Store(uint64(p * 1000))
+			}
+			getPressure := func() float64 {
+				return float64(pressureBits.Load()) / 1000.0
+			}
+			setPressure(0.20)
+
+			var valReasonCounts [4]atomic.Uint64
+			var entryReasonCounts [4]atomic.Uint64
+			var lastVal concValue
+			var lastReason lru.EvictionReason
+
+			cache := eng.constructor(
+				capacity,
+				lru.WithInvariantChecking(true),
+				lru.WithPressureFunc(getPressure),
+				lru.WithCompactionThreshold(0.75),
+				lru.WithEvictionThreshold(0.90),
+				lru.WithEvictionRetentionRatio(0.50),
+				lru.WithOnEvictValue(func(v concValue, r lru.EvictionReason) {
+					lastVal = v
+					lastReason = r
+					if int(r) < len(valReasonCounts) {
+						valReasonCounts[r].Add(1)
+					}
+				}),
+				lru.WithOnEvictEntry(func(k string, v concValue, r lru.EvictionReason) {
+					assert.Equal(t, lastVal, v, "OnEvictEntry must observe the exact value just passed to OnEvictValue under lock")
+					assert.Equal(t, lastReason, r, "OnEvictEntry must observe the exact reason just passed to OnEvictValue under lock")
+					assert.True(t, v.id == k || v.id == k+"_r", "reconstructed key %q must match evicted value id %q", k, v.id)
+					if int(r) < len(entryReasonCounts) {
+						entryReasonCounts[r].Add(1)
+					}
+				}),
+			)
+
+			reclaimer, ok := cache.(lru.PressureAwareCache[concValue])
+			require.True(t, ok, "expected %s to implement PressureAwareCache", eng.name)
+
+			// Act
+			var wg sync.WaitGroup
+			for g := range numGoroutines {
+				wg.Add(1)
+				go func(workerID int) {
+					defer wg.Done()
+					r := rand.New(rand.NewSource(int64(workerID*17777 + 42)))
+
+					for step := range opsPerWorker {
+						switch (workerID + step) % 3 {
+						case 0:
+							setPressure(0.20)
+						case 1:
+							setPressure(0.80)
+						case 2:
+							setPressure(0.95)
+						}
+
+						op := r.Intn(100)
+						kIdx := r.Intn(numKeys)
+						dirIdx := kIdx % 6
+						subIdx := (kIdx / 6) % 5
+						key := fmt.Sprintf("cb_dir_%02d/sub_%02d/file_%03d.dat", dirIdx, subIdx, kIdx)
+						if kIdx == 0 {
+							key = ""
+						}
+
+						switch {
+						case op < 35:
+							_, err := cache.Put(key, concValue{id: key, size: 10})
+							if err != nil {
+								assert.ErrorIs(t, err, lru.ErrInvalidEntrySize)
+							}
+						case op < 52:
+							_, _ = cache.Get(key)
+						case op < 65:
+							_, _ = cache.Peek(key)
+						case op < 78:
+							sz := uint64(5 + (step%3)*10) // 5, 15, or 25
+							err := cache.Replace(key, concValue{id: key + "_r", size: sz})
+							if err != nil {
+								assert.ErrorIs(t, err, lru.ErrEntryNotExist)
+							}
+						case op < 86:
+							// Self-evicting Replace (> capacity or !canFit alongside newer entries)
+							sz := uint64(capacity + 10)
+							if step%2 == 1 {
+								sz = capacity - 15
+							}
+							err := cache.Replace(key, concValue{id: key + "_r", size: sz})
+							if err != nil {
+								assert.ErrorIs(t, err, lru.ErrEntryNotExist)
+							}
+						case op < 92:
+							_, _ = cache.Delete(key)
+						case op < 96:
+							prefix := fmt.Sprintf("cb_dir_%02d/", dirIdx)
+							cache.DeletePrefix(prefix)
+						case op < 98:
+							reclaimer.Compact()
+						default:
+							_ = reclaimer.EvaluateMemoryPressure()
+						}
+					}
+				}(g)
+			}
+
+			wg.Wait()
+			setPressure(0.20)
+			cache.DeletePrefix("")
+			reclaimer.Compact()
+
+			// Assert: Value and entry callback counts match for every EvictionReason, and all 4 reasons fired.
+			for reason := range 4 {
+				vCount := valReasonCounts[reason].Load()
+				eCount := entryReasonCounts[reason].Load()
+				assert.Equalf(t, vCount, eCount, "reason %s count mismatch between OnEvictValue and OnEvictEntry", lru.EvictionReason(reason))
+				assert.Positivef(t, eCount, "expected EvictionReason %s to be exercised under concurrency", lru.EvictionReason(reason))
+			}
+		})
+	}
+}

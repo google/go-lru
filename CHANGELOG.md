@@ -8,6 +8,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+### Added
+- **Eviction & Removal Callbacks (`WithOnEvictValue` & `WithOnEvictEntry`)**:
+  - Added `EvictionReason` (`EvictionReasonCapacity`, `EvictionReasonPressure`, `EvictionReasonDeleted`, `EvictionReasonReplaced`) with `String()`.
+  - Added `WithOnEvictValue[V any](func(value V, reason EvictionReason))` for zero-key-reconstruction value lifecycle notifications (e.g., buffer pool recycling) and `WithOnEvictEntry[V any](func(key string, value V, reason EvictionReason))` for full key+value notifications across `MapCache`, `RadixCache`, and `ArenaRadixCache`.
+
 ### Changed
 - **Generic `Cache[V any]` & `PressureAwareCache[V any]` API**: Parameterized `Cache[V any]`, `PressureAwareCache[V any]`, `New[V any]`, `NewMapCache[V any]`, `NewRadixCache[V any]`, and `NewArenaRadixCache[V any]` by value type `V any`, eliminating wrapper interface boilerplate.
 - **Configurable Entry Weighing (`WithWeigher`)**: Added `WithWeigher[V any](func(key string, value V) uint64)` with a default unit weight of `1` per entry when omitted.

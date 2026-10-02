@@ -2912,3 +2912,156 @@ func TestPressure_BelowTier2ResetsZeroWatermarks(t *testing.T) {
 		})
 	}
 }
+
+func TestPressure_EvictionCallbacks_Tier2ExplicitAndForeground(t *testing.T) {
+	for _, b := range allBackends[string]() {
+		t.Run(b.name, func(t *testing.T) {
+			t.Run("ExplicitEvaluateMemoryPressureAndZeroSizeShedding", func(t *testing.T) {
+				// Arrange
+				probe := newPressureProbe(0.10)
+				var valEvents []recordedEvictValue
+				var entryEvents []recordedEvictEntry
+
+				cache := b.fn(
+					100,
+					WithInvariantChecking(true),
+					probe.Option(),
+					WithEvictionThreshold(0.80),
+					WithEvictionRetentionRatio(0.50),
+					WithWeigher(func(_ string, v string) uint64 { return uint64(len(v)) }),
+					WithOnEvictValue(func(v string, r EvictionReason) {
+						valEvents = append(valEvents, recordedEvictValue{val: v, reason: r})
+					}),
+					WithOnEvictEntry(func(k, v string, r EvictionReason) {
+						entryEvents = append(entryEvents, recordedEvictEntry{key: k, val: v, reason: r})
+					}),
+				).(PressureAwareCache[string])
+
+				_, err := cache.Put("pos1", "123456789012345678901234567890") // 30B (LRU)
+				require.NoError(t, err)
+				_, err = cache.Put("pos2", "123456789012345678901234567890") // 30B
+				require.NoError(t, err)
+				_, err = cache.Put("zero1", "") // 0B
+				require.NoError(t, err)
+				_, err = cache.Put("zero2", "") // 0B (MRU)
+				require.NoError(t, err)
+				require.Empty(t, valEvents)
+				require.Empty(t, entryEvents)
+
+				// Act: Spike pressure to 1.0 (retention ratio 0.50 -> targetSize=30B, targetZeroCount=1)
+				probe.Set(1.0)
+				evicted := cache.EvaluateMemoryPressure()
+
+				// Assert
+				assert.Equal(t, []string{"123456789012345678901234567890", ""}, evicted)
+				assert.Equal(t, []recordedEvictValue{
+					{val: "123456789012345678901234567890", reason: EvictionReasonPressure},
+					{val: "", reason: EvictionReasonPressure},
+				}, valEvents)
+				assert.Equal(t, []recordedEvictEntry{
+					{key: "pos1", val: "123456789012345678901234567890", reason: EvictionReasonPressure},
+					{key: "zero1", val: "", reason: EvictionReasonPressure},
+				}, entryEvents)
+			})
+
+			t.Run("ForegroundTier2SheddingOnPutReplaceDeleteAndDeletePrefix", func(t *testing.T) {
+				// Arrange
+				probe := newPressureProbe(0.10)
+				var entryEvents []recordedEvictEntry
+
+				cache := b.fn(
+					30,
+					WithInvariantChecking(true),
+					probe.Option(),
+					WithEvictionThreshold(0.80),
+					WithEvictionRetentionRatio(0.50),
+					WithWeigher(func(_ string, v string) uint64 { return uint64(len(v)) }),
+					WithOnEvictEntry(func(k, v string, r EvictionReason) {
+						entryEvents = append(entryEvents, recordedEvictEntry{key: k, val: v, reason: r})
+					}),
+				)
+
+				// Seed 3 entries of 10B each (total 30B): k1 (LRU), k2, k3 (MRU)
+				_, err := cache.Put("p/k1", "0123456789")
+				require.NoError(t, err)
+				_, err = cache.Put("p/k2", "abcdefghij")
+				require.NoError(t, err)
+				_, err = cache.Put("p/k3", "klmnopqrst")
+				require.NoError(t, err)
+
+				// 1. Replace LRU tail ("p/k1") while under Tier 2 (1.0 -> retention 0.50 -> targetSize=15B):
+				// "p/k1" is replaced first (EvictionReasonReplaced with old value "0123456789"),
+				// and then Tier 2 pressure sheds the tail ("p/k1" with new value "BBBBBBBBBB" and "p/k2") with EvictionReasonPressure!
+				entryEvents = nil
+				probe.Set(1.0)
+				require.NoError(t, cache.Replace("p/k1", "BBBBBBBBBB"))
+				assert.Equal(t, []recordedEvictEntry{
+					{key: "p/k1", val: "0123456789", reason: EvictionReasonReplaced},
+					{key: "p/k1", val: "BBBBBBBBBB", reason: EvictionReasonPressure},
+					{key: "p/k2", val: "abcdefghij", reason: EvictionReasonPressure},
+				}, entryEvents)
+
+				// 2. Re-populate at normal pressure (0.10): d1(10B), d2(10B), d3(10B)
+				probe.Set(0.10)
+				_, _ = cache.Delete("p/k3")
+				_, err = cache.Put("p/d1", "1111111111")
+				require.NoError(t, err)
+				_, err = cache.Put("p/d2", "2222222222")
+				require.NoError(t, err)
+				_, err = cache.Put("p/d3", "3333333333")
+				require.NoError(t, err)
+
+				// Delete "p/d3" while under Tier 2 (1.0 -> retention 0.50 of remaining 20B = 10B -> sheds "p/d1")
+				entryEvents = nil
+				probe.Set(1.0)
+				delVal, ok := cache.Delete("p/d3")
+				require.True(t, ok)
+				assert.Equal(t, "3333333333", delVal)
+				assert.Equal(t, []recordedEvictEntry{
+					{key: "p/d3", val: "3333333333", reason: EvictionReasonDeleted},
+					{key: "p/d1", val: "1111111111", reason: EvictionReasonPressure},
+				}, entryEvents)
+
+				// 3. Re-populate at normal pressure (0.10): sub/1(10B), keep/1(10B), keep/2(10B)
+				probe.Set(0.10)
+				_, _ = cache.Delete("p/d2")
+				_, err = cache.Put("keep/1", "aaaaaaaaaa")
+				require.NoError(t, err)
+				_, err = cache.Put("keep/2", "bbbbbbbbbb")
+				require.NoError(t, err)
+				_, err = cache.Put("sub/1", "cccccccccc")
+				require.NoError(t, err)
+
+				// DeletePrefix("sub/") while under Tier 2 (1.0 -> retention 0.50 of remaining 20B = 10B -> sheds "keep/1")
+				entryEvents = nil
+				probe.Set(1.0)
+				cache.DeletePrefix("sub/")
+				assert.Equal(t, []recordedEvictEntry{
+					{key: "sub/1", val: "cccccccccc", reason: EvictionReasonDeleted},
+					{key: "keep/1", val: "aaaaaaaaaa", reason: EvictionReasonPressure},
+				}, entryEvents)
+
+				// 4. Re-populate at normal pressure (0.10): keep/2(10B, LRU), f1(10B), f2(10B, MRU) = 30B
+				probe.Set(0.10)
+				_, err = cache.Put("p/f1", "dddddddddd")
+				require.NoError(t, err)
+				_, err = cache.Put("p/f2", "eeeeeeeeee")
+				require.NoError(t, err)
+
+				// Put new entry "p/f3" (10B) while under Tier 2 (1.0 -> retention 0.50 -> targetSize=15B):
+				// First evicts LRU "keep/2" for capacity (EvictionReasonCapacity), then inline Tier 2
+				// pressure shedding evicts "p/f1" and "p/f2" (EvictionReasonPressure) while protecting MRU "p/f3"!
+				entryEvents = nil
+				probe.Set(1.0)
+				evictedPut, err := cache.Put("p/f3", "ffffffffff")
+				require.NoError(t, err)
+				assert.Equal(t, []string{"bbbbbbbbbb", "dddddddddd", "eeeeeeeeee"}, evictedPut)
+				assert.Equal(t, []recordedEvictEntry{
+					{key: "keep/2", val: "bbbbbbbbbb", reason: EvictionReasonCapacity},
+					{key: "p/f1", val: "dddddddddd", reason: EvictionReasonPressure},
+					{key: "p/f2", val: "eeeeeeeeee", reason: EvictionReasonPressure},
+				}, entryEvents)
+			})
+		})
+	}
+}

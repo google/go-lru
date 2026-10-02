@@ -60,9 +60,44 @@ type arenaRadix[V any] struct {
 
 	len int
 
-	weigher func(key string, value V) uint64
+	weigher      func(key string, value V) uint64
+	onEvictValue func(value V, reason EvictionReason)
+	onEvictEntry func(key string, value V, reason EvictionReason)
 
 	pressureState
+}
+
+func (c *arenaRadix[V]) notifyEvict(key string, value V, reason EvictionReason) {
+	if c.onEvictValue != nil {
+		c.onEvictValue(value, reason)
+	}
+	if c.onEvictEntry != nil {
+		c.onEvictEntry(key, value, reason)
+	}
+}
+
+// reconstructKey reconstructs the full key for nodeID by walking the ancestor chain up to c.root.
+// It is only invoked when onEvictEntry is non-nil and the caller does not already have the key in hand.
+func (c *arenaRadix[V]) reconstructKey(nodeID uint32) string {
+	if nodeID == nilNode || nodeID == c.root {
+		return ""
+	}
+	if c.nodes[nodeID].parent == c.root {
+		return c.nodes[nodeID].prefix
+	}
+	var stackBuf [64]uint32
+	path := stackBuf[:0]
+	totalLen := 0
+	for curr := nodeID; curr != c.root && curr != nilNode; curr = c.nodes[curr].parent {
+		path = append(path, curr)
+		totalLen += len(c.nodes[curr].prefix)
+	}
+	var b strings.Builder
+	b.Grow(totalLen)
+	for i := len(path) - 1; i >= 0; i-- {
+		b.WriteString(c.nodes[path[i]].prefix)
+	}
+	return b.String()
 }
 
 // FNV-1a 64-bit hashing constants.
@@ -471,7 +506,7 @@ func (c *arenaRadix[V]) evictOne() (V, bool) {
 		return zero, false
 	}
 
-	return c.eraseInternal(nodeID)
+	return c.eraseInternal(nodeID, EvictionReasonCapacity)
 }
 
 const foregroundNoProtect uint32 = nilNode - 1
@@ -480,12 +515,21 @@ func (c *arenaRadix[V]) isDirtyLocked() bool {
 	return c.freeHead != nilNode || len(c.nodes) < cap(c.nodes) || c.nodeMapDirty
 }
 
-// eraseInternal handles unlinking from LRU, cleaning up nodeMap, and deleting from the tree.
-func (c *arenaRadix[V]) eraseInternal(nodeID uint32) (V, bool) {
-	return c.eraseInternalWithHash(nodeID, c.hashNodeKey(nodeID))
+// eraseInternal handles unlinking from LRU, cleaning up nodeMap, and deleting from the tree
+// when the caller does not already have the key or hash in hand.
+func (c *arenaRadix[V]) eraseInternal(nodeID uint32, reason EvictionReason) (V, bool) {
+	if nodeID == nilNode || !c.nodes[nodeID].hasValue {
+		var zero V
+		return zero, false
+	}
+	if c.onEvictEntry != nil {
+		key := c.reconstructKey(nodeID)
+		return c.eraseInternalWithHash(nodeID, hashString(key), key, reason)
+	}
+	return c.eraseInternalWithHash(nodeID, c.hashNodeKey(nodeID), "", reason)
 }
 
-func (c *arenaRadix[V]) eraseInternalWithHash(nodeID uint32, hash uint64) (V, bool) {
+func (c *arenaRadix[V]) eraseInternalWithHash(nodeID uint32, hash uint64, key string, reason EvictionReason) (V, bool) {
 	if nodeID == nilNode || !c.nodes[nodeID].hasValue {
 		var zero V
 		return zero, false
@@ -503,6 +547,7 @@ func (c *arenaRadix[V]) eraseInternalWithHash(nodeID uint32, hash uint64) (V, bo
 	c.remove(nodeID)
 	c.deleteNode(nodeID)
 
+	c.notifyEvict(key, deletedEntry, reason)
 	return deletedEntry, true
 }
 
@@ -699,7 +744,7 @@ func (c *arenaRadix[V]) shedAndCompactLocked(targetSize uint64, retention float6
 			break
 		}
 		nextVictimID := c.nodes[victimID].prev
-		if val, ok := c.eraseInternal(victimID); ok {
+		if val, ok := c.eraseInternal(victimID, EvictionReasonPressure); ok {
 			evicted = append(evicted, val)
 		}
 		victimID = nextVictimID

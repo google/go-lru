@@ -61,6 +61,12 @@ type radixCache[V any] struct {
 	// weigher computes the weight of a cache entry, or is nil when using the default unit weight of 1.
 	weigher func(key string, value V) uint64
 
+	// onEvictValue is the optional value eviction callback configured via WithOnEvictValue.
+	onEvictValue func(value V, reason EvictionReason)
+
+	// onEvictEntry is the optional entry eviction callback configured via WithOnEvictEntry.
+	onEvictEntry func(key string, value V, reason EvictionReason)
+
 	// mu synchronizes concurrent access to all cache data structures.
 	mu sync.RWMutex
 
@@ -81,6 +87,8 @@ func newRadixCacheWithOptions[V any](maxSize uint64, options Options) Cache[V] {
 		maxSize:       maxSize,
 		root:          &radixNode[V]{},
 		weigher:       resolveWeigher[V](options),
+		onEvictValue:  resolveOnEvictValue[V](options),
+		onEvictEntry:  resolveOnEvictEntry[V](options),
 		pressureState: pressureState{options: options},
 	}
 
@@ -96,6 +104,39 @@ func (c *radixCache[V]) weigh(key string, value V) uint64 {
 		return c.weigher(key, value)
 	}
 	return 1
+}
+
+func (c *radixCache[V]) notifyEvict(key string, value V, reason EvictionReason) {
+	if c.onEvictValue != nil {
+		c.onEvictValue(value, reason)
+	}
+	if c.onEvictEntry != nil {
+		c.onEvictEntry(key, value, reason)
+	}
+}
+
+// reconstructKey reconstructs the full key for node by walking the ancestor chain up to c.root.
+// It is only invoked when onEvictEntry is non-nil and the caller does not already have the key in hand.
+func (c *radixCache[V]) reconstructKey(node *radixNode[V]) string {
+	if node == nil || node == c.root {
+		return ""
+	}
+	if node.parent == c.root {
+		return node.prefix
+	}
+	var stackBuf [64]*radixNode[V]
+	path := stackBuf[:0]
+	totalLen := 0
+	for curr := node; curr != nil && curr != c.root; curr = curr.parent {
+		path = append(path, curr)
+		totalLen += len(curr.prefix)
+	}
+	var b strings.Builder
+	b.Grow(totalLen)
+	for i := len(path) - 1; i >= 0; i-- {
+		b.WriteString(path[i].prefix)
+	}
+	return b.String()
 }
 
 func (c *radixCache[V]) checkInvariants() {
@@ -511,9 +552,22 @@ func (c *radixCache[V]) remove(node *radixNode[V]) {
 	c.len--
 }
 
-// eraseInternal removes an entry from both the LRU list and radix trie without acquiring locks.
+// eraseInternal removes an entry from both the LRU list and radix trie without acquiring locks,
+// reconstructing the key before tree compression only when onEvictEntry is configured.
 // It returns the deleted value and true if the node held a value.
-func (c *radixCache[V]) eraseInternal(node *radixNode[V]) (V, bool) {
+func (c *radixCache[V]) eraseInternal(node *radixNode[V], reason EvictionReason) (V, bool) {
+	if node == nil || !node.hasValue {
+		var zero V
+		return zero, false
+	}
+	var key string
+	if c.onEvictEntry != nil {
+		key = c.reconstructKey(node)
+	}
+	return c.eraseInternalWithKey(node, key, reason)
+}
+
+func (c *radixCache[V]) eraseInternalWithKey(node *radixNode[V], key string, reason EvictionReason) (V, bool) {
 	if node == nil || !node.hasValue {
 		var zero V
 		return zero, false
@@ -526,6 +580,7 @@ func (c *radixCache[V]) eraseInternal(node *radixNode[V]) (V, bool) {
 	c.remove(node)
 	c.deleteNode(node)
 
+	c.notifyEvict(key, deletedEntry, reason)
 	return deletedEntry, true
 }
 
@@ -545,7 +600,7 @@ func (c *radixCache[V]) evictOne() (V, bool) {
 		var zero V
 		return zero, false
 	}
-	return c.eraseInternal(node)
+	return c.eraseInternal(node, EvictionReasonCapacity)
 }
 
 // sweepAndUnlink iteratively cleans up all value-bearing nodes in a detached subtree (O(1) space).
@@ -554,12 +609,18 @@ func (c *radixCache[V]) sweepAndUnlink(node *radixNode[V]) {
 	curr := node
 	for curr != nil {
 		if curr.hasValue {
+			var key string
+			if c.onEvictEntry != nil {
+				key = c.reconstructKey(curr)
+			}
+			evictedVal := curr.value
 			c.onEntryDeleted(curr.size)
 			c.currentSize -= curr.size
 			curr.size = 0
 			c.remove(curr)
 			curr.value = zero
 			curr.hasValue = false
+			c.notifyEvict(key, evictedVal, EvictionReasonDeleted)
 		}
 
 		if curr.child != nil {
@@ -666,6 +727,7 @@ func (c *radixCache[V]) Put(key string, value V) ([]V, error) {
 
 	node, exists := c.getNode(key)
 	if exists {
+		oldValue := node.value
 		c.onEntrySizeUpdated(node.size, valueSize)
 		c.moveToFront(node)
 		c.currentSize -= node.size
@@ -679,6 +741,7 @@ func (c *radixCache[V]) Put(key string, value V) ([]V, error) {
 		node.hasValue = true
 		node.size = valueSize
 		c.currentSize += valueSize
+		c.notifyEvict(key, oldValue, EvictionReasonReplaced)
 		reclaimedPrePut = c.shouldReclaimSingleSurvivorOnMutation(c.len, c.deletedSinceCompact > 0, false, evictedPrePut, c.currentSize, sizeBefore, pressure)
 	} else {
 		// Evict from the LRU tail before inserting into the trie to avoid redundant node splits and merges.
@@ -716,7 +779,7 @@ func (c *radixCache[V]) Delete(key string) (value V, ok bool) {
 	}
 
 	sizeBefore := c.currentSize
-	deleted, erased := c.eraseInternal(node)
+	deleted, erased := c.eraseInternalWithKey(node, key, EvictionReasonDeleted)
 	if !erased {
 		return value, false
 	}
@@ -771,10 +834,11 @@ func (c *radixCache[V]) Replace(key string, value V) error {
 	}
 
 	oldSize := node.size
+	oldValue := node.value
 
 	if newSize > c.maxSize {
 		sizeBefore := c.currentSize
-		c.eraseInternal(node)
+		c.eraseInternalWithKey(node, key, EvictionReasonCapacity)
 		c.finishDeleteReclaimLocked(sizeBefore, sampledEpoch, pressure)
 		return nil
 	}
@@ -818,7 +882,7 @@ func (c *radixCache[V]) Replace(key string, value V) error {
 				tailCurr = tailCurr.prev
 			}
 			if !canFit {
-				c.eraseInternal(node)
+				c.eraseInternalWithKey(node, key, EvictionReasonCapacity)
 				c.finishDeleteReclaimLocked(sizeBefore, sampledEpoch, pressure)
 				return nil
 			}
@@ -848,6 +912,8 @@ func (c *radixCache[V]) Replace(key string, value V) error {
 		node.value = value
 		node.hasValue = true
 	}
+
+	c.notifyEvict(key, oldValue, EvictionReasonReplaced)
 
 	reclaimedPreUpdate = c.shouldReclaimSingleSurvivorOnMutation(c.len, c.deletedSinceCompact > 0, false, evictedAny, c.currentSize, sizeBefore, pressure)
 
@@ -906,6 +972,7 @@ func (c *radixCache[V]) DeletePrefix(prefix string) {
 		if lcp == len(search) {
 			sizeBefore := c.currentSize
 			node.removeChild(child)
+			child.parent = node
 			c.sweepAndUnlink(child)
 			c.compressPathUpwards(node)
 			c.finishDeleteReclaimLocked(sizeBefore, sampledEpoch, pressure)
@@ -986,7 +1053,7 @@ func (c *radixCache[V]) shedAndCompactLocked(targetSize uint64, retention float6
 			break
 		}
 		nextVictim := victim.prev
-		if val, ok := c.eraseInternal(victim); ok {
+		if val, ok := c.eraseInternal(victim, EvictionReasonPressure); ok {
 			evicted = append(evicted, val)
 		}
 		victim = nextVictim

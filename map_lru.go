@@ -61,6 +61,12 @@ type mapCache[V any] struct {
 	// weigher computes the weight of a cache entry, or is nil when using the default unit weight of 1.
 	weigher func(key string, value V) uint64
 
+	// onEvictValue is the optional value eviction callback configured via WithOnEvictValue.
+	onEvictValue func(value V, reason EvictionReason)
+
+	// onEvictEntry is the optional entry eviction callback configured via WithOnEvictEntry.
+	onEvictEntry func(key string, value V, reason EvictionReason)
+
 	// mu synchronizes access to internal state.
 	mu sync.RWMutex
 
@@ -85,6 +91,8 @@ func newMapCacheWithOptions[V any](maxSize uint64, options Options) Cache[V] {
 		maxSize:       maxSize,
 		index:         make(map[string]*list.Element),
 		weigher:       resolveWeigher[V](options),
+		onEvictValue:  resolveOnEvictValue[V](options),
+		onEvictEntry:  resolveOnEvictEntry[V](options),
 		pressureState: pressureState{options: options},
 	}
 	if c.options.EnableInvariantChecking {
@@ -98,6 +106,15 @@ func (c *mapCache[V]) weigh(key string, value V) uint64 {
 		return c.weigher(key, value)
 	}
 	return 1
+}
+
+func (c *mapCache[V]) notifyEvict(key string, value V, reason EvictionReason) {
+	if c.onEvictValue != nil {
+		c.onEvictValue(value, reason)
+	}
+	if c.onEvictEntry != nil {
+		c.onEvictEntry(key, value, reason)
+	}
 }
 
 // checkInvariants validates internal data structure consistency and panics if any invariant is violated.
@@ -220,7 +237,7 @@ func (c *mapCache[V]) evictOne() (V, bool) {
 		return zero, false
 	}
 	entryVal := e.Value.(*entry[V])
-	return c.eraseInternal(entryVal.key)
+	return c.eraseInternal(entryVal.key, EvictionReasonCapacity)
 }
 
 func (c *mapCache[V]) finishDeleteReclaimLocked(sizeBefore, sampledEpoch uint64, pressure float64) {
@@ -284,6 +301,7 @@ func (c *mapCache[V]) Put(key string, value V) ([]V, error) {
 	if ok {
 		// Update existing entry in place (0 heap allocations).
 		entryVal := e.Value.(*entry[V])
+		oldValue := entryVal.value
 		c.onEntrySizeUpdated(entryVal.size, valueSize)
 		c.entries.MoveToFront(e)
 		c.currentSize -= entryVal.size
@@ -296,6 +314,7 @@ func (c *mapCache[V]) Put(key string, value V) ([]V, error) {
 		entryVal.value = value
 		entryVal.size = valueSize
 		c.currentSize += valueSize
+		c.notifyEvict(entryVal.key, oldValue, EvictionReasonReplaced)
 		if c.shouldReclaimSingleSurvivorOnMutation(c.entries.Len(), c.dirtyIndex, false, evictedPrePut, c.currentSize, sizeBefore, pressure) {
 			reclaimedPrePut = true
 		}
@@ -328,7 +347,7 @@ func (c *mapCache[V]) Put(key string, value V) ([]V, error) {
 // eraseInternal removes any entry for the supplied key from the cache without acquiring locks.
 // It returns the value of the erased key and true, or the zero value of V and false if not present.
 // Caller must hold c.mu (write lock).
-func (c *mapCache[V]) eraseInternal(key string) (V, bool) {
+func (c *mapCache[V]) eraseInternal(key string, reason EvictionReason) (V, bool) {
 	e, ok := c.index[key]
 	if !ok {
 		var zero V
@@ -336,6 +355,7 @@ func (c *mapCache[V]) eraseInternal(key string) (V, bool) {
 	}
 
 	entryVal := e.Value.(*entry[V])
+	evictedKey := entryVal.key
 	deletedEntry := entryVal.value
 	c.onEntryDeleted(entryVal.size)
 	c.currentSize -= entryVal.size
@@ -349,6 +369,7 @@ func (c *mapCache[V]) eraseInternal(key string) (V, bool) {
 	entryVal.size = 0
 	e.Value = nil
 
+	c.notifyEvict(evictedKey, deletedEntry, reason)
 	return deletedEntry, true
 }
 
@@ -375,7 +396,7 @@ func (c *mapCache[V]) Delete(key string) (V, bool) {
 	defer c.unlock()
 
 	sizeBefore := c.currentSize
-	deleted, ok := c.eraseInternal(key)
+	deleted, ok := c.eraseInternal(key, EvictionReasonDeleted)
 	if !ok {
 		return deleted, false
 	}
@@ -432,10 +453,11 @@ func (c *mapCache[V]) Replace(key string, value V) error {
 
 	entryVal := e.Value.(*entry[V])
 	oldSize := entryVal.size
+	oldValue := entryVal.value
 
 	if newSize > c.maxSize {
 		sizeBefore := c.currentSize
-		c.eraseInternal(entryVal.key)
+		c.eraseInternal(key, EvictionReasonCapacity)
 		c.finishDeleteReclaimLocked(sizeBefore, sampledEpoch, pressure)
 		return nil
 	}
@@ -479,7 +501,7 @@ func (c *mapCache[V]) Replace(key string, value V) error {
 				tailCurr = tailCurr.Prev()
 			}
 			if !canFit {
-				c.eraseInternal(entryVal.key)
+				c.eraseInternal(key, EvictionReasonCapacity)
 				c.finishDeleteReclaimLocked(sizeBefore, sampledEpoch, pressure)
 				return nil
 			}
@@ -506,6 +528,8 @@ func (c *mapCache[V]) Replace(key string, value V) error {
 	default:
 		entryVal.value = value
 	}
+
+	c.notifyEvict(entryVal.key, oldValue, EvictionReasonReplaced)
 
 	if c.shouldReclaimSingleSurvivorOnMutation(c.entries.Len(), c.dirtyIndex, false, evictedAny, c.currentSize, sizeBefore, pressure) {
 		reclaimedPreUpdate = true
@@ -537,12 +561,19 @@ func (c *mapCache[V]) DeletePrefix(prefix string) {
 		for e := c.entries.Front(); e != nil; {
 			next := e.Next()
 			if entryVal, ok := e.Value.(*entry[V]); ok && entryVal != nil {
+				evictedKey := entryVal.key
+				evictedVal := entryVal.value
+				c.currentSize -= entryVal.size
 				entryVal.key = ""
 				entryVal.value = zero
 				entryVal.size = 0
+				c.entries.Remove(e)
+				e.Value = nil
+				c.notifyEvict(evictedKey, evictedVal, EvictionReasonDeleted)
+			} else {
+				c.entries.Remove(e)
+				e.Value = nil
 			}
-			c.entries.Remove(e)
-			e.Value = nil
 			e = next
 		}
 		c.entries.Init()
@@ -561,7 +592,7 @@ func (c *mapCache[V]) DeletePrefix(prefix string) {
 	erasedAny := false
 	for key := range c.index {
 		if strings.HasPrefix(key, prefix) {
-			c.eraseInternal(key)
+			c.eraseInternal(key, EvictionReasonDeleted)
 			erasedAny = true
 		}
 	}
@@ -640,7 +671,7 @@ func (c *mapCache[V]) shedAndCompactLocked(targetSize uint64, retention float64,
 			break
 		}
 		nextVictim := victim.Prev()
-		if val, ok := c.eraseInternal(victim.Value.(*entry[V]).key); ok {
+		if val, ok := c.eraseInternal(victim.Value.(*entry[V]).key, EvictionReasonPressure); ok {
 			evicted = append(evicted, val)
 		}
 		victim = nextVictim
