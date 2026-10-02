@@ -16,6 +16,7 @@ package lru
 
 import (
 	"fmt"
+	"slices"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -659,11 +660,14 @@ func TestMapCache_CheckInvariants_PanicOnCorruption(t *testing.T) {
 		})
 	})
 
-	t.Run("InvalidElementType", func(t *testing.T) {
+	t.Run("CorruptPrevPointer", func(t *testing.T) {
 		// Arrange
-		c := NewMapCache[testData](50, testDataWeigher).(*mapCache[testData])
-		e := c.entries.PushFront("not-an-entry-struct")
-		c.index["someKey"] = e
+		c := NewMapCache[testData](100, testDataWeigher).(*mapCache[testData])
+		_, err := c.Put("k1", testData{value: 1, dataSize: 10})
+		require.NoError(t, err)
+		_, err = c.Put("k2", testData{value: 2, dataSize: 10})
+		require.NoError(t, err)
+		c.entries.tail.prev = nil
 
 		// Act & Assert
 		assert.Panics(t, func() {
@@ -671,16 +675,39 @@ func TestMapCache_CheckInvariants_PanicOnCorruption(t *testing.T) {
 		})
 	})
 
-	t.Run("ValueTypeEntryInsteadOfPointer", func(t *testing.T) {
+	t.Run("CorruptTailPointer", func(t *testing.T) {
 		// Arrange
-		c := NewMapCache[testData](100, WithInvariantChecking(true), testDataWeigher).(*mapCache[testData])
-		el := c.entries.PushFront(entry[testData]{
-			key:   "bad_value_type",
-			value: testData{value: 1, dataSize: 5},
-			size:  5,
+		c := NewMapCache[testData](100, testDataWeigher).(*mapCache[testData])
+		_, err := c.Put("k1", testData{value: 1, dataSize: 10})
+		require.NoError(t, err)
+		_, err = c.Put("k2", testData{value: 2, dataSize: 10})
+		require.NoError(t, err)
+		c.entries.tail = c.entries.head
+
+		// Act & Assert
+		assert.Panics(t, func() {
+			c.checkInvariants()
 		})
-		c.index["bad_value_type"] = el
-		c.currentSize = 5
+	})
+
+	t.Run("EmptyListNonNilHeadOrTail", func(t *testing.T) {
+		// Arrange
+		c := NewMapCache[testData](100, testDataWeigher).(*mapCache[testData])
+		c.entries.head = &entry[testData]{key: "ghost"}
+
+		// Act & Assert
+		assert.Panics(t, func() {
+			c.checkInvariants()
+		})
+	})
+
+	t.Run("LRUCountMismatch", func(t *testing.T) {
+		// Arrange
+		c := NewMapCache[testData](100, testDataWeigher).(*mapCache[testData])
+		_, err := c.Put("k1", testData{value: 1, dataSize: 10})
+		require.NoError(t, err)
+		c.entries.head.next = &entry[testData]{key: "orphan", prev: c.entries.head, size: 0}
+		c.entries.tail = c.entries.head.next
 
 		// Act & Assert
 		assert.Panics(t, func() {
@@ -719,7 +746,7 @@ func TestMapCache_Compact(t *testing.T) {
 	// Arrange
 	probe := newPressureProbe(0.10)
 	c := NewMapCache[testData](1000, WithInvariantChecking(true), testDataWeigher, probe.Option()).(PressureAwareCache[testData])
-	for i := 0; i < 20; i++ {
+	for i := range 20 {
 		_, err := c.Put(fmt.Sprintf("entry_%d", i), testData{value: int64(i), dataSize: 10})
 		require.NoError(t, err)
 	}
@@ -728,7 +755,7 @@ func TestMapCache_Compact(t *testing.T) {
 	assertAlreadyCompacted(t, c, probe)
 
 	// Arrange 2: Delete half the entries to dirty the index
-	for i := 0; i < 10; i++ {
+	for i := range 10 {
 		_, ok := c.Delete(fmt.Sprintf("entry_%d", i))
 		require.True(t, ok)
 	}
@@ -738,7 +765,7 @@ func TestMapCache_Compact(t *testing.T) {
 
 	// Assert 2
 	assertAlreadyCompacted(t, c, probe)
-	for i := 0; i < 10; i++ {
+	for i := range 10 {
 		_, ok := c.Peek(fmt.Sprintf("entry_%d", i))
 		assert.False(t, ok)
 	}
@@ -762,7 +789,7 @@ func TestMapCache_EvaluateMemoryPressure(t *testing.T) {
 		WithEvictionRetentionRatio(0.50),
 	).(PressureAwareCache[testData])
 
-	for i := 0; i < 10; i++ {
+	for i := range 10 {
 		_, err := c.Put(fmt.Sprintf("k%d", i), testData{value: int64(i), dataSize: 10})
 		require.NoError(t, err)
 	}
@@ -817,4 +844,160 @@ func TestMapCache_EvaluateMemoryPressure(t *testing.T) {
 	assert.Empty(t, evicted)
 	assert.False(t, advancedRepeat)
 	assertAlreadyCompacted(t, c, probe)
+}
+
+func TestMapCache_Iterators(t *testing.T) {
+	t.Run("EmptyCacheYieldsZeroItems", func(t *testing.T) {
+		c := setupCacheTest(t)
+		assert.Empty(t, slices.Collect(c.Keys()))
+		assert.Empty(t, slices.Collect(c.Values()))
+		count := 0
+		for range c.All() {
+			count++
+		}
+		assert.Zero(t, count)
+	})
+
+	t.Run("SingleAndRootEmptyKeyAndMRUToLRUOrder", func(t *testing.T) {
+		c := NewMapCache[testData](500, WithInvariantChecking(true), testDataWeigher)
+		_, err := c.Put("", testData{value: 10, dataSize: 10})
+		require.NoError(t, err)
+		_, err = c.Put("alpha", testData{value: 20, dataSize: 10})
+		require.NoError(t, err)
+		_, err = c.Put("beta", testData{value: 30, dataSize: 10})
+		require.NoError(t, err)
+		_, err = c.Put("gamma", testData{value: 40, dataSize: 10})
+		require.NoError(t, err)
+
+		// Promote "" to MRU via Get, inspect "alpha" via Peek (must not promote), update "beta" via Replace (must not promote).
+		_, ok := c.Get("")
+		require.True(t, ok)
+		_, ok = c.Peek("alpha")
+		require.True(t, ok)
+		require.NoError(t, c.Replace("beta", testData{value: 300, dataSize: 10}))
+
+		wantKeys := []string{"", "gamma", "beta", "alpha"}
+		wantVals := []testData{{10, 10}, {40, 10}, {300, 10}, {20, 10}}
+
+		assert.Equal(t, wantKeys, slices.Collect(c.Keys()))
+		assert.Equal(t, wantVals, slices.Collect(c.Values()))
+
+		var allKeys []string
+		var allVals []testData
+		for k, v := range c.All() {
+			allKeys = append(allKeys, k)
+			allVals = append(allVals, v)
+		}
+		assert.Equal(t, wantKeys, allKeys)
+		assert.Equal(t, wantVals, allVals)
+
+		// DeletePrefix("b") removes "beta" and preserves remaining MRU-to-LRU order.
+		c.DeletePrefix("b")
+		assert.Equal(t, []string{"", "gamma", "alpha"}, slices.Collect(c.Keys()))
+	})
+
+	t.Run("EarlyBreakTerminatesCleanlyAndRepeatedIterationDoesNotMutateLRUOrder", func(t *testing.T) {
+		c := NewMapCache[testData](50, WithInvariantChecking(true), testDataWeigher)
+		for i := range 5 {
+			_, err := c.Put(fmt.Sprintf("k%d", i), testData{value: int64(i + 1), dataSize: 10})
+			require.NoError(t, err)
+		}
+
+		var firstTwoKeys []string
+		for k, v := range c.All() {
+			firstTwoKeys = append(firstTwoKeys, k)
+			_ = v
+			if len(firstTwoKeys) == 2 {
+				break
+			}
+		}
+		assert.Equal(t, []string{"k4", "k3"}, firstTwoKeys)
+
+		var firstKey string
+		for k := range c.Keys() {
+			firstKey = k
+			break
+		}
+		assert.Equal(t, "k4", firstKey)
+
+		var firstVal testData
+		for v := range c.Values() {
+			firstVal = v
+			break
+		}
+		assert.Equal(t, int64(5), firstVal.value)
+
+		// Repeated full iteration must not alter LRU eviction order: inserting k5 (10B) must evict oldest entry k0 (value 1).
+		_ = slices.Collect(c.Keys())
+		_ = slices.Collect(c.Values())
+		evicted, err := c.Put("k5", testData{value: 6, dataSize: 10})
+		require.NoError(t, err)
+		assertEvictedValues(t, evicted, []int64{1})
+	})
+}
+
+func TestMapCache_ZeroAllocHotPathsAndSingleAllocNewEntryPut(t *testing.T) {
+	// 1. Pre-warmed new-entry Put allocates exactly 1 heap object per new entry (the entry[V] node itself,
+	// down from 2 with container/list). Use 1-byte ASCII keys so strings.Clone uses Go's static 1-byte
+	// string table (0 string allocations) and keep 1 pinned entry so Delete does not reset the empty map.
+	keys := make([]string, 64)
+	for i := range keys {
+		keys[i] = string(byte(33 + i))
+	}
+	c := NewMapCache[testData](100000, testDataWeigher)
+	_, err := c.Put("~", testData{value: 99, dataSize: 10})
+	require.NoError(t, err)
+	for _, k := range keys {
+		_, err := c.Put(k, testData{value: 1, dataSize: 10})
+		require.NoError(t, err)
+	}
+	for _, k := range keys {
+		_, ok := c.Delete(k)
+		require.True(t, ok)
+	}
+
+	idx := 0
+	newPutAllocs := testing.AllocsPerRun(50, func() {
+		k := keys[idx]
+		idx++
+		_, _ = c.Put(k, testData{value: 2, dataSize: 10})
+	})
+	assert.Equal(t, 1.0, newPutAllocs, "MapCache new-entry Put on pre-sized map must allocate 1 heap object (entry[V])")
+
+	// 2. Existing-key Put, Get, Peek, Replace (without eviction), and Values()/All()/Keys() allocate 0 heap objects.
+	mc := c.(*mapCache[testData])
+	valSeq := c.Values()
+	allSeq := c.All()
+	keySeq := c.Keys()
+	hotAllocs := testing.AllocsPerRun(100, func() {
+		_, _ = c.Get(keys[0])
+		_, _ = c.Peek(keys[1])
+		_, _ = c.Put(keys[0], testData{value: 3, dataSize: 10})
+		_ = c.Replace(keys[1], testData{value: 4, dataSize: 10})
+		valSeq(func(v testData) bool {
+			return v.value >= 0
+		})
+		allSeq(func(k string, v testData) bool {
+			return k != "" || v.value >= 0
+		})
+		keySeq(func(k string) bool {
+			return k != ""
+		})
+		for v := range mc.Values() {
+			if v.value < 0 {
+				break
+			}
+		}
+		for k, v := range mc.All() {
+			if k == "" && v.value < 0 {
+				break
+			}
+		}
+		for k := range mc.Keys() {
+			if k == "" {
+				break
+			}
+		}
+	})
+	assert.Zero(t, hotAllocs, "MapCache Get, Peek, overwrite Put, Replace, and iterators must allocate 0 heap objects")
 }

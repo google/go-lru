@@ -16,8 +16,9 @@ package lru
 
 import (
 	"fmt"
+	"iter"
 	"math"
-	"reflect"
+	"slices"
 	"strings"
 	"sync"
 )
@@ -116,7 +117,8 @@ func (c *radixCache[V]) notifyEvict(key string, value V, reason EvictionReason) 
 }
 
 // reconstructKey reconstructs the full key for node by walking the ancestor chain up to c.root.
-// It is only invoked when onEvictEntry is non-nil and the caller does not already have the key in hand.
+// It is invoked when onEvictEntry is non-nil (and the caller does not already have the key in hand)
+// or during All() / Keys() iteration.
 func (c *radixCache[V]) reconstructKey(node *radixNode[V]) string {
 	if node == nil || node == c.root {
 		return ""
@@ -133,8 +135,8 @@ func (c *radixCache[V]) reconstructKey(node *radixNode[V]) string {
 	}
 	var b strings.Builder
 	b.Grow(totalLen)
-	for i := len(path) - 1; i >= 0; i-- {
-		b.WriteString(path[i].prefix)
+	for _, n := range slices.Backward(path) {
+		b.WriteString(n.prefix)
 	}
 	return b.String()
 }
@@ -253,7 +255,7 @@ func (c *radixCache[V]) checkInvariants() {
 			if curr.prev != nil || curr.next != nil || c.head == curr || c.tail == curr {
 				panic(fmt.Sprintf("radixCache invariant violation: routing node with prefix '%s' has non-nil LRU pointers", curr.prefix))
 			}
-			if !reflect.ValueOf(&curr.value).Elem().IsZero() {
+			if !isZeroValue(&curr.value) {
 				panic(fmt.Sprintf("radixCache invariant violation: routing node with prefix '%s' retains non-zero value", curr.prefix))
 			}
 		}
@@ -986,6 +988,55 @@ func (c *radixCache[V]) DeletePrefix(prefix string) {
 		}
 
 		return
+	}
+}
+
+// All returns an iterator over all key-value pairs in MRU-to-LRU order without modifying recency.
+func (c *radixCache[V]) All() iter.Seq2[string, V] {
+	return c.all
+}
+
+func (c *radixCache[V]) all(yield func(string, V) bool) {
+	c.mu.RLock()
+	defer c.rUnlock()
+
+	for curr := c.head; curr != nil; curr = curr.next {
+		if !yield(c.reconstructKey(curr), curr.value) {
+			return
+		}
+	}
+}
+
+// Keys returns an iterator over all keys in MRU-to-LRU order without modifying recency.
+func (c *radixCache[V]) Keys() iter.Seq[string] {
+	return c.keys
+}
+
+func (c *radixCache[V]) keys(yield func(string) bool) {
+	c.mu.RLock()
+	defer c.rUnlock()
+
+	for curr := c.head; curr != nil; curr = curr.next {
+		if !yield(c.reconstructKey(curr)) {
+			return
+		}
+	}
+}
+
+// Values returns an iterator over all values in MRU-to-LRU order without modifying recency.
+// It skips key reconstruction completely, executing with zero heap allocations.
+func (c *radixCache[V]) Values() iter.Seq[V] {
+	return c.values
+}
+
+func (c *radixCache[V]) values(yield func(V) bool) {
+	c.mu.RLock()
+	defer c.rUnlock()
+
+	for curr := c.head; curr != nil; curr = curr.next {
+		if !yield(curr.value) {
+			return
+		}
 	}
 }
 

@@ -56,7 +56,12 @@ func main() {
 	_, _ = cache.Peek("bucket/dirB/inode-42")
 	_ = cache.Replace("bucket/dirA/chunk.bin", make([]byte, 4096))
 
-	// 5. Fast O(prefix + subtree) prefix deletion and individual key deletion.
+	// 5. Iterate over entries, keys, or values in MRU-to-LRU order under RLock without altering recency.
+	for k, v := range cache.All() {
+		fmt.Printf("%s: %d bytes\n", k, len(v))
+	}
+
+	// 6. Fast O(prefix + subtree) prefix deletion and individual key deletion.
 	cache.DeletePrefix("bucket/dirA/")
 	_, _ = cache.Delete("bucket/dirB/inode-42")
 }
@@ -76,7 +81,7 @@ Select an engine via `lru.New[V](maxSize, lru.WithBackend(...))` or call its ded
 | **`RadixCache`** | `lru.NewRadixCache[V]` / `WithBackend(BackendRadix)` | `O(K)` (~170 ns / ~172–230 ns in-place, ~472–511 ns turnover) | `O(P + S)` subtree (**20x–88x faster**) | ~94–96 B/entry (**~30–41% less heap**), 0-alloc updates | File paths, object storage namespaces, frequent prefix purges |
 | **`ArenaRadixCache`** | `lru.NewArenaRadixCache[V]` / `WithBackend(BackendArenaRadix)` | `O(1)` hash-accelerated (~100 ns / ~271–472 ns in-place, ~515–822 ns turnover) | `O(P + S)` subtree (**4x–29x faster**) | ~107–111 B/entry, `uint32` slice indices, **two-tier pressure compaction** | 1M+ hierarchical entries, strict GC latency & `GOMEMLIMIT` budgets |
 
-All three backends (`MapCache`, `RadixCache`, and `ArenaRadixCache`) also implement `lru.PressureAwareCache[V]`, exposing `Compact()` and `EvaluateMemoryPressure()`.
+All three backends (`MapCache`, `RadixCache`, and `ArenaRadixCache`) also implement `lru.PressureAwareCache[V]` (exposing `Compact()` and `EvaluateMemoryPressure()`) and provide Go 1.23+ range-over-function iterators (`All() iter.Seq2[string, V]`, `Keys() iter.Seq[string]`, and `Values() iter.Seq[V]`) that traverse live entries in deterministic MRU-to-LRU order under `RLock` without modifying recency (with `0 allocs/op` on `Values()` across all backends). Callers must not invoke write-locking methods on the same `Cache` instance from inside an iterator loop body.
 
 ---
 

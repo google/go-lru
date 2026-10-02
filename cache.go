@@ -24,6 +24,8 @@
 // All cache constructors require maxSize > 0 and unconditionally panic if maxSize == 0.
 package lru
 
+import "iter"
+
 // Cache defines the unified generic interface for LRU cache engines.
 // All implementations are safe for concurrent access by multiple goroutines.
 type Cache[V any] interface {
@@ -63,6 +65,30 @@ type Cache[V any] interface {
 	// DeletePrefix deletes all entries whose keys begin with prefix.
 	// If prefix is an empty string (""), all entries in the cache are deleted.
 	DeletePrefix(prefix string)
+
+	// All returns an iterator over all live key-value pairs in deterministic
+	// most-recently-used (MRU) to least-recently-used (LRU) order.
+	//
+	// Iteration acquires a read lock (RLock) for the duration of the loop, does not
+	// alter LRU recency order, and supports early termination (break). Callers must
+	// not invoke write-locking methods (Put, Get, Delete, Replace, DeletePrefix,
+	// Compact, EvaluateMemoryPressure) on the same Cache while iterating.
+	All() iter.Seq2[string, V]
+
+	// Keys returns an iterator over all live keys in deterministic MRU-to-LRU order.
+	//
+	// Iteration acquires a read lock (RLock) for the duration of the loop, does not
+	// alter LRU recency order, and supports early termination (break). Callers must
+	// not invoke write-locking methods on the same Cache while iterating.
+	Keys() iter.Seq[string]
+
+	// Values returns an iterator over all live values in deterministic MRU-to-LRU order.
+	//
+	// Iteration acquires a read lock (RLock) for the duration of the loop, does not
+	// alter LRU recency order, skips key reconstruction on radix backends (0 allocs/op),
+	// and supports early termination (break). Callers must not invoke write-locking
+	// methods on the same Cache while iterating.
+	Values() iter.Seq[V]
 }
 
 // PressureAwareCache extends Cache[V] with explicit arena/map compaction and memory-pressure reclamation.

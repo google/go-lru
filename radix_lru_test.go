@@ -15,6 +15,8 @@
 package lru
 
 import (
+	"fmt"
+	"slices"
 	"strings"
 	"testing"
 	"unsafe"
@@ -970,5 +972,119 @@ func TestRadixCache_DetachedNodesClearPrefixesAndTreePointers(t *testing.T) {
 		assert.Nil(t, leafA.parent)
 		assert.Nil(t, leafA.prev)
 		assert.Nil(t, leafA.next)
+	})
+}
+
+func TestRadixCache_Iterators(t *testing.T) {
+	t.Run("EmptyCacheYieldsZeroItems", func(t *testing.T) {
+		c := setupRadixCacheTest(t)
+		assert.Empty(t, slices.Collect(c.Keys()))
+		assert.Empty(t, slices.Collect(c.Values()))
+		count := 0
+		for range c.All() {
+			count++
+		}
+		assert.Zero(t, count)
+	})
+
+	t.Run("RootEmptyKeyAndSharedPrefixesAndDeepTreeOver64Levels", func(t *testing.T) {
+		c := NewRadixCache[testData](100000, WithInvariantChecking(true), testDataWeigher)
+		_, err := c.Put("", testData{value: 0, dataSize: 10})
+		require.NoError(t, err)
+		_, err = c.Put("dir/sub/a", testData{value: 1, dataSize: 10})
+		require.NoError(t, err)
+		_, err = c.Put("dir/sub/b", testData{value: 2, dataSize: 10})
+		require.NoError(t, err)
+
+		// Deep key with > 64 compressed segments to exercise reconstructKey fallback path during All()/Keys().
+		const depth = 80
+		for i := 1; i <= depth; i++ {
+			k := strings.Repeat("p", i) + "q"
+			_, err := c.Put(k, testData{value: int64(100 + i), dataSize: 10})
+			require.NoError(t, err)
+		}
+
+		// Promote "" to MRU head via Get, inspect "dir/sub/a" via Peek, update "dir/sub/b" via Replace.
+		_, ok := c.Get("")
+		require.True(t, ok)
+		_, ok = c.Peek("dir/sub/a")
+		require.True(t, ok)
+		require.NoError(t, c.Replace("dir/sub/b", testData{value: 22, dataSize: 10}))
+
+		keys := slices.Collect(c.Keys())
+		vals := slices.Collect(c.Values())
+		require.Len(t, keys, depth+3)
+		require.Len(t, vals, depth+3)
+		assert.Equal(t, "", keys[0])
+		assert.Equal(t, int64(0), vals[0].value)
+		assert.Equal(t, strings.Repeat("p", depth)+"q", keys[1])
+		assert.Equal(t, int64(100+depth), vals[1].value)
+		assert.Equal(t, "dir/sub/b", keys[len(keys)-2])
+		assert.Equal(t, int64(22), vals[len(vals)-2].value)
+		assert.Equal(t, "dir/sub/a", keys[len(keys)-1])
+		assert.Equal(t, int64(1), vals[len(vals)-1].value)
+
+		var allKeys []string
+		var allVals []testData
+		for k, v := range c.All() {
+			allKeys = append(allKeys, k)
+			allVals = append(allVals, v)
+		}
+		assert.Equal(t, keys, allKeys)
+		assert.Equal(t, vals, allVals)
+
+		c.DeletePrefix("p")
+		assert.Equal(t, []string{"", "dir/sub/b", "dir/sub/a"}, slices.Collect(c.Keys()))
+	})
+
+	t.Run("EarlyBreakAndNonMutationAndZeroAllocValues", func(t *testing.T) {
+		c := NewRadixCache[testData](50, WithInvariantChecking(true), testDataWeigher)
+		for i := range 5 {
+			_, err := c.Put(fmt.Sprintf("prefix/k%d", i), testData{value: int64(i + 1), dataSize: 10})
+			require.NoError(t, err)
+		}
+
+		var gotKeys []string
+		for k, v := range c.All() {
+			gotKeys = append(gotKeys, k)
+			_ = v
+			if len(gotKeys) == 2 {
+				break
+			}
+		}
+		assert.Equal(t, []string{"prefix/k4", "prefix/k3"}, gotKeys)
+
+		for k := range c.Keys() {
+			assert.Equal(t, "prefix/k4", k)
+			break
+		}
+		for v := range c.Values() {
+			assert.Equal(t, int64(5), v.value)
+			break
+		}
+
+		cNoInv := NewRadixCache[testData](50, testDataWeigher)
+		for i := range 5 {
+			_, err := cNoInv.Put(fmt.Sprintf("prefix/k%d", i), testData{value: int64(i + 1), dataSize: 10})
+			require.NoError(t, err)
+		}
+		rc := cNoInv.(*radixCache[testData])
+		valSeq := cNoInv.Values()
+		allocs := testing.AllocsPerRun(100, func() {
+			valSeq(func(v testData) bool {
+				return v.value >= 0
+			})
+			for v := range rc.Values() {
+				if v.value < 0 {
+					break
+				}
+			}
+		})
+		assert.Zero(t, allocs, "RadixCache.Values() must allocate 0 heap objects")
+
+		// Confirm iteration did not mutate LRU eviction order: inserting k5 (10B) evicts oldest entry k0 (value 1).
+		evicted, err := c.Put("prefix/k5", testData{value: 6, dataSize: 10})
+		require.NoError(t, err)
+		assertEvictedValues(t, evicted, []int64{1})
 	})
 }

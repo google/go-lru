@@ -16,6 +16,7 @@ package lru
 
 import (
 	"math"
+	"slices"
 	"strings"
 	"sync"
 )
@@ -77,7 +78,8 @@ func (c *arenaRadix[V]) notifyEvict(key string, value V, reason EvictionReason) 
 }
 
 // reconstructKey reconstructs the full key for nodeID by walking the ancestor chain up to c.root.
-// It is only invoked when onEvictEntry is non-nil and the caller does not already have the key in hand.
+// It is invoked when onEvictEntry is non-nil (and the caller does not already have the key in hand)
+// or during All() / Keys() iteration.
 func (c *arenaRadix[V]) reconstructKey(nodeID uint32) string {
 	if nodeID == nilNode || nodeID == c.root {
 		return ""
@@ -94,8 +96,8 @@ func (c *arenaRadix[V]) reconstructKey(nodeID uint32) string {
 	}
 	var b strings.Builder
 	b.Grow(totalLen)
-	for i := len(path) - 1; i >= 0; i-- {
-		b.WriteString(c.nodes[path[i]].prefix)
+	for _, id := range slices.Backward(path) {
+		b.WriteString(c.nodes[id].prefix)
 	}
 	return b.String()
 }
@@ -113,7 +115,7 @@ func hashString(s string) uint64 {
 
 // hashStringCont continues a 64-bit FNV-1a hash calculation from h over string s.
 func hashStringCont(h uint64, s string) uint64 {
-	for i := 0; i < len(s); i++ {
+	for i := range len(s) {
 		h ^= uint64(s[i])
 		h *= prime64
 	}
@@ -130,8 +132,8 @@ func (c *arenaRadix[V]) hashNodeKey(nodeID uint32) uint64 {
 		path = append(path, curr)
 	}
 	h := offset64
-	for i := len(path) - 1; i >= 0; i-- {
-		h = hashStringCont(h, c.nodes[path[i]].prefix)
+	for _, id := range slices.Backward(path) {
+		h = hashStringCont(h, c.nodes[id].prefix)
 	}
 	return h
 }
@@ -617,7 +619,7 @@ func (c *arenaRadix[V]) compactDataStructuresLocked() bool {
 		}
 		if c.nodeMapDirty {
 			newNodeMap := make(map[uint64]uint32, c.len)
-			for id := uint32(0); id < uint32(len(c.nodes)); id++ {
+			for id := range uint32(len(c.nodes)) {
 				if c.nodes[id].hasValue {
 					newNodeMap[c.hashNodeKey(id)] = id
 				}
@@ -633,7 +635,7 @@ func (c *arenaRadix[V]) compactDataStructuresLocked() bool {
 	oldToNew := make([]uint32, oldLen)
 
 	var liveCount uint32
-	for oldID := uint32(0); oldID < oldLen; oldID++ {
+	for oldID := range oldLen {
 		if oldID == c.root || c.nodes[oldID].parent != nilNode {
 			oldToNew[oldID] = liveCount
 			liveCount++
@@ -653,7 +655,7 @@ func (c *arenaRadix[V]) compactDataStructuresLocked() bool {
 	// and brand-new hash accelerator map healing any hash-collided surviving keys.
 	newNodes := make([]arenaRadixNode[V], liveCount)
 	newNodeMap := make(map[uint64]uint32, c.len)
-	for oldID := uint32(0); oldID < oldLen; oldID++ {
+	for oldID := range oldLen {
 		newID := oldToNew[oldID]
 		if newID == nilNode {
 			continue

@@ -17,6 +17,7 @@ package lru
 import (
 	"fmt"
 	"runtime"
+	"slices"
 	"strings"
 	"testing"
 	"unsafe"
@@ -1799,4 +1800,124 @@ func TestArenaRadixCache_PutSplitsPrefixAndRecyclesFreeSlot(t *testing.T) {
 	assert.False(t, ok)
 	_, ok = c.Peek("alpha/three")
 	assert.True(t, ok)
+}
+
+func TestArenaRadixCache_Iterators(t *testing.T) {
+	t.Run("EmptyCacheYieldsZeroItems", func(t *testing.T) {
+		c := setupArenaRadixCacheTest(t)
+		assert.Empty(t, slices.Collect(c.Keys()))
+		assert.Empty(t, slices.Collect(c.Values()))
+		count := 0
+		for range c.All() {
+			count++
+		}
+		assert.Zero(t, count)
+	})
+
+	t.Run("RootEmptyKeyAndPostCompactAndEvaluateMemoryPressureOrder", func(t *testing.T) {
+		pressure := 0.10
+		c := NewArenaRadixCache[testData](
+			100,
+			WithInvariantChecking(true),
+			testDataWeigher,
+			WithPressureFunc(func() float64 { return pressure }),
+			WithEvictionThreshold(0.90),
+			WithEvictionRetentionRatio(0.60),
+		).(PressureAwareCache[testData])
+
+		_, err := c.Put("", testData{value: 10, dataSize: 20})
+		require.NoError(t, err)
+		_, err = c.Put("dir/a", testData{value: 20, dataSize: 20})
+		require.NoError(t, err)
+		_, err = c.Put("dir/b", testData{value: 30, dataSize: 20})
+		require.NoError(t, err)
+		_, err = c.Put("dir/c", testData{value: 40, dataSize: 20})
+		require.NoError(t, err)
+		_, err = c.Put("dir/d", testData{value: 50, dataSize: 20})
+		require.NoError(t, err)
+
+		// Delete "dir/b" and Compact() to remap arena node indices.
+		_, ok := c.Delete("dir/b")
+		require.True(t, ok)
+		c.Compact()
+
+		// Promote "" to MRU head via Get, inspect "dir/a" via Peek, update "dir/c" via Replace.
+		_, ok = c.Get("")
+		require.True(t, ok)
+		_, ok = c.Peek("dir/a")
+		require.True(t, ok)
+		require.NoError(t, c.Replace("dir/c", testData{value: 400, dataSize: 20}))
+
+		wantKeys := []string{"", "dir/d", "dir/c", "dir/a"}
+		wantVals := []testData{{10, 20}, {50, 20}, {400, 20}, {20, 20}}
+		assert.Equal(t, wantKeys, slices.Collect(c.Keys()))
+		assert.Equal(t, wantVals, slices.Collect(c.Values()))
+
+		// Trigger Tier 2 pressure shedding down to 60B (evicts oldest entry "dir/a").
+		pressure = 0.95
+		evicted := c.EvaluateMemoryPressure()
+		assertEvictedValues(t, evicted, []int64{20})
+
+		wantAfterShedKeys := []string{"", "dir/d", "dir/c"}
+		wantAfterShedVals := []testData{{10, 20}, {50, 20}, {400, 20}}
+		var allKeys []string
+		var allVals []testData
+		for k, v := range c.All() {
+			allKeys = append(allKeys, k)
+			allVals = append(allVals, v)
+		}
+		assert.Equal(t, wantAfterShedKeys, allKeys)
+		assert.Equal(t, wantAfterShedVals, allVals)
+	})
+
+	t.Run("EarlyBreakAndNonMutationAndZeroAllocValues", func(t *testing.T) {
+		c := NewArenaRadixCache[testData](50, WithInvariantChecking(true), testDataWeigher)
+		for i := range 5 {
+			_, err := c.Put(fmt.Sprintf("arena/k%d", i), testData{value: int64(i + 1), dataSize: 10})
+			require.NoError(t, err)
+		}
+
+		var gotKeys []string
+		for k, v := range c.All() {
+			gotKeys = append(gotKeys, k)
+			_ = v
+			if len(gotKeys) == 2 {
+				break
+			}
+		}
+		assert.Equal(t, []string{"arena/k4", "arena/k3"}, gotKeys)
+
+		for k := range c.Keys() {
+			assert.Equal(t, "arena/k4", k)
+			break
+		}
+		for v := range c.Values() {
+			assert.Equal(t, int64(5), v.value)
+			break
+		}
+
+		cNoInv := NewArenaRadixCache[testData](50, testDataWeigher)
+		for i := range 5 {
+			_, err := cNoInv.Put(fmt.Sprintf("arena/k%d", i), testData{value: int64(i + 1), dataSize: 10})
+			require.NoError(t, err)
+		}
+		ac := cNoInv.(*arenaRadix[testData])
+		valSeq := cNoInv.Values()
+		allocs := testing.AllocsPerRun(100, func() {
+			valSeq(func(v testData) bool {
+				return v.value >= 0
+			})
+			for v := range ac.Values() {
+				if v.value < 0 {
+					break
+				}
+			}
+		})
+		assert.Zero(t, allocs, "ArenaRadixCache.Values() must allocate 0 heap objects")
+
+		// Confirm iteration did not mutate LRU eviction order: inserting k5 (10B) evicts oldest entry k0 (value 1).
+		evicted, err := c.Put("arena/k5", testData{value: 6, dataSize: 10})
+		require.NoError(t, err)
+		assertEvictedValues(t, evicted, []int64{1})
+	})
 }

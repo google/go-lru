@@ -16,7 +16,7 @@ package lru_test
 
 import (
 	"fmt"
-	"math/rand"
+	"math/rand/v2"
 	"runtime"
 	"sync/atomic"
 	"testing"
@@ -68,7 +68,7 @@ func generateBenchmarkKeys(prefixCount, itemsPerPrefix, depth int) (keys []strin
 	}
 
 	// Shuffle keys to simulate realistic, unpredictable access patterns
-	r := rand.New(rand.NewSource(42))
+	r := rand.New(rand.NewPCG(42, 0))
 	r.Shuffle(len(keys), func(i, j int) {
 		keys[i], keys[j] = keys[j], keys[i]
 	})
@@ -404,10 +404,10 @@ func runParallelWorkload(b *testing.B, constructor func(uint64, ...lru.Option) l
 
 	b.RunParallel(func(pb *testing.PB) {
 		workerID := workerSeq.Add(1)
-		r := rand.New(rand.NewSource(42 + workerID*10007))
+		r := rand.New(rand.NewPCG(uint64(42+workerID*10007), 0))
 		for pb.Next() {
-			op := r.Intn(100)
-			key := keys[r.Intn(keySpace)]
+			op := r.IntN(100)
+			key := keys[r.IntN(keySpace)]
 			switch {
 			case op < putPct:
 				_, _ = cache.Put(key, data)
@@ -663,4 +663,93 @@ func Benchmark_Replace_WithOnEvictEntry(b *testing.B) {
 	b.Run("ArenaRadixCache", func(b *testing.B) {
 		runBenchmarkReplaceWithOptions(b, lru.NewArenaRadixCache[benchValue], benchWeigher, cbOpt)
 	})
+}
+
+// ============================================================================
+// 11. Range-Over-Function Iterator Benchmarks (All, Keys, Values)
+// ============================================================================
+
+func runBenchmarkAll(b *testing.B, constructor func(uint64, ...lru.Option) lru.Cache[benchValue]) {
+	b.Helper()
+	const numKeys = 1000
+	keys, _, _ := generateBenchmarkKeys(20, 50, 2)
+	data := benchValue{val: 1, dataSize: 10}
+	cache := constructor(uint64(numKeys*100), benchWeigher)
+	for _, key := range keys[:numKeys] {
+		_, _ = cache.Put(key, data)
+	}
+
+	seq := cache.All()
+	b.ReportAllocs()
+	b.ResetTimer()
+
+	for b.Loop() {
+		seq(func(k string, v benchValue) bool {
+			benchSinkEvictKey = k
+			benchSinkVal = v
+			return true
+		})
+	}
+}
+
+func runBenchmarkKeys(b *testing.B, constructor func(uint64, ...lru.Option) lru.Cache[benchValue]) {
+	b.Helper()
+	const numKeys = 1000
+	keys, _, _ := generateBenchmarkKeys(20, 50, 2)
+	data := benchValue{val: 1, dataSize: 10}
+	cache := constructor(uint64(numKeys*100), benchWeigher)
+	for _, key := range keys[:numKeys] {
+		_, _ = cache.Put(key, data)
+	}
+
+	seq := cache.Keys()
+	b.ReportAllocs()
+	b.ResetTimer()
+
+	for b.Loop() {
+		seq(func(k string) bool {
+			benchSinkEvictKey = k
+			return true
+		})
+	}
+}
+
+func runBenchmarkValues(b *testing.B, constructor func(uint64, ...lru.Option) lru.Cache[benchValue]) {
+	b.Helper()
+	const numKeys = 1000
+	keys, _, _ := generateBenchmarkKeys(20, 50, 2)
+	data := benchValue{val: 1, dataSize: 10}
+	cache := constructor(uint64(numKeys*100), benchWeigher)
+	for _, key := range keys[:numKeys] {
+		_, _ = cache.Put(key, data)
+	}
+
+	seq := cache.Values()
+	b.ReportAllocs()
+	b.ResetTimer()
+
+	for b.Loop() {
+		seq(func(v benchValue) bool {
+			benchSinkVal = v
+			return true
+		})
+	}
+}
+
+func Benchmark_All_MapCache(b *testing.B)   { runBenchmarkAll(b, lru.NewMapCache[benchValue]) }
+func Benchmark_All_RadixCache(b *testing.B) { runBenchmarkAll(b, lru.NewRadixCache[benchValue]) }
+func Benchmark_All_ArenaRadixCache(b *testing.B) {
+	runBenchmarkAll(b, lru.NewArenaRadixCache[benchValue])
+}
+
+func Benchmark_Keys_MapCache(b *testing.B)   { runBenchmarkKeys(b, lru.NewMapCache[benchValue]) }
+func Benchmark_Keys_RadixCache(b *testing.B) { runBenchmarkKeys(b, lru.NewRadixCache[benchValue]) }
+func Benchmark_Keys_ArenaRadixCache(b *testing.B) {
+	runBenchmarkKeys(b, lru.NewArenaRadixCache[benchValue])
+}
+
+func Benchmark_Values_MapCache(b *testing.B)   { runBenchmarkValues(b, lru.NewMapCache[benchValue]) }
+func Benchmark_Values_RadixCache(b *testing.B) { runBenchmarkValues(b, lru.NewRadixCache[benchValue]) }
+func Benchmark_Values_ArenaRadixCache(b *testing.B) {
+	runBenchmarkValues(b, lru.NewArenaRadixCache[benchValue])
 }

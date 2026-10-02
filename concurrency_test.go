@@ -16,7 +16,8 @@ package lru_test
 
 import (
 	"fmt"
-	"math/rand"
+	"math/rand/v2"
+	"slices"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -41,10 +42,7 @@ func allEngines() []struct {
 } {
 	wrap := func(fn func(uint64, ...lru.Option) lru.Cache[concValue]) func(uint64, ...lru.Option) lru.Cache[concValue] {
 		return func(maxSize uint64, opts ...lru.Option) lru.Cache[concValue] {
-			allOpts := make([]lru.Option, 0, len(opts)+1)
-			allOpts = append(allOpts, concWeigher)
-			allOpts = append(allOpts, opts...)
-			return fn(maxSize, allOpts...)
+			return fn(maxSize, slices.Concat([]lru.Option{concWeigher}, opts)...)
 		}
 	}
 	return []struct {
@@ -81,47 +79,76 @@ func TestConcurrency_MixedOperations(t *testing.T) {
 			// Act
 			var wg sync.WaitGroup
 			for g := range numGoroutines {
-				wg.Add(1)
-				go func(workerID int) {
-					defer wg.Done()
-					r := rand.New(rand.NewSource(int64(workerID*10007 + 42)))
+				wg.Go(func() {
+					r := rand.New(rand.NewPCG(uint64(g*10007+42), 0))
 
-					for range opsPerWorker {
-						op := r.Intn(100)
-						kIdx := r.Intn(numKeys * 2)
+					for step := range opsPerWorker {
+						op := r.IntN(100)
+						kIdx := r.IntN(numKeys * 2)
 						dirIdx := kIdx % 5
 						subIdx := (kIdx / 5) % 10
 						key := fmt.Sprintf("dir_%02d/sub_%02d/file_%03d.txt", dirIdx, subIdx, kIdx)
 
 						switch {
-						case op < 30:
+						case op < 28:
 							_, err := cache.Put(key, concValue{id: key, size: 10})
 							if err != nil {
 								assert.ErrorIs(t, err, lru.ErrInvalidEntrySize)
 							}
-						case op < 55:
+						case op < 50:
 							_, _ = cache.Get(key)
-						case op < 70:
+						case op < 64:
 							_, _ = cache.Peek(key)
-						case op < 80:
+						case op < 74:
 							err := cache.Replace(key, concValue{id: key + "_upd", size: 10})
 							if err != nil {
 								assert.ErrorIs(t, err, lru.ErrEntryNotExist)
 							}
-						case op < 88:
+						case op < 82:
 							sz := uint64(5 + (kIdx%3)*10) // 5, 15, or 25 (shrinks or grows weight)
 							err := cache.Replace(key, concValue{id: key + "_sz", size: sz})
 							if err != nil {
 								assert.ErrorIs(t, err, lru.ErrEntryNotExist)
 							}
-						case op < 95:
+						case op < 88:
 							_, _ = cache.Delete(key)
+						case op < 94:
+							switch step % 3 {
+							case 0:
+								count := 0
+								for k, v := range cache.All() {
+									assert.NotEmpty(t, k)
+									assert.NotEmpty(t, v.id)
+									count++
+									if step%2 == 0 && count >= 5 {
+										break
+									}
+								}
+							case 1:
+								count := 0
+								for k := range cache.Keys() {
+									assert.NotEmpty(t, k)
+									count++
+									if step%2 == 0 && count >= 5 {
+										break
+									}
+								}
+							case 2:
+								count := 0
+								for v := range cache.Values() {
+									assert.NotEmpty(t, v.id)
+									count++
+									if step%2 == 0 && count >= 5 {
+										break
+									}
+								}
+							}
 						default:
 							prefix := fmt.Sprintf("dir_%02d/", dirIdx)
 							cache.DeletePrefix(prefix)
 						}
 					}
-				}(g)
+				})
 			}
 
 			wg.Wait()
@@ -162,15 +189,13 @@ func TestConcurrency_DeletePrefixAtomicity(t *testing.T) {
 			// Act
 			var writerWg sync.WaitGroup
 			for w := range numWriters {
-				writerWg.Add(1)
-				go func(workerID int) {
-					defer writerWg.Done()
+				writerWg.Go(func() {
 					for op := range opsPerWriter {
-						key := fmt.Sprintf("/target/w%d_%d", workerID, op)
+						key := fmt.Sprintf("/target/w%d_%d", w, op)
 						_, err := cache.Put(key, concValue{id: key, size: 10})
 						assert.NoError(t, err)
 					}
-				}(w)
+				})
 			}
 
 			for range 10 {
@@ -227,20 +252,18 @@ func TestConcurrency_ParallelReadersPeek(t *testing.T) {
 			// Act
 			var readerWg sync.WaitGroup
 			for r := range numReaders {
-				readerWg.Add(1)
-				go func(readerID int) {
-					defer readerWg.Done()
+				readerWg.Go(func() {
 					for i := range readsPerG {
 						targetKey := "key_0000"
 						if i%2 == 1 {
-							targetKey = fmt.Sprintf("key_%04d", (readerID*17+i)%totalKeys)
+							targetKey = fmt.Sprintf("key_%04d", (r*17+i)%totalKeys)
 						}
 						_, ok := cache.Peek(targetKey)
 						if !assert.True(t, ok) {
 							return
 						}
 					}
-				}(r)
+				})
 			}
 			readerWg.Wait()
 
@@ -258,6 +281,103 @@ func TestConcurrency_ParallelReadersPeek(t *testing.T) {
 			require.NoError(t, err)
 			require.Len(t, evicted, 1)
 			assert.Equal(t, "key_0000", evicted[0].id)
+		})
+	}
+}
+
+// TestConcurrency_ParallelIteratorsPreservesLRUOrder verifies that concurrent
+// All(), Keys(), and Values() iterators (both full traversals and early breaks)
+// observe deterministic MRU-to-LRU order under RLock and never alter LRU eviction order.
+func TestConcurrency_ParallelIteratorsPreservesLRUOrder(t *testing.T) {
+	for _, eng := range allEngines() {
+		t.Run(eng.name, func(t *testing.T) {
+			// Arrange
+			const (
+				totalKeys  = 100
+				numReaders = 16
+				itersPerG  = 50
+				capacity   = 1000 // exact capacity for 100 * 10-byte entries
+			)
+
+			cache := eng.constructor(capacity, lru.WithInvariantChecking(true))
+
+			for i := range totalKeys {
+				k := fmt.Sprintf("dir_%02d/key_%04d", i%5, i)
+				_, err := cache.Put(k, concValue{id: k, size: 10})
+				require.NoError(t, err)
+			}
+
+			// Act
+			var readerWg sync.WaitGroup
+			for r := range numReaders {
+				readerWg.Go(func() {
+					for i := range itersPerG {
+						earlyBreak := i%2 == 1
+						limit := 1 + (r+i)%10
+
+						switch (r + i) % 3 {
+						case 0:
+							idx := totalKeys - 1
+							count := 0
+							for k, v := range cache.All() {
+								expected := fmt.Sprintf("dir_%02d/key_%04d", idx%5, idx)
+								if !assert.Equal(t, expected, k) || !assert.Equal(t, expected, v.id) {
+									return
+								}
+								idx--
+								count++
+								if earlyBreak && count >= limit {
+									break
+								}
+							}
+							if !earlyBreak {
+								assert.Equal(t, totalKeys, count)
+							}
+						case 1:
+							idx := totalKeys - 1
+							count := 0
+							for k := range cache.Keys() {
+								expected := fmt.Sprintf("dir_%02d/key_%04d", idx%5, idx)
+								if !assert.Equal(t, expected, k) {
+									return
+								}
+								idx--
+								count++
+								if earlyBreak && count >= limit {
+									break
+								}
+							}
+							if !earlyBreak {
+								assert.Equal(t, totalKeys, count)
+							}
+						case 2:
+							idx := totalKeys - 1
+							count := 0
+							for v := range cache.Values() {
+								expected := fmt.Sprintf("dir_%02d/key_%04d", idx%5, idx)
+								if !assert.Equal(t, expected, v.id) {
+									return
+								}
+								idx--
+								count++
+								if earlyBreak && count >= limit {
+									break
+								}
+							}
+							if !earlyBreak {
+								assert.Equal(t, totalKeys, count)
+							}
+						}
+					}
+				})
+			}
+			readerWg.Wait()
+
+			// Assert: Inserting a new 10-byte entry must evict the original LRU tail (dir_00/key_0000).
+			evicted, err := cache.Put("overflow_trigger", concValue{id: "overflow", size: 10})
+			require.NoError(t, err)
+			require.Len(t, evicted, 1)
+			assert.Equal(t, "dir_00/key_0000", evicted[0].id)
 		})
 	}
 }
@@ -280,9 +400,7 @@ func TestConcurrency_EvictionThrashingWithInvariants(t *testing.T) {
 
 			// Act
 			for range numGoroutines {
-				wg.Add(1)
-				go func() {
-					defer wg.Done()
+				wg.Go(func() {
 					for i := range opsPerWorker {
 						key := fmt.Sprintf("inv/p%d/item_%d", i%5, i)
 						evicted, err := cache.Put(key, concValue{id: key, size: 10})
@@ -292,7 +410,7 @@ func TestConcurrency_EvictionThrashingWithInvariants(t *testing.T) {
 							cache.DeletePrefix(fmt.Sprintf("inv/p%d/", i%5))
 						}
 					}
-				}()
+				})
 			}
 
 			wg.Wait()
@@ -342,15 +460,13 @@ func TestConcurrency_MemoryPressureCompactionAndEviction(t *testing.T) {
 			// Act
 			var wg sync.WaitGroup
 			for g := range numGoroutines {
-				wg.Add(1)
-				go func(workerID int) {
-					defer wg.Done()
-					r := rand.New(rand.NewSource(int64(workerID*13337 + 99)))
+				wg.Go(func() {
+					r := rand.New(rand.NewPCG(uint64(g*13337+99), 0))
 
 					for step := range opsPerWorker {
 						// Dynamically oscillate simulated pressure across Normal (0.20),
 						// Moderate (0.80), and Critical (0.95) tiers.
-						switch (workerID + step) % 3 {
+						switch (g + step) % 3 {
 						case 0:
 							setPressure(0.20)
 						case 1:
@@ -359,35 +475,66 @@ func TestConcurrency_MemoryPressureCompactionAndEviction(t *testing.T) {
 							setPressure(0.95)
 						}
 
-						op := r.Intn(100)
-						kIdx := r.Intn(numKeys)
+						op := r.IntN(100)
+						kIdx := r.IntN(numKeys)
 						dirIdx := kIdx % 6
 						subIdx := (kIdx / 6) % 5
 						key := fmt.Sprintf("mp_dir_%02d/sub_%02d/file_%03d.dat", dirIdx, subIdx, kIdx)
 
 						switch {
-						case op < 30:
+						case op < 28:
 							_, err := cache.Put(key, concValue{id: key, size: 10})
 							if err != nil {
 								assert.ErrorIs(t, err, lru.ErrInvalidEntrySize)
 							}
-						case op < 50:
+						case op < 48:
 							_, _ = cache.Get(key)
-						case op < 68:
+						case op < 64:
 							_, _ = cache.Peek(key)
-						case op < 76:
+						case op < 72:
 							err := cache.Replace(key, concValue{id: key + "_u", size: 10})
 							if err != nil {
 								assert.ErrorIs(t, err, lru.ErrEntryNotExist)
 							}
-						case op < 84:
+						case op < 80:
 							sz := uint64(5 + (step%2)*10) // 5 or 15
 							err := cache.Replace(key, concValue{id: key + "_sz", size: sz})
 							if err != nil {
 								assert.ErrorIs(t, err, lru.ErrEntryNotExist)
 							}
-						case op < 90:
+						case op < 86:
 							_, _ = cache.Delete(key)
+						case op < 91:
+							switch step % 3 {
+							case 0:
+								count := 0
+								for k, v := range cache.All() {
+									assert.NotEmpty(t, k)
+									assert.NotEmpty(t, v.id)
+									count++
+									if step%2 == 0 && count >= 4 {
+										break
+									}
+								}
+							case 1:
+								count := 0
+								for k := range cache.Keys() {
+									assert.NotEmpty(t, k)
+									count++
+									if step%2 == 0 && count >= 4 {
+										break
+									}
+								}
+							case 2:
+								count := 0
+								for v := range cache.Values() {
+									assert.NotEmpty(t, v.id)
+									count++
+									if step%2 == 0 && count >= 4 {
+										break
+									}
+								}
+							}
 						case op < 95:
 							prefix := fmt.Sprintf("mp_dir_%02d/", dirIdx)
 							cache.DeletePrefix(prefix)
@@ -397,7 +544,7 @@ func TestConcurrency_MemoryPressureCompactionAndEviction(t *testing.T) {
 							_ = reclaimer.EvaluateMemoryPressure()
 						}
 					}
-				}(g)
+				})
 			}
 
 			wg.Wait()
@@ -468,13 +615,11 @@ func TestConcurrency_EvictionCallbacksUnderRace(t *testing.T) {
 			// Act
 			var wg sync.WaitGroup
 			for g := range numGoroutines {
-				wg.Add(1)
-				go func(workerID int) {
-					defer wg.Done()
-					r := rand.New(rand.NewSource(int64(workerID*17777 + 42)))
+				wg.Go(func() {
+					r := rand.New(rand.NewPCG(uint64(g*17777+42), 0))
 
 					for step := range opsPerWorker {
-						switch (workerID + step) % 3 {
+						switch (g + step) % 3 {
 						case 0:
 							setPressure(0.20)
 						case 1:
@@ -483,8 +628,8 @@ func TestConcurrency_EvictionCallbacksUnderRace(t *testing.T) {
 							setPressure(0.95)
 						}
 
-						op := r.Intn(100)
-						kIdx := r.Intn(numKeys)
+						op := r.IntN(100)
+						kIdx := r.IntN(numKeys)
 						dirIdx := kIdx % 6
 						subIdx := (kIdx / 6) % 5
 						key := fmt.Sprintf("cb_dir_%02d/sub_%02d/file_%03d.dat", dirIdx, subIdx, kIdx)
@@ -529,7 +674,7 @@ func TestConcurrency_EvictionCallbacksUnderRace(t *testing.T) {
 							_ = reclaimer.EvaluateMemoryPressure()
 						}
 					}
-				}(g)
+				})
 			}
 
 			wg.Wait()
