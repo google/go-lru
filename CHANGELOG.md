@@ -6,6 +6,15 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ---
 
+## [Unreleased]
+
+### Changed
+- **Generic `Cache[V any]` & `PressureAwareCache[V any]` API**: Parameterized `Cache[V any]`, `PressureAwareCache[V any]`, `New[V any]`, `NewMapCache[V any]`, `NewRadixCache[V any]`, and `NewArenaRadixCache[V any]` by value type `V any`, eliminating wrapper interface boilerplate.
+- **Configurable Entry Weighing (`WithWeigher`)**: Added `WithWeigher[V any](func(key string, value V) uint64)` with a default unit weight of `1` per entry when omitted.
+- **Idiomatic Cache Method Vocabulary**: Standardized `Cache[V any]` operations to `Put`, `Delete`, `Get`, `Peek`, `Replace`, and `DeletePrefix`.
+
+---
+
 ## [0.0.1] - 2026-04-20
 
 ### Added
@@ -19,7 +28,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
   - All three backends (`MapCache`, `RadixCache`, and `ArenaRadixCache`) implement `PressureAwareCache` (`Compact()` and `EvaluateMemoryPressure()`).
   - Configurable via `WithPressureFunc`, `WithMemoryBudget`, `WithCompactionThreshold` (Tier 1 lossless compaction), `WithEvictionThreshold` (Tier 2 proactive LRU tail shedding + compaction), `WithEvictionRetentionRatio`, and `DefaultRuntimePressureFunc`.
 - **Documentation & Runnable Examples**:
-  - `example_test.go` with `pkg.go.dev` runnable examples (`ExampleNew`, `ExampleNew_eviction`, `ExampleNew_backendsAndPrefixErase`, `ExampleNew_memoryPressure`).
+  - `example_test.go` with `pkg.go.dev` runnable examples (`ExampleNew`, `ExampleNew_eviction`, `ExampleNew_backendsAndDeletePrefix`, `ExampleNew_memoryPressure`).
   - Concise user guide in `README.md` backed by `docs/architecture.md` and `docs/performance.md`.
 - **Automated GitHub Actions CI**:
   - `.github/workflows/ci.yml`: formatting (`gofmt -s`, `goimports`), static analysis (`go vet`, `golangci-lint`), `go mod tidy` verification, `-race` unit/differential/concurrency tests, runnable examples, and statement coverage reporting.

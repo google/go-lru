@@ -103,7 +103,7 @@ var metricsSamplePool = sync.Pool{
 // Options contains configuration parameters for Cache instances.
 // Memory-pressure reclamation options (PressureFunc, MemoryBudget, CompactionThreshold,
 // EvictionThreshold, EvictionRetentionRatio) configure both automatic amortized foreground
-// reclamation (on Insert, Erase, UpdateWithoutChangingOrder, and EraseEntriesWithGivenPrefix) and explicit
+// reclamation (on Put, Delete, Replace, and DeletePrefix) and explicit
 // EvaluateMemoryPressure() / Compact() calls across ArenaRadixCache, MapCache, and RadixCache.
 type Options struct {
 	// Backend selects the underlying cache engine when calling New.
@@ -114,7 +114,7 @@ type Options struct {
 	// When nil (or a typed-nil function), every entry defaults to a weight of 1.
 	// Prefer a typed Weigher[V] / func(string, V) uint64 matching Cache[V] for zero-allocation
 	// weighing; a type-erased Weigher[any] / func(string, any) uint64 is also accepted but boxes
-	// non-pointer concrete V values into any on each Insert and UpdateWithoutChangingOrder.
+	// non-pointer concrete V values into any on each Put and Replace.
 	Weigher any
 
 	// EnableInvariantChecking enables internal data structure integrity and invariant validation.
@@ -167,13 +167,13 @@ func WithBackend(backend Backend) Option {
 }
 
 // WithWeigher configures a custom function to compute the logical or byte weight of each cache entry
-// on Insert and UpdateWithoutChangingOrder.
+// on Put and Replace.
 // If not configured (or if fn is nil), every entry defaults to a weight of 1.
 //
 // For zero heap allocations on hot paths, pass a function whose value parameter type V matches
 // the target Cache[V]. A type-erased WithWeigher[any] is also supported for shared Options across
 // caches, but binding a Weigher[any] / func(string, any) uint64 to a concrete non-pointer Cache[V]
-// (V != any) boxes V into any on every Insert and UpdateWithoutChangingOrder call.
+// (V != any) boxes V into any on every Put and Replace call.
 func WithWeigher[V any](fn func(key string, value V) uint64) Option {
 	return func(o *Options) {
 		if fn == nil {

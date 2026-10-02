@@ -25,13 +25,13 @@ import (
 func ExampleNew() {
 	cache := lru.New[string](1024)
 
-	_, _ = cache.Insert("greeting", "hello, world")
-	_, _ = cache.Insert("inode-42", "42")
+	_, _ = cache.Put("greeting", "hello, world")
+	_, _ = cache.Put("inode-42", "42")
 
-	if v, ok := cache.LookUp("greeting"); ok {
+	if v, ok := cache.Get("greeting"); ok {
 		fmt.Printf("greeting=%s (len=%d)\n", v, len(v))
 	}
-	if v, ok := cache.LookUp("inode-42"); ok {
+	if v, ok := cache.Get("inode-42"); ok {
 		fmt.Printf("inode=%s\n", v)
 	}
 	// Output:
@@ -47,21 +47,21 @@ func ExampleNew_eviction() {
 		return uint64(len(v))
 	}))
 
-	_, _ = cache.Insert("a", "1234") // size 4 (total 4)
-	_, _ = cache.Insert("b", "5678") // size 4 (total 8)
+	_, _ = cache.Put("a", "1234") // size 4 (total 4)
+	_, _ = cache.Put("b", "5678") // size 4 (total 8)
 
 	// Access "a" so "a" becomes MRU and "b" becomes LRU.
-	_, _ = cache.LookUp("a")
+	_, _ = cache.Get("a")
 
-	// Inserting "c" (size 4) exceeds capacity (8 + 4 > 10), evicting "b".
-	evicted, err := cache.Insert("c", "9012")
+	// Putting "c" (size 4) exceeds capacity (8 + 4 > 10), evicting "b".
+	evicted, err := cache.Put("c", "9012")
 	if err != nil {
 		panic(err)
 	}
 
-	_, okA := cache.LookUp("a")
-	_, okB := cache.LookUp("b")
-	_, okC := cache.LookUp("c")
+	_, okA := cache.Get("a")
+	_, okB := cache.Get("b")
+	_, okC := cache.Get("c")
 	fmt.Printf("evicted count=%d, first=%s\n", len(evicted), evicted[0])
 	fmt.Printf("a present=%v, b present=%v, c present=%v\n", okA, okB, okC)
 	// Output:
@@ -69,20 +69,20 @@ func ExampleNew_eviction() {
 	// a present=true, b present=false, c present=true
 }
 
-// ExampleNew_backendsAndPrefixErase demonstrates selecting the RadixCache backend
-// via WithBackend and performing fast hierarchical prefix erasure.
-func ExampleNew_backendsAndPrefixErase() {
+// ExampleNew_backendsAndDeletePrefix demonstrates selecting the RadixCache backend
+// via WithBackend and performing fast hierarchical prefix deletion.
+func ExampleNew_backendsAndDeletePrefix() {
 	cache := lru.New[string](4096, lru.WithBackend(lru.BackendRadix))
 
-	_, _ = cache.Insert("bucket/dirA/file1.txt", "data-1")
-	_, _ = cache.Insert("bucket/dirA/file2.txt", "data-2")
-	_, _ = cache.Insert("bucket/dirB/file3.txt", "data-3")
+	_, _ = cache.Put("bucket/dirA/file1.txt", "data-1")
+	_, _ = cache.Put("bucket/dirA/file2.txt", "data-2")
+	_, _ = cache.Put("bucket/dirB/file3.txt", "data-3")
 
 	// Purge only the "bucket/dirA/" subtree.
-	cache.EraseEntriesWithGivenPrefix("bucket/dirA/")
+	cache.DeletePrefix("bucket/dirA/")
 
-	_, okA := cache.LookUp("bucket/dirA/file1.txt")
-	_, okB := cache.LookUp("bucket/dirB/file3.txt")
+	_, okA := cache.Get("bucket/dirA/file1.txt")
+	_, okB := cache.Get("bucket/dirB/file3.txt")
 	fmt.Printf("dirA/file1=%v, dirB/file3=%v\n", okA, okB)
 	// Output:
 	// dirA/file1=false, dirB/file3=true
@@ -102,16 +102,16 @@ func ExampleNew_memoryPressure() {
 		lru.WithEvictionRetentionRatio(0.50),
 	)
 
-	_, _ = cache.Insert("dir/item1", "v1")
-	_, _ = cache.Insert("dir/item2", "v2")
+	_, _ = cache.Put("dir/item1", "v1")
+	_, _ = cache.Put("dir/item2", "v2")
 
 	// Simulate Critical Pressure (>= 0.90) to shed LRU entries down to 50% of maxSize (50 bytes).
 	pressure = 0.95
 	paCache := cache.(lru.PressureAwareCache[string])
 	shed := paCache.EvaluateMemoryPressure()
 
-	_, ok1 := cache.LookUpWithoutChangingOrder("dir/item1")
-	_, ok2 := cache.LookUpWithoutChangingOrder("dir/item2")
+	_, ok1 := cache.Peek("dir/item1")
+	_, ok2 := cache.Peek("dir/item2")
 	fmt.Printf("shed entries=%d, item1 remaining=%v, item2 remaining=%v\n",
 		len(shed),
 		ok1,

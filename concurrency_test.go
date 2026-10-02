@@ -74,7 +74,7 @@ func TestConcurrency_MixedOperations(t *testing.T) {
 
 			for i := range numKeys {
 				key := fmt.Sprintf("dir_%02d/sub_%02d/file_%03d.txt", i%5, (i/5)%10, i)
-				_, err := cache.Insert(key, concValue{id: key, size: 10})
+				_, err := cache.Put(key, concValue{id: key, size: 10})
 				require.NoError(t, err)
 			}
 
@@ -95,30 +95,30 @@ func TestConcurrency_MixedOperations(t *testing.T) {
 
 						switch {
 						case op < 30:
-							_, err := cache.Insert(key, concValue{id: key, size: 10})
+							_, err := cache.Put(key, concValue{id: key, size: 10})
 							if err != nil {
 								assert.ErrorIs(t, err, lru.ErrInvalidEntrySize)
 							}
 						case op < 55:
-							_, _ = cache.LookUp(key)
+							_, _ = cache.Get(key)
 						case op < 70:
-							_, _ = cache.LookUpWithoutChangingOrder(key)
+							_, _ = cache.Peek(key)
 						case op < 80:
-							err := cache.UpdateWithoutChangingOrder(key, concValue{id: key + "_upd", size: 10})
+							err := cache.Replace(key, concValue{id: key + "_upd", size: 10})
 							if err != nil {
 								assert.ErrorIs(t, err, lru.ErrEntryNotExist)
 							}
 						case op < 88:
 							sz := uint64(5 + (kIdx%3)*10) // 5, 15, or 25 (shrinks or grows weight)
-							err := cache.UpdateWithoutChangingOrder(key, concValue{id: key + "_sz", size: sz})
+							err := cache.Replace(key, concValue{id: key + "_sz", size: sz})
 							if err != nil {
 								assert.ErrorIs(t, err, lru.ErrEntryNotExist)
 							}
 						case op < 95:
-							_, _ = cache.Erase(key)
+							_, _ = cache.Delete(key)
 						default:
 							prefix := fmt.Sprintf("dir_%02d/", dirIdx)
-							cache.EraseEntriesWithGivenPrefix(prefix)
+							cache.DeletePrefix(prefix)
 						}
 					}
 				}(g)
@@ -127,19 +127,19 @@ func TestConcurrency_MixedOperations(t *testing.T) {
 			wg.Wait()
 
 			// Assert
-			_, err := cache.Insert("post_conc_check", concValue{id: "post_conc_check", size: 10})
+			_, err := cache.Put("post_conc_check", concValue{id: "post_conc_check", size: 10})
 			require.NoError(t, err)
-			val, ok := cache.LookUp("post_conc_check")
+			val, ok := cache.Get("post_conc_check")
 			assert.True(t, ok)
 			assert.Equal(t, "post_conc_check", val.id)
 		})
 	}
 }
 
-// TestConcurrency_PrefixErasureAtomicity verifies that EraseEntriesWithGivenPrefix
+// TestConcurrency_DeletePrefixAtomicity verifies that DeletePrefix
 // atomically removes all matching keys without affecting unrelated prefixes under
 // concurrent writer load.
-func TestConcurrency_PrefixErasureAtomicity(t *testing.T) {
+func TestConcurrency_DeletePrefixAtomicity(t *testing.T) {
 	for _, eng := range allEngines() {
 		t.Run(eng.name, func(t *testing.T) {
 			// Arrange
@@ -152,10 +152,10 @@ func TestConcurrency_PrefixErasureAtomicity(t *testing.T) {
 
 			for i := range 20 {
 				kTarget := fmt.Sprintf("/target/init_%d", i)
-				_, err := cache.Insert(kTarget, concValue{id: kTarget, size: 10})
+				_, err := cache.Put(kTarget, concValue{id: kTarget, size: 10})
 				require.NoError(t, err)
 				kKeep := fmt.Sprintf("/keep/init_%d", i)
-				_, err = cache.Insert(kKeep, concValue{id: kKeep, size: 10})
+				_, err = cache.Put(kKeep, concValue{id: kKeep, size: 10})
 				require.NoError(t, err)
 			}
 
@@ -167,35 +167,35 @@ func TestConcurrency_PrefixErasureAtomicity(t *testing.T) {
 					defer writerWg.Done()
 					for op := range opsPerWriter {
 						key := fmt.Sprintf("/target/w%d_%d", workerID, op)
-						_, err := cache.Insert(key, concValue{id: key, size: 10})
+						_, err := cache.Put(key, concValue{id: key, size: 10})
 						assert.NoError(t, err)
 					}
 				}(w)
 			}
 
 			for range 10 {
-				cache.EraseEntriesWithGivenPrefix("/target/")
+				cache.DeletePrefix("/target/")
 			}
 
 			writerWg.Wait()
 
-			// Final prefix erase after writers finish must remove all /target/ keys.
-			cache.EraseEntriesWithGivenPrefix("/target/")
+			// Final prefix delete after writers finish must remove all /target/ keys.
+			cache.DeletePrefix("/target/")
 
 			// Assert
 			for i := range 20 {
 				kTarget := fmt.Sprintf("/target/init_%d", i)
-				_, okTarget := cache.LookUp(kTarget)
+				_, okTarget := cache.Get(kTarget)
 				assert.False(t, okTarget)
 				kKeep := fmt.Sprintf("/keep/init_%d", i)
-				_, okKeep := cache.LookUp(kKeep)
+				_, okKeep := cache.Get(kKeep)
 				assert.True(t, okKeep)
 			}
 
 			for w := range numWriters {
 				for op := range opsPerWriter {
 					key := fmt.Sprintf("/target/w%d_%d", w, op)
-					_, ok := cache.LookUp(key)
+					_, ok := cache.Get(key)
 					assert.False(t, ok)
 				}
 			}
@@ -203,9 +203,9 @@ func TestConcurrency_PrefixErasureAtomicity(t *testing.T) {
 	}
 }
 
-// TestConcurrency_ParallelReadersWithoutChangingOrder verifies concurrent
-// LookUpWithoutChangingOrder calls execute safely and preserve LRU eviction order.
-func TestConcurrency_ParallelReadersWithoutChangingOrder(t *testing.T) {
+// TestConcurrency_ParallelReadersPeek verifies concurrent
+// Peek calls execute safely and preserve LRU eviction order.
+func TestConcurrency_ParallelReadersPeek(t *testing.T) {
 	for _, eng := range allEngines() {
 		t.Run(eng.name, func(t *testing.T) {
 			// Arrange
@@ -220,7 +220,7 @@ func TestConcurrency_ParallelReadersWithoutChangingOrder(t *testing.T) {
 
 			for i := range totalKeys {
 				k := fmt.Sprintf("key_%04d", i)
-				_, err := cache.Insert(k, concValue{id: k, size: 10})
+				_, err := cache.Put(k, concValue{id: k, size: 10})
 				require.NoError(t, err)
 			}
 
@@ -235,7 +235,7 @@ func TestConcurrency_ParallelReadersWithoutChangingOrder(t *testing.T) {
 						if i%2 == 1 {
 							targetKey = fmt.Sprintf("key_%04d", (readerID*17+i)%totalKeys)
 						}
-						_, ok := cache.LookUpWithoutChangingOrder(targetKey)
+						_, ok := cache.Peek(targetKey)
 						if !assert.True(t, ok) {
 							return
 						}
@@ -247,12 +247,12 @@ func TestConcurrency_ParallelReadersWithoutChangingOrder(t *testing.T) {
 			// Fill remaining capacity (50,000 - 2,000 = 48,000 bytes).
 			for i := range 48 {
 				k := fmt.Sprintf("filler_%03d", i)
-				_, err := cache.Insert(k, concValue{id: k, size: 1000})
+				_, err := cache.Put(k, concValue{id: k, size: 1000})
 				require.NoError(t, err)
 			}
 
-			// Next 10-byte insert must evict key_0000 (the untouched LRU tail).
-			evicted, err := cache.Insert("overflow_trigger", concValue{id: "overflow", size: 10})
+			// Next 10-byte write must evict key_0000 (the untouched LRU tail).
+			evicted, err := cache.Put("overflow_trigger", concValue{id: "overflow", size: 10})
 
 			// Assert
 			require.NoError(t, err)
@@ -285,11 +285,11 @@ func TestConcurrency_EvictionThrashingWithInvariants(t *testing.T) {
 					defer wg.Done()
 					for i := range opsPerWorker {
 						key := fmt.Sprintf("inv/p%d/item_%d", i%5, i)
-						evicted, err := cache.Insert(key, concValue{id: key, size: 10})
+						evicted, err := cache.Put(key, concValue{id: key, size: 10})
 						assert.NoError(t, err)
 						totalEvictions.Add(int64(len(evicted)))
 						if i%20 == 0 {
-							cache.EraseEntriesWithGivenPrefix(fmt.Sprintf("inv/p%d/", i%5))
+							cache.DeletePrefix(fmt.Sprintf("inv/p%d/", i%5))
 						}
 					}
 				}()
@@ -303,8 +303,8 @@ func TestConcurrency_EvictionThrashingWithInvariants(t *testing.T) {
 	}
 }
 
-// TestConcurrency_MemoryPressureCompactionAndEviction exercises concurrent reads, inserts,
-// updates, size updates, erasures, prefix deletions, and explicit/automatic compactions
+// TestConcurrency_MemoryPressureCompactionAndEviction exercises concurrent reads, writes,
+// replacements, size updates, deletions, prefix deletions, and explicit/automatic compactions
 // while memory pressure dynamically oscillates across normal, moderate, and critical tiers
 // with WithInvariantChecking(true) enabled.
 func TestConcurrency_MemoryPressureCompactionAndEviction(t *testing.T) {
@@ -367,30 +367,30 @@ func TestConcurrency_MemoryPressureCompactionAndEviction(t *testing.T) {
 
 						switch {
 						case op < 30:
-							_, err := cache.Insert(key, concValue{id: key, size: 10})
+							_, err := cache.Put(key, concValue{id: key, size: 10})
 							if err != nil {
 								assert.ErrorIs(t, err, lru.ErrInvalidEntrySize)
 							}
 						case op < 50:
-							_, _ = cache.LookUp(key)
+							_, _ = cache.Get(key)
 						case op < 68:
-							_, _ = cache.LookUpWithoutChangingOrder(key)
+							_, _ = cache.Peek(key)
 						case op < 76:
-							err := cache.UpdateWithoutChangingOrder(key, concValue{id: key + "_u", size: 10})
+							err := cache.Replace(key, concValue{id: key + "_u", size: 10})
 							if err != nil {
 								assert.ErrorIs(t, err, lru.ErrEntryNotExist)
 							}
 						case op < 84:
 							sz := uint64(5 + (step%2)*10) // 5 or 15
-							err := cache.UpdateWithoutChangingOrder(key, concValue{id: key + "_sz", size: sz})
+							err := cache.Replace(key, concValue{id: key + "_sz", size: sz})
 							if err != nil {
 								assert.ErrorIs(t, err, lru.ErrEntryNotExist)
 							}
 						case op < 90:
-							_, _ = cache.Erase(key)
+							_, _ = cache.Delete(key)
 						case op < 95:
 							prefix := fmt.Sprintf("mp_dir_%02d/", dirIdx)
-							cache.EraseEntriesWithGivenPrefix(prefix)
+							cache.DeletePrefix(prefix)
 						case op < 98:
 							reclaimer.Compact()
 						default:

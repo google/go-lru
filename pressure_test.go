@@ -26,7 +26,7 @@ import (
 )
 
 func hasKey[V any](c Cache[V], key string) bool {
-	_, ok := c.LookUpWithoutChangingOrder(key)
+	_, ok := c.Peek(key)
 	return ok
 }
 
@@ -44,11 +44,11 @@ func TestPressure_CriticalPressureSheddingAndZeroSizeRetention(t *testing.T) {
 					WithEvictionRetentionRatio(0.50),
 				).(PressureAwareCache[testData])
 
-				// Insert 1 positive-size entry (60B) at LRU tail, followed by 50 zero-size entries toward MRU.
-				_, err := cache.Insert("lru_60", testData{value: 1, dataSize: 60})
+				// Put 1 positive-size entry (60B) at LRU tail, followed by 50 zero-size entries toward MRU.
+				_, err := cache.Put("lru_60", testData{value: 1, dataSize: 60})
 				require.NoError(t, err)
 				for i := range 50 {
-					_, err = cache.Insert("zero_"+string(rune('A'+i)), testData{value: 0, dataSize: 0})
+					_, err = cache.Put("zero_"+string(rune('A'+i)), testData{value: 0, dataSize: 0})
 					require.NoError(t, err)
 				}
 
@@ -75,10 +75,10 @@ func TestPressure_CriticalPressureSheddingAndZeroSizeRetention(t *testing.T) {
 				).(PressureAwareCache[testData])
 
 				for i := range 100 {
-					_, err := cache.Insert(fmt.Sprintf("z-%03d", i), testData{value: 0, dataSize: 0})
+					_, err := cache.Put(fmt.Sprintf("z-%03d", i), testData{value: 0, dataSize: 0})
 					require.NoError(t, err)
 				}
-				_, err := cache.Insert("one_byte", testData{value: 1, dataSize: 1})
+				_, err := cache.Put("one_byte", testData{value: 1, dataSize: 1})
 				require.NoError(t, err)
 
 				// Act: Critical pressure must shed ~50 zero-size entries even though currentSize == 1 <= targetSize (50).
@@ -101,10 +101,10 @@ func TestPressure_CriticalPressureSheddingAndZeroSizeRetention(t *testing.T) {
 				).(PressureAwareCache[testData])
 
 				for i := range 10 {
-					_, err := cache.Insert(fmt.Sprintf("z-%02d", i), testData{value: 0, dataSize: 0})
+					_, err := cache.Put(fmt.Sprintf("z-%02d", i), testData{value: 0, dataSize: 0})
 					require.NoError(t, err)
 				}
-				_, err := cache.Insert("mru_60", testData{value: 1, dataSize: 60})
+				_, err := cache.Put("mru_60", testData{value: 1, dataSize: 60})
 				require.NoError(t, err)
 
 				// Act: Critical pressure (targetSize = 50, targetLen = 5) must shed mru_60 and retain 5 zero-size entries.
@@ -127,10 +127,10 @@ func TestPressure_CriticalPressureSheddingAndZeroSizeRetention(t *testing.T) {
 					WithEvictionRetentionRatio(0.50),
 				)
 
-				// Act: Insert 100 zero-size entries via foreground Insert under critical pressure.
+				// Act: Put 100 zero-size entries via foreground Put under critical pressure.
 				totalEvicted := 0
 				for i := range 100 {
-					evicted, err := cache.Insert(fmt.Sprintf("fg_zero_%03d", i), testData{value: 0, dataSize: 0})
+					evicted, err := cache.Put(fmt.Sprintf("fg_zero_%03d", i), testData{value: 0, dataSize: 0})
 					require.NoError(t, err)
 					totalEvicted += len(evicted)
 				}
@@ -142,7 +142,7 @@ func TestPressure_CriticalPressureSheddingAndZeroSizeRetention(t *testing.T) {
 			})
 
 			t.Run("PositiveTailPlusZeroSizeEntriesShedTogether", func(t *testing.T) {
-				// Arrange: Insert 1 entry of 51B at tail (targetSize = 50B) followed by 100 zero-size entries.
+				// Arrange: Put 1 entry of 51B at tail (targetSize = 50B) followed by 100 zero-size entries.
 				pressure := 0.0
 				cache := b.fn(
 					100,
@@ -152,10 +152,10 @@ func TestPressure_CriticalPressureSheddingAndZeroSizeRetention(t *testing.T) {
 					WithEvictionRetentionRatio(0.50),
 				).(PressureAwareCache[testData])
 
-				_, err := cache.Insert("tail_51", testData{value: 1, dataSize: 51})
+				_, err := cache.Put("tail_51", testData{value: 1, dataSize: 51})
 				require.NoError(t, err)
 				for i := range 100 {
-					_, err = cache.Insert(fmt.Sprintf("z_%03d", i), testData{value: 0, dataSize: 0})
+					_, err = cache.Put(fmt.Sprintf("z_%03d", i), testData{value: 0, dataSize: 0})
 					require.NoError(t, err)
 				}
 
@@ -182,12 +182,12 @@ func TestPressure_CriticalPressureSheddingAndZeroSizeRetention(t *testing.T) {
 				).(PressureAwareCache[testData])
 
 				for i := range 50 {
-					_, err := cache.Insert(fmt.Sprintf("pos_%02d", i), testData{value: 1, dataSize: 10})
+					_, err := cache.Put(fmt.Sprintf("pos_%02d", i), testData{value: 1, dataSize: 10})
 					require.NoError(t, err)
 				}
-				_, err := cache.Insert("zero_1", testData{value: 0, dataSize: 0})
+				_, err := cache.Put("zero_1", testData{value: 0, dataSize: 0})
 				require.NoError(t, err)
-				_, err = cache.Insert("zero_2", testData{value: 0, dataSize: 0})
+				_, err = cache.Put("zero_2", testData{value: 0, dataSize: 0})
 				require.NoError(t, err)
 
 				// Act: Invoke EvaluateMemoryPressure() 6 times under sustained critical pressure (0.95).
@@ -221,13 +221,13 @@ func TestPressure_CriticalPressureSheddingAndZeroSizeRetention(t *testing.T) {
 				).(PressureAwareCache[testData])
 
 				for i := range 1000 {
-					_, err := cache.Insert(fmt.Sprintf("z_%04d", i), testData{value: 0, dataSize: 0})
+					_, err := cache.Put(fmt.Sprintf("z_%04d", i), testData{value: 0, dataSize: 0})
 					require.NoError(t, err)
 				}
-				_, err := cache.Insert("p_seed", testData{value: 1, dataSize: 1})
+				_, err := cache.Put("p_seed", testData{value: 1, dataSize: 1})
 				require.NoError(t, err)
 				for i := range 500 {
-					_, err = cache.Insert(fmt.Sprintf("p_%04d", i), testData{value: 1, dataSize: 1})
+					_, err = cache.Put(fmt.Sprintf("p_%04d", i), testData{value: 1, dataSize: 1})
 					require.NoError(t, err)
 				}
 
@@ -239,7 +239,7 @@ func TestPressure_CriticalPressureSheddingAndZeroSizeRetention(t *testing.T) {
 
 				// Grow the MRU entry by +100B under critical pressure (bringing currentSize to 600B > targetSize 500B),
 				// which sheds 100x1B entries ("p_0000".."p_0099") past the 500 retained zero-size tail entries in a single pass.
-				err = cache.UpdateWithoutChangingOrder("p_0499", testData{value: 1, dataSize: 101})
+				err = cache.Replace("p_0499", testData{value: 1, dataSize: 101})
 				require.NoError(t, err)
 
 				// Assert: All 500 retained zero-size tail entries survive while the 100 oldest 1B entries were evicted.
@@ -257,7 +257,7 @@ func TestPressure_CriticalPressureSheddingAndZeroSizeRetention(t *testing.T) {
 func TestPressure_ForegroundMutations(t *testing.T) {
 	for _, b := range testBackends() {
 		t.Run(b.name, func(t *testing.T) {
-			t.Run("ForegroundInsertShedsOldestEntriesAcrossAllBackends", func(t *testing.T) {
+			t.Run("ForegroundPutShedsOldestEntriesAcrossAllBackends", func(t *testing.T) {
 				// Arrange: Configure critical pressure (0.95) and 50% retention (targetSize = 50B).
 				cache := b.fn(
 					100,
@@ -266,14 +266,14 @@ func TestPressure_ForegroundMutations(t *testing.T) {
 					WithEvictionRetentionRatio(0.50),
 				)
 
-				// Act: Insert 4 entries of 20B each (80B total > 50B targetSize).
-				_, err := cache.Insert("k1", testData{value: 1, dataSize: 20})
+				// Act: Put 4 entries of 20B each (80B total > 50B targetSize).
+				_, err := cache.Put("k1", testData{value: 1, dataSize: 20})
 				require.NoError(t, err)
-				_, err = cache.Insert("k2", testData{value: 2, dataSize: 20})
+				_, err = cache.Put("k2", testData{value: 2, dataSize: 20})
 				require.NoError(t, err)
-				_, err = cache.Insert("k3", testData{value: 3, dataSize: 20})
+				_, err = cache.Put("k3", testData{value: 3, dataSize: 20})
 				require.NoError(t, err)
-				_, err = cache.Insert("k4", testData{value: 4, dataSize: 20})
+				_, err = cache.Put("k4", testData{value: 4, dataSize: 20})
 				require.NoError(t, err)
 
 				// Assert: Foreground pressure reclamation sheds oldest entries (k1, k2) across all 3 backends.
@@ -283,8 +283,8 @@ func TestPressure_ForegroundMutations(t *testing.T) {
 				assert.True(t, hasKey(cache, "k4"))
 			})
 
-			t.Run("ForegroundEraseTriggersTier2SheddingOfRemainingExcess", func(t *testing.T) {
-				// Arrange: Insert 4 entries of 20B (80B total) at 0.0 pressure, then raise pressure to 0.95 (targetSize = 50B).
+			t.Run("ForegroundDeleteTriggersTier2SheddingOfRemainingExcess", func(t *testing.T) {
+				// Arrange: Put 4 entries of 20B (80B total) at 0.0 pressure, then raise pressure to 0.95 (targetSize = 50B).
 				pressure := 0.0
 				cache := b.fn(
 					100,
@@ -294,27 +294,27 @@ func TestPressure_ForegroundMutations(t *testing.T) {
 					WithEvictionRetentionRatio(0.50),
 				)
 
-				_, err := cache.Insert("p/1", testData{value: 1, dataSize: 20})
+				_, err := cache.Put("p/1", testData{value: 1, dataSize: 20})
 				require.NoError(t, err)
-				_, err = cache.Insert("p/2", testData{value: 2, dataSize: 20})
+				_, err = cache.Put("p/2", testData{value: 2, dataSize: 20})
 				require.NoError(t, err)
-				_, err = cache.Insert("other/3", testData{value: 3, dataSize: 20})
+				_, err = cache.Put("other/3", testData{value: 3, dataSize: 20})
 				require.NoError(t, err)
-				_, err = cache.Insert("other/4", testData{value: 4, dataSize: 20})
+				_, err = cache.Put("other/4", testData{value: 4, dataSize: 20})
 				require.NoError(t, err)
 
-				// Act: Erase "other/4" (leaving 60B > targetSize 50B) under 0.95 critical pressure.
+				// Act: Delete "other/4" (leaving 60B > targetSize 50B) under 0.95 critical pressure.
 				pressure = 0.95
-				_, ok := cache.Erase("other/4")
+				_, ok := cache.Delete("other/4")
 
-				// Assert: Foreground Erase also triggers Tier 2 shedding of "p/1" (oldest 20B) so currentSize drops to 40B <= 50B.
+				// Assert: Foreground Delete also triggers Tier 2 shedding of "p/1" (oldest 20B) so currentSize drops to 40B <= 50B.
 				require.True(t, ok)
 				assert.False(t, hasKey(cache, "p/1"))
 				assert.True(t, hasKey(cache, "p/2"))
 				assert.True(t, hasKey(cache, "other/3"))
 			})
 
-			t.Run("UpdateWithoutChangingOrderStrictLRUEvictsOldestTailEntry", func(t *testing.T) {
+			t.Run("ReplaceStrictLRUEvictsOldestTailEntry", func(t *testing.T) {
 				// Arrange: k1 (20B) at LRU tail, k2 (30B) at MRU head, maxSize = 100, targetSize = 50.
 				pressure := 0.10
 				cache := b.fn(
@@ -325,14 +325,14 @@ func TestPressure_ForegroundMutations(t *testing.T) {
 					WithEvictionRetentionRatio(0.50),
 				)
 
-				_, err := cache.Insert("k1", testData{value: 1, dataSize: 20})
+				_, err := cache.Put("k1", testData{value: 1, dataSize: 20})
 				require.NoError(t, err)
-				_, err = cache.Insert("k2", testData{value: 2, dataSize: 30})
+				_, err = cache.Put("k2", testData{value: 2, dataSize: 30})
 				require.NoError(t, err)
 
 				// Act: Raise pressure to 0.95 and grow LRU tail entry k1 by +10 (20 -> 30, currentSize = 60 > 50).
 				pressure = 0.95
-				err = cache.UpdateWithoutChangingOrder("k1", testData{value: 1, dataSize: 30})
+				err = cache.Replace("k1", testData{value: 1, dataSize: 30})
 
 				// Assert: Strict LRU eviction order must evict k1 (oldest at LRU tail) and retain k2 (newest at MRU head).
 				require.NoError(t, err)
@@ -350,12 +350,12 @@ func TestPressure_ForegroundMutations(t *testing.T) {
 					probe.Option(),
 				).(PressureAwareCache[testData])
 
-				// Act: Insert a single 800B entry (> targetSize 500B). Because it is the protected MRU head
+				// Act: Put a single 800B entry (> targetSize 500B). Because it is the protected MRU head
 				// and there are no older entries or dirty index buckets, 0 evictions and 0 compactions occur.
 				var evicted []testData
 				var err error
 				advanced := observeEpochAdvance(t, probe, cache, func() {
-					evicted, err = cache.Insert("protected_jumbo", testData{value: 1, dataSize: 800})
+					evicted, err = cache.Put("protected_jumbo", testData{value: 1, dataSize: 800})
 				})
 
 				// Assert: The reclamation epoch must not advance because no memory was evicted or compacted.
@@ -364,20 +364,20 @@ func TestPressure_ForegroundMutations(t *testing.T) {
 				assert.False(t, advanced)
 			})
 
-			t.Run("UpdateWithoutChangingOrderWithZeroDeltaProtectsMRUHeadUnderCriticalPressure", func(t *testing.T) {
-				// Arrange: Insert "head" (800B > targetSize 500B) under critical pressure (0.95).
+			t.Run("ReplaceWithZeroDeltaProtectsMRUHeadUnderCriticalPressure", func(t *testing.T) {
+				// Arrange: Put "head" (800B > targetSize 500B) under critical pressure (0.95).
 				cache := b.fn(
 					1000,
 					WithInvariantChecking(true),
 					WithEvictionRetentionRatio(0.50),
 					WithPressureFunc(func() float64 { return 0.95 }),
 				)
-				_, err := cache.Insert("head", testData{value: 1, dataSize: 800})
+				_, err := cache.Put("head", testData{value: 1, dataSize: 800})
 				require.NoError(t, err)
 				require.True(t, hasKey(cache, "head"))
 
-				// Act: Call UpdateWithoutChangingOrder("head", 800B) on the MRU head entry.
-				err = cache.UpdateWithoutChangingOrder("head", testData{value: 2, dataSize: 800})
+				// Act: Call Replace("head", 800B) on the MRU head entry.
+				err = cache.Replace("head", testData{value: 2, dataSize: 800})
 
 				// Assert: Updating the MRU head with sizeDelta == 0 must protect the MRU head just like sizeDelta > 0.
 				require.NoError(t, err)
@@ -392,20 +392,20 @@ func TestPressure_ForegroundMutations(t *testing.T) {
 					WithInvariantChecking(true),
 					probe.Option(),
 				).(PressureAwareCache[testData])
-				_, err := cache.Insert("z_erase", testData{value: 0, dataSize: 0})
+				_, err := cache.Put("z_erase", testData{value: 0, dataSize: 0})
 				require.NoError(t, err)
-				_, err = cache.Insert("z_prefix/1", testData{value: 0, dataSize: 0})
+				_, err = cache.Put("z_prefix/1", testData{value: 0, dataSize: 0})
 				require.NoError(t, err)
-				_, err = cache.Insert("z_self_evict", testData{value: 0, dataSize: 0})
+				_, err = cache.Put("z_self_evict", testData{value: 0, dataSize: 0})
 				require.NoError(t, err)
-				_, err = cache.Insert("mru_full", testData{value: 1, dataSize: 100})
+				_, err = cache.Put("mru_full", testData{value: 1, dataSize: 100})
 				require.NoError(t, err)
 
-				// Act: Erase a 0B entry, prefix-erase a 0B entry, and self-evict a 0B entry via UpdateWithoutChangingOrder (+10B when avail == 0).
+				// Act: Delete a 0B entry, prefix-erase a 0B entry, and self-evict a 0B entry via Replace (+10B when avail == 0).
 				advanced := observeEpochAdvance(t, probe, cache, func() {
-					_, _ = cache.Erase("z_erase")
-					cache.EraseEntriesWithGivenPrefix("z_prefix/")
-					err = cache.UpdateWithoutChangingOrder("z_self_evict", testData{value: 1, dataSize: 10})
+					_, _ = cache.Delete("z_erase")
+					cache.DeletePrefix("z_prefix/")
+					err = cache.Replace("z_self_evict", testData{value: 1, dataSize: 10})
 				})
 				require.NoError(t, err)
 
@@ -414,8 +414,8 @@ func TestPressure_ForegroundMutations(t *testing.T) {
 				assert.True(t, hasKey(cache, "mru_full"))
 			})
 
-			t.Run("UpdateWithoutChangingOrderNetByteGrowthUnderTier1PressureDoesNotAdvanceReclaimEpoch", func(t *testing.T) {
-				// Arrange: Insert "small" (10B) and "target" (20B) in a 100B cache under Tier 1 pressure (0.80).
+			t.Run("ReplaceNetByteGrowthUnderTier1PressureDoesNotAdvanceReclaimEpoch", func(t *testing.T) {
+				// Arrange: Put "small" (10B) and "target" (20B) in a 100B cache under Tier 1 pressure (0.80).
 				probe := newPressureProbe(0.80)
 				cache := b.fn(
 					100,
@@ -423,14 +423,14 @@ func TestPressure_ForegroundMutations(t *testing.T) {
 					probe.Option(),
 				).(PressureAwareCache[testData])
 
-				_, err := cache.Insert("small", testData{value: 1, dataSize: 10})
+				_, err := cache.Put("small", testData{value: 1, dataSize: 10})
 				require.NoError(t, err)
-				_, err = cache.Insert("target", testData{value: 1, dataSize: 20})
+				_, err = cache.Put("target", testData{value: 1, dataSize: 20})
 				require.NoError(t, err)
 
 				// Act: Grow "target" by +80B (to 100B). This evicts "small" (10B), so net currentSize increases from 30B to 100B.
 				advanced := observeEpochAdvance(t, probe, cache, func() {
-					err = cache.UpdateWithoutChangingOrder("target", testData{value: 1, dataSize: 100})
+					err = cache.Replace("target", testData{value: 1, dataSize: 100})
 				})
 
 				// Assert: Because net cache memory grew from 30B to 100B and no compaction occurred, the reclamation epoch must not advance.
@@ -438,7 +438,7 @@ func TestPressure_ForegroundMutations(t *testing.T) {
 				assert.False(t, advanced)
 				assert.False(t, hasKey(cache, "small"))
 				require.True(t, hasKey(cache, "target"))
-				assert.NoError(t, cache.UpdateWithoutChangingOrder("target", testData{value: 2, dataSize: 100}))
+				assert.NoError(t, cache.Replace("target", testData{value: 2, dataSize: 100}))
 			})
 		})
 	}
@@ -450,26 +450,26 @@ func TestPressure_KeyAndPrefixMissesDoNotEvictLiveEntriesUnderCriticalPressure(t
 		act  func(t *testing.T, c Cache[testData])
 	}{
 		{
-			name: "EraseMiss",
+			name: "DeleteMiss",
 			act: func(t *testing.T, c Cache[testData]) {
 				t.Helper()
-				_, ok := c.Erase("absent_key")
+				_, ok := c.Delete("absent_key")
 				assert.False(t, ok)
 			},
 		},
 		{
-			name: "UpdateWithoutChangingOrderMiss",
+			name: "ReplaceMiss",
 			act: func(t *testing.T, c Cache[testData]) {
 				t.Helper()
-				err := c.UpdateWithoutChangingOrder("absent_key", testData{value: 1, dataSize: 10})
+				err := c.Replace("absent_key", testData{value: 1, dataSize: 10})
 				assert.ErrorIs(t, err, ErrEntryNotExist)
 			},
 		},
 		{
-			name: "EraseEntriesWithGivenPrefixMiss",
+			name: "DeletePrefixMiss",
 			act: func(t *testing.T, c Cache[testData]) {
 				t.Helper()
-				c.EraseEntriesWithGivenPrefix("absent_prefix/")
+				c.DeletePrefix("absent_prefix/")
 			},
 		},
 	}
@@ -488,10 +488,10 @@ func TestPressure_KeyAndPrefixMissesDoNotEvictLiveEntriesUnderCriticalPressure(t
 						WithPressureFunc(func() float64 { return pressure }),
 					)
 
-					_, err := cache.Insert("victim", testData{value: 1, dataSize: 300})
+					_, err := cache.Put("victim", testData{value: 1, dataSize: 300})
 					require.NoError(t, err)
 
-					_, err = cache.Insert("protected_head", testData{value: 2, dataSize: 500})
+					_, err = cache.Put("protected_head", testData{value: 2, dataSize: 500})
 					require.NoError(t, err)
 					require.True(t, hasKey(cache, "victim"))
 					require.True(t, hasKey(cache, "protected_head"))
@@ -512,7 +512,7 @@ func TestPressure_KeyAndPrefixMissesDoNotEvictLiveEntriesUnderCriticalPressure(t
 func TestPressure_ShedAndCompactZeroSizeWatermarkAccuracyWhenTargetLenStopsShedding(t *testing.T) {
 	for _, b := range testBackends() {
 		t.Run(b.name, func(t *testing.T) {
-			t.Run("ProtectedMRUHeadInsertThenEvaluate", func(t *testing.T) {
+			t.Run("ProtectedMRUHeadPutThenEvaluate", func(t *testing.T) {
 				// Arrange: Populate 100B cache at 0.10 pressure with 5x8B positive-size entries (40B total)
 				// followed by 4 zero-size entries.
 				pressure := 0.10
@@ -525,17 +525,17 @@ func TestPressure_ShedAndCompactZeroSizeWatermarkAccuracyWhenTargetLenStopsShedd
 				).(PressureAwareCache[testData])
 
 				for i := range 5 {
-					_, err := cache.Insert(fmt.Sprintf("p8_%d", i), testData{value: 1, dataSize: 8})
+					_, err := cache.Put(fmt.Sprintf("p8_%d", i), testData{value: 1, dataSize: 8})
 					require.NoError(t, err)
 				}
 				for i := range 4 {
-					_, err := cache.Insert(fmt.Sprintf("z_%d", i), testData{value: 0, dataSize: 0})
+					_, err := cache.Put(fmt.Sprintf("z_%d", i), testData{value: 0, dataSize: 0})
 					require.NoError(t, err)
 				}
 
 				// Act: Under critical pressure (0.95), insert "mru_60" (60B), then call EvaluateMemoryPressure().
 				pressure = 0.95
-				evicted1, err := cache.Insert("mru_60", testData{value: 1, dataSize: 60})
+				evicted1, err := cache.Put("mru_60", testData{value: 1, dataSize: 60})
 				require.NoError(t, err)
 				require.Len(t, evicted1, 5)
 
@@ -553,11 +553,11 @@ func TestPressure_ShedAndCompactZeroSizeWatermarkAccuracyWhenTargetLenStopsShedd
 	}
 }
 
-func TestPressure_EraseEmptyPrefixInvalidationAndEmptyNoOp(t *testing.T) {
+func TestPressure_DeleteEmptyPrefixInvalidationAndEmptyNoOp(t *testing.T) {
 	for _, b := range testBackends() {
 		t.Run(b.name, func(t *testing.T) {
-			t.Run("NonEmptyCacheEraseEmptyPrefixInvalidatesStaleCachedPressure", func(t *testing.T) {
-				// Arrange: Populate cache and seed critical pressure (0.95) before resetting via EraseEntriesWithGivenPrefix("").
+			t.Run("NonEmptyCacheDeleteEmptyPrefixInvalidatesStaleCachedPressure", func(t *testing.T) {
+				// Arrange: Populate cache and seed critical pressure (0.95) before resetting via DeletePrefix("").
 				probe := newPressureProbe(0.10)
 				c := b.fn(
 					200,
@@ -566,30 +566,30 @@ func TestPressure_EraseEmptyPrefixInvalidationAndEmptyNoOp(t *testing.T) {
 					probe.Option(),
 				).(PressureAwareCache[testData])
 
-				_, err := c.Insert("pre_1", testData{value: 1, dataSize: 40})
+				_, err := c.Put("pre_1", testData{value: 1, dataSize: 40})
 				require.NoError(t, err)
 
 				probe.Set(0.95)
 				_ = c.EvaluateMemoryPressure()
 				probe.Set(0.10)
 
-				// Act: EraseEntriesWithGivenPrefix("") on a non-empty cache must advance the reclamation epoch and invalidate cached pressure.
+				// Act: DeletePrefix("") on a non-empty cache must advance the reclamation epoch and invalidate cached pressure.
 				advanced := observeEpochAdvance(t, probe, c, func() {
-					c.EraseEntriesWithGivenPrefix("")
+					c.DeletePrefix("")
 				})
 
 				// Assert
 				assert.True(t, advanced)
-				_, err = c.Insert("post_1", testData{value: 1, dataSize: 60})
+				_, err = c.Put("post_1", testData{value: 1, dataSize: 60})
 				require.NoError(t, err)
-				_, err = c.Insert("post_2", testData{value: 2, dataSize: 60})
+				_, err = c.Put("post_2", testData{value: 2, dataSize: 60})
 				require.NoError(t, err)
 				assert.True(t, hasKey(c, "post_1"))
 				assert.True(t, hasKey(c, "post_2"))
 			})
 
 			t.Run("InFlightSampleAcrossReclamationDoesNotClearPressureNeedsRefresh", func(t *testing.T) {
-				// Arrange: Goroutine 1 starts sampling 0.95 before EraseEntriesWithGivenPrefix("") reclaims the cache
+				// Arrange: Goroutine 1 starts sampling 0.95 before DeletePrefix("") reclaims the cache
 				// and pressure returns to 0.10.
 				var blockSample atomic.Bool
 				var currentPressure atomic.Uint64
@@ -611,7 +611,7 @@ func TestPressure_EraseEmptyPrefixInvalidationAndEmptyNoOp(t *testing.T) {
 					}),
 				).(PressureAwareCache[testData])
 
-				_, err := c.Insert("seed", testData{value: 1, dataSize: 20})
+				_, err := c.Put("seed", testData{value: 1, dataSize: 20})
 				require.NoError(t, err)
 
 				blockSample.Store(true)
@@ -623,14 +623,14 @@ func TestPressure_EraseEmptyPrefixInvalidationAndEmptyNoOp(t *testing.T) {
 				<-inSample
 
 				// Act: Reclaim all entries while the stale 0.95 sample is in-flight, then release the sampler.
-				c.EraseEntriesWithGivenPrefix("")
+				c.DeletePrefix("")
 				close(releaseSample)
 				<-done
 
 				// Assert: Stale pre-reclamation 0.95 sample was rejected; subsequent inserts above targetSize (50B) at 0.10 survive.
-				_, err = c.Insert("k1", testData{value: 1, dataSize: 40})
+				_, err = c.Put("k1", testData{value: 1, dataSize: 40})
 				require.NoError(t, err)
-				_, err = c.Insert("k2", testData{value: 2, dataSize: 40})
+				_, err = c.Put("k2", testData{value: 2, dataSize: 40})
 				require.NoError(t, err)
 				assert.True(t, hasKey(c, "k1"))
 				assert.True(t, hasKey(c, "k2"))
@@ -646,18 +646,18 @@ func TestPressure_EmptyPrefixOnAlreadyEmptyCacheDoesNotInvalidate(t *testing.T) 
 				// Arrange: Create a fresh empty cache.
 				cache := b.fn(1000, WithInvariantChecking(true))
 
-				// Act & Assert: Calling EraseEntriesWithGivenPrefix("") on an already-empty cache must allocate 0 objects.
+				// Act & Assert: Calling DeletePrefix("") on an already-empty cache must allocate 0 objects.
 				allocs := testing.AllocsPerRun(20, func() {
-					cache.EraseEntriesWithGivenPrefix("")
+					cache.DeletePrefix("")
 				})
 				assert.Zero(t, allocs,
-					"%s.EraseEntriesWithGivenPrefix(\"\") on an already-empty cache allocated memory on every call", b.name)
+					"%s.DeletePrefix(\"\") on an already-empty cache allocated memory on every call", b.name)
 			})
 
 			t.Run("DoesNotForceConcurrentWriterToResamplePressureOnEmptyCache", func(t *testing.T) {
-				// Arrange: Empty cache where Goroutine A samples healthy 0.10 pressure for Insert,
+				// Arrange: Empty cache where Goroutine A samples healthy 0.10 pressure for Put,
 				// and while Goroutine A is about to return from PressureFunc, Goroutine B calls
-				// EraseEntriesWithGivenPrefix("") on the already-empty cache.
+				// DeletePrefix("") on the already-empty cache.
 				var cache Cache[testData]
 				var writerSamples atomic.Int32
 				var interceptWriter atomic.Bool
@@ -684,20 +684,20 @@ func TestPressure_EmptyPrefixOnAlreadyEmptyCacheDoesNotInvalidate(t *testing.T) 
 				interceptWriter.Store(true)
 				insertDone := make(chan error, 1)
 				go func() {
-					_, err := cache.Insert("k1", testData{value: 1, dataSize: 10})
+					_, err := cache.Put("k1", testData{value: 1, dataSize: 10})
 					insertDone <- err
 				}()
 				<-writerInSample
 
-				// Act: Call EraseEntriesWithGivenPrefix("") on the already-empty cache while Goroutine A is in flight.
-				cache.EraseEntriesWithGivenPrefix("")
+				// Act: Call DeletePrefix("") on the already-empty cache while Goroutine A is in flight.
+				cache.DeletePrefix("")
 				close(releaseWriter)
 				require.NoError(t, <-insertDone)
 
-				// Assert: Because the cache was already empty and clean, EraseEntriesWithGivenPrefix("") must not
+				// Assert: Because the cache was already empty and clean, DeletePrefix("") must not
 				// advance the reclamation epoch or force Goroutine A to re-run PressureFunc.
 				assert.Equal(t, int32(1), writerSamples.Load(),
-					"%s.EraseEntriesWithGivenPrefix(\"\") on an already-empty cache advanced the reclamation epoch and forced concurrent Insert to re-sample PressureFunc", b.name)
+					"%s.DeletePrefix(\"\") on an already-empty cache advanced the reclamation epoch and forced concurrent Put to re-sample PressureFunc", b.name)
 			})
 		})
 	}
@@ -727,13 +727,13 @@ func TestPressure_ConcurrentColdStartZeroPressureAndPostReclamationSampling(t *t
 					WithEvictionRetentionRatio(0.50),
 				).(PressureAwareCache[testData])
 
-				_, err := cache.Insert("k1", testData{value: 1, dataSize: 40})
+				_, err := cache.Put("k1", testData{value: 1, dataSize: 40})
 				require.NoError(t, err)
-				_, err = cache.Insert("k2", testData{value: 2, dataSize: 40})
+				_, err = cache.Put("k2", testData{value: 2, dataSize: 40})
 				require.NoError(t, err)
-				_, err = cache.Insert("tmp", testData{value: 3, dataSize: 10})
+				_, err = cache.Put("tmp", testData{value: 3, dataSize: 10})
 				require.NoError(t, err)
-				_, _ = cache.Erase("tmp")
+				_, _ = cache.Delete("tmp")
 
 				// Invalidate cached pressure via Compact() to simulate cold uninitialized pressure before spike.
 				cache.Compact()
@@ -777,9 +777,9 @@ func TestPressure_ConcurrentColdStartZeroPressureAndPostReclamationSampling(t *t
 					WithEvictionRetentionRatio(0.50),
 				).(PressureAwareCache[testData])
 
-				_, err := cache.Insert("k0", testData{value: 0, dataSize: 40})
+				_, err := cache.Put("k0", testData{value: 0, dataSize: 40})
 				require.NoError(t, err)
-				_, err = cache.Insert("k1", testData{value: 1, dataSize: 40})
+				_, err = cache.Put("k1", testData{value: 1, dataSize: 40})
 				require.NoError(t, err)
 
 				blockFirst.Store(true)
@@ -818,9 +818,9 @@ func TestPressure_ConcurrentColdStartZeroPressureAndPostReclamationSampling(t *t
 					WithEvictionRetentionRatio(0.50),
 				).(PressureAwareCache[testData])
 
-				_, err := cache.Insert("k0", testData{value: 0, dataSize: 40})
+				_, err := cache.Put("k0", testData{value: 0, dataSize: 40})
 				require.NoError(t, err)
-				_, err = cache.Insert("k1", testData{value: 1, dataSize: 40})
+				_, err = cache.Put("k1", testData{value: 1, dataSize: 40})
 				require.NoError(t, err)
 
 				// Act: Enable re-entrant EvaluateMemoryPressure() inside PressureFunc() returning 0.0.
@@ -856,16 +856,16 @@ func TestPressure_ConcurrentColdStartZeroPressureAndPostReclamationSampling(t *t
 
 				// Seed high pressure (0.95) in cachedPressureBits, then reclaim and restore healthy pressure (0.10).
 				_ = cache.EvaluateMemoryPressure()
-				cache.EraseEntriesWithGivenPrefix("")
+				cache.DeletePrefix("")
 				pressureBits.Store(math.Float64bits(0.10))
 
-				_, err := cache.Insert("k1", testData{value: 1, dataSize: 40})
+				_, err := cache.Put("k1", testData{value: 1, dataSize: 40})
 				require.NoError(t, err)
-				_, err = cache.Insert("k2", testData{value: 2, dataSize: 40})
+				_, err = cache.Put("k2", testData{value: 2, dataSize: 40})
 				require.NoError(t, err)
-				_, err = cache.Insert("tmp", testData{value: 3, dataSize: 10})
+				_, err = cache.Put("tmp", testData{value: 3, dataSize: 10})
 				require.NoError(t, err)
-				_, _ = cache.Erase("tmp")
+				_, _ = cache.Delete("tmp")
 				cache.Compact()
 
 				blockFirst.Store(true)
@@ -916,13 +916,13 @@ func TestPressure_EpochInvalidationAndResamplingSynchronization(t *testing.T) {
 					WithEvictionRetentionRatio(0.50),
 				).(PressureAwareCache[testData])
 
-				_, err := cache.Insert("k1", testData{value: 1, dataSize: 40})
+				_, err := cache.Put("k1", testData{value: 1, dataSize: 40})
 				require.NoError(t, err)
-				_, err = cache.Insert("k2", testData{value: 2, dataSize: 40})
+				_, err = cache.Put("k2", testData{value: 2, dataSize: 40})
 				require.NoError(t, err)
 
 				pressureBits.Store(math.Float64bits(0.95))
-				_, err = cache.Insert("k4", testData{value: 4, dataSize: 30})
+				_, err = cache.Put("k4", testData{value: 4, dataSize: 30})
 				require.NoError(t, err)
 				require.False(t, hasKey(cache, "k1"))
 				require.False(t, hasKey(cache, "k2"))
@@ -938,7 +938,7 @@ func TestPressure_EpochInvalidationAndResamplingSynchronization(t *testing.T) {
 				<-entered
 
 				// Act: While Goroutine 1 is in flight, Goroutine 2 inserts k5 and calls EvaluateMemoryPressure().
-				evictedK5, err := cache.Insert("k5", testData{value: 5, dataSize: 30})
+				evictedK5, err := cache.Put("k5", testData{value: 5, dataSize: 30})
 				require.NoError(t, err)
 				evicted2 := cache.EvaluateMemoryPressure()
 				close(release)
@@ -953,7 +953,7 @@ func TestPressure_EpochInvalidationAndResamplingSynchronization(t *testing.T) {
 			})
 
 			t.Run("SampledEpochMismatchResamplesFreshPressureOutsideLock", func(t *testing.T) {
-				// Arrange: Create real reclaimable slack so a concurrent Compact() bumps the reclamation epoch while Insert samples.
+				// Arrange: Create real reclaimable slack so a concurrent Compact() bumps the reclamation epoch while Put samples.
 				inFirstSample := make(chan struct{})
 				proceedSample := make(chan struct{})
 				var armed atomic.Bool
@@ -976,39 +976,39 @@ func TestPressure_EpochInvalidationAndResamplingSynchronization(t *testing.T) {
 					WithEvictionRetentionRatio(0.50),
 				).(PressureAwareCache[testData])
 
-				_, err := cache.Insert("keep_zero", testData{value: 0, dataSize: 0})
+				_, err := cache.Put("keep_zero", testData{value: 0, dataSize: 0})
 				require.NoError(t, err)
-				_, err = cache.Insert("scratch", testData{value: 1, dataSize: 10})
+				_, err = cache.Put("scratch", testData{value: 1, dataSize: 10})
 				require.NoError(t, err)
-				_, ok := cache.Erase("scratch")
+				_, ok := cache.Delete("scratch")
 				require.True(t, ok)
 				trapFirst.Store(true)
 				armed.Store(true)
 
-				doneInsert := make(chan error, 1)
+				donePut := make(chan error, 1)
 				go func() {
-					_, err := cache.Insert("k1", testData{value: 1, dataSize: 60})
-					doneInsert <- err
+					_, err := cache.Put("k1", testData{value: 1, dataSize: 60})
+					donePut <- err
 				}()
 				<-inFirstSample
 
-				// Bump the reclamation epoch via real compaction while Insert's initial pressure sample is in flight.
+				// Bump the reclamation epoch via real compaction while Put's initial pressure sample is in flight.
 				cache.Compact()
 				close(proceedSample)
 
 				// Act
-				err = <-doneInsert
+				err = <-donePut
 				require.NoError(t, err)
-				_, err = cache.Insert("k2", testData{value: 2, dataSize: 20})
+				_, err = cache.Put("k2", testData{value: 2, dataSize: 20})
 				require.NoError(t, err)
 
-				// Assert: Insert re-sampled 0.95 outside lock instead of reading 0.0 from the invalidated pressure cache.
+				// Assert: Put re-sampled 0.95 outside lock instead of reading 0.0 from the invalidated pressure cache.
 				assert.False(t, hasKey(cache, "k1"))
 				assert.True(t, hasKey(cache, "k2"))
 			})
 
-			t.Run("NormalPressureErasePreservesReclaimEpoch", func(t *testing.T) {
-				// Arrange: Insert 3 entries at normal 0.10 pressure (< CompactionThreshold 0.75).
+			t.Run("NormalPressureDeletePreservesReclaimEpoch", func(t *testing.T) {
+				// Arrange: Put 3 entries at normal 0.10 pressure (< CompactionThreshold 0.75).
 				var samples atomic.Int32
 				cache := b.fn(
 					100,
@@ -1019,18 +1019,18 @@ func TestPressure_EpochInvalidationAndResamplingSynchronization(t *testing.T) {
 						return 0.10
 					}),
 				)
-				_, err := cache.Insert("k1", testData{value: 1, dataSize: 20})
+				_, err := cache.Put("k1", testData{value: 1, dataSize: 20})
 				require.NoError(t, err)
-				_, err = cache.Insert("k2", testData{value: 2, dataSize: 40})
+				_, err = cache.Put("k2", testData{value: 2, dataSize: 40})
 				require.NoError(t, err)
-				_, err = cache.Insert("k3", testData{value: 3, dataSize: 40})
+				_, err = cache.Put("k3", testData{value: 3, dataSize: 40})
 				require.NoError(t, err)
 				samples.Store(0)
 
-				// Act: Erase k1 at normal pressure while k2 and k3 (80B > targetSize 50B) remain in the cache.
-				_, ok := cache.Erase("k1")
+				// Act: Delete k1 at normal pressure while k2 and k3 (80B > targetSize 50B) remain in the cache.
+				_, ok := cache.Delete("k1")
 
-				// Assert: Normal-pressure Erase samples once, does not retry or shed remaining entries.
+				// Assert: Normal-pressure Delete samples once, does not retry or shed remaining entries.
 				require.True(t, ok)
 				assert.Equal(t, int32(1), samples.Load())
 				assert.False(t, hasKey(cache, "k1"))
@@ -1061,11 +1061,11 @@ func TestPressure_EpochInvalidationAndResamplingSynchronization(t *testing.T) {
 					WithEvictionRetentionRatio(0.50),
 				).(PressureAwareCache[testData])
 
-				_, err := cache.Insert("seed_1", testData{value: 1, dataSize: 5})
+				_, err := cache.Put("seed_1", testData{value: 1, dataSize: 5})
 				require.NoError(t, err)
-				_, err = cache.Insert("seed_2", testData{value: 2, dataSize: 5})
+				_, err = cache.Put("seed_2", testData{value: 2, dataSize: 5})
 				require.NoError(t, err)
-				_, _ = cache.Erase("seed_1")
+				_, _ = cache.Delete("seed_1")
 
 				pressureBits.Store(math.Float64bits(0.95))
 				blockEval.Store(true)
@@ -1078,9 +1078,9 @@ func TestPressure_EpochInvalidationAndResamplingSynchronization(t *testing.T) {
 
 				pressureBits.Store(math.Float64bits(0.10))
 				cache.Compact()
-				_, err = cache.Insert("live_1", testData{value: 1, dataSize: 40})
+				_, err = cache.Put("live_1", testData{value: 1, dataSize: 40})
 				require.NoError(t, err)
-				_, err = cache.Insert("live_2", testData{value: 2, dataSize: 40})
+				_, err = cache.Put("live_2", testData{value: 2, dataSize: 40})
 				require.NoError(t, err)
 
 				// Act: Release Goroutine A so it acquires c.mu.Lock() in EvaluateMemoryPressure().
@@ -1093,7 +1093,7 @@ func TestPressure_EpochInvalidationAndResamplingSynchronization(t *testing.T) {
 				assert.True(t, hasKey(cache, "live_2"))
 			})
 
-			t.Run("EraseDuringInFlightSamplerInvalidatesReclaimEpoch", func(t *testing.T) {
+			t.Run("DeleteDuringInFlightSamplerInvalidatesReclaimEpoch", func(t *testing.T) {
 				// Arrange
 				var pressureBits atomic.Uint64
 				pressureBits.Store(math.Float64bits(0.10))
@@ -1116,27 +1116,27 @@ func TestPressure_EpochInvalidationAndResamplingSynchronization(t *testing.T) {
 					WithEvictionRetentionRatio(0.50),
 				)
 
-				_, err := cache.Insert("k1", testData{value: 1, dataSize: 40})
+				_, err := cache.Put("k1", testData{value: 1, dataSize: 40})
 				require.NoError(t, err)
-				_, err = cache.Insert("k2", testData{value: 2, dataSize: 40})
+				_, err = cache.Put("k2", testData{value: 2, dataSize: 40})
 				require.NoError(t, err)
-				_, err = cache.Insert("k3", testData{value: 3, dataSize: 10})
+				_, err = cache.Put("k3", testData{value: 3, dataSize: 10})
 				require.NoError(t, err)
 
 				blockSampler.Store(true)
-				doneInsert := make(chan []testData, 1)
+				donePut := make(chan []testData, 1)
 				go func() {
-					ev, _ := cache.Insert("k4", testData{value: 4, dataSize: 20})
-					doneInsert <- ev
+					ev, _ := cache.Put("k4", testData{value: 4, dataSize: 20})
+					donePut <- ev
 				}()
 				<-samplerInFlight
 
 				// Act
-				_, ok := cache.Erase("k1")
+				_, ok := cache.Delete("k1")
 				require.True(t, ok)
 
 				close(releaseSampler)
-				evicted := <-doneInsert
+				evicted := <-donePut
 
 				// Assert
 				assert.Empty(t, evicted)
@@ -1169,11 +1169,11 @@ func TestPressure_EpochInvalidationAndResamplingSynchronization(t *testing.T) {
 					}),
 				).(PressureAwareCache[testData])
 
-				_, err := cache.Insert("k1", testData{value: 1, dataSize: 20})
+				_, err := cache.Put("k1", testData{value: 1, dataSize: 20})
 				require.NoError(t, err)
-				_, err = cache.Insert("k2", testData{value: 2, dataSize: 20})
+				_, err = cache.Put("k2", testData{value: 2, dataSize: 20})
 				require.NoError(t, err)
-				_, _ = cache.Erase("k1")
+				_, _ = cache.Delete("k1")
 				armed.Store(true)
 
 				panicObserved := make(chan any, 1)
@@ -1214,8 +1214,8 @@ func TestPressure_EpochInvalidationAndResamplingSynchronization(t *testing.T) {
 									inChild.Store(false)
 									close(done)
 								}()
-								_, _ = cacheRef.Insert("tmp_item", testData{value: 1, dataSize: 1})
-								cacheRef.EraseEntriesWithGivenPrefix("tmp_")
+								_, _ = cacheRef.Put("tmp_item", testData{value: 1, dataSize: 1})
+								cacheRef.DeletePrefix("tmp_")
 							}()
 							<-done
 						}
@@ -1227,10 +1227,10 @@ func TestPressure_EpochInvalidationAndResamplingSynchronization(t *testing.T) {
 
 				// Act
 				parentSampleCalls.Store(0)
-				_, err := cache.Insert("target_key", testData{value: 1, dataSize: 10})
+				_, err := cache.Put("target_key", testData{value: 1, dataSize: 10})
 				_ = cache.(PressureAwareCache[testData]).EvaluateMemoryPressure()
 
-				// Assert: Both Insert and EvaluateMemoryPressure terminate in bounded retries (3 parent samples each = 6 total).
+				// Assert: Both Put and EvaluateMemoryPressure terminate in bounded retries (3 parent samples each = 6 total).
 				require.NoError(t, err)
 				assert.True(t, hasKey(cache, "target_key"))
 				assert.Equal(t, int32(6), parentSampleCalls.Load())
@@ -1260,7 +1260,7 @@ func TestPressure_EpochInvalidationAndResamplingSynchronization(t *testing.T) {
 					}),
 				).(PressureAwareCache[testData])
 
-				_, err := cache.Insert("survivor", testData{value: 1, dataSize: 600})
+				_, err := cache.Put("survivor", testData{value: 1, dataSize: 600})
 				require.NoError(t, err)
 
 				interceptCaller.Store(true)
@@ -1275,8 +1275,8 @@ func TestPressure_EpochInvalidationAndResamplingSynchronization(t *testing.T) {
 					if attempt == 2 {
 						currentPressure.Store(math.Float64bits(0.10))
 					}
-					_, _ = cache.Insert("tmp", testData{value: 1, dataSize: 10})
-					_, _ = cache.Erase("tmp")
+					_, _ = cache.Put("tmp", testData{value: 1, dataSize: 10})
+					_, _ = cache.Delete("tmp")
 					cache.Compact()
 					if attempt == 2 {
 						_ = cache.EvaluateMemoryPressure()
@@ -1317,7 +1317,7 @@ func TestPressure_ReentrancyAndOverflowSamplerCoordination(t *testing.T) {
 					}),
 				)
 				pac = cache.(PressureAwareCache[testData])
-				_, err := cache.Insert("k1", testData{value: 1, dataSize: 80})
+				_, err := cache.Put("k1", testData{value: 1, dataSize: 80})
 				require.NoError(t, err)
 
 				// Act & Assert: EvaluateMemoryPressure must not infinitely recurse.
@@ -1347,7 +1347,7 @@ func TestPressure_ReentrancyAndOverflowSamplerCoordination(t *testing.T) {
 				)
 				pac = cache.(PressureAwareCache[testData])
 
-				_, err := cache.Insert("seed", testData{value: 1, dataSize: 10})
+				_, err := cache.Put("seed", testData{value: 1, dataSize: 10})
 				require.NoError(t, err)
 				invocations = 0
 				reentrantCall = true
@@ -1410,8 +1410,8 @@ func TestPressure_ReentrancyAndOverflowSamplerCoordination(t *testing.T) {
 						if (order == 3 || order == 4) && pac != nil {
 							pac.Compact()
 							_ = pac.EvaluateMemoryPressure()
-							_, _ = cache.Insert(fmt.Sprintf("reentrant_%d", order), testData{value: 1, dataSize: 10})
-							_, _ = cache.Erase(fmt.Sprintf("reentrant_%d", order))
+							_, _ = cache.Put(fmt.Sprintf("reentrant_%d", order), testData{value: 1, dataSize: 10})
+							_, _ = cache.Delete(fmt.Sprintf("reentrant_%d", order))
 							if overflowDone.Add(1) == numCallers-2 {
 								close(releaseHolders)
 							}
@@ -1478,17 +1478,17 @@ func TestPressure_ReentrancyAndOverflowSamplerCoordination(t *testing.T) {
 				pac = cache.(PressureAwareCache[testData])
 
 				for i := range 5 {
-					_, err := cache.Insert(fmt.Sprintf("k-%d", i), testData{value: int64(i), dataSize: 10})
+					_, err := cache.Put(fmt.Sprintf("k-%d", i), testData{value: int64(i), dataSize: 10})
 					require.NoError(t, err)
 				}
-				_, _ = cache.Erase("k-0")
+				_, _ = cache.Delete("k-0")
 
 				// Act: Trigger fresh pressure sampling with reentrantCompact enabled, then insert 80B at 0.10 pressure
 				// (bringing total occupancy to 130B > targetSize 100B).
 				reentrantCompact.Store(true)
-				_, err := cache.Insert("k-after", testData{value: 10, dataSize: 10})
+				_, err := cache.Put("k-after", testData{value: 10, dataSize: 10})
 				require.NoError(t, err)
-				evicted, err := cache.Insert("k-large", testData{value: 11, dataSize: 80})
+				evicted, err := cache.Put("k-large", testData{value: 11, dataSize: 80})
 				require.NoError(t, err)
 
 				// Assert: Because Compact() reclaimed memory during PressureFunc, the pre-reclamation 0.95 reading
@@ -1521,13 +1521,13 @@ func TestPressure_ReentrancyAndOverflowSamplerCoordination(t *testing.T) {
 				)
 				pac = cache.(PressureAwareCache[testData])
 
-				_, err := cache.Insert("k1", testData{value: 1, dataSize: 40})
+				_, err := cache.Put("k1", testData{value: 1, dataSize: 40})
 				require.NoError(t, err)
-				_, err = cache.Insert("k2", testData{value: 2, dataSize: 40})
+				_, err = cache.Put("k2", testData{value: 2, dataSize: 40})
 				require.NoError(t, err)
-				_, err = cache.Insert("tmp", testData{value: 3, dataSize: 10})
+				_, err = cache.Put("tmp", testData{value: 3, dataSize: 10})
 				require.NoError(t, err)
-				_, ok := cache.Erase("tmp")
+				_, ok := cache.Delete("tmp")
 				require.True(t, ok)
 
 				// Act: Evaluate memory pressure when PressureFunc performs re-entrant Compact() before returning critical pressure (0.95).
@@ -1566,13 +1566,13 @@ func TestPressure_ReentrancyAndOverflowSamplerCoordination(t *testing.T) {
 				pac, ok := cache.(PressureAwareCache[testData])
 				require.True(t, ok)
 
-				_, err := cache.Insert("k1", testData{value: 1, dataSize: 40})
+				_, err := cache.Put("k1", testData{value: 1, dataSize: 40})
 				require.NoError(t, err)
-				_, err = cache.Insert("k2", testData{value: 2, dataSize: 40})
+				_, err = cache.Put("k2", testData{value: 2, dataSize: 40})
 				require.NoError(t, err)
-				_, err = cache.Insert("scratch", testData{value: 3, dataSize: 1})
+				_, err = cache.Put("scratch", testData{value: 3, dataSize: 1})
 				require.NoError(t, err)
-				_, ok = cache.Erase("scratch")
+				_, ok = cache.Delete("scratch")
 				require.True(t, ok)
 
 				pressureBits.Store(math.Float64bits(0.95))
@@ -1601,11 +1601,11 @@ func TestPressure_ReentrancyAndOverflowSamplerCoordination(t *testing.T) {
 				assert.True(t, hasKey(cache, "k2"))
 			})
 
-			t.Run("ReentrantInsertPreservesLastSampledPressureAndZeroWatermark", func(t *testing.T) {
+			t.Run("ReentrantPutPreservesLastSampledPressureAndZeroWatermark", func(t *testing.T) {
 				// Arrange: Populate 4 zero-size entries at 0.0 pressure, then shed 2 of them at 0.95 pressure
 				// so 2 zero-size entries ("z-2", "z-3") remain with a zero-size watermark of 2.
 				var cache Cache[testData]
-				var reentrantInsert atomic.Bool
+				var reentrantPut atomic.Bool
 				var pressure atomic.Uint64
 				pressure.Store(math.Float64bits(0.0))
 
@@ -1614,8 +1614,8 @@ func TestPressure_ReentrancyAndOverflowSamplerCoordination(t *testing.T) {
 					WithInvariantChecking(true),
 					WithEvictionRetentionRatio(0.50),
 					WithPressureFunc(func() float64 {
-						if reentrantInsert.CompareAndSwap(true, false) && cache != nil {
-							_, _ = cache.Insert("reentrant_key", testData{value: 1, dataSize: 10})
+						if reentrantPut.CompareAndSwap(true, false) && cache != nil {
+							_, _ = cache.Put("reentrant_key", testData{value: 1, dataSize: 10})
 						}
 						return math.Float64frombits(pressure.Load())
 					}),
@@ -1623,7 +1623,7 @@ func TestPressure_ReentrancyAndOverflowSamplerCoordination(t *testing.T) {
 				pac := cache.(PressureAwareCache[testData])
 
 				for i := range 4 {
-					_, err := cache.Insert(fmt.Sprintf("z-%d", i), testData{value: int64(i), dataSize: 0})
+					_, err := cache.Put(fmt.Sprintf("z-%d", i), testData{value: int64(i), dataSize: 0})
 					require.NoError(t, err)
 				}
 				pressure.Store(math.Float64bits(0.95))
@@ -1632,12 +1632,12 @@ func TestPressure_ReentrancyAndOverflowSamplerCoordination(t *testing.T) {
 				require.True(t, hasKey(cache, "z-2"))
 				require.True(t, hasKey(cache, "z-3"))
 
-				// Act: Insert "trigger" under 0.95 while PressureFunc performs a re-entrant 10B Insert.
-				reentrantInsert.Store(true)
-				_, err := cache.Insert("trigger", testData{value: 99, dataSize: 10})
+				// Act: Put "trigger" under 0.95 while PressureFunc performs a re-entrant 10B Put.
+				reentrantPut.Store(true)
+				_, err := cache.Put("trigger", testData{value: 99, dataSize: 10})
 				require.NoError(t, err)
 
-				// Assert: Re-entrant Insert at synthetic 0.0 pressure did not reset the zero-size watermark to 0,
+				// Assert: Re-entrant Put at synthetic 0.0 pressure did not reset the zero-size watermark to 0,
 				// so the retained zero-size entries ("z-2", "z-3") were not re-shed.
 				assert.True(t, hasKey(cache, "z-2"))
 				assert.True(t, hasKey(cache, "z-3"))
@@ -1686,8 +1686,8 @@ func TestPressure_ConcurrentReentrantSamplersAndOverflowEpochInvalidation(t *tes
 							// Fallback sampler G2 creates dirty slack and compacts it re-entrantly.
 							close(fallbackEntered)
 							<-primaryCompacted
-							_, _ = cache.Insert("k2", testData{value: 2, dataSize: 10})
-							_, _ = cache.Erase("k2")
+							_, _ = cache.Put("k2", testData{value: 2, dataSize: 10})
+							_, _ = cache.Delete("k2")
 							pac.Compact()
 							close(releaseFallback)
 							return 0.10
@@ -1698,11 +1698,11 @@ func TestPressure_ConcurrentReentrantSamplersAndOverflowEpochInvalidation(t *tes
 				)
 				pac = cache.(PressureAwareCache[testData])
 
-				_, err := cache.Insert("keep", testData{value: 1, dataSize: 10})
+				_, err := cache.Put("keep", testData{value: 1, dataSize: 10})
 				require.NoError(t, err)
-				_, err = cache.Insert("k1", testData{value: 1, dataSize: 10})
+				_, err = cache.Put("k1", testData{value: 1, dataSize: 10})
 				require.NoError(t, err)
-				_, ok := cache.Erase("k1") // Leaves non-empty dirty slack so G1's Compact() reclaims
+				_, ok := cache.Delete("k1") // Leaves non-empty dirty slack so G1's Compact() reclaims
 				require.True(t, ok)
 				armed.Store(true)
 
@@ -1780,13 +1780,13 @@ func TestPressure_ConcurrentReentrantSamplersAndOverflowEpochInvalidation(t *tes
 
 				// Populate two 60B live entries (120B > targetSize 100B) plus a deleted "tmp" entry at 0.10 pressure
 				// so G1's re-entrant Compact() performs a real compaction (compactDataStructuresLocked() == true).
-				_, err := cache.Insert("k1", testData{value: 1, dataSize: 60})
+				_, err := cache.Put("k1", testData{value: 1, dataSize: 60})
 				require.NoError(t, err)
-				_, err = cache.Insert("k2", testData{value: 2, dataSize: 60})
+				_, err = cache.Put("k2", testData{value: 2, dataSize: 60})
 				require.NoError(t, err)
-				_, err = cache.Insert("tmp", testData{value: 3, dataSize: 10})
+				_, err = cache.Put("tmp", testData{value: 3, dataSize: 10})
 				require.NoError(t, err)
-				_, ok := cache.Erase("tmp")
+				_, ok := cache.Delete("tmp")
 				require.True(t, ok)
 				armed.Store(true)
 
@@ -1852,8 +1852,8 @@ func TestPressure_ConcurrentReentrantSamplersAndOverflowEpochInvalidation(t *tes
 							// Wait for G2 external reclamation
 							<-releaseG1Compact
 							// Perform re-entrant Compact
-							_, _ = cache.Insert("k_scratch", testData{value: 1, dataSize: 10})
-							_, _ = cache.Erase("k_scratch")
+							_, _ = cache.Put("k_scratch", testData{value: 1, dataSize: 10})
+							_, _ = cache.Delete("k_scratch")
 							pac.Compact()
 							<-releaseG1Finish
 							return 0.95 // Stale pre-reclamation reading
@@ -1864,7 +1864,7 @@ func TestPressure_ConcurrentReentrantSamplersAndOverflowEpochInvalidation(t *tes
 				)
 				pac = cache.(PressureAwareCache[testData])
 
-				_, err := cache.Insert("k1", testData{value: 1, dataSize: 100})
+				_, err := cache.Put("k1", testData{value: 1, dataSize: 100})
 				require.NoError(t, err)
 
 				armed.Store(true)
@@ -1878,8 +1878,8 @@ func TestPressure_ConcurrentReentrantSamplersAndOverflowEpochInvalidation(t *tes
 				<-g1Entered
 
 				// External reclamation G2
-				_, _ = cache.Insert("k_ext", testData{value: 1, dataSize: 10})
-				_, _ = cache.Erase("k_ext")
+				_, _ = cache.Put("k_ext", testData{value: 1, dataSize: 10})
+				_, _ = cache.Delete("k_ext")
 				pac.Compact() // This increments externalReclaimEpoch
 
 				close(releaseG1Compact)
@@ -1927,13 +1927,13 @@ func TestPressure_PreSampleEpochLoadAndConcurrentSamplerOrdering(t *testing.T) {
 				)
 				pac := cache.(PressureAwareCache[testData])
 
-				_, err := cache.Insert("k1", testData{value: 1, dataSize: 40})
+				_, err := cache.Put("k1", testData{value: 1, dataSize: 40})
 				require.NoError(t, err)
-				_, err = cache.Insert("k2", testData{value: 2, dataSize: 40})
+				_, err = cache.Put("k2", testData{value: 2, dataSize: 40})
 				require.NoError(t, err)
-				_, err = cache.Insert("scratch", testData{value: 3, dataSize: 10})
+				_, err = cache.Put("scratch", testData{value: 3, dataSize: 10})
 				require.NoError(t, err)
-				_, ok := cache.Erase("scratch")
+				_, ok := cache.Delete("scratch")
 				require.True(t, ok)
 
 				// G1 enters PressureFunc at epoch 0 and holds the primary sampler slot.
@@ -1950,7 +1950,7 @@ func TestPressure_PreSampleEpochLoadAndConcurrentSamplerOrdering(t *testing.T) {
 				pac.Compact()
 
 				// Act: G2 inserts k3 (10B), spins against G1's primary sampler slot, and samples 0.95 via the fallback slot in epoch 1.
-				evicted, err := cache.Insert("k3", testData{value: 3, dataSize: 10})
+				evicted, err := cache.Put("k3", testData{value: 3, dataSize: 10})
 				g2Calls := g2SampleCalls.Load()
 				close(releaseG1)
 				<-g1Done
@@ -1989,7 +1989,7 @@ func TestPressure_PreSampleEpochLoadAndConcurrentSamplerOrdering(t *testing.T) {
 				)
 
 				for i := range 80 {
-					_, err := cache.Insert(fmt.Sprintf("k/%02d", i), testData{value: int64(i), dataSize: 10})
+					_, err := cache.Put(fmt.Sprintf("k/%02d", i), testData{value: int64(i), dataSize: 10})
 					require.NoError(t, err)
 				}
 
@@ -2000,25 +2000,25 @@ func TestPressure_PreSampleEpochLoadAndConcurrentSamplerOrdering(t *testing.T) {
 				wg.Add(1)
 				go func() {
 					defer wg.Done()
-					_, _ = cache.Erase("nonexistent-1")
+					_, _ = cache.Delete("nonexistent-1")
 				}()
 				<-g1Entered
 
-				_, _ = cache.Erase("nonexistent-2")
+				_, _ = cache.Delete("nonexistent-2")
 				close(releaseG1)
 				wg.Wait()
 
-				_, err := cache.Insert("post-spike", testData{value: 99, dataSize: 10})
+				_, err := cache.Put("post-spike", testData{value: 99, dataSize: 10})
 				require.NoError(t, err)
 
-				// Assert: Compute surviving byte total solely via the public LookUpWithoutChangingOrder API.
+				// Assert: Compute surviving byte total solely via the public Peek API.
 				var survivingBytes uint64
 				for i := range 80 {
-					if v, ok := cache.LookUpWithoutChangingOrder(fmt.Sprintf("k/%02d", i)); ok {
+					if v, ok := cache.Peek(fmt.Sprintf("k/%02d", i)); ok {
 						survivingBytes += v.dataSize
 					}
 				}
-				if v, ok := cache.LookUpWithoutChangingOrder("post-spike"); ok {
+				if v, ok := cache.Peek("post-spike"); ok {
 					survivingBytes += v.dataSize
 				}
 				assert.LessOrEqual(t, survivingBytes, uint64(500))
@@ -2059,12 +2059,12 @@ func TestPressure_PreSampleEpochLoadAndConcurrentSamplerOrdering(t *testing.T) {
 				pac = cache.(PressureAwareCache[testData])
 
 				for i := range 85 {
-					_, err := cache.Insert(fmt.Sprintf("k/%02d", i), testData{value: int64(i), dataSize: 10})
+					_, err := cache.Put(fmt.Sprintf("k/%02d", i), testData{value: int64(i), dataSize: 10})
 					require.NoError(t, err)
 				}
-				_, err := cache.Insert("scratch", testData{value: 1, dataSize: 10})
+				_, err := cache.Put("scratch", testData{value: 1, dataSize: 10})
 				require.NoError(t, err)
-				_, ok := cache.Erase("scratch")
+				_, ok := cache.Delete("scratch")
 				require.True(t, ok)
 
 				// Act
@@ -2074,7 +2074,7 @@ func TestPressure_PreSampleEpochLoadAndConcurrentSamplerOrdering(t *testing.T) {
 				wg.Add(1)
 				go func() {
 					defer wg.Done()
-					_, err := cache.Insert("g2-key", testData{value: 1, dataSize: 10})
+					_, err := cache.Put("g2-key", testData{value: 1, dataSize: 10})
 					assert.NoError(t, err)
 				}()
 
@@ -2086,12 +2086,12 @@ func TestPressure_PreSampleEpochLoadAndConcurrentSamplerOrdering(t *testing.T) {
 				// Assert: Verify all 85 original entries plus "g2-key" (860B total) survived via public API.
 				var survivingBytes uint64
 				for i := range 85 {
-					v, ok := cache.LookUpWithoutChangingOrder(fmt.Sprintf("k/%02d", i))
+					v, ok := cache.Peek(fmt.Sprintf("k/%02d", i))
 					if assert.True(t, ok) {
 						survivingBytes += v.dataSize
 					}
 				}
-				vG2, ok := cache.LookUpWithoutChangingOrder("g2-key")
+				vG2, ok := cache.Peek("g2-key")
 				if assert.True(t, ok) {
 					survivingBytes += vG2.dataSize
 				}
@@ -2148,13 +2148,13 @@ func TestPressure_PreSampleEpochLoadAndConcurrentSamplerOrdering(t *testing.T) {
 				)
 				pac = cache.(PressureAwareCache[testData])
 
-				_, err := cache.Insert("k1", testData{value: 1, dataSize: 60})
+				_, err := cache.Put("k1", testData{value: 1, dataSize: 60})
 				require.NoError(t, err)
-				_, err = cache.Insert("k2", testData{value: 2, dataSize: 60})
+				_, err = cache.Put("k2", testData{value: 2, dataSize: 60})
 				require.NoError(t, err)
-				_, err = cache.Insert("tmp", testData{value: 3, dataSize: 10})
+				_, err = cache.Put("tmp", testData{value: 3, dataSize: 10})
 				require.NoError(t, err)
-				_, ok := cache.Erase("tmp")
+				_, ok := cache.Delete("tmp")
 				require.True(t, ok)
 				armed.Store(true)
 
@@ -2220,13 +2220,13 @@ func TestPressure_PreSampleEpochLoadAndConcurrentSamplerOrdering(t *testing.T) {
 				)
 				pac = cache.(PressureAwareCache[testData])
 
-				_, err := cache.Insert("k1", testData{value: 1, dataSize: 60})
+				_, err := cache.Put("k1", testData{value: 1, dataSize: 60})
 				require.NoError(t, err)
-				_, err = cache.Insert("k2", testData{value: 2, dataSize: 60})
+				_, err = cache.Put("k2", testData{value: 2, dataSize: 60})
 				require.NoError(t, err)
-				_, err = cache.Insert("tmp1", testData{value: 3, dataSize: 10})
+				_, err = cache.Put("tmp1", testData{value: 3, dataSize: 10})
 				require.NoError(t, err)
-				_, ok := cache.Erase("tmp1")
+				_, ok := cache.Delete("tmp1")
 				require.True(t, ok)
 				armed.Store(true)
 
@@ -2239,9 +2239,9 @@ func TestPressure_PreSampleEpochLoadAndConcurrentSamplerOrdering(t *testing.T) {
 
 				// External caller creates dirty slack and compacts while G1 is still inside PressureFunc.
 				armed.Store(false)
-				_, err = cache.Insert("tmp2", testData{value: 4, dataSize: 10})
+				_, err = cache.Put("tmp2", testData{value: 4, dataSize: 10})
 				require.NoError(t, err)
-				_, ok = cache.Erase("tmp2")
+				_, ok = cache.Delete("tmp2")
 				require.True(t, ok)
 				armed.Store(true)
 				pac.Compact()
@@ -2285,21 +2285,21 @@ func TestPressure_PreSampleEpochLoadAndConcurrentSamplerOrdering(t *testing.T) {
 				)
 				pac := cache.(PressureAwareCache[testData])
 
-				_, err := cache.Insert("k1", testData{value: 1, dataSize: 40})
+				_, err := cache.Put("k1", testData{value: 1, dataSize: 40})
 				require.NoError(t, err)
-				_, err = cache.Insert("k2", testData{value: 2, dataSize: 40})
+				_, err = cache.Put("k2", testData{value: 2, dataSize: 40})
 				require.NoError(t, err)
 				armed.Store(true)
 
 				g1Done := make(chan struct{})
 				go func() {
 					defer close(g1Done)
-					_, _ = cache.Erase("miss-1")
+					_, _ = cache.Delete("miss-1")
 				}()
 				<-g1Entered
 
 				// G2 completes a 0.95 sample via the fallback slot while G1 is blocked in the primary slot.
-				_, _ = cache.Erase("miss-2")
+				_, _ = cache.Delete("miss-2")
 
 				// Act: G3 calls EvaluateMemoryPressure() while G1 is still in the primary slot.
 				evicted := pac.EvaluateMemoryPressure()
@@ -2320,7 +2320,7 @@ func TestPressure_PreSampleEpochLoadAndConcurrentSamplerOrdering(t *testing.T) {
 func TestPressure_ZeroSizeWatermarksAndIdempotency(t *testing.T) {
 	for _, b := range testBackends() {
 		t.Run(b.name, func(t *testing.T) {
-			t.Run("ProtectedZeroSizeInsertDoesNotLeakFloorOneIntoSubsequentEvaluateMemoryPressure", func(t *testing.T) {
+			t.Run("ProtectedZeroSizePutDoesNotLeakFloorOneIntoSubsequentEvaluateMemoryPressure", func(t *testing.T) {
 				var pressureBits atomic.Uint64
 				pressureBits.Store(math.Float64bits(0.10))
 				cache := b.fn(
@@ -2335,26 +2335,26 @@ func TestPressure_ZeroSizeWatermarksAndIdempotency(t *testing.T) {
 				pac := cache.(PressureAwareCache[testData])
 
 				for _, k := range []string{"z1", "z2", "z3"} {
-					_, err := cache.Insert(k, testData{value: 0, dataSize: 0})
+					_, err := cache.Put(k, testData{value: 0, dataSize: 0})
 					require.NoError(t, err)
 				}
 
 				// Act 1: Under Tier 2 (0.95) with RetentionRatio = 0.0, inserting "z4" (0B) protects the newly inserted
 				// MRU entry ("z4") while shedding "z1", "z2", "z3".
 				pressureBits.Store(math.Float64bits(0.95))
-				evictedInsert, err := cache.Insert("z4", testData{value: 0, dataSize: 0})
+				evictedPut, err := cache.Put("z4", testData{value: 0, dataSize: 0})
 				require.NoError(t, err)
-				require.Len(t, evictedInsert, 3)
+				require.Len(t, evictedPut, 3)
 				require.True(t, hasKey(cache, "z4"))
 
-				// Act 2: Immediately call unprotected EvaluateMemoryPressure(). Because Insert did not leak its
+				// Act 2: Immediately call unprotected EvaluateMemoryPressure(). Because Put did not leak its
 				// temporary floor of 1 into lastReclaimedZeroCount, "z4" must now be shed (RetentionRatio = 0.0 -> targetZero = 0).
 				evictedEval := pac.EvaluateMemoryPressure()
 				assert.Len(t, evictedEval, 1)
 				assert.False(t, hasKey(cache, "z4"))
 			})
 
-			t.Run("TargetLenBoundedZeroSheddingIsIdempotentUntilPositiveSurvivorErased", func(t *testing.T) {
+			t.Run("TargetLenBoundedZeroSheddingIsIdempotentUntilPositiveSurvivorDeleted", func(t *testing.T) {
 				// Arrange: 2 positive-size entries at LRU tail (p1, p2: 30B each) + 2 zero-size entries in middle (z1, z2: 0B)
 				// + 1 positive-size entry at MRU head (p3: 40B). Total = 5 entries, 100B in 100B maxSize, RetentionRatio = 0.60.
 				// Under Tier 2 (0.95), targetSize = 60B, targetLen = int(5 * 0.60) = 3, targetZero = int(2 * 0.60) = 1.
@@ -2372,14 +2372,14 @@ func TestPressure_ZeroSizeWatermarksAndIdempotency(t *testing.T) {
 				pac := cache.(PressureAwareCache[testData])
 
 				for _, k := range []string{"p1", "p2"} {
-					_, err := cache.Insert(k, testData{value: 1, dataSize: 30})
+					_, err := cache.Put(k, testData{value: 1, dataSize: 30})
 					require.NoError(t, err)
 				}
 				for _, k := range []string{"z1", "z2"} {
-					_, err := cache.Insert(k, testData{value: 0, dataSize: 0})
+					_, err := cache.Put(k, testData{value: 0, dataSize: 0})
 					require.NoError(t, err)
 				}
-				_, err := cache.Insert("p3", testData{value: 3, dataSize: 40})
+				_, err := cache.Put("p3", testData{value: 3, dataSize: 40})
 				require.NoError(t, err)
 
 				// Act 1: First EvaluateMemoryPressure() at 0.95 sheds p1 and p2 (60B) to reach 40B <= targetSize (60B),
@@ -2398,8 +2398,8 @@ func TestPressure_ZeroSizeWatermarksAndIdempotency(t *testing.T) {
 				assert.True(t, hasKey(cache, "z2"))
 				assert.True(t, hasKey(cache, "p3"))
 
-				// Act 3: Erase positive-size survivor "p3". Deferred zero-size entry "z1" is now shed, leaving "z2".
-				_, ok := cache.Erase("p3")
+				// Act 3: Delete positive-size survivor "p3". Deferred zero-size entry "z1" is now shed, leaving "z2".
+				_, ok := cache.Delete("p3")
 				require.True(t, ok)
 				_ = pac.EvaluateMemoryPressure()
 				assert.False(t, hasKey(cache, "z1"))
@@ -2421,11 +2421,11 @@ func TestPressure_ZeroSizeWatermarksAndIdempotency(t *testing.T) {
 				pac := cache.(PressureAwareCache[testData])
 
 				// Populate in LRU-to-MRU order: z1 (0B), p1 (80B), p2 (20B).
-				_, err := cache.Insert("z1", testData{value: 0, dataSize: 0})
+				_, err := cache.Put("z1", testData{value: 0, dataSize: 0})
 				require.NoError(t, err)
-				_, err = cache.Insert("p1", testData{value: 1, dataSize: 80})
+				_, err = cache.Put("p1", testData{value: 1, dataSize: 80})
 				require.NoError(t, err)
-				_, err = cache.Insert("p2", testData{value: 2, dataSize: 20})
+				_, err = cache.Put("p2", testData{value: 2, dataSize: 20})
 				require.NoError(t, err)
 
 				// Act: EvaluateMemoryPressure() at 0.95 (targetSize = 50B) must evict z1 and p1 in True LRU order.
@@ -2470,7 +2470,7 @@ func TestPressure_ZeroSizeWatermarksAndIdempotency(t *testing.T) {
 					{"p6", 9, 55},
 				}
 				for _, e := range entries {
-					_, err := cache.Insert(e.key, testData{value: e.val, dataSize: e.size})
+					_, err := cache.Put(e.key, testData{value: e.val, dataSize: e.size})
 					require.NoError(t, err)
 				}
 
@@ -2489,7 +2489,7 @@ func TestPressure_ZeroSizeWatermarksAndIdempotency(t *testing.T) {
 				}
 			})
 
-			t.Run("NoOpUpdateWithoutChangingOrderAfterEvaluateDoesNotRatchetZeroEntries", func(t *testing.T) {
+			t.Run("NoOpReplaceAfterEvaluateDoesNotRatchetZeroEntries", func(t *testing.T) {
 				// Arrange: Populate [p1: 30B, p2: 30B, z1: 0B, z2: 0B, p3: 40B] (100B, 5 entries, retention = 0.60).
 				// First EvaluateMemoryPressure() at 0.95 sheds p1, p2 and stops at targetLen = 3 with [z1, z2, p3] (40B <= 60B).
 				var pressureBits atomic.Uint64
@@ -2506,22 +2506,22 @@ func TestPressure_ZeroSizeWatermarksAndIdempotency(t *testing.T) {
 				pac := cache.(PressureAwareCache[testData])
 
 				for _, k := range []string{"p1", "p2"} {
-					_, err := cache.Insert(k, testData{value: 1, dataSize: 30})
+					_, err := cache.Put(k, testData{value: 1, dataSize: 30})
 					require.NoError(t, err)
 				}
 				for _, k := range []string{"z1", "z2"} {
-					_, err := cache.Insert(k, testData{value: 0, dataSize: 0})
+					_, err := cache.Put(k, testData{value: 0, dataSize: 0})
 					require.NoError(t, err)
 				}
-				_, err := cache.Insert("p3", testData{value: 3, dataSize: 40})
+				_, err := cache.Put("p3", testData{value: 3, dataSize: 40})
 				require.NoError(t, err)
 
 				pressureBits.Store(math.Float64bits(0.95))
 				require.Len(t, pac.EvaluateMemoryPressure(), 2)
 
-				// Act: Call UpdateWithoutChangingOrder("p3", 40B) (no-op delta) and UpdateWithoutChangingOrder("p3", 50B) (grows p3 to 50B <= targetSize 60B) under 0.95.
-				require.NoError(t, cache.UpdateWithoutChangingOrder("p3", testData{value: 3, dataSize: 40}))
-				require.NoError(t, cache.UpdateWithoutChangingOrder("p3", testData{value: 4, dataSize: 50}))
+				// Act: Call Replace("p3", 40B) (no-op delta) and Replace("p3", 50B) (grows p3 to 50B <= targetSize 60B) under 0.95.
+				require.NoError(t, cache.Replace("p3", testData{value: 3, dataSize: 40}))
+				require.NoError(t, cache.Replace("p3", testData{value: 4, dataSize: 50}))
 
 				// Assert: Protected mutation with protectedSize <= targetSize must not ratchet-evict z1 or z2.
 				assert.True(t, hasKey(cache, "z1"))
@@ -2547,14 +2547,14 @@ func TestPressure_ZeroSizeWatermarksAndIdempotency(t *testing.T) {
 				pac := cache.(PressureAwareCache[testData])
 
 				for _, k := range []string{"p1", "p2"} {
-					_, err := cache.Insert(k, testData{value: 1, dataSize: 30})
+					_, err := cache.Put(k, testData{value: 1, dataSize: 30})
 					require.NoError(t, err)
 				}
 				for _, k := range []string{"z1", "z2"} {
-					_, err := cache.Insert(k, testData{value: 0, dataSize: 0})
+					_, err := cache.Put(k, testData{value: 0, dataSize: 0})
 					require.NoError(t, err)
 				}
-				_, err := cache.Insert("p3", testData{value: 3, dataSize: 40})
+				_, err := cache.Put("p3", testData{value: 3, dataSize: 40})
 				require.NoError(t, err)
 
 				pressureBits.Store(math.Float64bits(0.95))
@@ -2563,7 +2563,7 @@ func TestPressure_ZeroSizeWatermarksAndIdempotency(t *testing.T) {
 
 				// Act: Convert positive survivor p3 (40B) into a 0B entry via overwrite under 0.95,
 				// then verify EvaluateMemoryPressure() is idempotent.
-				evictedOverwrite, err := cache.Insert("p3", testData{value: 0, dataSize: 0})
+				evictedOverwrite, err := cache.Put("p3", testData{value: 0, dataSize: 0})
 				require.NoError(t, err)
 				evictedSecond := pac.EvaluateMemoryPressure()
 
@@ -2591,7 +2591,7 @@ func TestPressure_ZeroSizeWatermarksAndIdempotency(t *testing.T) {
 				pac := cache.(PressureAwareCache[testData])
 
 				for i := range 4 {
-					_, err := cache.Insert(fmt.Sprintf("z-%d", i), testData{value: int64(i), dataSize: 0})
+					_, err := cache.Put(fmt.Sprintf("z-%d", i), testData{value: int64(i), dataSize: 0})
 					require.NoError(t, err)
 				}
 
@@ -2618,7 +2618,7 @@ func TestPressure_ZeroSizeWatermarksAndIdempotency(t *testing.T) {
 func TestPressure_TargetSizeBoundsAndSafeSizeCallbacks(t *testing.T) {
 	for _, b := range allBackends[testData]() {
 		t.Run(b.name, func(t *testing.T) {
-			t.Run("UpdateWithoutChangingOrderSamplesValueSizeOutsideLock", func(t *testing.T) {
+			t.Run("ReplaceSamplesValueSizeOutsideLock", func(t *testing.T) {
 				// Arrange
 				var c Cache[testData]
 				var onWeigh func()
@@ -2632,20 +2632,20 @@ func TestPressure_TargetSizeBoundsAndSafeSizeCallbacks(t *testing.T) {
 						return v.dataSize
 					}),
 				)
-				_, err := c.Insert("k1", testData{value: 1, dataSize: 10})
+				_, err := c.Put("k1", testData{value: 1, dataSize: 10})
 				require.NoError(t, err)
 
 				readSucceededInsideWeigher := false
 				onWeigh = func() {
-					_, ok1 := c.LookUpWithoutChangingOrder("k1")
-					_, ok2 := c.LookUp("k1")
+					_, ok1 := c.Peek("k1")
+					_, ok2 := c.Get("k1")
 					if ok1 && ok2 {
 						readSucceededInsideWeigher = true
 					}
 				}
 
 				// Act
-				err = c.UpdateWithoutChangingOrder("k1", testData{value: 2, dataSize: 10})
+				err = c.Replace("k1", testData{value: 2, dataSize: 10})
 
 				// Assert
 				require.NoError(t, err)
@@ -2670,15 +2670,15 @@ func TestPressure_TargetSizeBoundsAndSafeSizeCallbacks(t *testing.T) {
 					}),
 				)
 				for i := range 10 {
-					_, err := cache.Insert(fmt.Sprintf("k-%d", i), testData{value: int64(i), dataSize: 10})
+					_, err := cache.Put(fmt.Sprintf("k-%d", i), testData{value: int64(i), dataSize: 10})
 					require.NoError(t, err)
 				}
 
-				// Act: Re-entrant LookUpWithoutChangingOrder inside Weigher and PressureAwareCache evaluation.
+				// Act: Re-entrant Peek inside Weigher and PressureAwareCache evaluation.
 				onWeigh = func() {
-					_, _ = cache.LookUpWithoutChangingOrder("k-0")
+					_, _ = cache.Peek("k-0")
 				}
-				err := cache.UpdateWithoutChangingOrder("k-0", testData{value: 10, dataSize: 10})
+				err := cache.Replace("k-0", testData{value: 10, dataSize: 10})
 				onWeigh = nil
 				pac, ok := cache.(PressureAwareCache[testData])
 				require.True(t, ok)
@@ -2702,7 +2702,7 @@ func TestPressure_TargetSizeBoundsAndSafeSizeCallbacks(t *testing.T) {
 					testDataWeigher,
 				).(PressureAwareCache[testData])
 				for i := range 10 {
-					_, err := c.Insert(fmt.Sprintf("zero-%d", i), testData{value: int64(i), dataSize: 0})
+					_, err := c.Put(fmt.Sprintf("zero-%d", i), testData{value: int64(i), dataSize: 0})
 					require.NoError(t, err)
 				}
 				pressure = 0.95
@@ -2726,7 +2726,7 @@ func TestPressure_TargetSizeBoundsAndSafeSizeCallbacks(t *testing.T) {
 					WithEvictionRetentionRatio(0.50),
 					testDataWeigher,
 				).(PressureAwareCache[testData])
-				_, err := minCache.Insert("one-byte", testData{value: 1, dataSize: 1})
+				_, err := minCache.Put("one-byte", testData{value: 1, dataSize: 1})
 				require.NoError(t, err)
 				assert.Empty(t, minCache.EvaluateMemoryPressure())
 				assert.True(t, hasKey(minCache, "one-byte"))
@@ -2741,7 +2741,7 @@ func TestPressure_TargetSizeBoundsAndSafeSizeCallbacks(t *testing.T) {
 						WithEvictionRetentionRatio(retention),
 						testDataWeigher,
 					).(PressureAwareCache[testData])
-					_, err := maxCache.Insert("large", testData{value: 1, dataSize: 1 << 62})
+					_, err := maxCache.Put("large", testData{value: 1, dataSize: 1 << 62})
 					require.NoError(t, err)
 					assert.Empty(t, maxCache.EvaluateMemoryPressure())
 					assert.True(t, hasKey(maxCache, "large"))
@@ -2758,7 +2758,7 @@ func TestPressure_TargetSizeBoundsAndSafeSizeCallbacks(t *testing.T) {
 					WithEvictionRetentionRatio(0.0),
 					testDataWeigher,
 				).(PressureAwareCache[testData])
-				_, err := c.Insert("only-key", testData{value: 1, dataSize: 100})
+				_, err := c.Put("only-key", testData{value: 1, dataSize: 100})
 				require.NoError(t, err)
 
 				// Act: EvaluateMemoryPressure passes the unprotected sentinel so all entries are shed when retention == 0.0.
@@ -2788,10 +2788,10 @@ func TestPressure_BelowTier2ResetsZeroWatermarks(t *testing.T) {
 				).(PressureAwareCache[testData])
 
 				for i := 0; i < 127; i++ {
-					_, err := cache.Insert(fmt.Sprintf("p-%03d", i), testData{value: int64(i), dataSize: 0})
+					_, err := cache.Put(fmt.Sprintf("p-%03d", i), testData{value: int64(i), dataSize: 0})
 					require.NoError(t, err)
 				}
-				_, err := cache.Insert("survivor", testData{value: 999, dataSize: 0})
+				_, err := cache.Put("survivor", testData{value: 999, dataSize: 0})
 				require.NoError(t, err)
 
 				// At pressure 0.80 (retention 0.50), 64 of 128 zero-size entries survive,
@@ -2804,7 +2804,7 @@ func TestPressure_BelowTier2ResetsZeroWatermarks(t *testing.T) {
 				// Drop below Tier 2 and delete all 63 remaining "p-" entries in one operation,
 				// triggering shouldReclaimSingleSurvivorOnDelete == true with "survivor" as the sole entry.
 				probe.Set(0.10)
-				cache.EraseEntriesWithGivenPrefix("p-")
+				cache.DeletePrefix("p-")
 				require.True(t, hasKey(cache, "survivor"))
 
 				// Return to Tier 2 (retention 0.75 => int(1 * 0.75) == 0).
@@ -2821,10 +2821,10 @@ func TestPressure_BelowTier2ResetsZeroWatermarks(t *testing.T) {
 					name string
 					act  func(c Cache[testData])
 				}{
-					{"EraseMiss", func(c Cache[testData]) { _, _ = c.Erase("non-existent-key") }},
-					{"ErasePrefixMiss", func(c Cache[testData]) { c.EraseEntriesWithGivenPrefix("non-existent-prefix") }},
-					{"UpdateWithoutChangingOrderMiss", func(c Cache[testData]) {
-						_ = c.UpdateWithoutChangingOrder("non-existent-key", testData{value: 1, dataSize: 1})
+					{"DeleteMiss", func(c Cache[testData]) { _, _ = c.Delete("non-existent-key") }},
+					{"DeletePrefixMiss", func(c Cache[testData]) { c.DeletePrefix("non-existent-prefix") }},
+					{"ReplaceMiss", func(c Cache[testData]) {
+						_ = c.Replace("non-existent-key", testData{value: 1, dataSize: 1})
 					}},
 				}
 
@@ -2840,9 +2840,9 @@ func TestPressure_BelowTier2ResetsZeroWatermarks(t *testing.T) {
 							WithEvictionRetentionRatio(0.50),
 						).(PressureAwareCache[testData])
 
-						_, err := cache.Insert("z1", testData{value: 1, dataSize: 0})
+						_, err := cache.Put("z1", testData{value: 1, dataSize: 0})
 						require.NoError(t, err)
-						_, err = cache.Insert("z2", testData{value: 2, dataSize: 0})
+						_, err = cache.Put("z2", testData{value: 2, dataSize: 0})
 						require.NoError(t, err)
 
 						probe.Set(0.875)
@@ -2878,7 +2878,7 @@ func TestPressure_BelowTier2ResetsZeroWatermarks(t *testing.T) {
 					WithEvictionRetentionRatio(0.50),
 					WithPressureFunc(func() float64 {
 						if reentrantMiss.CompareAndSwap(true, false) && cache != nil {
-							_, _ = cache.Erase("absent-during-sampling")
+							_, _ = cache.Delete("absent-during-sampling")
 						}
 						return math.Float64frombits(pressureBits.Load())
 					}),
@@ -2886,14 +2886,14 @@ func TestPressure_BelowTier2ResetsZeroWatermarks(t *testing.T) {
 				pac = cache.(PressureAwareCache[testData])
 
 				for i := range 4 {
-					_, err := cache.Insert(fmt.Sprintf("z-%d", i), testData{value: int64(i), dataSize: 0})
+					_, err := cache.Put(fmt.Sprintf("z-%d", i), testData{value: int64(i), dataSize: 0})
 					require.NoError(t, err)
 				}
 
 				pressureBits.Store(math.Float64bits(0.95))
 				require.Len(t, pac.EvaluateMemoryPressure(), 2)
 
-				// Act 1: Re-entrant Erase("absent-during-sampling") inside PressureFunc while outer pressure is 0.95
+				// Act 1: Re-entrant Delete("absent-during-sampling") inside PressureFunc while outer pressure is 0.95
 				// must not clear lastReclaimedZeroCount, so EvaluateMemoryPressure() remains idempotent (0 evictions).
 				reentrantMiss.Store(true)
 				assert.Empty(t, pac.EvaluateMemoryPressure())
@@ -2902,7 +2902,7 @@ func TestPressure_BelowTier2ResetsZeroWatermarks(t *testing.T) {
 
 				// Act 2: Non-sampling operation below Tier 2 (0.10) resets the watermark so a subsequent 0.95 evaluation sheds z-2.
 				pressureBits.Store(math.Float64bits(0.10))
-				_, _ = cache.Erase("absent-below-tier2")
+				_, _ = cache.Delete("absent-below-tier2")
 				pressureBits.Store(math.Float64bits(0.95))
 				evictedAfterReset := pac.EvaluateMemoryPressure()
 				assert.Len(t, evictedAfterReset, 1)

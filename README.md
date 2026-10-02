@@ -41,24 +41,24 @@ func main() {
 		}),
 	)
 
-	// 2. Insert typed values directly—no wrapper interfaces required.
-	_, _ = cache.Insert("bucket/dirA/config.json", []byte(`{"version":1}`))
-	_, _ = cache.Insert("bucket/dirA/chunk.bin", []byte{0xDE, 0xAD, 0xBE, 0xEF})
-	_, _ = cache.Insert("bucket/dirB/inode-42", make([]byte, 128))
+	// 2. Put typed values directly—no wrapper interfaces required.
+	_, _ = cache.Put("bucket/dirA/config.json", []byte(`{"version":1}`))
+	_, _ = cache.Put("bucket/dirA/chunk.bin", []byte{0xDE, 0xAD, 0xBE, 0xEF})
+	_, _ = cache.Put("bucket/dirB/inode-42", make([]byte, 128))
 
-	// 3. Point Lookup (promotes entry to MRU).
-	if v, ok := cache.LookUp("bucket/dirA/config.json"); ok {
+	// 3. Point Get (promotes entry to MRU).
+	if v, ok := cache.Get("bucket/dirA/config.json"); ok {
 		fmt.Printf("config: %s (%d bytes)\n", string(v), len(v))
 	}
 
-	// 4. Inspect or update in-place without altering LRU recency order.
+	// 4. Peek or replace in-place without altering LRU recency order.
 	//    If the new value weighs more, older entries are automatically evicted if capacity is exceeded.
-	_, _ = cache.LookUpWithoutChangingOrder("bucket/dirB/inode-42")
-	_ = cache.UpdateWithoutChangingOrder("bucket/dirA/chunk.bin", make([]byte, 4096))
+	_, _ = cache.Peek("bucket/dirB/inode-42")
+	_ = cache.Replace("bucket/dirA/chunk.bin", make([]byte, 4096))
 
-	// 5. Fast O(prefix + subtree) prefix eviction and individual key erasure.
-	cache.EraseEntriesWithGivenPrefix("bucket/dirA/")
-	_, _ = cache.Erase("bucket/dirB/inode-42")
+	// 5. Fast O(prefix + subtree) prefix deletion and individual key deletion.
+	cache.DeletePrefix("bucket/dirA/")
+	_, _ = cache.Delete("bucket/dirB/inode-42")
 }
 ```
 
@@ -70,7 +70,7 @@ When `WithWeigher` is omitted, each entry defaults to weight `1`, making `maxSiz
 
 Select an engine via `lru.New[V](maxSize, lru.WithBackend(...))` or call its dedicated generic constructor directly:
 
-| Backend | Constructor / Option | Lookup / Insert | Prefix Erase (`EraseEntriesWithGivenPrefix`) | Memory & GC Profile | Best Workload Fit |
+| Backend | Constructor / Option | Get / Put | Prefix Delete (`DeletePrefix`) | Memory & GC Profile | Best Workload Fit |
 | :--- | :--- | :--- | :--- | :--- | :--- |
 | **`MapCache`** *(default)* | `lru.NewMapCache[V]` / `WithBackend(BackendMap)` | `O(1)` (~50 ns / ~98 ns in-place, ~383–466 ns turnover) | `O(N)` full map scan | ~136–163 B/entry, standard GC pointers | Flat keys, maximum point read/write throughput |
 | **`RadixCache`** | `lru.NewRadixCache[V]` / `WithBackend(BackendRadix)` | `O(K)` (~170 ns / ~172–230 ns in-place, ~472–511 ns turnover) | `O(P + S)` subtree (**20x–88x faster**) | ~94–96 B/entry (**~30–41% less heap**), 0-alloc updates | File paths, object storage namespaces, frequent prefix purges |

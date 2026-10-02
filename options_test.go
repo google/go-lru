@@ -283,7 +283,7 @@ func TestOptions_MemoryPressureCustomAndValidation(t *testing.T) {
 	require.NotNil(t, optsDirectStructPressure.PressureFunc)
 	callsBefore := customCalls
 	c := NewMapCache[string](100, func(o *Options) { o.PressureFunc = customFn })
-	_, err := c.Insert("k", "v")
+	_, err := c.Put("k", "v")
 	require.NoError(t, err)
 	assert.Greater(t, customCalls, callsBefore)
 }
@@ -294,35 +294,35 @@ func TestCache_DefaultUnitWeigher_AllBackends(t *testing.T) {
 			// Default weigher assigns weight 1 to every entry regardless of string length.
 			cache := b.fn(3, WithInvariantChecking(true))
 
-			ev, err := cache.Insert("k1", "a")
+			ev, err := cache.Put("k1", "a")
 			require.NoError(t, err)
 			assert.Empty(t, ev)
 
-			ev, err = cache.Insert("k2", "bb")
+			ev, err = cache.Put("k2", "bb")
 			require.NoError(t, err)
 			assert.Empty(t, ev)
 
-			ev, err = cache.Insert("k3", strings.Repeat("c", 4096))
+			ev, err = cache.Put("k3", strings.Repeat("c", 4096))
 			require.NoError(t, err)
 			assert.Empty(t, ev)
 
 			// Promote k1; k2 becomes LRU tail.
-			v1, ok := cache.LookUp("k1")
+			v1, ok := cache.Get("k1")
 			require.True(t, ok)
 			assert.Equal(t, "a", v1)
 
-			// Update k1 in place to 10KB string; under default weigher its weight stays 1.
-			require.NoError(t, cache.UpdateWithoutChangingOrder("k1", strings.Repeat("x", 10240)))
+			// Replace k1 in place with 10KB string; under default weigher its weight stays 1.
+			require.NoError(t, cache.Replace("k1", strings.Repeat("x", 10240)))
 
-			// Inserting 4th entry evicts k2 ("bb").
-			ev, err = cache.Insert("k4", "dddd")
+			// Putting 4th entry evicts k2 ("bb").
+			ev, err = cache.Put("k4", "dddd")
 			require.NoError(t, err)
 			assert.Equal(t, []string{"bb"}, ev)
 
-			_, ok = cache.LookUpWithoutChangingOrder("k2")
+			_, ok = cache.Peek("k2")
 			assert.False(t, ok)
 
-			v1After, ok := cache.LookUpWithoutChangingOrder("k1")
+			v1After, ok := cache.Peek("k1")
 			require.True(t, ok)
 			assert.Equal(t, strings.Repeat("x", 10240), v1After)
 		})
@@ -332,34 +332,34 @@ func TestCache_DefaultUnitWeigher_AllBackends(t *testing.T) {
 	for _, backend := range []Backend{BackendMap, BackendRadix, BackendArenaRadix} {
 		t.Run(backend.String()+"_ArbitraryTypesAndNilValues", func(t *testing.T) {
 			intCache := New[int](2, WithBackend(backend), WithInvariantChecking(true))
-			_, err := intCache.Insert("zero", 0)
+			_, err := intCache.Put("zero", 0)
 			require.NoError(t, err)
-			vInt, ok := intCache.LookUp("zero")
+			vInt, ok := intCache.Get("zero")
 			require.True(t, ok)
 			assert.Equal(t, 0, vInt)
 
 			sliceCache := New[[]byte](2, WithBackend(backend), WithInvariantChecking(true))
-			_, err = sliceCache.Insert("nil_slice", nil)
+			_, err = sliceCache.Put("nil_slice", nil)
 			require.NoError(t, err)
-			_, err = sliceCache.Insert("empty_slice", []byte{})
+			_, err = sliceCache.Put("empty_slice", []byte{})
 			require.NoError(t, err)
-			vNilSlice, ok := sliceCache.LookUpWithoutChangingOrder("nil_slice")
+			vNilSlice, ok := sliceCache.Peek("nil_slice")
 			require.True(t, ok)
 			assert.Nil(t, vNilSlice)
-			vEmptySlice, ok := sliceCache.LookUpWithoutChangingOrder("empty_slice")
+			vEmptySlice, ok := sliceCache.Peek("empty_slice")
 			require.True(t, ok)
 			assert.NotNil(t, vEmptySlice)
 			assert.Empty(t, vEmptySlice)
 
 			ptrCache := New[*testData](2, WithBackend(backend), WithInvariantChecking(true))
-			_, err = ptrCache.Insert("nil_ptr", nil)
+			_, err = ptrCache.Put("nil_ptr", nil)
 			require.NoError(t, err)
-			vPtr, ok := ptrCache.LookUp("nil_ptr")
+			vPtr, ok := ptrCache.Get("nil_ptr")
 			require.True(t, ok)
 			assert.Nil(t, vPtr)
-			erasedPtr, ok := ptrCache.Erase("nil_ptr")
+			deletedPtr, ok := ptrCache.Delete("nil_ptr")
 			require.True(t, ok)
-			assert.Nil(t, erasedPtr)
+			assert.Nil(t, deletedPtr)
 		})
 	}
 }
@@ -367,82 +367,82 @@ func TestCache_DefaultUnitWeigher_AllBackends(t *testing.T) {
 func TestCache_CustomWeigher_AllBackends(t *testing.T) {
 	for _, b := range allBackends[string]() {
 		t.Run(b.name, func(t *testing.T) {
-			t.Run("KeyAndValueWeigherAndInsertExceedingMaxSize", func(t *testing.T) {
+			t.Run("KeyAndValueWeigherAndPutExceedingMaxSize", func(t *testing.T) {
 				cache := b.fn(20, WithInvariantChecking(true), WithWeigher(func(k, v string) uint64 {
 					return uint64(len(k) + len(v))
 				}))
 
 				// "k1" (2) + "12345678" (8) = 10
-				ev, err := cache.Insert("k1", "12345678")
+				ev, err := cache.Put("k1", "12345678")
 				require.NoError(t, err)
 				assert.Empty(t, ev)
 
 				// Entry exceeding maxSize (20) returns ErrInvalidEntrySize without mutating state.
-				ev, err = cache.Insert("huge", strings.Repeat("z", 20))
+				ev, err = cache.Put("huge", strings.Repeat("z", 20))
 				require.ErrorIs(t, err, ErrInvalidEntrySize)
 				assert.Nil(t, ev)
 
-				v1, ok := cache.LookUpWithoutChangingOrder("k1")
+				v1, ok := cache.Peek("k1")
 				require.True(t, ok)
 				assert.Equal(t, "12345678", v1)
 			})
 
-			t.Run("UpdateWithoutChangingOrder_ShrinkGrowAndSelfEvict", func(t *testing.T) {
+			t.Run("Replace_ShrinkGrowAndSelfEvict", func(t *testing.T) {
 				cache := b.fn(50, WithInvariantChecking(true), WithWeigher(func(_ string, v string) uint64 {
 					return uint64(len(v))
 				}))
 
-				// Insert k1 (20B, LRU) and k2 (30B, MRU) -> total 50B.
-				_, err := cache.Insert("k1", strings.Repeat("a", 20))
+				// Put k1 (20B, LRU) and k2 (30B, MRU) -> total 50B.
+				_, err := cache.Put("k1", strings.Repeat("a", 20))
 				require.NoError(t, err)
-				_, err = cache.Insert("k2", strings.Repeat("b", 30))
+				_, err = cache.Put("k2", strings.Repeat("b", 30))
 				require.NoError(t, err)
 
 				// 1. Shrink k1 from 20B to 5B -> total drops to 35B while k1 stays at LRU tail.
-				require.NoError(t, cache.UpdateWithoutChangingOrder("k1", strings.Repeat("a", 5)))
+				require.NoError(t, cache.Replace("k1", strings.Repeat("a", 5)))
 
-				// Insert k3 (15B) -> fits in remaining 15B without evicting k1 or k2!
-				ev, err := cache.Insert("k3", strings.Repeat("c", 15))
+				// Put k3 (15B) -> fits in remaining 15B without evicting k1 or k2!
+				ev, err := cache.Put("k3", strings.Repeat("c", 15))
 				require.NoError(t, err)
 				assert.Empty(t, ev)
 
 				// 2. Transition k1 weight to 0 and back to 5B (verifying zeroSizeCount invariants).
-				require.NoError(t, cache.UpdateWithoutChangingOrder("k1", ""))
-				require.NoError(t, cache.UpdateWithoutChangingOrder("k1", strings.Repeat("a", 5)))
+				require.NoError(t, cache.Replace("k1", ""))
+				require.NoError(t, cache.Replace("k1", strings.Repeat("a", 5)))
 
 				// 3. Grow k3 (MRU) from 15B to 25B (total 5+30+25 = 60 > 50) -> evicts oldest k1 (5B) and k2 (30B).
-				require.NoError(t, cache.UpdateWithoutChangingOrder("k3", strings.Repeat("c", 25)))
-				_, ok := cache.LookUpWithoutChangingOrder("k1")
+				require.NoError(t, cache.Replace("k3", strings.Repeat("c", 25)))
+				_, ok := cache.Peek("k1")
 				assert.False(t, ok)
-				_, ok = cache.LookUpWithoutChangingOrder("k2")
+				_, ok = cache.Peek("k2")
 				assert.False(t, ok)
-				v3, ok := cache.LookUpWithoutChangingOrder("k3")
+				v3, ok := cache.Peek("k3")
 				require.True(t, ok)
 				assert.Len(t, v3, 25)
 
 				// 4. Re-populate: k_old (10B, LRU), k_mid (15B, mid), k3 (25B, MRU).
-				_, err = cache.Insert("k_old", strings.Repeat("o", 10))
+				_, err = cache.Put("k_old", strings.Repeat("o", 10))
 				require.NoError(t, err)
-				_, err = cache.Insert("k_mid", strings.Repeat("m", 15))
+				_, err = cache.Put("k_mid", strings.Repeat("m", 15))
 				require.NoError(t, err)
 				// Promote k3 so order is k_old (10B, LRU) -> k_mid (15B) -> k3 (25B, MRU).
-				_, _ = cache.LookUp("k3")
+				_, _ = cache.Get("k3")
 
 				// Grow k_mid from 15B to 30B: k_mid (30B) + newer k3 (25B) = 55B > 50B (!canFit).
 				// k_mid must self-evict while both k_old and k3 survive!
-				require.NoError(t, cache.UpdateWithoutChangingOrder("k_mid", strings.Repeat("m", 30)))
-				_, ok = cache.LookUpWithoutChangingOrder("k_mid")
+				require.NoError(t, cache.Replace("k_mid", strings.Repeat("m", 30)))
+				_, ok = cache.Peek("k_mid")
 				assert.False(t, ok, "k_mid should self-evict when unable to fit alongside newer k3")
-				_, ok = cache.LookUpWithoutChangingOrder("k_old")
+				_, ok = cache.Peek("k_old")
 				assert.True(t, ok, "older k_old must not be evicted when k_mid self-evicts")
-				_, ok = cache.LookUpWithoutChangingOrder("k3")
+				_, ok = cache.Peek("k3")
 				assert.True(t, ok, "newer k3 must survive")
 
 				// 5. Grow k3 beyond maxSize (60B > 50B) -> k3 self-evicts while k_old survives.
-				require.NoError(t, cache.UpdateWithoutChangingOrder("k3", strings.Repeat("c", 60)))
-				_, ok = cache.LookUpWithoutChangingOrder("k3")
+				require.NoError(t, cache.Replace("k3", strings.Repeat("c", 60)))
+				_, ok = cache.Peek("k3")
 				assert.False(t, ok)
-				_, ok = cache.LookUpWithoutChangingOrder("k_old")
+				_, ok = cache.Peek("k_old")
 				assert.True(t, ok)
 			})
 		})
@@ -861,42 +861,42 @@ func testGenericCacheWithScalar[V any](t *testing.T, val1, val2 V) {
 
 func exerciseScalarCache[V any](t *testing.T, c Cache[V], val1, val2 V) {
 	t.Helper()
-	evicted, err := c.Insert("key1", val1)
+	evicted, err := c.Put("key1", val1)
 	require.NoError(t, err)
 	assert.Empty(t, evicted)
 
-	evicted, err = c.Insert("key2", val2)
+	evicted, err = c.Put("key2", val2)
 	require.NoError(t, err)
 	assert.Empty(t, evicted)
 
-	v, ok := c.LookUp("key1")
+	v, ok := c.Get("key1")
 	require.True(t, ok)
 	assert.Equal(t, val1, v)
 
-	v, ok = c.LookUpWithoutChangingOrder("key2")
+	v, ok = c.Peek("key2")
 	require.True(t, ok)
 	assert.Equal(t, val2, v)
 
-	require.NoError(t, c.UpdateWithoutChangingOrder("key1", val2))
+	require.NoError(t, c.Replace("key1", val2))
 
-	v, ok = c.LookUp("key1")
+	v, ok = c.Get("key1")
 	require.True(t, ok)
 	assert.Equal(t, val2, v)
 
-	v, ok = c.Erase("key1")
+	v, ok = c.Delete("key1")
 	require.True(t, ok)
 	assert.Equal(t, val2, v)
 
-	_, ok = c.LookUp("key1")
+	_, ok = c.Get("key1")
 	assert.False(t, ok)
 
-	_, err = c.Insert("prefix/1", val1)
+	_, err = c.Put("prefix/1", val1)
 	require.NoError(t, err)
-	_, err = c.Insert("prefix/2", val2)
+	_, err = c.Put("prefix/2", val2)
 	require.NoError(t, err)
 
-	c.EraseEntriesWithGivenPrefix("prefix/")
+	c.DeletePrefix("prefix/")
 
-	_, ok = c.LookUp("prefix/1")
+	_, ok = c.Get("prefix/1")
 	assert.False(t, ok)
 }
