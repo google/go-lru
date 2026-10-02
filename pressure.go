@@ -409,7 +409,7 @@ func (p *pressureState) samplePressureWithEpoch() (uint64, float64, bool) {
 	return epoch, math.Float64frombits(bits), true
 }
 
-func (p *pressureState) onEntryInserted(newLen int, size uint64) {
+func (p *pressureState) onEntryPut(newLen int, size uint64) {
 	if newLen > p.peakEntryLen {
 		p.peakEntryLen = newLen
 	}
@@ -482,7 +482,7 @@ func (p *pressureState) shouldReclaimSingleSurvivorOnDelete(currentLen int, isDi
 	return currentLen == 1 && isDirty && (extraChurn || p.peakEntryLen >= 64 || p.deletedSinceCompact >= 64)
 }
 
-func (p *pressureState) shouldReclaimEmptyPreInsert(currentLen int, extraChurn, evictedPre bool, newSize, sizeBefore uint64, pressure float64) bool {
+func (p *pressureState) shouldReclaimEmptyPrePut(currentLen int, extraChurn, evictedPre bool, newSize, sizeBefore uint64, pressure float64) bool {
 	return currentLen == 0 && (extraChurn || p.peakEntryLen >= 64 || p.deletedSinceCompact >= 64 || (evictedPre && newSize < sizeBefore && p.hasElevatedPressureToInvalidate(pressure)))
 }
 

@@ -33,8 +33,8 @@ type entry[V any] struct {
 // mapCache is a map-based LRU cache implementation that indexes entries
 // using a Go hash map and tracks access order with a doubly-linked list (container/list).
 //
-// It provides O(1) time complexity for Insert, Erase, LookUp, LookUpWithoutChangingOrder,
-// and UpdateWithoutChangingOrder. Prefix erasure operates in O(N) where N is
+// It provides O(1) time complexity for Put, Delete, Get, Peek,
+// and Replace. DeletePrefix operates in O(N) where N is
 // the total number of entries in the cache.
 //
 // mapCache is safe for concurrent use by multiple goroutines via sync.RWMutex.
@@ -260,13 +260,13 @@ func (c *mapCache[V]) finishMutationReclaimLocked(evictedValues []V, protectedEl
 	return evictedValues
 }
 
-// Insert inserts or updates the given key and value in the cache.
+// Put inserts or updates the given key and value in the cache.
 // If the key already exists, its value is replaced and moved to the most recently used (MRU) position.
 // If the cache exceeds capacity after insertion, least recently used (LRU) entries are evicted
 // and returned in the slice.
 //
 // Returns ErrInvalidEntrySize if the entry's weight exceeds maxSize.
-func (c *mapCache[V]) Insert(key string, value V) ([]V, error) {
+func (c *mapCache[V]) Put(key string, value V) ([]V, error) {
 	valueSize := c.weigh(key, value)
 	if valueSize > c.maxSize {
 		return nil, ErrInvalidEntrySize
@@ -277,8 +277,8 @@ func (c *mapCache[V]) Insert(key string, value V) ([]V, error) {
 
 	var evictedValues []V
 	sizeBefore := c.currentSize
-	reclaimedPreInsert := false
-	evictedPreInsert := false
+	reclaimedPrePut := false
+	evictedPrePut := false
 
 	e, ok := c.index[key]
 	if ok {
@@ -290,38 +290,38 @@ func (c *mapCache[V]) Insert(key string, value V) ([]V, error) {
 		for valueSize > c.maxSize-c.currentSize && c.entries.Len() > 1 {
 			if evicted, evictedOK := c.evictOne(); evictedOK {
 				evictedValues = append(evictedValues, evicted)
-				evictedPreInsert = true
+				evictedPrePut = true
 			}
 		}
 		entryVal.value = value
 		entryVal.size = valueSize
 		c.currentSize += valueSize
-		if c.shouldReclaimSingleSurvivorOnMutation(c.entries.Len(), c.dirtyIndex, false, evictedPreInsert, c.currentSize, sizeBefore, pressure) {
-			reclaimedPreInsert = true
+		if c.shouldReclaimSingleSurvivorOnMutation(c.entries.Len(), c.dirtyIndex, false, evictedPrePut, c.currentSize, sizeBefore, pressure) {
+			reclaimedPrePut = true
 		}
 	} else {
 		// Evict prior to adding new entry if valueSize would exceed remaining capacity (prevents uint64 overflow).
 		for valueSize > c.maxSize-c.currentSize && c.entries.Len() > 0 {
 			if evicted, evictedOK := c.evictOne(); evictedOK {
 				evictedValues = append(evictedValues, evicted)
-				evictedPreInsert = true
+				evictedPrePut = true
 			}
 		}
-		if c.shouldReclaimEmptyPreInsert(c.entries.Len(), false, evictedPreInsert, valueSize, sizeBefore, pressure) {
+		if c.shouldReclaimEmptyPrePut(c.entries.Len(), false, evictedPrePut, valueSize, sizeBefore, pressure) {
 			c.clearEmptyIndexStateLocked()
-			reclaimedPreInsert = true
-		} else if c.shouldReclaimSingleSurvivorOnMutation(c.entries.Len(), c.dirtyIndex, false, evictedPreInsert, c.currentSize+valueSize, sizeBefore, pressure) {
-			reclaimedPreInsert = true
+			reclaimedPrePut = true
+		} else if c.shouldReclaimSingleSurvivorOnMutation(c.entries.Len(), c.dirtyIndex, false, evictedPrePut, c.currentSize+valueSize, sizeBefore, pressure) {
+			reclaimedPrePut = true
 		}
 		// Clone key to prevent substring keys from pinning large caller backing arrays.
 		clonedKey := clonePrefix(key)
 		e = c.entries.PushFront(&entry[V]{key: clonedKey, value: value, size: valueSize})
 		c.index[clonedKey] = e
-		c.onEntryInserted(len(c.index), valueSize)
+		c.onEntryPut(len(c.index), valueSize)
 		c.currentSize += valueSize
 	}
 
-	evictedValues = c.finishMutationReclaimLocked(evictedValues, e, reclaimedPreInsert, sizeBefore, sampledEpoch, pressure)
+	evictedValues = c.finishMutationReclaimLocked(evictedValues, e, reclaimedPrePut, sizeBefore, sampledEpoch, pressure)
 	return evictedValues, nil
 }
 
@@ -368,9 +368,9 @@ func (c *mapCache[V]) resetEmptyIndexLocked() {
 	c.markReclaimedLocked()
 }
 
-// Erase removes the entry associated with the given key from the cache.
-// Returns the value of the erased entry and true, or the zero value of V and false if the key was not found.
-func (c *mapCache[V]) Erase(key string) (V, bool) {
+// Delete removes the entry associated with the given key from the cache.
+// Returns the value of the deleted entry and true, or the zero value of V and false if the key was not found.
+func (c *mapCache[V]) Delete(key string) (V, bool) {
 	sampledEpoch, pressure := c.lockWithPressure(&c.mu, false)
 	defer c.unlock()
 
@@ -383,9 +383,9 @@ func (c *mapCache[V]) Erase(key string) (V, bool) {
 	return deleted, true
 }
 
-// LookUp retrieves the value associated with key and updates its position to MRU.
+// Get retrieves the value associated with key and updates its position to MRU.
 // Returns the zero value of V and false if key is not found in the cache.
-func (c *mapCache[V]) LookUp(key string) (V, bool) {
+func (c *mapCache[V]) Get(key string) (V, bool) {
 	c.lock()
 	defer c.unlock()
 
@@ -398,9 +398,9 @@ func (c *mapCache[V]) LookUp(key string) (V, bool) {
 	return e.Value.(*entry[V]).value, true
 }
 
-// LookUpWithoutChangingOrder retrieves the value associated with key without altering its LRU position.
+// Peek retrieves the value associated with key without altering its LRU position.
 // Returns the zero value of V and false if key is not found in the cache.
-func (c *mapCache[V]) LookUpWithoutChangingOrder(key string) (V, bool) {
+func (c *mapCache[V]) Peek(key string) (V, bool) {
 	c.rLock()
 	defer c.rUnlock()
 
@@ -412,14 +412,14 @@ func (c *mapCache[V]) LookUpWithoutChangingOrder(key string) (V, bool) {
 	return e.Value.(*entry[V]).value, true
 }
 
-// UpdateWithoutChangingOrder updates the value of an existing key and recomputes its weight
+// Replace updates the value of an existing key and recomputes its weight
 // without modifying its LRU position.
 // If the entry's updated weight exceeds maxSize (or cannot fit alongside entries more recent than key),
 // the entry itself is evicted immediately without evicting older entries. Otherwise, if total cache
 // capacity is exceeded, least recently used entries are evicted to ensure the size invariant holds.
 //
 // Returns ErrEntryNotExist if key is not present in the cache.
-func (c *mapCache[V]) UpdateWithoutChangingOrder(key string, value V) error {
+func (c *mapCache[V]) Replace(key string, value V) error {
 	newSize := c.weigh(key, value)
 
 	sampledEpoch, pressure := c.lockWithPressure(&c.mu, false)
@@ -520,9 +520,9 @@ func (c *mapCache[V]) UpdateWithoutChangingOrder(key string, value V) error {
 	return nil
 }
 
-// EraseEntriesWithGivenPrefix removes all entries from the cache whose keys start with prefix.
-// If prefix is empty (""), all entries in the cache are erased.
-func (c *mapCache[V]) EraseEntriesWithGivenPrefix(prefix string) {
+// DeletePrefix removes all entries from the cache whose keys start with prefix.
+// If prefix is empty (""), all entries in the cache are deleted.
+func (c *mapCache[V]) DeletePrefix(prefix string) {
 	if prefix == "" {
 		c.mu.Lock()
 		defer c.unlock()

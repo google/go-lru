@@ -645,12 +645,12 @@ func (c *radixCache[V]) finishMutationReclaimLocked(evictedValues []V, protected
 	return evictedValues
 }
 
-// Insert inserts or updates a key-value entry in the cache.
+// Put inserts or updates a key-value entry in the cache.
 // If the key exists, its value is updated and moved to MRU.
 // If capacity is exceeded, excess LRU entries are evicted and returned.
 //
 // Returns ErrInvalidEntrySize if the entry's weight exceeds maxSize.
-func (c *radixCache[V]) Insert(key string, value V) ([]V, error) {
+func (c *radixCache[V]) Put(key string, value V) ([]V, error) {
 	valueSize := c.weigh(key, value)
 	if valueSize > c.maxSize {
 		return nil, ErrInvalidEntrySize
@@ -661,8 +661,8 @@ func (c *radixCache[V]) Insert(key string, value V) ([]V, error) {
 
 	var evictedValues []V
 	sizeBefore := c.currentSize
-	reclaimedPreInsert := false
-	evictedPreInsert := false
+	reclaimedPrePut := false
+	evictedPrePut := false
 
 	node, exists := c.getNode(key)
 	if exists {
@@ -672,41 +672,41 @@ func (c *radixCache[V]) Insert(key string, value V) ([]V, error) {
 		for valueSize > c.maxSize-c.currentSize && c.tail != nil && c.tail != node {
 			if evicted, ok := c.evictOne(); ok {
 				evictedValues = append(evictedValues, evicted)
-				evictedPreInsert = true
+				evictedPrePut = true
 			}
 		}
 		node.value = value
 		node.hasValue = true
 		node.size = valueSize
 		c.currentSize += valueSize
-		reclaimedPreInsert = c.shouldReclaimSingleSurvivorOnMutation(c.len, c.deletedSinceCompact > 0, false, evictedPreInsert, c.currentSize, sizeBefore, pressure)
+		reclaimedPrePut = c.shouldReclaimSingleSurvivorOnMutation(c.len, c.deletedSinceCompact > 0, false, evictedPrePut, c.currentSize, sizeBefore, pressure)
 	} else {
 		// Evict from the LRU tail before inserting into the trie to avoid redundant node splits and merges.
 		for valueSize > c.maxSize-c.currentSize && c.tail != nil {
 			if evicted, ok := c.evictOne(); ok {
 				evictedValues = append(evictedValues, evicted)
-				evictedPreInsert = true
+				evictedPrePut = true
 			}
 		}
-		if c.shouldReclaimEmptyPreInsert(c.len, false, evictedPreInsert, valueSize, sizeBefore, pressure) {
+		if c.shouldReclaimEmptyPrePut(c.len, false, evictedPrePut, valueSize, sizeBefore, pressure) {
 			c.clearEmptyTreeStateLocked()
-			reclaimedPreInsert = true
-		} else if c.shouldReclaimSingleSurvivorOnMutation(c.len, c.deletedSinceCompact > 0, false, evictedPreInsert, c.currentSize+valueSize, sizeBefore, pressure) {
-			reclaimedPreInsert = true
+			reclaimedPrePut = true
+		} else if c.shouldReclaimSingleSurvivorOnMutation(c.len, c.deletedSinceCompact > 0, false, evictedPrePut, c.currentSize+valueSize, sizeBefore, pressure) {
+			reclaimedPrePut = true
 		}
 		node = c.insertNode(key, value)
 		node.size = valueSize
 		c.pushFront(node)
-		c.onEntryInserted(c.len, valueSize)
+		c.onEntryPut(c.len, valueSize)
 		c.currentSize += valueSize
 	}
 
-	evictedValues = c.finishMutationReclaimLocked(evictedValues, node, reclaimedPreInsert, sizeBefore, sampledEpoch, pressure)
+	evictedValues = c.finishMutationReclaimLocked(evictedValues, node, reclaimedPrePut, sizeBefore, sampledEpoch, pressure)
 	return evictedValues, nil
 }
 
-// Erase removes the entry associated with key, returning its value and true (or the zero value of V and false if not found).
-func (c *radixCache[V]) Erase(key string) (value V, ok bool) {
+// Delete removes the entry associated with key, returning its value and true (or the zero value of V and false if not found).
+func (c *radixCache[V]) Delete(key string) (value V, ok bool) {
 	sampledEpoch, pressure := c.lockWithPressure(&c.mu, false)
 	defer c.unlock()
 
@@ -724,9 +724,9 @@ func (c *radixCache[V]) Erase(key string) (value V, ok bool) {
 	return deleted, true
 }
 
-// LookUp retrieves the value for key and promotes it to the MRU position.
+// Get retrieves the value for key and promotes it to the MRU position.
 // Returns the zero value of V and false if key is not found.
-func (c *radixCache[V]) LookUp(key string) (value V, ok bool) {
+func (c *radixCache[V]) Get(key string) (value V, ok bool) {
 	c.mu.Lock()
 	defer c.unlock()
 
@@ -739,9 +739,9 @@ func (c *radixCache[V]) LookUp(key string) (value V, ok bool) {
 	return node.value, true
 }
 
-// LookUpWithoutChangingOrder retrieves the value for key without modifying its LRU position.
+// Peek retrieves the value for key without modifying its LRU position.
 // Returns the zero value of V and false if key is not found.
-func (c *radixCache[V]) LookUpWithoutChangingOrder(key string) (value V, ok bool) {
+func (c *radixCache[V]) Peek(key string) (value V, ok bool) {
 	c.mu.RLock()
 	defer c.rUnlock()
 
@@ -753,13 +753,13 @@ func (c *radixCache[V]) LookUpWithoutChangingOrder(key string) (value V, ok bool
 	return node.value, true
 }
 
-// UpdateWithoutChangingOrder updates the value of an existing key and recomputes its weight
+// Replace updates the value of an existing key and recomputes its weight
 // without modifying its LRU order.
 // If the entry's new weight exceeds maxSize (or cannot fit alongside entries more recent than node),
 // only node itself is evicted without evicting older entries. Otherwise, excess LRU entries are evicted if needed.
 //
 // Returns ErrEntryNotExist if key does not exist.
-func (c *radixCache[V]) UpdateWithoutChangingOrder(key string, value V) error {
+func (c *radixCache[V]) Replace(key string, value V) error {
 	newSize := c.weigh(key, value)
 
 	sampledEpoch, pressure := c.lockWithPressure(&c.mu, false)
@@ -860,9 +860,9 @@ func (c *radixCache[V]) UpdateWithoutChangingOrder(key string, value V) error {
 	return nil
 }
 
-// EraseEntriesWithGivenPrefix deletes all entries whose keys start with prefix.
+// DeletePrefix deletes all entries whose keys start with prefix.
 // Prunes subtrees in O(prefix_length + subtree_size) time and sweeps detached nodes.
-func (c *radixCache[V]) EraseEntriesWithGivenPrefix(prefix string) {
+func (c *radixCache[V]) DeletePrefix(prefix string) {
 	if prefix == "" {
 		c.mu.Lock()
 		defer c.unlock()

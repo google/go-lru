@@ -369,12 +369,12 @@ func (c *arenaRadix[V]) finishMutationReclaimLocked(evictedValues []V, protected
 	return evictedValues
 }
 
-// Insert inserts or updates the given key and value in the cache.
+// Put inserts or updates the given key and value in the cache.
 // If the key already exists, its value is replaced and promoted to MRU position.
 // If the cache exceeds capacity after insertion, LRU entries are evicted and returned.
 //
 // Returns ErrInvalidEntrySize if the entry's weight exceeds maxSize.
-func (c *arenaRadix[V]) Insert(key string, value V) ([]V, error) {
+func (c *arenaRadix[V]) Put(key string, value V) ([]V, error) {
 	valueSize := c.weigh(key, value)
 	if valueSize > c.maxSize {
 		return nil, ErrInvalidEntrySize
@@ -385,8 +385,8 @@ func (c *arenaRadix[V]) Insert(key string, value V) ([]V, error) {
 
 	var evictedValues []V
 	sizeBefore := c.currentSize
-	reclaimedPreInsert := false
-	evictedPreInsert := false
+	reclaimedPrePut := false
+	evictedPrePut := false
 	keyHash := hashString(key)
 
 	nodeID, exists := c.getNodeKeyWithHash(key, keyHash)
@@ -398,24 +398,24 @@ func (c *arenaRadix[V]) Insert(key string, value V) ([]V, error) {
 		for valueSize > c.maxSize-c.currentSize && c.tail != nilNode && c.tail != nodeID {
 			if evicted, ok := c.evictOne(); ok {
 				evictedValues = append(evictedValues, evicted)
-				evictedPreInsert = true
+				evictedPrePut = true
 			}
 		}
 		c.nodes[nodeID].value = value
 		c.nodes[nodeID].hasValue = true
 		c.nodes[nodeID].size = valueSize
 		c.currentSize += valueSize
-		if evictedPreInsert {
+		if evictedPrePut {
 			c.nodeMap[keyHash] = nodeID
 		}
-		reclaimedPreInsert = c.shouldReclaimSingleSurvivorOnMutation(c.len, c.freeCount > 0 || c.nodeMapDirty, c.freeCount >= 63, evictedPreInsert, c.currentSize, sizeBefore, pressure)
+		reclaimedPrePut = c.shouldReclaimSingleSurvivorOnMutation(c.len, c.freeCount > 0 || c.nodeMapDirty, c.freeCount >= 63, evictedPrePut, c.currentSize, sizeBefore, pressure)
 	} else {
 		// A single new-key insert can allocate up to 2 nodes (one routing node, one leaf).
 		// If the slice has reached its physical uint32 maximum, ensure enough free slots exist.
 		for uint64(len(c.nodes))-uint64(c.freeCount)+2 > uint64(foregroundNoProtect) && c.tail != nilNode {
 			if evicted, ok := c.evictOne(); ok {
 				evictedValues = append(evictedValues, evicted)
-				evictedPreInsert = true
+				evictedPrePut = true
 			}
 		}
 
@@ -424,30 +424,30 @@ func (c *arenaRadix[V]) Insert(key string, value V) ([]V, error) {
 		for valueSize > c.maxSize-c.currentSize && c.tail != nilNode {
 			if evicted, ok := c.evictOne(); ok {
 				evictedValues = append(evictedValues, evicted)
-				evictedPreInsert = true
+				evictedPrePut = true
 			}
 		}
-		if c.shouldReclaimEmptyPreInsert(c.len, c.freeCount >= 64, evictedPreInsert, valueSize, sizeBefore, pressure) {
+		if c.shouldReclaimEmptyPrePut(c.len, c.freeCount >= 64, evictedPrePut, valueSize, sizeBefore, pressure) {
 			c.clearEmptyArenaStateLocked()
-			reclaimedPreInsert = true
-		} else if c.shouldReclaimSingleSurvivorOnMutation(c.len, c.freeCount > 0 || c.nodeMapDirty, c.freeCount >= 63, evictedPreInsert, c.currentSize+valueSize, sizeBefore, pressure) {
-			reclaimedPreInsert = true
+			reclaimedPrePut = true
+		} else if c.shouldReclaimSingleSurvivorOnMutation(c.len, c.freeCount > 0 || c.nodeMapDirty, c.freeCount >= 63, evictedPrePut, c.currentSize+valueSize, sizeBefore, pressure) {
+			reclaimedPrePut = true
 		}
 
 		nodeID = c.insertNode(key, value)
 		c.nodes[nodeID].size = valueSize
 		c.pushFront(nodeID)
-		c.onEntryInserted(c.len, valueSize)
+		c.onEntryPut(c.len, valueSize)
 		c.currentSize += valueSize
 		c.nodeMap[keyHash] = nodeID
 	}
 
-	evictedValues = c.finishMutationReclaimLocked(evictedValues, nodeID, reclaimedPreInsert, sizeBefore, sampledEpoch, pressure)
+	evictedValues = c.finishMutationReclaimLocked(evictedValues, nodeID, reclaimedPrePut, sizeBefore, sampledEpoch, pressure)
 	return evictedValues, nil
 }
 
-// Erase removes the entry associated with key from the cache, returning its value and true (or the zero value of V and false if not found).
-func (c *arenaRadix[V]) Erase(key string) (value V, ok bool) {
+// Delete removes the entry associated with key from the cache, returning its value and true (or the zero value of V and false if not found).
+func (c *arenaRadix[V]) Delete(key string) (value V, ok bool) {
 	sampledEpoch, pressure := c.lockWithPressure(&c.mu, false)
 	defer c.unlock()
 
@@ -466,9 +466,9 @@ func (c *arenaRadix[V]) Erase(key string) (value V, ok bool) {
 	return deleted, true
 }
 
-// LookUp retrieves the value associated with key and promotes it to MRU position.
+// Get retrieves the value associated with key and promotes it to MRU position.
 // Returns the zero value of V and false if the key is not found in the cache.
-func (c *arenaRadix[V]) LookUp(key string) (value V, ok bool) {
+func (c *arenaRadix[V]) Get(key string) (value V, ok bool) {
 	c.mu.Lock()
 	defer c.unlock()
 
@@ -482,9 +482,9 @@ func (c *arenaRadix[V]) LookUp(key string) (value V, ok bool) {
 	return c.nodes[nodeID].value, true
 }
 
-// LookUpWithoutChangingOrder retrieves the value associated with key without altering its LRU position.
+// Peek retrieves the value associated with key without altering its LRU position.
 // Returns the zero value of V and false if the key is not found in the cache.
-func (c *arenaRadix[V]) LookUpWithoutChangingOrder(key string) (value V, ok bool) {
+func (c *arenaRadix[V]) Peek(key string) (value V, ok bool) {
 	c.mu.RLock()
 	defer c.rUnlock()
 
@@ -496,14 +496,14 @@ func (c *arenaRadix[V]) LookUpWithoutChangingOrder(key string) (value V, ok bool
 	return c.nodes[nodeID].value, true
 }
 
-// UpdateWithoutChangingOrder updates the value of an existing key and recomputes its weight
+// Replace updates the value of an existing key and recomputes its weight
 // without modifying its LRU position.
 // If the entry's updated weight exceeds maxSize (or cannot fit alongside entries more recent than node),
 // only the entry itself is evicted without evicting older entries.
 // Otherwise, if the updated cache size exceeds maxSize, excess LRU entries are evicted to maintain capacity invariants.
 //
 // Returns ErrEntryNotExist if key is not present in the cache.
-func (c *arenaRadix[V]) UpdateWithoutChangingOrder(key string, value V) error {
+func (c *arenaRadix[V]) Replace(key string, value V) error {
 	newSize := c.weigh(key, value)
 
 	sampledEpoch, pressure := c.lockWithPressure(&c.mu, false)
@@ -612,9 +612,9 @@ func (c *arenaRadix[V]) UpdateWithoutChangingOrder(key string, value V) error {
 	return nil
 }
 
-// EraseEntriesWithGivenPrefix deletes all entries whose keys begin with prefix.
+// DeletePrefix deletes all entries whose keys begin with prefix.
 // It severs the matching subtree in O(1) and iteratively reclaims all nodes into the free-list.
-func (c *arenaRadix[V]) EraseEntriesWithGivenPrefix(prefix string) {
+func (c *arenaRadix[V]) DeletePrefix(prefix string) {
 	if prefix == "" {
 		c.mu.Lock()
 		defer c.unlock()

@@ -27,7 +27,7 @@ package lru
 // Cache defines the unified generic interface for LRU cache engines.
 // All implementations are safe for concurrent access by multiple goroutines.
 type Cache[V any] interface {
-	// Insert inserts or updates the given key and value in the cache.
+	// Put inserts or updates the given key and value in the cache.
 	// If key already exists, its value is replaced, its weight is recomputed via the configured
 	// weigher (or defaults to 1), and the entry is moved to the most recently used (MRU) position.
 	// If the cache exceeds capacity after insertion, least recently used (LRU) entries are evicted
@@ -35,21 +35,21 @@ type Cache[V any] interface {
 	//
 	// On error, no entries are evicted, the cache state remains unmodified, and (nil, err) is returned.
 	// Returns ErrInvalidEntrySize if the entry's weight exceeds the cache's maximum size.
-	Insert(key string, value V) ([]V, error)
+	Put(key string, value V) ([]V, error)
 
-	// Erase removes the entry associated with the given key from the cache.
-	// Returns the value of the erased entry and true if found, or the zero value of V and false if not found.
-	Erase(key string) (value V, ok bool)
+	// Delete removes the entry associated with the given key from the cache.
+	// Returns the value of the deleted entry and true if found, or the zero value of V and false if not found.
+	Delete(key string) (value V, ok bool)
 
-	// LookUp retrieves the value associated with key and updates its position to MRU.
+	// Get retrieves the value associated with key and updates its position to MRU.
 	// Returns the zero value of V and false if key is not found in the cache.
-	LookUp(key string) (value V, ok bool)
+	Get(key string) (value V, ok bool)
 
-	// LookUpWithoutChangingOrder retrieves the value associated with key without altering its LRU position.
+	// Peek retrieves the value associated with key without altering its LRU position.
 	// Returns the zero value of V and false if key is not found in the cache.
-	LookUpWithoutChangingOrder(key string) (value V, ok bool)
+	Peek(key string) (value V, ok bool)
 
-	// UpdateWithoutChangingOrder updates the value of an existing key and recomputes its weight
+	// Replace updates the value of an existing key and recomputes its weight
 	// using the configured weigher (or 1 if no weigher is configured) without modifying its LRU position.
 	//
 	// If the updated entry's weight is smaller than its previous weight, currentSize is reduced accordingly.
@@ -58,17 +58,17 @@ type Cache[V any] interface {
 	// fit alongside entries more recent than key.
 	//
 	// Returns ErrEntryNotExist if key is not present in the cache.
-	UpdateWithoutChangingOrder(key string, value V) error
+	Replace(key string, value V) error
 
-	// EraseEntriesWithGivenPrefix deletes all entries whose keys begin with prefix.
+	// DeletePrefix deletes all entries whose keys begin with prefix.
 	// If prefix is an empty string (""), all entries in the cache are deleted.
-	EraseEntriesWithGivenPrefix(prefix string)
+	DeletePrefix(prefix string)
 }
 
 // PressureAwareCache extends Cache[V] with explicit arena/map compaction and memory-pressure reclamation.
 // All three cache backends (MapCache, RadixCache, and ArenaRadixCache) implement this interface
-// and perform both automatic amortized foreground reclamation (on Insert, Erase, UpdateWithoutChangingOrder,
-// and EraseEntriesWithGivenPrefix) and explicit reclamation via EvaluateMemoryPressure() and Compact().
+// and perform both automatic amortized foreground reclamation (on Put, Delete, Replace,
+// and DeletePrefix) and explicit reclamation via EvaluateMemoryPressure() and Compact().
 type PressureAwareCache[V any] interface {
 	Cache[V]
 

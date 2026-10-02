@@ -13,11 +13,11 @@ This document details the internal data structures, concurrency models, and memo
 | **Per-Node Heap Allocations** | 2 allocations per entry (0 on update) | 1 allocation per node | **0 allocations** (recycled via intrusive free-list) |
 | **Node Pointer Width** | 64-bit pointers | 64-bit pointers (5 pointers / node) | **32-bit indices** (`uint32`, sentinel `nilNode = math.MaxUint32`) |
 | **Max Entry Capacity** | Memory / Heap limited | Memory / Heap limited | **`2^32 - 2` total arena nodes** (`0..math.MaxUint32-2`; `nilNode = MaxUint32`, `foregroundNoProtect = MaxUint32-1`) |
-| **Point Lookup Latency** | **~50 ns/op** (`O(1)` Hash Map) | ~170 ns/op (`O(K)` Trie Descent) | **~100 ns/op** (`O(1)` FNV-1a Hash Map + Zero-Alloc Path Check) |
-| **Sequential Insert Latency** | ~98 ns/op in-place (~383 ns/op turnover) | ~175 ns/op in-place (~472 ns/op turnover) | ~270 ns/op in-place (~515 ns/op turnover, 0 node allocs) |
-| **Point Update Latency** | ~71 ns/op (0 allocs) | ~121 ns/op (0 allocs) | ~124 ns/op (0 allocs) |
-| **Prefix Erase (100 items)** | ~151.2–219.9 µs (`O(N)` full scan) | **~2.25–2.50 µs** (**65.7x–88.0x faster**) | **~7.3–7.6 µs** (**20.7x–28.9x faster**) |
-| **Prefix Erase (50K/100K items)** | ~21.6 ms | **~1.05 ms** (**20.5x faster**) | **~5.1 ms** (**4.2x faster**) |
+| **Point Get Latency** | **~50 ns/op** (`O(1)` Hash Map) | ~170 ns/op (`O(K)` Trie Descent) | **~100 ns/op** (`O(1)` FNV-1a Hash Map + Zero-Alloc Path Check) |
+| **Sequential Put Latency** | ~98 ns/op in-place (~383 ns/op turnover) | ~175 ns/op in-place (~472 ns/op turnover) | ~270 ns/op in-place (~515 ns/op turnover, 0 node allocs) |
+| **Point Replace Latency** | ~71 ns/op (0 allocs) | ~121 ns/op (0 allocs) | ~124 ns/op (0 allocs) |
+| **Prefix Delete (100 items)** | ~151.2–219.9 µs (`O(N)` full scan) | **~2.25–2.50 µs** (**65.7x–88.0x faster**) | **~7.3–7.6 µs** (**20.7x–28.9x faster**) |
+| **Prefix Delete (50K/100K items)** | ~21.6 ms | **~1.05 ms** (**20.5x faster**) | **~5.1 ms** (**4.2x faster**) |
 | **Live Heap Memory** | ~135.9 B/entry at 1M (~163.0 `heap-B/entry` at 100K) | **~94.2 B/entry at 1M** (~96.0 `heap-B/entry` at 100K, **~30.7%–41.1% reduction**) | **~106.9 B/entry at 1M** (~111.2 `heap-B/entry` at 100K, **~21.4%–31.8% reduction**) |
 | **GC Pressure & Overhead** | High (millions of distinct heap objects) | Moderate (heap nodes with pointers) | **Ultra-Low** (flat slice; internal tree indices invisible to GC) |
 | **Concurrency Lock** | `sync.RWMutex` | `sync.RWMutex` | `sync.RWMutex` |
@@ -29,22 +29,22 @@ This document details the internal data structures, concurrency models, and memo
 
 ### 2.1 `MapCache` (`map_lru.go`)
 `MapCache` pairs Go's standard hash map (`map[string]*list.Element`) with a doubly-linked recency list (`container/list.List`) guarded by a `sync.RWMutex`.
-- **Operations**: `Insert`, `LookUp`, `LookUpWithoutChangingOrder`, `UpdateWithoutChangingOrder`, and `Erase` execute in `O(1)` time.
-- **Prefix Eviction Trade-off**: `EraseEntriesWithGivenPrefix(prefix)` must iterate over all `N` entries in the map (`O(N)`), making it unsuitable for frequent directory-tree purges on large caches.
+- **Operations**: `Put`, `Get`, `Peek`, `Replace`, and `Delete` execute in `O(1)` time.
+- **Prefix Deletion Trade-off**: `DeletePrefix(prefix)` must iterate over all `N` entries in the map (`O(N)`), making it unsuitable for frequent directory-tree purges on large caches.
 
 ### 2.2 `RadixCache` (`radix_lru.go`)
 `RadixCache` stores keys in a compressed **Left-Child Right-Sibling (LCRS)** radix tree (`radixNode[V]`, 80 bytes per node for 8-byte `V`).
 - **Intrusive Doubly-Linked LRU List**: Each `radixNode[V]` embeds `prev` and `next` pointers alongside tree topology links (`parent`, `child`, `sibling`) and a `hasValue` discriminator, avoiding separate `list.Element` wrapper allocations.
-- **Subtree Detachment**: `EraseEntriesWithGivenPrefix(prefix)` descends `O(P)` characters to the prefix root, detaches the subtree in `O(1)`, and unlinks the `S` descendant value nodes from the intrusive LRU list in `O(S)` (`O(P + S)` total work).
-- **Path Compression**: When an internal node loses children after `Erase` or eviction, `compressPathUpwards` merges single-child routing nodes with their parent to keep tree depth minimal.
+- **Subtree Detachment**: `DeletePrefix(prefix)` descends `O(P)` characters to the prefix root, detaches the subtree in `O(1)`, and unlinks the `S` descendant value nodes from the intrusive LRU list in `O(S)` (`O(P + S)` total work).
+- **Path Compression**: When an internal node loses children after `Delete` or eviction, `compressPathUpwards` merges single-child routing nodes with their parent to keep tree depth minimal.
 
 ### 2.3 `ArenaRadixCache` (`arena_radix.go`, `arena_radix_lru.go`)
 `ArenaRadixCache` eliminates per-node heap objects and pointer-graph scanning by storing all nodes in a contiguous slice `[]arenaRadixNode[V]` (`56 bytes per node for 8-byte V, 64 bytes for 16-byte V`) indexed by 32-bit integers (`uint32`, with `nilNode = math.MaxUint32`).
-- **Intrusive O(1) Free-List**: Erased or evicted node slots are pushed onto an intrusive singly-linked free-list (`freeHead`, linked via `next` index with `parent = nilNode`, `child = nilNode`, `sibling = nilNode`, `prev = nilNode`, `hasValue = false`) and recycled on subsequent insertions with zero heap allocations.
+- **Intrusive O(1) Free-List**: Deleted or evicted node slots are pushed onto an intrusive singly-linked free-list (`freeHead`, linked via `next` index with `parent = nilNode`, `child = nilNode`, `sibling = nilNode`, `prev = nilNode`, `hasValue = false`) and recycled on subsequent insertions with zero heap allocations.
 - **O(1) 64-Bit FNV-1a Lookup Accelerator**:
   - `nodeMap map[uint64]uint32` maps the 64-bit FNV-1a hash of full keys directly to their arena node index.
   - `verifyKey(nodeID, key)` walks `parent` indices from `nodeID` up to `root`, verifying byte-for-byte suffix equality against `key` in zero allocations.
-  - If two distinct keys collide on the same 64-bit FNV-1a hash, `ArenaRadixCache` preserves full correctness by falling back to `O(K)` trie descent (`getNodeKeyWithHash`) and healing `nodeMap` entries on write-locked lookups (`LookUp`, `Insert`, `UpdateWithoutChangingOrder`) or `compactLocked()`.
+  - If two distinct keys collide on the same 64-bit FNV-1a hash, `ArenaRadixCache` preserves full correctness by falling back to `O(K)` trie descent (`getNodeKeyWithHash`) and healing `nodeMap` entries on write-locked operations (`Get`, `Put`, `Replace`) or `compactLocked()`.
 
 ---
 
@@ -54,7 +54,7 @@ Go's built-in `map` never shrinks its bucket array after deletions, pointer-base
 
 ### 3.1 Lock-Free Amortized Pressure Sampling
 - **Built-In Probe (`DefaultRuntimePressureFunc`)**: Reads `/memory/classes/total:bytes`, `/memory/classes/heap/released:bytes`, `/memory/classes/heap/free:bytes`, and `/memory/classes/heap/objects:bytes` from `runtime/metrics` using a `sync.Pool` of `[4]metrics.Sample` arrays (`metricsSamplePool`, `0 allocs/op`, zero Stop-The-World pauses), with an `O(1)` fast-path when `memoryBudget == 0` that reads `/gc/gomemlimit:bytes` via a pooled `[1]metrics.Sample` array (`gomemlimitSamplePool`) and returns `0.0` immediately when `GOMEMLIMIT` is unbounded without acquiring `worldsema` or sweeping per-P heap stats.
-- **Amortized Window (`samplePressureWithEpoch`)**: When using the built-in `DefaultRuntimePressureFunc`, foreground write operations (`Insert`, `UpdateWithoutChangingOrder`, `Erase`, `EraseEntriesWithGivenPrefix`) sample the runtime metrics probe once every 256 writes (`seq&255 == 1`) or immediately following a reclamation epoch (`pressureNeedsRefresh`), whereas custom `WithPressureFunc` callbacks are sampled on every foreground write and `EvaluateMemoryPressure()` call.
+- **Amortized Window (`samplePressureWithEpoch`)**: When using the built-in `DefaultRuntimePressureFunc`, foreground write operations (`Put`, `Replace`, `Delete`, `DeletePrefix`) sample the runtime metrics probe once every 256 writes (`seq&255 == 1`) or immediately following a reclamation epoch (`pressureNeedsRefresh`), whereas custom `WithPressureFunc` callbacks are sampled on every foreground write and `EvaluateMemoryPressure()` call.
 - **Re-Entrancy Guard**: Atomic sampler tracking (`samplingPressure`, `fallbackSampling`, `overflowSamplingGIDs`) ensures that even if a user-supplied `PressureFunc` re-entrantly calls methods on the same `Cache`, it will never deadlock or recurse infinitely.
 
 ### 3.2 Tier 1 — Moderate Pressure (`pressure >= CompactionThreshold`, default `0.75`)
@@ -65,7 +65,7 @@ When normalized memory pressure reaches `CompactionThreshold`:
 ### 3.3 Tier 2 — Critical Pressure (`pressure >= EvictionThreshold`, default `0.90`)
 When normalized memory pressure reaches `EvictionThreshold`:
 - `shedAndCompactLocked()` proactively evicts least-recently-used (`tail`) entries until `currentSize <= maxSize * EvictionRetentionRatio` (default `50%` of `maxSize`), and also proportionally sheds zero-size entries (`size == 0`) down to `EvictionRetentionRatio` (bounded by `targetLen` and `lastReclaimedZeroCount` / `lastReclaimedLen` watermarks so repeated evaluations at sustained critical pressure remain idempotent).
-- Foreground insertions pass the MRU head entry as a protected reference so the entry currently being inserted or overwritten is never self-evicted during inline pressure shedding, while foreground order-preserving updates (`UpdateWithoutChangingOrder`) pass an unprotected sentinel (`nil` / `foregroundNoProtect`) and protect the MRU head entry when `tail == head`.
+- Foreground `Put` operations pass the MRU head entry as a protected reference so the entry currently being stored or overwritten is never self-evicted during inline pressure shedding, while foreground order-preserving replacements (`Replace`) pass an unprotected sentinel (`nil` / `foregroundNoProtect`) and protect the MRU head entry when `tail == head`.
 - After shedding LRU entries, `compactDataStructuresLocked()` executes immediately to return both the evicted entries' backing structures and any prior map/tree/arena slack to the Go runtime heap.
 
 ---
