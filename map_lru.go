@@ -563,7 +563,6 @@ func (c *mapCache[V]) DeletePrefix(prefix string) {
 			if entryVal, ok := e.Value.(*entry[V]); ok && entryVal != nil {
 				evictedKey := entryVal.key
 				evictedVal := entryVal.value
-				c.onEntryDeleted(entryVal.size)
 				c.currentSize -= entryVal.size
 				entryVal.key = ""
 				entryVal.value = zero

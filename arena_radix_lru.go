@@ -640,7 +640,6 @@ func (c *arenaRadix[V]) DeletePrefix(prefix string) {
 					key = c.reconstructKey(currID)
 				}
 				evictedVal := c.nodes[currID].value
-				c.onEntryDeleted(c.nodes[currID].size)
 				c.currentSize -= c.nodes[currID].size
 				c.remove(currID)
 				c.nodes[currID].value = zero
