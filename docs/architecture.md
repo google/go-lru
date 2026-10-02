@@ -77,3 +77,16 @@ Enabling `WithInvariantChecking(true)` validates structural integrity across eve
 2. **Iterative Tree Walk**: Uses parent/sibling pointers (`radixCache`) or `uint32` index links (`ArenaRadixCache`) to traverse the entire LCRS tree in `O(1)` auxiliary space without recursion, verifying parent-child symmetry and absence of cycles.
 3. **LRU List Bijection**: Verifies that every value-bearing tree node appears in the doubly-linked `head`/`tail` list with matching forward and reverse traversal counts and exact `currentSize` sum parity.
 4. **Free-List & Hash Index Integrity (`ArenaRadixCache`)**: Confirms `len(nodes) - freeCount == treeNodeCount`, verifies zero overlap between free-list slots and live tree nodes, and checks `nodeMap` index consistency.
+
+---
+
+## 5. Eviction Callbacks & Zero-Overhead Key Reconstruction
+
+All three engines support synchronous entry removal/replacement callbacks via `WithOnEvictValue[V any]` (`func(value V, reason EvictionReason)`) and `WithOnEvictEntry[V any]` (`func(key string, value V, reason EvictionReason)`):
+- **Four Removal Causes (`EvictionReason`)**: `EvictionReasonCapacity` (LRU eviction on `Put`/`Replace`, or `Replace` self-eviction when the updated weight exceeds `maxSize` or cannot fit alongside newer entries), `EvictionReasonPressure` (Tier 2 critical memory-pressure shedding), `EvictionReasonDeleted` (`Delete` or `DeletePrefix`), and `EvictionReasonReplaced` (in-place value overwrite on `Put` or `Replace`). When both callbacks are configured, `OnEvictValue` is invoked before `OnEvictEntry`.
+- **Zero Key-Reconstruction Overhead**:
+  - Because `RadixCache` and `ArenaRadixCache` store compressed prefix segments across tree ancestors rather than full key strings per node, `WithOnEvictValue` never reconstructs keys (`0` string allocations).
+  - Even when `WithOnEvictEntry` is configured, operations that already have `key` in hand (`Delete(key)`, `Put(key, ...)` overwrite, `Replace(key, ...)` overwrite, and `Replace` self-eviction) forward `key` directly without walking the tree.
+  - When `WithOnEvictEntry` is configured and an entry is removed without a caller-supplied key (`evictOne`, `shedAndCompactLocked`, `DeletePrefix`), `reconstructKey` walks parent links using a 64-element stack buffer (`[64]*radixNode[V]` / `[64]uint32`) and a pre-sized `strings.Builder` strictly before `deleteNode` (`compressPathUpwards`) mutates prefix or parent pointers.
+
+

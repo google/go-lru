@@ -589,3 +589,78 @@ func Benchmark_ArenaRadixCache_PutUnderPressure(b *testing.B) {
 		i++
 	}
 }
+
+// ============================================================================
+// 10. Eviction Callback Benchmarks
+// ============================================================================
+
+var (
+	benchSinkEvictKey    string
+	benchSinkEvictReason lru.EvictionReason
+)
+
+func Benchmark_Put_WithOnEvictValue(b *testing.B) {
+	cbOpt := lru.WithOnEvictValue(func(v benchValue, r lru.EvictionReason) {
+		benchSinkVal = v
+		benchSinkEvictReason = r
+	})
+	b.Run("MapCache", func(b *testing.B) {
+		runBenchmarkPutWithOptions(b, lru.NewMapCache[benchValue], 2, 5, benchWeigher, cbOpt)
+	})
+	b.Run("RadixCache", func(b *testing.B) {
+		runBenchmarkPutWithOptions(b, lru.NewRadixCache[benchValue], 2, 5, benchWeigher, cbOpt)
+	})
+	b.Run("ArenaRadixCache", func(b *testing.B) {
+		runBenchmarkPutWithOptions(b, lru.NewArenaRadixCache[benchValue], 2, 5, benchWeigher, cbOpt)
+	})
+}
+
+func Benchmark_Put_WithOnEvictEntry(b *testing.B) {
+	cbOpt := lru.WithOnEvictEntry(func(k string, v benchValue, r lru.EvictionReason) {
+		benchSinkEvictKey = k
+		benchSinkVal = v
+		benchSinkEvictReason = r
+	})
+	b.Run("MapCache", func(b *testing.B) {
+		runBenchmarkPutWithOptions(b, lru.NewMapCache[benchValue], 2, 5, benchWeigher, cbOpt)
+	})
+	b.Run("RadixCache", func(b *testing.B) {
+		runBenchmarkPutWithOptions(b, lru.NewRadixCache[benchValue], 2, 5, benchWeigher, cbOpt)
+	})
+	b.Run("ArenaRadixCache", func(b *testing.B) {
+		runBenchmarkPutWithOptions(b, lru.NewArenaRadixCache[benchValue], 2, 5, benchWeigher, cbOpt)
+	})
+}
+
+func Benchmark_Replace_WithOnEvictValue(b *testing.B) {
+	cbOpt := lru.WithOnEvictValue(func(v benchValue, r lru.EvictionReason) {
+		benchSinkVal = v
+		benchSinkEvictReason = r
+	})
+	b.Run("MapCache", func(b *testing.B) {
+		runBenchmarkReplaceWithOptions(b, lru.NewMapCache[benchValue], benchWeigher, cbOpt)
+	})
+	b.Run("RadixCache", func(b *testing.B) {
+		runBenchmarkReplaceWithOptions(b, lru.NewRadixCache[benchValue], benchWeigher, cbOpt)
+	})
+	b.Run("ArenaRadixCache", func(b *testing.B) {
+		runBenchmarkReplaceWithOptions(b, lru.NewArenaRadixCache[benchValue], benchWeigher, cbOpt)
+	})
+}
+
+func Benchmark_Replace_WithOnEvictEntry(b *testing.B) {
+	cbOpt := lru.WithOnEvictEntry(func(k string, v benchValue, r lru.EvictionReason) {
+		benchSinkEvictKey = k
+		benchSinkVal = v
+		benchSinkEvictReason = r
+	})
+	b.Run("MapCache", func(b *testing.B) {
+		runBenchmarkReplaceWithOptions(b, lru.NewMapCache[benchValue], benchWeigher, cbOpt)
+	})
+	b.Run("RadixCache", func(b *testing.B) {
+		runBenchmarkReplaceWithOptions(b, lru.NewRadixCache[benchValue], benchWeigher, cbOpt)
+	})
+	b.Run("ArenaRadixCache", func(b *testing.B) {
+		runBenchmarkReplaceWithOptions(b, lru.NewArenaRadixCache[benchValue], benchWeigher, cbOpt)
+	})
+}

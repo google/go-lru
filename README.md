@@ -86,12 +86,16 @@ All three backends (`MapCache`, `RadixCache`, and `ArenaRadixCache`) also implem
 | :--- | :--- | :--- | :--- |
 | `WithBackend(backend)` | `BackendMap` | `lru.New` | Selects underlying cache engine (`BackendMap`, `BackendRadix`, `BackendArenaRadix`) |
 | `WithWeigher(fn)` | `1` per entry | All engines | Custom entry-weight callback `func(key string, value V) uint64` for byte/resource-bounded eviction |
+| `WithOnEvictValue(fn)` | `nil` | All engines | Value-only eviction/removal callback `func(value V, reason EvictionReason)` (zero key-reconstruction overhead on radix backends) |
+| `WithOnEvictEntry(fn)` | `nil` | All engines | Full key+value eviction/removal callback `func(key string, value V, reason EvictionReason)` |
 | `WithInvariantChecking(bool)` | `false` | All engines | Enables runtime structural & size parity invariant verification (for tests/debugging) |
 | `WithMemoryBudget(bytes)` | `0` (`GOMEMLIMIT`) | All engines | Explicit memory ceiling in bytes for the built-in `runtime/metrics` pressure probe |
 | `WithPressureFunc(fn)` | `DefaultRuntimePressureFunc` | All engines | Custom callback `func() float64` returning normalized memory pressure in `[0.0, 1.0+]` |
 | `WithCompactionThreshold(float64)` | `0.75` (`DefaultCompactionThreshold`) | All engines | Tier 1 Moderate Pressure threshold triggering lossless backing structure & hash map compaction |
 | `WithEvictionThreshold(float64)` | `0.90` (`DefaultEvictionThreshold`) | All engines | Tier 2 Critical Pressure threshold triggering proactive LRU tail shedding + compaction |
 | `WithEvictionRetentionRatio(float64)` | `0.50` (`DefaultEvictionRetentionRatio`) | All engines | Target fraction `[0.0, 1.0]` of `maxSize` retained during Tier 2 Critical Pressure shedding |
+
+Eviction callbacks receive an `EvictionReason` (`EvictionReasonCapacity`, `EvictionReasonPressure`, `EvictionReasonDeleted`, or `EvictionReasonReplaced`) and run synchronously inside the mutating operation under the cache's write lock (must not re-enter the same `Cache` instance).
 
 ---
 

@@ -120,3 +120,37 @@ func ExampleNew_memoryPressure() {
 	// Output:
 	// shed entries=1, item1 remaining=false, item2 remaining=true
 }
+
+// ExampleNew_onEvict demonstrates observing entry removals and value replacements
+// using WithOnEvictValue and WithOnEvictEntry along with EvictionReason.
+func ExampleNew_onEvict() {
+	cache := lru.New[string](
+		2,
+		lru.WithBackend(lru.BackendRadix),
+		lru.WithOnEvictValue(func(val string, reason lru.EvictionReason) {
+			fmt.Printf("value callback: val=%s reason=%s\n", val, reason)
+		}),
+		lru.WithOnEvictEntry(func(key, val string, reason lru.EvictionReason) {
+			fmt.Printf("entry callback: key=%s val=%s reason=%s\n", key, val, reason)
+		}),
+	)
+
+	_, _ = cache.Put("dir/a", "v1")
+	_, _ = cache.Put("dir/b", "v2")
+
+	// Overwriting "dir/a" triggers EvictionReasonReplaced for the old value "v1".
+	_, _ = cache.Put("dir/a", "v1-updated")
+
+	// Inserting "dir/c" exceeds capacity (2), evicting LRU "dir/b" with EvictionReasonCapacity.
+	_, _ = cache.Put("dir/c", "v3")
+
+	// Explicitly deleting "dir/a" triggers EvictionReasonDeleted.
+	_, _ = cache.Delete("dir/a")
+	// Output:
+	// value callback: val=v1 reason=Replaced
+	// entry callback: key=dir/a val=v1 reason=Replaced
+	// value callback: val=v2 reason=Capacity
+	// entry callback: key=dir/b val=v2 reason=Capacity
+	// value callback: val=v1-updated reason=Deleted
+	// entry callback: key=dir/a val=v1-updated reason=Deleted
+}

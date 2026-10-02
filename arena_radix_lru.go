@@ -35,6 +35,8 @@ func newArenaRadixCacheWithOptions[V any](maxSize uint64, options Options) Cache
 	c := &arenaRadix[V]{
 		maxSize:       maxSize,
 		weigher:       resolveWeigher[V](options),
+		onEvictValue:  resolveOnEvictValue[V](options),
+		onEvictEntry:  resolveOnEvictEntry[V](options),
 		pressureState: pressureState{options: options},
 	}
 
@@ -392,6 +394,7 @@ func (c *arenaRadix[V]) Put(key string, value V) ([]V, error) {
 	nodeID, exists := c.getNodeKeyWithHash(key, keyHash)
 	if exists {
 		// Updating an existing key requires 0 new node allocations and 0 trie walks.
+		oldValue := c.nodes[nodeID].value
 		c.onEntrySizeUpdated(c.nodes[nodeID].size, valueSize)
 		c.moveToFront(nodeID)
 		c.currentSize -= c.nodes[nodeID].size
@@ -408,6 +411,7 @@ func (c *arenaRadix[V]) Put(key string, value V) ([]V, error) {
 		if evictedPrePut {
 			c.nodeMap[keyHash] = nodeID
 		}
+		c.notifyEvict(key, oldValue, EvictionReasonReplaced)
 		reclaimedPrePut = c.shouldReclaimSingleSurvivorOnMutation(c.len, c.freeCount > 0 || c.nodeMapDirty, c.freeCount >= 63, evictedPrePut, c.currentSize, sizeBefore, pressure)
 	} else {
 		// A single new-key insert can allocate up to 2 nodes (one routing node, one leaf).
@@ -458,7 +462,7 @@ func (c *arenaRadix[V]) Delete(key string) (value V, ok bool) {
 	}
 
 	sizeBefore := c.currentSize
-	deleted, erased := c.eraseInternalWithHash(nodeID, keyHash)
+	deleted, erased := c.eraseInternalWithHash(nodeID, keyHash, key, EvictionReasonDeleted)
 	if !erased {
 		return value, false
 	}
@@ -516,10 +520,11 @@ func (c *arenaRadix[V]) Replace(key string, value V) error {
 	}
 
 	oldSize := c.nodes[nodeID].size
+	oldValue := c.nodes[nodeID].value
 
 	if newSize > c.maxSize {
 		sizeBefore := c.currentSize
-		c.eraseInternalWithHash(nodeID, keyHash)
+		c.eraseInternalWithHash(nodeID, keyHash, key, EvictionReasonCapacity)
 		c.finishDeleteReclaimLocked(sizeBefore, sampledEpoch, pressure)
 		return nil
 	}
@@ -563,7 +568,7 @@ func (c *arenaRadix[V]) Replace(key string, value V) error {
 				tailCurr = c.nodes[tailCurr].prev
 			}
 			if !canFit {
-				c.eraseInternalWithHash(nodeID, keyHash)
+				c.eraseInternalWithHash(nodeID, keyHash, key, EvictionReasonCapacity)
 				c.finishDeleteReclaimLocked(sizeBefore, sampledEpoch, pressure)
 				return nil
 			}
@@ -598,6 +603,7 @@ func (c *arenaRadix[V]) Replace(key string, value V) error {
 	if !hadPrevMapped || prevMappedID != nodeID {
 		c.nodeMap[keyHash] = nodeID
 	}
+	c.notifyEvict(key, oldValue, EvictionReasonReplaced)
 	reclaimedPreUpdate = c.shouldReclaimSingleSurvivorOnMutation(c.len, c.freeCount > 0 || c.nodeMapDirty, c.freeCount >= 63, evictedAny, c.currentSize, sizeBefore, pressure)
 
 	protectedID := foregroundNoProtect
@@ -625,6 +631,15 @@ func (c *arenaRadix[V]) DeletePrefix(prefix string) {
 			return
 		}
 		hadReclaimable := c.currentSize > 0 || hadDirtySlack
+		if (c.onEvictValue != nil || c.onEvictEntry != nil) && c.len > 0 {
+			for currID := c.head; currID != nilNode; currID = c.nodes[currID].next {
+				var key string
+				if c.onEvictEntry != nil {
+					key = c.reconstructKey(currID)
+				}
+				c.notifyEvict(key, c.nodes[currID].value, EvictionReasonDeleted)
+			}
+		}
 		c.clearEmptyArenaStateLocked()
 		if hadReclaimable && c.hasElevatedPressureToInvalidate(0.0) {
 			c.markReclaimedLocked()
@@ -688,6 +703,11 @@ func (c *arenaRadix[V]) freeSubtree(nodeID uint32) {
 	currID := nodeID
 	for currID != nilNode {
 		if c.nodes[currID].hasValue {
+			var key string
+			if c.onEvictEntry != nil {
+				key = c.reconstructKey(currID)
+			}
+			evictedVal := c.nodes[currID].value
 			c.onEntryDeleted(c.nodes[currID].size)
 			c.currentSize -= c.nodes[currID].size
 			c.remove(currID)
@@ -698,6 +718,7 @@ func (c *arenaRadix[V]) freeSubtree(nodeID uint32) {
 			c.nodes[currID].value = zero
 			c.nodes[currID].hasValue = false
 			c.nodes[currID].size = 0
+			c.notifyEvict(key, evictedVal, EvictionReasonDeleted)
 		}
 
 		if c.nodes[currID].child != nilNode {
