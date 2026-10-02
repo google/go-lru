@@ -1426,24 +1426,20 @@ func TestPressure_ReentrancyAndOverflowSamplerCoordination(t *testing.T) {
 
 				// Act: Launch G1 first (primary), then G2 (fallback), then G3 and G4 (overflow).
 				var wg sync.WaitGroup
-				wg.Add(numCallers)
-				go func() {
-					defer wg.Done()
+				wg.Go(func() {
 					_ = pac.EvaluateMemoryPressure()
-				}()
+				})
 				<-firstEntered
 
-				go func() {
-					defer wg.Done()
+				wg.Go(func() {
 					_ = pac.EvaluateMemoryPressure()
-				}()
+				})
 				<-secondEntered
 
 				for range numCallers - 2 {
-					go func() {
-						defer wg.Done()
+					wg.Go(func() {
 						_ = pac.EvaluateMemoryPressure()
-					}()
+					})
 				}
 				wg.Wait()
 
@@ -1581,11 +1577,9 @@ func TestPressure_ReentrancyAndOverflowSamplerCoordination(t *testing.T) {
 				// Act: 3 concurrent samplers enter PressureFunc (primary + fallback + 1 overflow sampler).
 				var wg sync.WaitGroup
 				for range 3 {
-					wg.Add(1)
-					go func() {
-						defer wg.Done()
+					wg.Go(func() {
 						pac.EvaluateMemoryPressure()
-					}()
+					})
 				}
 				for range 3 {
 					<-enteredCh
@@ -1707,17 +1701,14 @@ func TestPressure_ConcurrentReentrantSamplersAndOverflowEpochInvalidation(t *tes
 				armed.Store(true)
 
 				var wg sync.WaitGroup
-				wg.Add(2)
-				go func() {
-					defer wg.Done()
+				wg.Go(func() {
 					_ = pac.EvaluateMemoryPressure()
-				}()
+				})
 				<-primaryEntered
 
-				go func() {
-					defer wg.Done()
+				wg.Go(func() {
 					_ = pac.EvaluateMemoryPressure()
-				}()
+				})
 				<-fallbackEntered
 
 				// Act: Release G1 to run re-entrant Compact(), then G2 runs re-entrant Compact(), and both return.
@@ -1792,23 +1783,19 @@ func TestPressure_ConcurrentReentrantSamplersAndOverflowEpochInvalidation(t *tes
 
 				// Act: Launch G1 first (primary), then G2 (fallback), then G3 (overflow) deterministically.
 				var wg sync.WaitGroup
-				wg.Add(3)
-				go func() {
-					defer wg.Done()
+				wg.Go(func() {
 					_ = pac.EvaluateMemoryPressure()
-				}()
+				})
 				<-g1Ready
 
-				go func() {
-					defer wg.Done()
+				wg.Go(func() {
 					_ = pac.EvaluateMemoryPressure()
-				}()
+				})
 				<-g2Ready
 
-				go func() {
-					defer wg.Done()
+				wg.Go(func() {
 					_ = pac.EvaluateMemoryPressure()
-				}()
+				})
 				<-g3Ready
 
 				// Release G1 first so G1 calls pac.Compact() re-entrantly while G3 is still in overflow,
@@ -1869,11 +1856,9 @@ func TestPressure_ConcurrentReentrantSamplersAndOverflowEpochInvalidation(t *tes
 
 				armed.Store(true)
 				var wg sync.WaitGroup
-				wg.Add(1)
-				go func() {
-					defer wg.Done()
+				wg.Go(func() {
 					_ = pac.EvaluateMemoryPressure()
-				}()
+				})
 
 				<-g1Entered
 
@@ -1997,11 +1982,9 @@ func TestPressure_PreSampleEpochLoadAndConcurrentSamplerOrdering(t *testing.T) {
 				mode.Store(1)
 
 				var wg sync.WaitGroup
-				wg.Add(1)
-				go func() {
-					defer wg.Done()
+				wg.Go(func() {
 					_, _ = cache.Delete("nonexistent-1")
-				}()
+				})
 				<-g1Entered
 
 				_, _ = cache.Delete("nonexistent-2")
@@ -2071,12 +2054,10 @@ func TestPressure_PreSampleEpochLoadAndConcurrentSamplerOrdering(t *testing.T) {
 				phase.Store(1)
 
 				var wg sync.WaitGroup
-				wg.Add(1)
-				go func() {
-					defer wg.Done()
+				wg.Go(func() {
 					_, err := cache.Put("g2-key", testData{value: 1, dataSize: 10})
-					assert.NoError(t, err)
-				}()
+					assert.NoError(t, err) //nolint:testifylint // wg.Go runs in a child goroutine where require.* (t.FailNow) is invalid
+				})
 
 				<-g2Sampled
 				pac.EvaluateMemoryPressure()
@@ -2159,23 +2140,19 @@ func TestPressure_PreSampleEpochLoadAndConcurrentSamplerOrdering(t *testing.T) {
 				armed.Store(true)
 
 				var wg sync.WaitGroup
-				wg.Add(3)
-				go func() {
-					defer wg.Done()
+				wg.Go(func() {
 					_ = pac.EvaluateMemoryPressure()
-				}()
+				})
 				<-g1Ready
 
-				go func() {
-					defer wg.Done()
+				wg.Go(func() {
 					_ = pac.EvaluateMemoryPressure()
-				}()
+				})
 				<-g2Ready
 
-				go func() {
-					defer wg.Done()
+				wg.Go(func() {
 					_ = pac.EvaluateMemoryPressure()
-				}()
+				})
 				<-g3Ready
 
 				// Act: Release overflow sampler G3 to run re-entrant Compact(), then release G1 and G2.
@@ -2787,7 +2764,7 @@ func TestPressure_BelowTier2ResetsZeroWatermarks(t *testing.T) {
 					WithEvictionRetentionRatio(0.50),
 				).(PressureAwareCache[testData])
 
-				for i := 0; i < 127; i++ {
+				for i := range 127 {
 					_, err := cache.Put(fmt.Sprintf("p-%03d", i), testData{value: int64(i), dataSize: 0})
 					require.NoError(t, err)
 				}

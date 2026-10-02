@@ -154,3 +154,39 @@ func ExampleNew_onEvict() {
 	// value callback: val=v1-updated reason=Deleted
 	// entry callback: key=dir/a val=v1-updated reason=Deleted
 }
+
+// ExampleNew_iterators demonstrates iterating over cache entries, keys, and values
+// in deterministic MRU-to-LRU order using Go 1.23 range-over-function iterators
+// without altering LRU recency order.
+func ExampleNew_iterators() {
+	cache := lru.New[int](10, lru.WithBackend(lru.BackendRadix))
+
+	_, _ = cache.Put("dir/a", 1)
+	_, _ = cache.Put("dir/b", 2)
+	_, _ = cache.Put("dir/c", 3)
+
+	// Promote "dir/a" to MRU; order is now: dir/a (MRU), dir/c, dir/b (LRU).
+	_, _ = cache.Get("dir/a")
+
+	for k, v := range cache.All() {
+		fmt.Printf("%s=%d\n", k, v)
+	}
+
+	// Early break is supported and leaves LRU order unchanged.
+	for k := range cache.Keys() {
+		fmt.Printf("mru=%s\n", k)
+		break
+	}
+
+	var sum int
+	for v := range cache.Values() {
+		sum += v
+	}
+	fmt.Printf("sum=%d\n", sum)
+	// Output:
+	// dir/a=1
+	// dir/c=3
+	// dir/b=2
+	// mru=dir/a
+	// sum=6
+}

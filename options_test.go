@@ -18,6 +18,7 @@ import (
 	"fmt"
 	"math"
 	"runtime/debug"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -704,13 +705,11 @@ func TestDefaultRuntimePressureFunc(t *testing.T) {
 	// Act & Assert 4: Concurrent race-free reads across 16 goroutines.
 	var wg sync.WaitGroup
 	for range 16 {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
+		wg.Go(func() {
 			for range 100 {
 				assert.Greater(t, probeBudget512MB(), 0.0)
 			}
-		}()
+		})
 	}
 	wg.Wait()
 }
@@ -1520,7 +1519,7 @@ func TestCache_OnEvictZeroKeyReconstructionAllocs(t *testing.T) {
 			var sinkKey, sinkVal string
 			var sinkReason EvictionReason
 			runDeleteCycle := func(opts ...Option) float64 {
-				allOpts := append([]Option{WithWeigher(func(_, v string) uint64 { return uint64(len(v)) })}, opts...)
+				allOpts := slices.Concat([]Option{WithWeigher(func(_, v string) uint64 { return uint64(len(v)) })}, opts)
 				c := b.fn(16, allOpts...)
 				_, _ = c.Put("alpha/beta/pin", "pin")
 				return testing.AllocsPerRun(100, func() {
@@ -1554,7 +1553,7 @@ func TestCache_OnEvictZeroKeyReconstructionAllocs(t *testing.T) {
 			var sinkVal int
 			var sinkReason EvictionReason
 			runTurnover := func(opts ...Option) float64 {
-				allOpts := append([]Option{WithWeigher(func(_ string, _ int) uint64 { return 1 })}, opts...)
+				allOpts := slices.Concat([]Option{WithWeigher(func(_ string, _ int) uint64 { return 1 })}, opts)
 				c := b.fn(2, allOpts...)
 				_, _ = c.Put("prefix/sub/pin", 1)
 				_, _ = c.Put("prefix/sub/a", 2)

@@ -16,8 +16,8 @@ package lru
 
 import (
 	"fmt"
+	"iter"
 	"math"
-	"reflect"
 )
 
 // NewArenaRadixCache returns a new arena-backed radix LRU Cache[V] bounded by maxSize.
@@ -195,7 +195,7 @@ func (c *arenaRadix[V]) checkInvariants() {
 			if c.nodes[currID].prev != nilNode || c.nodes[currID].next != nilNode || c.head == currID || c.tail == currID {
 				panic(fmt.Sprintf("arenaRadix invariant violation: routing node %d has non-nilNode LRU pointers", currID))
 			}
-			if !reflect.ValueOf(&c.nodes[currID].value).Elem().IsZero() {
+			if !isZeroValue(&c.nodes[currID].value) {
 				panic(fmt.Sprintf("arenaRadix invariant violation: routing node %d with prefix '%s' retains non-zero value", currID, c.nodes[currID].prefix))
 			}
 		}
@@ -274,7 +274,7 @@ func (c *arenaRadix[V]) checkInvariants() {
 		if c.nodes[freeID].hasValue {
 			panic(fmt.Sprintf("arenaRadix invariant violation: free-list node %d has hasValue=true", freeID))
 		}
-		if !reflect.ValueOf(&c.nodes[freeID].value).Elem().IsZero() {
+		if !isZeroValue(&c.nodes[freeID].value) {
 			panic(fmt.Sprintf("arenaRadix invariant violation: free-list node %d retains non-zero value", freeID))
 		}
 		if c.nodes[freeID].size != 0 {
@@ -754,5 +754,54 @@ func (c *arenaRadix[V]) freeSubtree(nodeID uint32) {
 		currID = siblingID
 		parentHash := hashStack[len(hashStack)-1]
 		currHash = hashStringCont(parentHash, c.nodes[currID].prefix)
+	}
+}
+
+// All returns an iterator over all key-value pairs in MRU-to-LRU order without modifying recency.
+func (c *arenaRadix[V]) All() iter.Seq2[string, V] {
+	return c.all
+}
+
+func (c *arenaRadix[V]) all(yield func(string, V) bool) {
+	c.mu.RLock()
+	defer c.rUnlock()
+
+	for currID := c.head; currID != nilNode; currID = c.nodes[currID].next {
+		if !yield(c.reconstructKey(currID), c.nodes[currID].value) {
+			return
+		}
+	}
+}
+
+// Keys returns an iterator over all keys in MRU-to-LRU order without modifying recency.
+func (c *arenaRadix[V]) Keys() iter.Seq[string] {
+	return c.keys
+}
+
+func (c *arenaRadix[V]) keys(yield func(string) bool) {
+	c.mu.RLock()
+	defer c.rUnlock()
+
+	for currID := c.head; currID != nilNode; currID = c.nodes[currID].next {
+		if !yield(c.reconstructKey(currID)) {
+			return
+		}
+	}
+}
+
+// Values returns an iterator over all values in MRU-to-LRU order without modifying recency.
+// It skips key reconstruction completely, executing with zero heap allocations.
+func (c *arenaRadix[V]) Values() iter.Seq[V] {
+	return c.values
+}
+
+func (c *arenaRadix[V]) values(yield func(V) bool) {
+	c.mu.RLock()
+	defer c.rUnlock()
+
+	for currID := c.head; currID != nilNode; currID = c.nodes[currID].next {
+		if !yield(c.nodes[currID].value) {
+			return
+		}
 	}
 }

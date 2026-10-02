@@ -18,6 +18,7 @@ import (
 	"fmt"
 	"math"
 	"runtime"
+	"slices"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -179,13 +180,13 @@ func testBackends() []struct {
 		fn   func(uint64, ...Option) Cache[testData]
 	}{
 		{"MapCache", func(maxSize uint64, opts ...Option) Cache[testData] {
-			return NewMapCache[testData](maxSize, append([]Option{testDataWeigher}, opts...)...)
+			return NewMapCache[testData](maxSize, slices.Concat([]Option{testDataWeigher}, opts)...)
 		}},
 		{"RadixCache", func(maxSize uint64, opts ...Option) Cache[testData] {
-			return NewRadixCache[testData](maxSize, append([]Option{testDataWeigher}, opts...)...)
+			return NewRadixCache[testData](maxSize, slices.Concat([]Option{testDataWeigher}, opts)...)
 		}},
 		{"ArenaRadixCache", func(maxSize uint64, opts ...Option) Cache[testData] {
-			return NewArenaRadixCache[testData](maxSize, append([]Option{testDataWeigher}, opts...)...)
+			return NewArenaRadixCache[testData](maxSize, slices.Concat([]Option{testDataWeigher}, opts)...)
 		}},
 	}
 }

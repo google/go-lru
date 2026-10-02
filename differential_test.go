@@ -17,7 +17,8 @@ package lru_test
 import (
 	"fmt"
 	"math"
-	"math/rand"
+	"math/rand/v2"
+	"slices"
 	"strings"
 	"testing"
 
@@ -67,10 +68,7 @@ type differentialHarness struct {
 
 func newDifferentialHarness(t *testing.T, maxSize uint64, opts ...lru.Option) *differentialHarness {
 	t.Helper()
-	allOpts := make([]lru.Option, 0, len(opts)+1)
-	allOpts = append(allOpts, diffWeigher)
-	allOpts = append(allOpts, opts...)
-	return newDifferentialHarnessWithOpts(t, maxSize, false, allOpts...)
+	return newDifferentialHarnessWithOpts(t, maxSize, false, slices.Concat([]lru.Option{diffWeigher}, opts)...)
 }
 
 func newDifferentialHarnessDefaultWeigher(t *testing.T, maxSize uint64, opts ...lru.Option) *differentialHarness {
@@ -97,10 +95,7 @@ func newDifferentialHarnessWithOpts(t *testing.T, maxSize uint64, unitWeight boo
 
 	for _, cfg := range configs {
 		for _, inv := range []bool{false, true} {
-			instanceOpts := make([]lru.Option, 0, len(opts)+1)
-			instanceOpts = append(instanceOpts, lru.WithInvariantChecking(inv))
-			instanceOpts = append(instanceOpts, opts...)
-			c := cfg.constructor(maxSize, instanceOpts...)
+			c := cfg.constructor(maxSize, slices.Concat([]lru.Option{lru.WithInvariantChecking(inv)}, opts)...)
 			h.instances = append(h.instances, diffInstance{
 				name:       cfg.name,
 				invariants: inv,
@@ -236,25 +231,113 @@ func (h *differentialHarness) DeletePrefix(prefix string) {
 	}
 }
 
+func (h *differentialHarness) VerifyIterators() {
+	h.t.Helper()
+	var baseKeys []string
+	var baseVals []*diffValue
+
+	for i, inst := range h.instances {
+		var allKeys []string
+		var allVals []*diffValue
+		for k, v := range inst.cache.All() {
+			allKeys = append(allKeys, k)
+			allVals = append(allVals, v)
+		}
+
+		keysSeq := slices.Collect(inst.cache.Keys())
+		valsSeq := slices.Collect(inst.cache.Values())
+
+		require.Equalf(h.t, allKeys, keysSeq, "[VerifyIterators] All() keys vs Keys() mismatch on %s (inv=%v)", inst.name, inst.invariants)
+		require.Lenf(h.t, valsSeq, len(allVals), "[VerifyIterators] All() values vs Values() len mismatch on %s (inv=%v)", inst.name, inst.invariants)
+		for j := range allVals {
+			h.compareValues(fmt.Sprintf("VerifyIterators.Values[%d]", j), allVals[j], true, valsSeq[j], true, inst.name, inst.invariants)
+		}
+
+		if i == 0 {
+			baseKeys = allKeys
+			baseVals = allVals
+		} else {
+			require.Equalf(h.t, baseKeys, allKeys, "[VerifyIterators] MRU-to-LRU key order mismatch on %s (inv=%v)", inst.name, inst.invariants)
+			require.Lenf(h.t, allVals, len(baseVals), "[VerifyIterators] MRU-to-LRU value count mismatch on %s (inv=%v)", inst.name, inst.invariants)
+			for j := range baseVals {
+				h.compareValues(fmt.Sprintf("VerifyIterators.All[%d]", j), baseVals[j], true, allVals[j], true, inst.name, inst.invariants)
+			}
+		}
+
+		for _, limit := range []int{1, len(allKeys) / 2} {
+			if limit <= 0 || limit > len(allKeys) {
+				continue
+			}
+			var prefixAllKeys []string
+			var prefixAllVals []*diffValue
+			for k, v := range inst.cache.All() {
+				prefixAllKeys = append(prefixAllKeys, k)
+				prefixAllVals = append(prefixAllVals, v)
+				if len(prefixAllKeys) == limit {
+					break
+				}
+			}
+			require.Equalf(h.t, baseKeys[:limit], prefixAllKeys, "[VerifyIterators] early break All() keys mismatch on %s (inv=%v)", inst.name, inst.invariants)
+			for j := range limit {
+				h.compareValues(fmt.Sprintf("VerifyIterators.EarlyBreakAll[%d]", j), baseVals[j], true, prefixAllVals[j], true, inst.name, inst.invariants)
+			}
+
+			var prefixKeys []string
+			for k := range inst.cache.Keys() {
+				prefixKeys = append(prefixKeys, k)
+				if len(prefixKeys) == limit {
+					break
+				}
+			}
+			require.Equalf(h.t, baseKeys[:limit], prefixKeys, "[VerifyIterators] early break Keys() mismatch on %s (inv=%v)", inst.name, inst.invariants)
+
+			var prefixVals []*diffValue
+			for v := range inst.cache.Values() {
+				prefixVals = append(prefixVals, v)
+				if len(prefixVals) == limit {
+					break
+				}
+			}
+			for j := range limit {
+				h.compareValues(fmt.Sprintf("VerifyIterators.EarlyBreakValues[%d]", j), baseVals[j], true, prefixVals[j], true, inst.name, inst.invariants)
+			}
+		}
+	}
+}
+
 func (h *differentialHarness) DrainAndVerifyEvictionOrder(allKnownKeys []string) {
 	h.t.Helper()
+	h.VerifyIterators()
+	preDrainVals := slices.Collect(h.instances[0].cache.Values())
+	var expectedLRUOrder []*diffValue
+	for _, v := range slices.Backward(preDrainVals) {
+		expectedLRUOrder = append(expectedLRUOrder, v)
+	}
+
 	for _, k := range allKnownKeys {
 		h.Peek(k)
 	}
 	if h.unitWeight {
-		for i := uint64(0); i < h.maxSize; i++ {
+		var allEvicted []*diffValue
+		for i := range h.maxSize {
 			drainKey := fmt.Sprintf("__DRAIN_KEY_%d__", i)
-			h.Put(drainKey, &diffValue{id: fmt.Sprintf("__DRAIN_ITEM_%d__", i), size: 1})
+			evicted := h.Put(drainKey, &diffValue{id: fmt.Sprintf("__DRAIN_ITEM_%d__", i), size: 1})
+			allEvicted = append(allEvicted, evicted...)
 		}
+		h.compareEvicted("DrainAndVerifyEvictionOrder.unitWeight", expectedLRUOrder, allEvicted, h.instances[0].name, h.instances[0].invariants)
+		h.VerifyIterators()
 		return
 	}
 	drainVal := &diffValue{id: "__DRAIN_ITEM__", size: h.maxSize}
-	h.Put("__DRAIN_KEY__", drainVal)
+	evicted := h.Put("__DRAIN_KEY__", drainVal)
+	require.LessOrEqual(h.t, len(evicted), len(expectedLRUOrder))
+	h.compareEvicted("DrainAndVerifyEvictionOrder", expectedLRUOrder[:len(evicted)], evicted, h.instances[0].name, h.instances[0].invariants)
+	h.VerifyIterators()
 }
 
 func TestDifferential_FlatWorkload(t *testing.T) {
 	// Arrange
-	r := rand.New(rand.NewSource(1337))
+	r := rand.New(rand.NewPCG(1337, 0))
 	const (
 		numOps        = 5000
 		keyPoolSize   = 200
@@ -270,12 +353,12 @@ func TestDifferential_FlatWorkload(t *testing.T) {
 
 	// Act
 	for op := range numOps {
-		k := keys[r.Intn(keyPoolSize)]
-		dice := r.Intn(100)
+		k := keys[r.IntN(keyPoolSize)]
+		dice := r.IntN(100)
 
 		switch {
 		case dice < 35:
-			sz := uint64(r.Intn(50) + 1)
+			sz := uint64(r.IntN(50) + 1)
 			h.Put(k, &diffValue{id: fmt.Sprintf("%s_v%d", k, op), size: sz})
 		case dice < 60:
 			h.Get(k)
@@ -289,13 +372,16 @@ func TestDifferential_FlatWorkload(t *testing.T) {
 				h.Replace(k, &diffValue{id: fmt.Sprintf("%s_upd_%d", k, op), size: 10})
 			}
 		case dice < 90:
-			newSz := uint64(r.Intn(80))
+			newSz := uint64(r.IntN(80))
 			h.Replace(k, &diffValue{id: fmt.Sprintf("%s_szupd_%d", k, op), size: newSz})
 		case dice < 95:
 			h.Delete(k)
 		default:
-			prefix := fmt.Sprintf("flat_key_%02d", r.Intn(20))
+			prefix := fmt.Sprintf("flat_key_%02d", r.IntN(20))
 			h.DeletePrefix(prefix)
+		}
+		if (op+1)%250 == 0 {
+			h.VerifyIterators()
 		}
 	}
 
@@ -305,7 +391,7 @@ func TestDifferential_FlatWorkload(t *testing.T) {
 
 func TestDifferential_HierarchicalDirectoryWorkload(t *testing.T) {
 	// Arrange
-	r := rand.New(rand.NewSource(4242))
+	r := rand.New(rand.NewPCG(4242, 0))
 	const (
 		numOps        = 5000
 		cacheCapacity = 3000
@@ -329,12 +415,12 @@ func TestDifferential_HierarchicalDirectoryWorkload(t *testing.T) {
 
 	// Act
 	for op := range numOps {
-		path := paths[r.Intn(len(paths))]
-		dice := r.Intn(100)
+		path := paths[r.IntN(len(paths))]
+		dice := r.IntN(100)
 
 		switch {
 		case dice < 30:
-			sz := uint64(r.Intn(80) + 1)
+			sz := uint64(r.IntN(80) + 1)
 			h.Put(path, &diffValue{id: fmt.Sprintf("file_%d", op), size: sz})
 		case dice < 55:
 			h.Get(path)
@@ -346,13 +432,16 @@ func TestDifferential_HierarchicalDirectoryWorkload(t *testing.T) {
 				h.Replace(path, &diffValue{id: fmt.Sprintf("upd_%d", op), size: existing.weight()})
 			}
 		case dice < 85:
-			newSz := uint64(r.Intn(120))
+			newSz := uint64(r.IntN(120))
 			h.Replace(path, &diffValue{id: fmt.Sprintf("szupd_%d", op), size: newSz})
 		case dice < 90:
 			h.Delete(path)
 		default:
-			prefix := fmt.Sprintf("%s/%s/", topDirs[r.Intn(len(topDirs))], subDirs[r.Intn(len(subDirs))])
+			prefix := fmt.Sprintf("%s/%s/", topDirs[r.IntN(len(topDirs))], subDirs[r.IntN(len(subDirs))])
 			h.DeletePrefix(prefix)
+		}
+		if (op+1)%250 == 0 {
+			h.VerifyIterators()
 		}
 	}
 
@@ -362,7 +451,7 @@ func TestDifferential_HierarchicalDirectoryWorkload(t *testing.T) {
 
 func TestDifferential_CapacityThrashingAndSizeUpdates(t *testing.T) {
 	// Arrange
-	r := rand.New(rand.NewSource(7777))
+	r := rand.New(rand.NewPCG(7777, 0))
 	const (
 		numOps        = 5000
 		cacheCapacity = 200
@@ -381,24 +470,27 @@ func TestDifferential_CapacityThrashingAndSizeUpdates(t *testing.T) {
 	h.Replace("overflow_key", &diffValue{id: "ovf_miss", size: math.MaxUint64 - 10})
 
 	for op := range numOps {
-		k := keys[r.Intn(len(keys))]
-		dice := r.Intn(100)
+		k := keys[r.IntN(len(keys))]
+		dice := r.IntN(100)
 
 		switch {
 		case dice < 40:
-			sz := uint64(r.Intn(170) + 10)
+			sz := uint64(r.IntN(170) + 10)
 			h.Put(k, &diffValue{id: fmt.Sprintf("thrash_v%d", op), size: sz})
 		case dice < 60:
 			h.Get(k)
 		case dice < 75:
 			h.Peek(k)
 		case dice < 85:
-			newSz := uint64(r.Intn(230))
+			newSz := uint64(r.IntN(230))
 			h.Replace(k, &diffValue{id: fmt.Sprintf("thrash_upd_%d", op), size: newSz})
 		case dice < 95:
 			h.Delete(k)
 		default:
 			h.DeletePrefix("thrash_")
+		}
+		if (op+1)%250 == 0 {
+			h.VerifyIterators()
 		}
 	}
 
@@ -408,7 +500,7 @@ func TestDifferential_CapacityThrashingAndSizeUpdates(t *testing.T) {
 
 func TestDifferential_BoundaryAndEdgeCases(t *testing.T) {
 	// Arrange
-	r := rand.New(rand.NewSource(12345))
+	r := rand.New(rand.NewPCG(12345, 0))
 	const (
 		numOps        = 3000
 		cacheCapacity = 1000
@@ -431,12 +523,12 @@ func TestDifferential_BoundaryAndEdgeCases(t *testing.T) {
 
 	// Act
 	for op := range numOps {
-		k := adversarialKeys[r.Intn(len(adversarialKeys))]
-		dice := r.Intn(100)
+		k := adversarialKeys[r.IntN(len(adversarialKeys))]
+		dice := r.IntN(100)
 
 		switch {
 		case dice < 30:
-			szRoll := r.Intn(10)
+			szRoll := r.IntN(10)
 			var sz uint64
 			switch szRoll {
 			case 0:
@@ -444,7 +536,7 @@ func TestDifferential_BoundaryAndEdgeCases(t *testing.T) {
 			case 1:
 				sz = cacheCapacity + 100
 			default:
-				sz = uint64(r.Intn(100) + 1)
+				sz = uint64(r.IntN(100) + 1)
 			}
 			h.Put(k, &diffValue{id: fmt.Sprintf("adv_%d", op), size: sz})
 		case dice < 35:
@@ -456,7 +548,7 @@ func TestDifferential_BoundaryAndEdgeCases(t *testing.T) {
 		case dice < 80:
 			existing := h.Peek(k)
 			if existing != nil {
-				switch r.Intn(3) {
+				switch r.IntN(3) {
 				case 0:
 					h.Replace(k, &diffValue{id: fmt.Sprintf("upd_%d", op), size: existing.weight()})
 				case 1:
@@ -472,12 +564,15 @@ func TestDifferential_BoundaryAndEdgeCases(t *testing.T) {
 				h.Replace(k, &diffValue{id: fmt.Sprintf("noent_%d", op), size: 10})
 			}
 		case dice < 88:
-			h.Replace(k, &diffValue{id: fmt.Sprintf("rand_sz_%d", op), size: uint64(r.Intn(150))})
+			h.Replace(k, &diffValue{id: fmt.Sprintf("rand_sz_%d", op), size: uint64(r.IntN(150))})
 		case dice < 94:
 			h.Delete(k)
 		default:
-			prefix := adversarialKeys[r.Intn(len(adversarialKeys))]
+			prefix := adversarialKeys[r.IntN(len(adversarialKeys))]
 			h.DeletePrefix(prefix)
+		}
+		if (op+1)%250 == 0 {
+			h.VerifyIterators()
 		}
 	}
 
@@ -501,7 +596,7 @@ func TestDifferential_ReplaceSelfEvictionPreservesPreviousValue(t *testing.T) {
 
 func TestDifferential_PressureAwareAndCompactionParity(t *testing.T) {
 	// Arrange
-	r := rand.New(rand.NewSource(20260925))
+	r := rand.New(rand.NewPCG(20260925, 0))
 	const (
 		numOps        = 2000
 		cacheCapacity = 1000
@@ -533,11 +628,11 @@ func TestDifferential_PressureAwareAndCompactionParity(t *testing.T) {
 			pressure = 0.10 // Normal pressure
 		}
 
-		k := keys[r.Intn(len(keys))]
-		dice := r.Intn(100)
+		k := keys[r.IntN(len(keys))]
+		dice := r.IntN(100)
 		switch {
 		case dice < 35:
-			sz := uint64(r.Intn(45) + 5)
+			sz := uint64(r.IntN(45) + 5)
 			h.Put(k, &diffValue{id: fmt.Sprintf("pv_%d", op), size: sz})
 		case dice < 55:
 			h.Get(k)
@@ -546,7 +641,7 @@ func TestDifferential_PressureAwareAndCompactionParity(t *testing.T) {
 		case dice < 78:
 			h.Delete(k)
 		case dice < 86:
-			newSz := uint64(r.Intn(60))
+			newSz := uint64(r.IntN(60))
 			h.Replace(k, &diffValue{id: fmt.Sprintf("pu_%d", op), size: newSz})
 		case dice < 93:
 			for _, inst := range h.instances {
@@ -562,6 +657,9 @@ func TestDifferential_PressureAwareAndCompactionParity(t *testing.T) {
 					h.compareEvicted("EvaluateMemoryPressure()", baseEvicted, ev, inst.name, inst.invariants)
 				}
 			}
+		}
+		if (op+1)%250 == 0 {
+			h.VerifyIterators()
 		}
 	}
 
@@ -705,7 +803,7 @@ func TestDifferential_ReplaceLockstepParity(t *testing.T) {
 func TestDifferential_DefaultWeigherWorkload(t *testing.T) {
 	// Arrange: 6 instances (MapCache, RadixCache, ArenaRadixCache x invariants={false,true})
 	// configured WITHOUT WithWeigher so every entry has default weight 1.
-	r := rand.New(rand.NewSource(20260930))
+	r := rand.New(rand.NewPCG(20260930, 0))
 	const (
 		numOps        = 5000
 		cacheCapacity = 50
@@ -736,25 +834,25 @@ func TestDifferential_DefaultWeigherWorkload(t *testing.T) {
 			pressure = 0.10
 		}
 
-		k := keys[r.Intn(len(keys))]
-		dice := r.Intn(100)
+		k := keys[r.IntN(len(keys))]
+		dice := r.IntN(100)
 		switch {
 		case dice < 35:
-			if r.Intn(10) == 0 {
+			if r.IntN(10) == 0 {
 				h.Put(k, nil) // nil pointer value still weighs 1 under default weigher
 			} else {
-				h.Put(k, &diffValue{id: fmt.Sprintf("def_%d", op), size: uint64(r.Intn(10000))})
+				h.Put(k, &diffValue{id: fmt.Sprintf("def_%d", op), size: uint64(r.IntN(10000))})
 			}
 		case dice < 55:
 			h.Get(k)
 		case dice < 70:
 			h.Peek(k)
 		case dice < 82:
-			h.Replace(k, &diffValue{id: fmt.Sprintf("def_upd_%d", op), size: uint64(r.Intn(10000))})
+			h.Replace(k, &diffValue{id: fmt.Sprintf("def_upd_%d", op), size: uint64(r.IntN(10000))})
 		case dice < 90:
 			h.Delete(k)
 		case dice < 95:
-			prefix := fmt.Sprintf("ns_%d/dir_%d/", r.Intn(4), r.Intn(5))
+			prefix := fmt.Sprintf("ns_%d/dir_%d/", r.IntN(4), r.IntN(5))
 			h.DeletePrefix(prefix)
 		case dice < 98:
 			for _, inst := range h.instances {
@@ -771,6 +869,9 @@ func TestDifferential_DefaultWeigherWorkload(t *testing.T) {
 				}
 			}
 		}
+		if (op+1)%250 == 0 {
+			h.VerifyIterators()
+		}
 	}
 
 	// Assert
@@ -780,7 +881,7 @@ func TestDifferential_DefaultWeigherWorkload(t *testing.T) {
 
 func TestDifferential_CustomWeigherGrowAndShrinkReplace(t *testing.T) {
 	// Arrange: Custom key+value weigher exercising shrinking (including to 0), equal, growing, and self-evicting updates.
-	r := rand.New(rand.NewSource(987654321))
+	r := rand.New(rand.NewPCG(987654321, 0))
 	const (
 		numOps        = 5000
 		cacheCapacity = 300
@@ -807,18 +908,18 @@ func TestDifferential_CustomWeigherGrowAndShrinkReplace(t *testing.T) {
 
 	// Act
 	for op := range numOps {
-		k := keys[r.Intn(len(keys))]
-		dice := r.Intn(100)
+		k := keys[r.IntN(len(keys))]
+		dice := r.IntN(100)
 		switch {
 		case dice < 35:
 			var sz uint64
-			switch r.Intn(8) {
+			switch r.IntN(8) {
 			case 0:
 				sz = 0
 			case 1:
 				sz = cacheCapacity + 50
 			default:
-				sz = uint64(r.Intn(80) + 1)
+				sz = uint64(r.IntN(80) + 1)
 			}
 			h.Put(k, &diffValue{id: fmt.Sprintf("ins_%d", op), size: sz})
 		case dice < 50:
@@ -829,11 +930,11 @@ func TestDifferential_CustomWeigherGrowAndShrinkReplace(t *testing.T) {
 			// Exercise all 4 Replace weight transitions:
 			// 0: shrink to 0; 1: shrink to smaller positive; 2: same size; 3: grow within capacity; 4: grow > maxSize.
 			var targetSz uint64
-			switch r.Intn(5) {
+			switch r.IntN(5) {
 			case 0:
 				targetSz = 0
 			case 1:
-				targetSz = uint64(r.Intn(15) + 1)
+				targetSz = uint64(r.IntN(15) + 1)
 			case 2:
 				if cur := h.Peek(k); cur != nil {
 					targetSz = cur.size
@@ -841,16 +942,19 @@ func TestDifferential_CustomWeigherGrowAndShrinkReplace(t *testing.T) {
 					targetSz = 20
 				}
 			case 3:
-				targetSz = uint64(r.Intn(180) + 30)
+				targetSz = uint64(r.IntN(180) + 30)
 			default:
-				targetSz = cacheCapacity + uint64(r.Intn(100)+1)
+				targetSz = cacheCapacity + uint64(r.IntN(100)+1)
 			}
 			h.Replace(k, &diffValue{id: fmt.Sprintf("upd_%d", op), size: targetSz})
 		case dice < 95:
 			h.Delete(k)
 		default:
-			prefix := fmt.Sprintf("tree/%02d/", r.Intn(3))
+			prefix := fmt.Sprintf("tree/%02d/", r.IntN(3))
 			h.DeletePrefix(prefix)
+		}
+		if (op+1)%250 == 0 {
+			h.VerifyIterators()
 		}
 	}
 
@@ -869,7 +973,7 @@ type diffEvictEvent struct {
 func TestDifferential_EvictionCallbacksParity(t *testing.T) {
 	// Arrange: 6 instances (MapCache, RadixCache, ArenaRadixCache x invariants={false,true})
 	// configured with both WithOnEvictValue and WithOnEvictEntry under oscillating memory pressure.
-	r := rand.New(rand.NewSource(20261002))
+	r := rand.New(rand.NewPCG(20261002, 0))
 	const (
 		numOps        = 6000
 		cacheCapacity = 300
@@ -1003,19 +1107,19 @@ func TestDifferential_EvictionCallbacksParity(t *testing.T) {
 			pressure = 0.10
 		}
 
-		k := keys[r.Intn(len(keys))]
-		dice := r.Intn(100)
+		k := keys[r.IntN(len(keys))]
+		dice := r.IntN(100)
 		isDeletePrefix := false
 		switch {
 		case dice < 35:
 			var sz uint64
-			switch r.Intn(8) {
+			switch r.IntN(8) {
 			case 0:
 				sz = 0
 			case 1:
 				sz = cacheCapacity + 20
 			default:
-				sz = uint64(r.Intn(80) + 1)
+				sz = uint64(r.IntN(80) + 1)
 			}
 			h.Put(k, &diffValue{id: fmt.Sprintf("p_%d", op), size: sz})
 		case dice < 50:
@@ -1024,13 +1128,13 @@ func TestDifferential_EvictionCallbacksParity(t *testing.T) {
 			h.Peek(k)
 		case dice < 80:
 			var sz uint64
-			switch r.Intn(5) {
+			switch r.IntN(5) {
 			case 0:
 				sz = 0
 			case 1:
-				sz = uint64(r.Intn(20) + 1)
+				sz = uint64(r.IntN(20) + 1)
 			case 2:
-				sz = uint64(r.Intn(120) + 20)
+				sz = uint64(r.IntN(120) + 20)
 			default:
 				sz = cacheCapacity + 20
 			}
@@ -1039,10 +1143,10 @@ func TestDifferential_EvictionCallbacksParity(t *testing.T) {
 			h.Delete(k)
 		case dice < 95:
 			isDeletePrefix = true
-			if r.Intn(12) == 0 {
+			if r.IntN(12) == 0 {
 				h.DeletePrefix("")
 			} else {
-				prefix := fmt.Sprintf("svc/%02d/mod/%02d/", r.Intn(4), r.Intn(4))
+				prefix := fmt.Sprintf("svc/%02d/mod/%02d/", r.IntN(4), r.IntN(4))
 				h.DeletePrefix(prefix)
 			}
 		case dice < 97:
@@ -1061,6 +1165,9 @@ func TestDifferential_EvictionCallbacksParity(t *testing.T) {
 			}
 		}
 
+		if (op+1)%250 == 0 {
+			h.VerifyIterators()
+		}
 		for _, e := range instances[0].entryEvents {
 			if int(e.reason) < len(reasonTotals) {
 				reasonTotals[e.reason]++
@@ -1077,4 +1184,135 @@ func TestDifferential_EvictionCallbacksParity(t *testing.T) {
 
 	pressure = 0.10
 	h.DrainAndVerifyEvictionOrder(keys)
+}
+
+func TestDifferential_IteratorsParity(t *testing.T) {
+	// Arrange
+	pressure := 0.10
+	h := newDifferentialHarness(
+		t,
+		100,
+		lru.WithPressureFunc(func() float64 { return pressure }),
+		lru.WithCompactionThreshold(0.75),
+		lru.WithEvictionThreshold(0.90),
+		lru.WithEvictionRetentionRatio(0.50),
+	)
+
+	// 1. Empty cache state: All, Keys, Values yield nothing; early break is a no-op.
+	h.VerifyIterators()
+	for _, inst := range h.instances {
+		require.Nil(t, slices.Collect(inst.cache.Keys()))
+		require.Nil(t, slices.Collect(inst.cache.Values()))
+	}
+
+	// 2. Single-entry states: empty root key "" and nil *diffValue.
+	h.Put("", &diffValue{id: "root_val", size: 10})
+	h.VerifyIterators()
+	require.Equal(t, []string{""}, slices.Collect(h.instances[0].cache.Keys()))
+
+	h.Replace("", nil)
+	h.VerifyIterators()
+	require.Equal(t, []*diffValue{nil}, slices.Collect(h.instances[0].cache.Values()))
+
+	h.Delete("")
+	h.VerifyIterators()
+	require.Empty(t, slices.Collect(h.instances[0].cache.Keys()))
+
+	// 3. Multi-entry hierarchical keys with Get, Peek, Replace, Delete, DeletePrefix, Compact, and EvaluateMemoryPressure.
+	allKeys := []string{
+		"",
+		"dir/a/file1",
+		"dir/a/file2",
+		"dir/b/sub/file3",
+		"dir/b/sub/deep/leaf/file4",
+		"other/item",
+	}
+	for i, k := range allKeys {
+		h.Put(k, &diffValue{id: fmt.Sprintf("v_%d", i), size: 10})
+		h.VerifyIterators()
+	}
+
+	// Expected MRU-to-LRU order after sequential Put: reverse of allKeys.
+	expectedAfterPut := slices.Clone(allKeys)
+	slices.Reverse(expectedAfterPut)
+	require.Equal(t, expectedAfterPut, slices.Collect(h.instances[0].cache.Keys()))
+
+	// Peek does not alter recency order.
+	h.Peek("dir/a/file1")
+	h.Peek("")
+	h.VerifyIterators()
+	require.Equal(t, expectedAfterPut, slices.Collect(h.instances[0].cache.Keys()))
+
+	// Get promotes accessed entries to MRU head.
+	h.Get("dir/a/file1")
+	h.Get("")
+	h.VerifyIterators()
+	require.Equal(t, []string{
+		"",
+		"dir/a/file1",
+		"other/item",
+		"dir/b/sub/deep/leaf/file4",
+		"dir/b/sub/file3",
+		"dir/a/file2",
+	}, slices.Collect(h.instances[0].cache.Keys()))
+
+	// Replace in-place updates value/size without altering recency order.
+	h.Replace("other/item", &diffValue{id: "v_other_updated", size: 15})
+	h.VerifyIterators()
+	require.Equal(t, []string{
+		"",
+		"dir/a/file1",
+		"other/item",
+		"dir/b/sub/deep/leaf/file4",
+		"dir/b/sub/file3",
+		"dir/a/file2",
+	}, slices.Collect(h.instances[0].cache.Keys()))
+
+	// Replace with size > maxSize self-evicts only the target entry.
+	h.Replace("dir/b/sub/file3", &diffValue{id: "too_big", size: 200})
+	h.VerifyIterators()
+	require.Equal(t, []string{
+		"",
+		"dir/a/file1",
+		"other/item",
+		"dir/b/sub/deep/leaf/file4",
+		"dir/a/file2",
+	}, slices.Collect(h.instances[0].cache.Keys()))
+
+	// Delete removes specific key.
+	h.Delete("")
+	h.VerifyIterators()
+	require.Equal(t, []string{
+		"dir/a/file1",
+		"other/item",
+		"dir/b/sub/deep/leaf/file4",
+		"dir/a/file2",
+	}, slices.Collect(h.instances[0].cache.Keys()))
+
+	// DeletePrefix removes "dir/a/" subtree while preserving relative MRU-to-LRU order of survivors.
+	h.DeletePrefix("dir/a/")
+	h.VerifyIterators()
+	require.Equal(t, []string{
+		"other/item",
+		"dir/b/sub/deep/leaf/file4",
+	}, slices.Collect(h.instances[0].cache.Keys()))
+
+	// Repopulate and exercise Compact() and EvaluateMemoryPressure().
+	h.Put("dir/c/item1", &diffValue{id: "c1", size: 20})
+	h.Put("dir/c/item2", &diffValue{id: "c2", size: 20})
+	for _, inst := range h.instances {
+		inst.cache.(lru.PressureAwareCache[*diffValue]).Compact()
+	}
+	h.VerifyIterators()
+
+	// Tier 2 critical pressure sheds from LRU tail until <= 50 bytes.
+	pressure = 0.95
+	for _, inst := range h.instances {
+		_ = inst.cache.(lru.PressureAwareCache[*diffValue]).EvaluateMemoryPressure()
+	}
+	pressure = 0.10
+	h.VerifyIterators()
+
+	// 4. Verify DrainAndVerifyEvictionOrder (including reverse Values() == eviction order).
+	h.DrainAndVerifyEvictionOrder(append(allKeys, "dir/c/item1", "dir/c/item2"))
 }

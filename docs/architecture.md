@@ -8,9 +8,9 @@ This document details the internal data structures, concurrency models, and memo
 
 | Dimension | `MapCache` (`NewMapCache`) | `RadixCache` (`NewRadixCache`) | `ArenaRadixCache` (`NewArenaRadixCache`) |
 | :--- | :--- | :--- | :--- |
-| **Primary Data Structure** | `map[string]*list.Element` + `container/list.List` | Compressed Radix Tree (LCRS) + Intrusive Pointer LRU List | Contiguous Slice Arena `[]arenaRadixNode` + Freelist + Hash Index |
-| **Node Representation** | `list.Element` (48 B) + `entry` (40 B) + Map Buckets | `radixNode` struct (80 B heap object) | `arenaRadixNode` struct (64 B contiguous array entry) |
-| **Per-Node Heap Allocations** | 2 allocations per entry (0 on update) | 1 allocation per node | **0 allocations** (recycled via intrusive free-list) |
+| **Primary Data Structure** | `map[string]*entry[V]` + Intrusive Generic Doubly-Linked List (`entryList[V]`) | Compressed Radix Tree (LCRS) + Intrusive Pointer LRU List | Contiguous Slice Arena `[]arenaRadixNode` + Freelist + Hash Index |
+| **Node Representation** | Intrusive `entry[V]` struct (40 B + `sizeof(V)`) + Map Buckets | `radixNode` struct (80 B heap object) | `arenaRadixNode` struct (64 B contiguous array entry) |
+| **Per-Node Heap Allocations** | 1 allocation per new entry (0 on update) | 1 allocation per node | **0 allocations** (recycled via intrusive free-list) |
 | **Node Pointer Width** | 64-bit pointers | 64-bit pointers (5 pointers / node) | **32-bit indices** (`uint32`, sentinel `nilNode = math.MaxUint32`) |
 | **Max Entry Capacity** | Memory / Heap limited | Memory / Heap limited | **`2^32 - 2` total arena nodes** (`0..math.MaxUint32-2`; `nilNode = MaxUint32`, `foregroundNoProtect = MaxUint32-1`) |
 | **Point Get Latency** | **~50 ns/op** (`O(1)` Hash Map) | ~170 ns/op (`O(K)` Trie Descent) | **~100 ns/op** (`O(1)` FNV-1a Hash Map + Zero-Alloc Path Check) |
@@ -28,7 +28,8 @@ This document details the internal data structures, concurrency models, and memo
 ## 2. Engine Data Structure Layouts
 
 ### 2.1 `MapCache` (`map_lru.go`)
-`MapCache` pairs Go's standard hash map (`map[string]*list.Element`) with a doubly-linked recency list (`container/list.List`) guarded by a `sync.RWMutex`.
+`MapCache` pairs Go's standard hash map (`map[string]*entry[V]`) with a strongly typed generic intrusive doubly-linked recency list (`entryList[V]` tracking `head, tail *entry[V]`) guarded by a `sync.RWMutex`.
+- **Intrusive Doubly-Linked LRU List**: Each `entry[V]` embeds `prev` and `next` pointers directly alongside `key`, `size`, and `value`, eliminating `container/list` `any` interface boxing and cutting per-entry heap allocations in half (from 2 allocations to 1 allocation per new entry, and 0 allocations on existing-key updates).
 - **Operations**: `Put`, `Get`, `Peek`, `Replace`, and `Delete` execute in `O(1)` time.
 - **Prefix Deletion Trade-off**: `DeletePrefix(prefix)` must iterate over all `N` entries in the map (`O(N)`), making it unsuitable for frequent directory-tree purges on large caches.
 
@@ -60,7 +61,7 @@ Go's built-in `map` never shrinks its bucket array after deletions, pointer-base
 ### 3.2 Tier 1 — Moderate Pressure (`pressure >= CompactionThreshold`, default `0.75`)
 When normalized memory pressure reaches `CompactionThreshold`:
 - Triggered automatically on foreground writes whenever backing-structure slack or post-peak entry deletion exceeds 25%, or unconditionally via `Compact()` / `EvaluateMemoryPressure()`.
-- `MapCache` reallocates its `map[string]*list.Element` index (`make(map[string]*list.Element, len(c.index))` + `maps.Copy`) when `dirtyIndex` is true to reclaim Go map bucket slack; `RadixCache` eagerly clones prefixes at insertion/split time and zeroes detached nodes upon deletion while resetting compaction watermarks (`onCompacted`); `ArenaRadixCache` allocates a fresh, tightly-sized `newNodes` slice (`len == cap == liveCount`), remaps all 8 `uint32` index fields via `oldToNew`, resets `freeHead = nilNode`, and rebuilds `nodeMap` (`make(map[uint64]uint32, c.len)`) from scratch to release Go hash-map bucket slack.
+- `MapCache` reallocates its `map[string]*entry[V]` index (`make(map[string]*entry[V], len(c.index))` + `maps.Copy`) when `dirtyIndex` is true to reclaim Go map bucket slack; `RadixCache` eagerly clones prefixes at insertion/split time and zeroes detached nodes upon deletion while resetting compaction watermarks (`onCompacted`); `ArenaRadixCache` allocates a fresh, tightly-sized `newNodes` slice (`len == cap == liveCount`), remaps all 8 `uint32` index fields via `oldToNew`, resets `freeHead = nilNode`, and rebuilds `nodeMap` (`make(map[uint64]uint32, c.len)`) from scratch to release Go hash-map bucket slack.
 
 ### 3.3 Tier 2 — Critical Pressure (`pressure >= EvictionThreshold`, default `0.90`)
 When normalized memory pressure reaches `EvictionThreshold`:
@@ -80,11 +81,14 @@ Enabling `WithInvariantChecking(true)` validates structural integrity across eve
 
 ---
 
-## 5. Eviction Callbacks & Zero-Overhead Key Reconstruction
+## 5. Eviction Callbacks, Range-Over-Function Iterators & Zero-Overhead Key Reconstruction
 
-All three engines support synchronous entry removal/replacement callbacks via `WithOnEvictValue[V any]` (`func(value V, reason EvictionReason)`) and `WithOnEvictEntry[V any]` (`func(key string, value V, reason EvictionReason)`):
+All three engines support synchronous entry removal/replacement callbacks via `WithOnEvictValue[V any]` (`func(value V, reason EvictionReason)`) and `WithOnEvictEntry[V any]` (`func(key string, value V, reason EvictionReason)`), as well as Go 1.23+ range-over-function iterators (`All() iter.Seq2[string, V]`, `Keys() iter.Seq[string]`, and `Values() iter.Seq[V]`):
 - **Four Removal Causes (`EvictionReason`)**: `EvictionReasonCapacity` (LRU eviction on `Put`/`Replace`, or `Replace` self-eviction when the updated weight exceeds `maxSize` or cannot fit alongside newer entries), `EvictionReasonPressure` (Tier 2 critical memory-pressure shedding), `EvictionReasonDeleted` (`Delete` or `DeletePrefix`), and `EvictionReasonReplaced` (in-place value overwrite on `Put` or `Replace`). Callbacks execute synchronously under the cache's exclusive write lock (and must not re-enter the same `Cache` instance). When both callbacks are configured, `OnEvictValue` is invoked before `OnEvictEntry`. Capacity and pressure evictions fire in strict LRU-to-MRU order; `DeletePrefix` invokes callbacks once per removed entry in an unspecified (backend-dependent) traversal order.
+- **Range-Over-Function Iterators (`All`, `Keys`, `Values`)**:
+  - `All() iter.Seq2[string, V]`, `Keys() iter.Seq[string]`, and `Values() iter.Seq[V]` acquire the cache's read lock (`RLock`, released via `defer rUnlock()`) and traverse the intrusive doubly-linked LRU list from `head` (MRU) to `tail` (LRU) without altering entry recency order, supporting early termination (`break`).
+  - `Values()` delegates to an unexported method (`return c.values`) and skips key reconstruction completely on `RadixCache` and `ArenaRadixCache`, executing with **0 heap allocations (`0 allocs/op`)** across all three backends.
 - **Zero Key-Reconstruction Overhead**:
-  - Because `RadixCache` and `ArenaRadixCache` store compressed prefix segments across tree ancestors rather than full key strings per node, `WithOnEvictValue` never reconstructs keys (`0` string allocations).
+  - Because `RadixCache` and `ArenaRadixCache` store compressed prefix segments across tree ancestors rather than full key strings per node, `WithOnEvictValue` and `Values()` never reconstruct keys (`0` string allocations).
   - Even when `WithOnEvictEntry` is configured, operations that already have `key` in hand (`Delete(key)`, `Put(key, ...)` overwrite, `Replace(key, ...)` overwrite, and `Replace` self-eviction) forward `key` directly without walking the tree (and `MapCache` always passes the `clonePrefix`-cloned `entry.key`).
-  - When `WithOnEvictEntry` is configured and an entry is removed without a caller-supplied key (`evictOne`, `shedAndCompactLocked`, `DeletePrefix`), `reconstructKey` walks parent links using a 64-element stack buffer (`[64]*radixNode[V]` / `[64]uint32`) and a pre-sized `strings.Builder` strictly before `deleteNode` (`compressPathUpwards`) mutates prefix or parent pointers.
+  - When `WithOnEvictEntry`, `All()`, or `Keys()` needs to materialize a node's full key on `RadixCache` or `ArenaRadixCache`, `reconstructKey` returns single-segment keys (`node.parent == root`) in `0` allocations and walks deeper parent links using a 64-element stack buffer (`[64]*radixNode[V]` / `[64]uint32`), `slices.Backward`, and a pre-sized `strings.Builder`.

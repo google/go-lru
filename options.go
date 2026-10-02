@@ -245,6 +245,23 @@ func WithWeigher[V any](fn func(key string, value V) uint64) Option {
 	}
 }
 
+// isNilFunc reports whether fn is nil or a typed-nil function value wrapped in
+// a non-nil interface.
+func isNilFunc(fn any) bool {
+	if fn == nil {
+		return true
+	}
+	v := reflect.ValueOf(fn)
+	return v.Kind() == reflect.Func && v.IsNil()
+}
+
+// isZeroValue reports whether *v equals the zero value of V. Taking a pointer
+// ensures interface types V (such as any) holding nil are inspected via a valid
+// reflect.Interface Value rather than an invalid zero reflect.Value.
+func isZeroValue[V any](v *V) bool {
+	return reflect.ValueOf(v).Elem().IsZero()
+}
+
 func resolveWeigher[V any](options Options) func(string, V) uint64 {
 	if options.Weigher == nil {
 		return nil
@@ -271,7 +288,7 @@ func resolveWeigher[V any](options Options) func(string, V) uint64 {
 			return fnAny(k, v)
 		}
 	}
-	if v := reflect.ValueOf(options.Weigher); v.IsValid() && v.Kind() == reflect.Func && v.IsNil() {
+	if isNilFunc(options.Weigher) {
 		return nil
 	}
 	panic(fmt.Sprintf("lru: WithWeigher function type %T does not match cache value type %s", options.Weigher, reflect.TypeFor[V]()))
@@ -329,7 +346,7 @@ func resolveOnEvictValue[V any](options Options) func(V, EvictionReason) {
 			fnAny(v, r)
 		}
 	}
-	if v := reflect.ValueOf(options.OnEvictValue); v.IsValid() && v.Kind() == reflect.Func && v.IsNil() {
+	if isNilFunc(options.OnEvictValue) {
 		return nil
 	}
 	panic(fmt.Sprintf("lru: WithOnEvictValue function type %T does not match cache value type %s", options.OnEvictValue, reflect.TypeFor[V]()))
@@ -386,7 +403,7 @@ func resolveOnEvictEntry[V any](options Options) func(string, V, EvictionReason)
 			fnAny(k, v, r)
 		}
 	}
-	if v := reflect.ValueOf(options.OnEvictEntry); v.IsValid() && v.Kind() == reflect.Func && v.IsNil() {
+	if isNilFunc(options.OnEvictEntry) {
 		return nil
 	}
 	panic(fmt.Sprintf("lru: WithOnEvictEntry function type %T does not match cache value type %s", options.OnEvictEntry, reflect.TypeFor[V]()))
@@ -559,20 +576,14 @@ func ApplyOptions(opts ...Option) Options {
 	case options.EvictionRetentionRatio == 0:
 		options.EvictionRetentionRatio = 0.0
 	}
-	if options.Weigher != nil {
-		if v := reflect.ValueOf(options.Weigher); v.IsValid() && v.Kind() == reflect.Func && v.IsNil() {
-			options.Weigher = nil
-		}
+	if isNilFunc(options.Weigher) {
+		options.Weigher = nil
 	}
-	if options.OnEvictValue != nil {
-		if v := reflect.ValueOf(options.OnEvictValue); v.IsValid() && v.Kind() == reflect.Func && v.IsNil() {
-			options.OnEvictValue = nil
-		}
+	if isNilFunc(options.OnEvictValue) {
+		options.OnEvictValue = nil
 	}
-	if options.OnEvictEntry != nil {
-		if v := reflect.ValueOf(options.OnEvictEntry); v.IsValid() && v.Kind() == reflect.Func && v.IsNil() {
-			options.OnEvictEntry = nil
-		}
+	if isNilFunc(options.OnEvictEntry) {
+		options.OnEvictEntry = nil
 	}
 	if options.PressureFunc == nil {
 		options.PressureFunc = DefaultRuntimePressureFunc(options.MemoryBudget)
