@@ -3040,6 +3040,27 @@ func TestPressure_EvictionCallbacks_Tier2ExplicitAndForeground(t *testing.T) {
 					{key: "sub/1", val: "cccccccccc", reason: EvictionReasonDeleted},
 					{key: "keep/1", val: "aaaaaaaaaa", reason: EvictionReasonPressure},
 				}, entryEvents)
+
+				// 4. Re-populate at normal pressure (0.10): keep/2(10B, LRU), f1(10B), f2(10B, MRU) = 30B
+				probe.Set(0.10)
+				_, err = cache.Put("p/f1", "dddddddddd")
+				require.NoError(t, err)
+				_, err = cache.Put("p/f2", "eeeeeeeeee")
+				require.NoError(t, err)
+
+				// Put new entry "p/f3" (10B) while under Tier 2 (1.0 -> retention 0.50 -> targetSize=15B):
+				// First evicts LRU "keep/2" for capacity (EvictionReasonCapacity), then inline Tier 2
+				// pressure shedding evicts "p/f1" and "p/f2" (EvictionReasonPressure) while protecting MRU "p/f3"!
+				entryEvents = nil
+				probe.Set(1.0)
+				evictedPut, err := cache.Put("p/f3", "ffffffffff")
+				require.NoError(t, err)
+				assert.Equal(t, []string{"bbbbbbbbbb", "dddddddddd", "eeeeeeeeee"}, evictedPut)
+				assert.Equal(t, []recordedEvictEntry{
+					{key: "keep/2", val: "bbbbbbbbbb", reason: EvictionReasonCapacity},
+					{key: "p/f1", val: "dddddddddd", reason: EvictionReasonPressure},
+					{key: "p/f2", val: "eeeeeeeeee", reason: EvictionReasonPressure},
+				}, entryEvents)
 			})
 		})
 	}

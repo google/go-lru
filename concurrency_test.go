@@ -436,6 +436,7 @@ func TestConcurrency_EvictionCallbacksUnderRace(t *testing.T) {
 			var valReasonCounts [4]atomic.Uint64
 			var entryReasonCounts [4]atomic.Uint64
 			var lastVal concValue
+			var lastReason lru.EvictionReason
 
 			cache := eng.constructor(
 				capacity,
@@ -446,13 +447,15 @@ func TestConcurrency_EvictionCallbacksUnderRace(t *testing.T) {
 				lru.WithEvictionRetentionRatio(0.50),
 				lru.WithOnEvictValue(func(v concValue, r lru.EvictionReason) {
 					lastVal = v
+					lastReason = r
 					if int(r) < len(valReasonCounts) {
 						valReasonCounts[r].Add(1)
 					}
 				}),
 				lru.WithOnEvictEntry(func(k string, v concValue, r lru.EvictionReason) {
 					assert.Equal(t, lastVal, v, "OnEvictEntry must observe the exact value just passed to OnEvictValue under lock")
-					assert.NotEmpty(t, k)
+					assert.Equal(t, lastReason, r, "OnEvictEntry must observe the exact reason just passed to OnEvictValue under lock")
+					assert.True(t, v.id == k || v.id == k+"_r", "reconstructed key %q must match evicted value id %q", k, v.id)
 					if int(r) < len(entryReasonCounts) {
 						entryReasonCounts[r].Add(1)
 					}
@@ -485,6 +488,9 @@ func TestConcurrency_EvictionCallbacksUnderRace(t *testing.T) {
 						dirIdx := kIdx % 6
 						subIdx := (kIdx / 6) % 5
 						key := fmt.Sprintf("cb_dir_%02d/sub_%02d/file_%03d.dat", dirIdx, subIdx, kIdx)
+						if kIdx == 0 {
+							key = ""
+						}
 
 						switch {
 						case op < 35:
@@ -503,8 +509,12 @@ func TestConcurrency_EvictionCallbacksUnderRace(t *testing.T) {
 								assert.ErrorIs(t, err, lru.ErrEntryNotExist)
 							}
 						case op < 86:
-							// Self-evicting Replace (> capacity)
-							err := cache.Replace(key, concValue{id: key + "_big", size: capacity + 10})
+							// Self-evicting Replace (> capacity or !canFit alongside newer entries)
+							sz := uint64(capacity + 10)
+							if step%2 == 1 {
+								sz = capacity - 15
+							}
+							err := cache.Replace(key, concValue{id: key + "_r", size: sz})
 							if err != nil {
 								assert.ErrorIs(t, err, lru.ErrEntryNotExist)
 							}

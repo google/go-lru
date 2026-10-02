@@ -207,6 +207,29 @@ func TestOptions_WithOnEvictValue(t *testing.T) {
 	assert.PanicsWithValue(t, expectedPanic, func() { _ = NewMapCache[string](10, mismatchedOpt) })
 	assert.PanicsWithValue(t, expectedPanic, func() { _ = NewRadixCache[string](10, mismatchedOpt) })
 	assert.PanicsWithValue(t, expectedPanic, func() { _ = NewArenaRadixCache[string](10, mismatchedOpt) })
+	assert.PanicsWithValue(t,
+		"lru: WithOnEvictValue function type func(int, lru.EvictionReason) does not match cache value type *lru.testData",
+		func() { _ = New[*testData](10, mismatchedOpt) },
+	)
+	assert.PanicsWithValue(t,
+		"lru: WithOnEvictValue function type func(int, lru.EvictionReason) does not match cache value type interface {}",
+		func() { _ = New[any](10, mismatchedOpt) },
+	)
+
+	for _, b := range allBackends[int]() {
+		var gotAnyVal any
+		var gotReason EvictionReason
+		c := b.fn(2, WithOnEvictValue(func(v any, r EvictionReason) {
+			gotAnyVal = v
+			gotReason = r
+		}))
+		_, err := c.Put("k", 42)
+		require.NoError(t, err)
+		_, ok := c.Delete("k")
+		require.True(t, ok)
+		assert.Equal(t, 42, gotAnyVal)
+		assert.Equal(t, EvictionReasonDeleted, gotReason)
+	}
 }
 
 func TestOptions_WithOnEvictEntry(t *testing.T) {
@@ -292,6 +315,32 @@ func TestOptions_WithOnEvictEntry(t *testing.T) {
 	assert.PanicsWithValue(t, expectedPanic, func() { _ = NewMapCache[string](10, mismatchedOpt) })
 	assert.PanicsWithValue(t, expectedPanic, func() { _ = NewRadixCache[string](10, mismatchedOpt) })
 	assert.PanicsWithValue(t, expectedPanic, func() { _ = NewArenaRadixCache[string](10, mismatchedOpt) })
+	assert.PanicsWithValue(t,
+		"lru: WithOnEvictEntry function type func(string, int, lru.EvictionReason) does not match cache value type *lru.testData",
+		func() { _ = New[*testData](10, mismatchedOpt) },
+	)
+	assert.PanicsWithValue(t,
+		"lru: WithOnEvictEntry function type func(string, int, lru.EvictionReason) does not match cache value type interface {}",
+		func() { _ = New[any](10, mismatchedOpt) },
+	)
+
+	for _, b := range allBackends[int]() {
+		var gotKey string
+		var gotAnyVal any
+		var gotReason EvictionReason
+		c := b.fn(2, WithOnEvictEntry(func(k string, v any, r EvictionReason) {
+			gotKey = k
+			gotAnyVal = v
+			gotReason = r
+		}))
+		_, err := c.Put("k", 99)
+		require.NoError(t, err)
+		_, ok := c.Delete("k")
+		require.True(t, ok)
+		assert.Equal(t, "k", gotKey)
+		assert.Equal(t, 99, gotAnyVal)
+		assert.Equal(t, EvictionReasonDeleted, gotReason)
+	}
 }
 
 func TestOptions_Default(t *testing.T) {
@@ -1139,7 +1188,7 @@ func TestCache_OnEvictCallbacks_AllBackends(t *testing.T) {
 					}
 					if mode.useValue && mode.useEntry {
 						require.Len(t, callOrder, 2*len(expectedEntries))
-						for i := 0; i < len(expectedEntries); i++ {
+						for i := range expectedEntries {
 							assert.Equal(t, "value", callOrder[2*i], "OnEvictValue must be invoked before OnEvictEntry")
 							assert.Equal(t, "entry", callOrder[2*i+1], "OnEvictEntry must be invoked immediately after OnEvictValue")
 						}
@@ -1288,9 +1337,15 @@ func TestCache_OnEvictCallbacks_AllBackends(t *testing.T) {
 				treeCache := b.fn(1024, buildOpts()...)
 				_, err = treeCache.Put("", "rootval")
 				require.NoError(t, err)
+				_, err = treeCache.Put("app/service/", "svcval")
+				require.NoError(t, err)
 				_, err = treeCache.Put("app/service/v1/users", "u1")
 				require.NoError(t, err)
 				_, err = treeCache.Put("app/service/v1/users/profile", "u2")
+				require.NoError(t, err)
+				_, err = treeCache.Put("app/service/v1/users/settings", "u3")
+				require.NoError(t, err)
+				_, err = treeCache.Put("app/service/v1/items", "i1")
 				require.NoError(t, err)
 				_, err = treeCache.Put("app/service/v2/orders", "o1")
 				require.NoError(t, err)
@@ -1312,23 +1367,33 @@ func TestCache_OnEvictCallbacks_AllBackends(t *testing.T) {
 					{key: "", val: "rootval", reason: EvictionReasonDeleted},
 				}, false)
 
+				// Re-insert empty root key "" so both "" (c.root) and "app/service/" (ancestor) hold values during DeletePrefix
+				_, err = treeCache.Put("", "rootval2")
+				require.NoError(t, err)
+
 				// DeletePrefix miss
 				resetEvents()
 				treeCache.DeletePrefix("missing/")
 				assertRecorded(nil, false)
 
-				// DeletePrefix matching partial edge / subtree ("app/service/v1/")
+				// DeletePrefix matching partial edge / subtree ("app/service/v1/") under value-bearing ancestor "app/service/"
 				resetEvents()
 				treeCache.DeletePrefix("app/service/v1/")
 				assertRecorded([]recordedEvictEntry{
 					{key: "app/service/v1/users", val: "u1", reason: EvictionReasonDeleted},
 					{key: "app/service/v1/users/profile", val: "u2", reason: EvictionReasonDeleted},
+					{key: "app/service/v1/users/settings", val: "u3", reason: EvictionReasonDeleted},
+					{key: "app/service/v1/items", val: "i1", reason: EvictionReasonDeleted},
 				}, true)
+				assert.True(t, hasKey(treeCache, ""), "root empty key must survive DeletePrefix(\"app/service/v1/\")")
+				assert.True(t, hasKey(treeCache, "app/service/"), "value-bearing ancestor \"app/service/\" must survive DeletePrefix(\"app/service/v1/\")")
 
-				// DeletePrefix("") clearing all remaining entries
+				// DeletePrefix("") clearing all remaining entries (including root "" and ancestor "app/service/")
 				resetEvents()
 				treeCache.DeletePrefix("")
 				assertRecorded([]recordedEvictEntry{
+					{key: "", val: "rootval2", reason: EvictionReasonDeleted},
+					{key: "app/service/", val: "svcval", reason: EvictionReasonDeleted},
 					{key: "app/service/v2/orders", val: "o1", reason: EvictionReasonDeleted},
 					{key: "other/key", val: "ok1", reason: EvictionReasonDeleted},
 				}, true)
@@ -1392,10 +1457,10 @@ func TestCache_OnEvictDeepKeyReconstruction_ExceedsStackBuffer(t *testing.T) {
 }
 
 func TestCache_OnEvictZeroKeyReconstructionAllocs(t *testing.T) {
-	// 1. Steady-state Replace (caller already has key in hand) with WithOnEvictEntry across all 3 backends -> 0 allocs
+	// 1. Steady-state Replace and Put overwrite (caller already has key in hand) at radix depth >= 2 -> 0 allocs
 	for _, b := range allBackends[string]() {
 		t.Run(b.name+"/ReplaceWithOnEvictEntry", func(t *testing.T) {
-			// Arrange
+			// Arrange: seed sibling "alpha/beta/pin" so "alpha/beta/gamma/delta" sits at depth >= 2 (parent != root)
 			var sinkKey, sinkVal string
 			var sinkReason EvictionReason
 			c := b.fn(1024,
@@ -1405,7 +1470,9 @@ func TestCache_OnEvictZeroKeyReconstructionAllocs(t *testing.T) {
 					sinkReason = r
 				}),
 			)
-			_, err := c.Put("alpha/beta/gamma/delta", "val1")
+			_, err := c.Put("alpha/beta/pin", "pin")
+			require.NoError(t, err)
+			_, err = c.Put("alpha/beta/gamma/delta", "val1")
 			require.NoError(t, err)
 
 			// Act
@@ -1421,7 +1488,7 @@ func TestCache_OnEvictZeroKeyReconstructionAllocs(t *testing.T) {
 		})
 
 		t.Run(b.name+"/PutOverwriteWithOnEvictEntry", func(t *testing.T) {
-			// Arrange
+			// Arrange: seed sibling "alpha/beta/pin" so "alpha/beta/gamma/delta" sits at depth >= 2 (parent != root)
 			var sinkKey, sinkVal string
 			var sinkReason EvictionReason
 			c := b.fn(1024,
@@ -1431,7 +1498,9 @@ func TestCache_OnEvictZeroKeyReconstructionAllocs(t *testing.T) {
 					sinkReason = r
 				}),
 			)
-			_, err := c.Put("alpha/beta/gamma/delta", "val1")
+			_, err := c.Put("alpha/beta/pin", "pin")
+			require.NoError(t, err)
+			_, err = c.Put("alpha/beta/gamma/delta", "val1")
 			require.NoError(t, err)
 
 			// Act
@@ -1444,6 +1513,37 @@ func TestCache_OnEvictZeroKeyReconstructionAllocs(t *testing.T) {
 			assert.Equal(t, "alpha/beta/gamma/delta", sinkKey)
 			assert.Equal(t, "val2", sinkVal)
 			assert.Equal(t, EvictionReasonReplaced, sinkReason)
+		})
+
+		t.Run(b.name+"/DeleteAndReplaceSelfEvictAddZeroKeyReconstructionAllocs", func(t *testing.T) {
+			// Arrange: verify Delete(key) and self-evicting Replace(key, oversized) do not call reconstructKey
+			var sinkKey, sinkVal string
+			var sinkReason EvictionReason
+			runDeleteCycle := func(opts ...Option) float64 {
+				allOpts := append([]Option{WithWeigher(func(_, v string) uint64 { return uint64(len(v)) })}, opts...)
+				c := b.fn(16, allOpts...)
+				_, _ = c.Put("alpha/beta/pin", "pin")
+				return testing.AllocsPerRun(100, func() {
+					_, _ = c.Put("alpha/beta/gamma/delta", "v1")
+					_, _ = c.Delete("alpha/beta/gamma/delta")
+					_, _ = c.Put("alpha/beta/gamma/delta", "v2")
+					_ = c.Replace("alpha/beta/gamma/delta", "oversized-value-exceeding-16B")
+				})
+			}
+
+			// Act
+			baselineAllocs := runDeleteCycle()
+			entryCbAllocs := runDeleteCycle(WithOnEvictEntry(func(k, v string, r EvictionReason) {
+				sinkKey = k
+				sinkVal = v
+				sinkReason = r
+			}))
+
+			// Assert
+			assert.InDelta(t, baselineAllocs, entryCbAllocs, 1e-9, "Delete and self-evicting Replace with WithOnEvictEntry must add zero key-reconstruction allocations")
+			assert.Equal(t, "alpha/beta/gamma/delta", sinkKey)
+			assert.Equal(t, "v2", sinkVal)
+			assert.Equal(t, EvictionReasonCapacity, sinkReason)
 		})
 	}
 
@@ -1483,4 +1583,36 @@ func TestCache_OnEvictZeroKeyReconstructionAllocs(t *testing.T) {
 			assert.Equal(t, EvictionReasonCapacity, sinkReason)
 		})
 	}
+
+	// 3. MapCache always passes the cloned entryVal.key (not a caller's transient buffer slice) to OnEvictEntry
+	t.Run("MapCache/OnEvictEntryReceivesClonedKeyWithoutPinningCallerBuffer", func(t *testing.T) {
+		// Arrange
+		var gotKey string
+		c := NewMapCache[string](10, WithOnEvictEntry(func(k, _ string, _ EvictionReason) {
+			gotKey = k
+		}))
+		backingBuf := strings.Repeat("X", 64) + "target_key" + strings.Repeat("Y", 64)
+		subKey := backingBuf[64 : 64+len("target_key")]
+
+		// Act & Assert: Put initial -> Put overwrite -> Replace overwrite -> Delete
+		_, err := c.Put(subKey, "v1")
+		require.NoError(t, err)
+
+		callerBuf2 := strings.Repeat("A", 64) + "target_key" + strings.Repeat("B", 64)
+		subKey2 := callerBuf2[64 : 64+len("target_key")]
+
+		_, err = c.Put(subKey2, "v2")
+		require.NoError(t, err)
+		assert.Equal(t, "target_key", gotKey)
+		assert.NotSame(t, unsafe.StringData(subKey2), unsafe.StringData(gotKey), "MapCache Put overwrite must pass cloned entry.key")
+
+		require.NoError(t, c.Replace(subKey2, "v3"))
+		assert.Equal(t, "target_key", gotKey)
+		assert.NotSame(t, unsafe.StringData(subKey2), unsafe.StringData(gotKey), "MapCache Replace overwrite must pass cloned entry.key")
+
+		_, ok := c.Delete(subKey2)
+		require.True(t, ok)
+		assert.Equal(t, "target_key", gotKey)
+		assert.NotSame(t, unsafe.StringData(subKey2), unsafe.StringData(gotKey), "MapCache Delete must pass cloned entry.key")
+	})
 }

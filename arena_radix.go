@@ -522,11 +522,11 @@ func (c *arenaRadix[V]) eraseInternal(nodeID uint32, reason EvictionReason) (V, 
 		var zero V
 		return zero, false
 	}
-	var key string
 	if c.onEvictEntry != nil {
-		key = c.reconstructKey(nodeID)
+		key := c.reconstructKey(nodeID)
+		return c.eraseInternalWithHash(nodeID, hashString(key), key, reason)
 	}
-	return c.eraseInternalWithHash(nodeID, c.hashNodeKey(nodeID), key, reason)
+	return c.eraseInternalWithHash(nodeID, c.hashNodeKey(nodeID), "", reason)
 }
 
 func (c *arenaRadix[V]) eraseInternalWithHash(nodeID uint32, hash uint64, key string, reason EvictionReason) (V, bool) {

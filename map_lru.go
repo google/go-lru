@@ -314,7 +314,7 @@ func (c *mapCache[V]) Put(key string, value V) ([]V, error) {
 		entryVal.value = value
 		entryVal.size = valueSize
 		c.currentSize += valueSize
-		c.notifyEvict(key, oldValue, EvictionReasonReplaced)
+		c.notifyEvict(entryVal.key, oldValue, EvictionReasonReplaced)
 		if c.shouldReclaimSingleSurvivorOnMutation(c.entries.Len(), c.dirtyIndex, false, evictedPrePut, c.currentSize, sizeBefore, pressure) {
 			reclaimedPrePut = true
 		}
@@ -355,6 +355,7 @@ func (c *mapCache[V]) eraseInternal(key string, reason EvictionReason) (V, bool)
 	}
 
 	entryVal := e.Value.(*entry[V])
+	evictedKey := entryVal.key
 	deletedEntry := entryVal.value
 	c.onEntryDeleted(entryVal.size)
 	c.currentSize -= entryVal.size
@@ -368,7 +369,7 @@ func (c *mapCache[V]) eraseInternal(key string, reason EvictionReason) (V, bool)
 	entryVal.size = 0
 	e.Value = nil
 
-	c.notifyEvict(key, deletedEntry, reason)
+	c.notifyEvict(evictedKey, deletedEntry, reason)
 	return deletedEntry, true
 }
 
@@ -528,7 +529,7 @@ func (c *mapCache[V]) Replace(key string, value V) error {
 		entryVal.value = value
 	}
 
-	c.notifyEvict(key, oldValue, EvictionReasonReplaced)
+	c.notifyEvict(entryVal.key, oldValue, EvictionReasonReplaced)
 
 	if c.shouldReclaimSingleSurvivorOnMutation(c.entries.Len(), c.dirtyIndex, false, evictedAny, c.currentSize, sizeBefore, pressure) {
 		reclaimedPreUpdate = true
@@ -562,6 +563,8 @@ func (c *mapCache[V]) DeletePrefix(prefix string) {
 			if entryVal, ok := e.Value.(*entry[V]); ok && entryVal != nil {
 				evictedKey := entryVal.key
 				evictedVal := entryVal.value
+				c.onEntryDeleted(entryVal.size)
+				c.currentSize -= entryVal.size
 				entryVal.key = ""
 				entryVal.value = zero
 				entryVal.size = 0

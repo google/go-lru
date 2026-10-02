@@ -632,12 +632,22 @@ func (c *arenaRadix[V]) DeletePrefix(prefix string) {
 		}
 		hadReclaimable := c.currentSize > 0 || hadDirtySlack
 		if (c.onEvictValue != nil || c.onEvictEntry != nil) && c.len > 0 {
-			for currID := c.head; currID != nilNode; currID = c.nodes[currID].next {
+			var zero V
+			for currID := c.head; currID != nilNode; {
+				nextID := c.nodes[currID].next
 				var key string
 				if c.onEvictEntry != nil {
 					key = c.reconstructKey(currID)
 				}
-				c.notifyEvict(key, c.nodes[currID].value, EvictionReasonDeleted)
+				evictedVal := c.nodes[currID].value
+				c.onEntryDeleted(c.nodes[currID].size)
+				c.currentSize -= c.nodes[currID].size
+				c.remove(currID)
+				c.nodes[currID].value = zero
+				c.nodes[currID].hasValue = false
+				c.nodes[currID].size = 0
+				c.notifyEvict(key, evictedVal, EvictionReasonDeleted)
+				currID = nextID
 			}
 		}
 		c.clearEmptyArenaStateLocked()
