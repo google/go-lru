@@ -16,7 +16,6 @@ package lru
 
 import (
 	"fmt"
-	"math"
 	"runtime"
 	"strings"
 	"testing"
@@ -26,9 +25,9 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-func setupArenaRadixCacheTest(t *testing.T) Cache {
+func setupArenaRadixCacheTest(t *testing.T) Cache[testData] {
 	t.Helper()
-	return NewArenaRadixCache(testMaxSize, WithInvariantChecking(true))
+	return NewArenaRadixCache[testData](testMaxSize, WithInvariantChecking(true), testDataWeigher)
 }
 
 func TestArenaRadixCache_LookUpInEmptyCache(t *testing.T) {
@@ -36,24 +35,31 @@ func TestArenaRadixCache_LookUpInEmptyCache(t *testing.T) {
 	cache := setupArenaRadixCacheTest(t)
 
 	// Act
-	emptyVal := cache.LookUp("")
-	tacoVal := cache.LookUp("taco")
+	emptyVal, okEmpty := cache.LookUp("")
+	tacoVal, okTaco := cache.LookUp("taco")
 
 	// Assert
-	assert.Nil(t, emptyVal)
-	assert.Nil(t, tacoVal)
+	assert.False(t, okEmpty)
+	assert.Equal(t, testData{}, emptyVal)
+	assert.False(t, okTaco)
+	assert.Equal(t, testData{}, tacoVal)
 }
 
-func TestArenaRadixCache_InsertNilValue(t *testing.T) {
+func TestArenaRadixCache_InsertZeroAndNilSliceValue(t *testing.T) {
 	// Arrange
-	cache := setupArenaRadixCacheTest(t)
+	cache := NewArenaRadixCache[[]byte](testMaxSize, WithInvariantChecking(true), WithWeigher(func(_ string, b []byte) uint64 {
+		return uint64(len(b))
+	}))
 
-	// Act
+	// Act: nil slice is a valid value in a generic cache.
 	evicted, err := cache.Insert("taco", nil)
 
 	// Assert
-	require.ErrorIs(t, err, ErrInvalidEntry)
+	require.NoError(t, err)
 	assert.Empty(t, evicted)
+	val, ok := cache.LookUp("taco")
+	assert.True(t, ok)
+	assert.Nil(t, val)
 }
 
 func TestArenaRadixCache_InsertEmptyKey(t *testing.T) {
@@ -62,15 +68,15 @@ func TestArenaRadixCache_InsertEmptyKey(t *testing.T) {
 
 	// Act
 	evicted, err := cache.Insert("", testData{value: 42, dataSize: 10})
-	val := cache.LookUp("")
-	tacoVal := cache.LookUp("taco")
+	val, ok := cache.LookUp("")
+	_, okTaco := cache.LookUp("taco")
 
 	// Assert
 	require.NoError(t, err)
 	assert.Empty(t, evicted)
-	require.NotNil(t, val)
-	assert.Equal(t, int64(42), val.(testData).value)
-	assert.Nil(t, tacoVal)
+	require.True(t, ok)
+	assert.Equal(t, int64(42), val.value)
+	assert.False(t, okTaco)
 }
 
 func TestArenaRadixCache_LookUpUnknownKey(t *testing.T) {
@@ -82,12 +88,14 @@ func TestArenaRadixCache_LookUpUnknownKey(t *testing.T) {
 	require.NoError(t, err)
 
 	// Act
-	emptyVal := cache.LookUp("")
-	enchiladaVal := cache.LookUp("enchilada")
+	emptyVal, okEmpty := cache.LookUp("")
+	enchiladaVal, okEnchilada := cache.LookUp("enchilada")
 
 	// Assert
-	assert.Nil(t, emptyVal)
-	assert.Nil(t, enchiladaVal)
+	assert.False(t, okEmpty)
+	assert.Equal(t, testData{}, emptyVal)
+	assert.False(t, okEnchilada)
+	assert.Equal(t, testData{}, enchiladaVal)
 }
 
 func TestArenaRadixCache_FillUpToCapacity(t *testing.T) {
@@ -107,17 +115,17 @@ func TestArenaRadixCache_FillUpToCapacity(t *testing.T) {
 	require.NoError(t, err3)
 	assert.Empty(t, ev3)
 
-	v1 := cache.LookUp("burrito")
-	require.NotNil(t, v1)
-	assert.Equal(t, int64(23), v1.(testData).value)
+	v1, ok := cache.LookUp("burrito")
+	require.True(t, ok)
+	assert.Equal(t, int64(23), v1.value)
 
-	v2 := cache.LookUp("taco")
-	require.NotNil(t, v2)
-	assert.Equal(t, int64(26), v2.(testData).value)
+	v2, ok := cache.LookUp("taco")
+	require.True(t, ok)
+	assert.Equal(t, int64(26), v2.value)
 
-	v3 := cache.LookUp("enchilada")
-	require.NotNil(t, v3)
-	assert.Equal(t, int64(28), v3.(testData).value)
+	v3, ok := cache.LookUp("enchilada")
+	require.True(t, ok)
+	assert.Equal(t, int64(28), v3.value)
 }
 
 func TestArenaRadixCache_ExpiresLeastRecentlyUsed(t *testing.T) {
@@ -131,9 +139,9 @@ func TestArenaRadixCache_ExpiresLeastRecentlyUsed(t *testing.T) {
 	require.NoError(t, err)
 
 	// Promote burrito to MRU
-	promoted := cache.LookUp("burrito")
-	require.NotNil(t, promoted)
-	assert.Equal(t, int64(23), promoted.(testData).value)
+	promoted, ok := cache.LookUp("burrito")
+	require.True(t, ok)
+	assert.Equal(t, int64(23), promoted.value)
 
 	// Act: Insert another item; taco (least recent) should be evicted
 	evicted, err := cache.Insert("queso", testData{value: 34, dataSize: 5})
@@ -141,19 +149,20 @@ func TestArenaRadixCache_ExpiresLeastRecentlyUsed(t *testing.T) {
 	// Assert
 	require.NoError(t, err)
 	assertEvictedValues(t, evicted, []int64{26})
-	assert.Nil(t, cache.LookUp("taco"))
+	_, ok = cache.LookUp("taco")
+	assert.False(t, ok)
 
-	vBurrito := cache.LookUp("burrito")
-	require.NotNil(t, vBurrito)
-	assert.Equal(t, int64(23), vBurrito.(testData).value)
+	vBurrito, ok := cache.LookUp("burrito")
+	require.True(t, ok)
+	assert.Equal(t, int64(23), vBurrito.value)
 
-	vEnchilada := cache.LookUp("enchilada")
-	require.NotNil(t, vEnchilada)
-	assert.Equal(t, int64(28), vEnchilada.(testData).value)
+	vEnchilada, ok := cache.LookUp("enchilada")
+	require.True(t, ok)
+	assert.Equal(t, int64(28), vEnchilada.value)
 
-	vQueso := cache.LookUp("queso")
-	require.NotNil(t, vQueso)
-	assert.Equal(t, int64(34), vQueso.(testData).value)
+	vQueso, ok := cache.LookUp("queso")
+	require.True(t, ok)
+	assert.Equal(t, int64(34), vQueso.value)
 }
 
 func TestArenaRadixCache_Overwrite(t *testing.T) {
@@ -175,15 +184,16 @@ func TestArenaRadixCache_Overwrite(t *testing.T) {
 	// Assert
 	require.NoError(t, err)
 	assertEvictedValues(t, evicted, []int64{26})
-	assert.Nil(t, cache.LookUp("taco"))
+	_, ok := cache.LookUp("taco")
+	assert.False(t, ok)
 
-	vBurrito := cache.LookUp("burrito")
-	require.NotNil(t, vBurrito)
-	assert.Equal(t, int64(33), vBurrito.(testData).value)
+	vBurrito, ok := cache.LookUp("burrito")
+	require.True(t, ok)
+	assert.Equal(t, int64(33), vBurrito.value)
 
-	vEnchilada := cache.LookUp("enchilada")
-	require.NotNil(t, vEnchilada)
-	assert.Equal(t, int64(28), vEnchilada.(testData).value)
+	vEnchilada, ok := cache.LookUp("enchilada")
+	require.True(t, ok)
+	assert.Equal(t, int64(28), vEnchilada.value)
 }
 
 func TestArenaRadixCache_MultipleEviction(t *testing.T) {
@@ -202,13 +212,16 @@ func TestArenaRadixCache_MultipleEviction(t *testing.T) {
 	// Assert
 	require.NoError(t, err)
 	assertEvictedValues(t, evicted, []int64{23, 26, 28})
-	assert.Nil(t, cache.LookUp("taco"))
-	assert.Nil(t, cache.LookUp("burrito"))
-	assert.Nil(t, cache.LookUp("enchilada"))
+	_, ok := cache.LookUp("taco")
+	assert.False(t, ok)
+	_, ok = cache.LookUp("burrito")
+	assert.False(t, ok)
+	_, ok = cache.LookUp("enchilada")
+	assert.False(t, ok)
 
-	vLarge := cache.LookUp("large_data")
-	require.NotNil(t, vLarge)
-	assert.Equal(t, int64(33), vLarge.(testData).value)
+	vLarge, ok := cache.LookUp("large_data")
+	require.True(t, ok)
+	assert.Equal(t, int64(33), vLarge.value)
 }
 
 func TestArenaRadixCache_WhenEntrySizeMoreThanCacheMaxSize(t *testing.T) {
@@ -224,9 +237,9 @@ func TestArenaRadixCache_WhenEntrySizeMoreThanCacheMaxSize(t *testing.T) {
 	require.ErrorIs(t, err, ErrInvalidEntrySize)
 	assert.Empty(t, evicted)
 
-	vBurrito := cache.LookUp("burrito")
-	require.NotNil(t, vBurrito)
-	assert.Equal(t, int64(23), vBurrito.(testData).value)
+	vBurrito, ok := cache.LookUp("burrito")
+	require.True(t, ok)
+	assert.Equal(t, int64(23), vBurrito.value)
 }
 
 func TestArenaRadixCache_EraseWhenKeyPresent(t *testing.T) {
@@ -236,12 +249,13 @@ func TestArenaRadixCache_EraseWhenKeyPresent(t *testing.T) {
 	require.NoError(t, err)
 
 	// Act
-	deletedEntry := cache.Erase("burrito")
+	deletedEntry, ok := cache.Erase("burrito")
 
 	// Assert
-	require.NotNil(t, deletedEntry)
-	assert.Equal(t, int64(23), deletedEntry.(testData).value)
-	assert.Nil(t, cache.LookUp("burrito"))
+	require.True(t, ok)
+	assert.Equal(t, int64(23), deletedEntry.value)
+	_, ok = cache.LookUp("burrito")
+	assert.False(t, ok)
 }
 
 func TestArenaRadixCache_EraseWhenKeyNotPresent(t *testing.T) {
@@ -251,13 +265,14 @@ func TestArenaRadixCache_EraseWhenKeyNotPresent(t *testing.T) {
 	require.NoError(t, err)
 
 	// Act
-	deletedEntry := cache.Erase("taco")
+	deletedEntry, ok := cache.Erase("taco")
 
 	// Assert
-	assert.Nil(t, deletedEntry)
-	vBurrito := cache.LookUp("burrito")
-	require.NotNil(t, vBurrito)
-	assert.Equal(t, int64(23), vBurrito.(testData).value)
+	assert.False(t, ok)
+	assert.Equal(t, testData{}, deletedEntry)
+	vBurrito, ok := cache.LookUp("burrito")
+	require.True(t, ok)
+	assert.Equal(t, int64(23), vBurrito.value)
 }
 
 func TestArenaRadixCache_EraseCacheWithGivenPrefix(t *testing.T) {
@@ -278,14 +293,18 @@ func TestArenaRadixCache_EraseCacheWithGivenPrefix(t *testing.T) {
 	cache.EraseEntriesWithGivenPrefix("a")
 
 	// Assert
-	assert.Nil(t, cache.LookUp("a"))
-	assert.Nil(t, cache.LookUp("a/b"))
-	assert.Nil(t, cache.LookUp("a/b/d"))
-	assert.Nil(t, cache.LookUp("a/c"))
+	_, ok := cache.LookUp("a")
+	assert.False(t, ok)
+	_, ok = cache.LookUp("a/b")
+	assert.False(t, ok)
+	_, ok = cache.LookUp("a/b/d")
+	assert.False(t, ok)
+	_, ok = cache.LookUp("a/c")
+	assert.False(t, ok)
 
-	vb := cache.LookUp("b")
-	require.NotNil(t, vb)
-	assert.Equal(t, uint64(2), vb.Size())
+	vb, ok := cache.LookUp("b")
+	require.True(t, ok)
+	assert.Equal(t, uint64(2), vb.dataSize)
 }
 
 func TestArenaRadixCache_EraseCacheWithEmptyPrefix(t *testing.T) {
@@ -302,9 +321,12 @@ func TestArenaRadixCache_EraseCacheWithEmptyPrefix(t *testing.T) {
 	cache.EraseEntriesWithGivenPrefix("")
 
 	// Assert
-	assert.Nil(t, cache.LookUp("a"))
-	assert.Nil(t, cache.LookUp("a/b"))
-	assert.Nil(t, cache.LookUp("b"))
+	_, ok := cache.LookUp("a")
+	assert.False(t, ok)
+	_, ok = cache.LookUp("a/b")
+	assert.False(t, ok)
+	_, ok = cache.LookUp("b")
+	assert.False(t, ok)
 }
 
 func TestArenaRadixCache_EraseCacheWhereNoEntriesExistWithGivenPrefix(t *testing.T) {
@@ -321,17 +343,17 @@ func TestArenaRadixCache_EraseCacheWhereNoEntriesExistWithGivenPrefix(t *testing
 	cache.EraseEntriesWithGivenPrefix("c")
 
 	// Assert
-	va := cache.LookUp("a")
-	require.NotNil(t, va)
-	assert.Equal(t, uint64(4), va.Size())
+	va, ok := cache.LookUp("a")
+	require.True(t, ok)
+	assert.Equal(t, uint64(4), va.dataSize)
 
-	vab := cache.LookUp("a/b")
-	require.NotNil(t, vab)
-	assert.Equal(t, uint64(5), vab.Size())
+	vab, ok := cache.LookUp("a/b")
+	require.True(t, ok)
+	assert.Equal(t, uint64(5), vab.dataSize)
 
-	vb := cache.LookUp("b")
-	require.NotNil(t, vb)
-	assert.Equal(t, uint64(2), vb.Size())
+	vb, ok := cache.LookUp("b")
+	require.True(t, ok)
+	assert.Equal(t, uint64(2), vb.dataSize)
 }
 
 func TestArenaRadixCache_EraseCacheWithGivenPrefixWithSomeEntriesEvictedDueToCacheSize(t *testing.T) {
@@ -353,23 +375,27 @@ func TestArenaRadixCache_EraseCacheWithGivenPrefixWithSomeEntriesEvictedDueToCac
 	cache.EraseEntriesWithGivenPrefix("a")
 
 	// Assert
-	assert.Nil(t, cache.LookUp("a"))
-	assert.Nil(t, cache.LookUp("a/b"))
-	assert.Nil(t, cache.LookUp("a/b/d"))
-	assert.Nil(t, cache.LookUp("a/c"))
+	_, ok := cache.LookUp("a")
+	assert.False(t, ok)
+	_, ok = cache.LookUp("a/b")
+	assert.False(t, ok)
+	_, ok = cache.LookUp("a/b/d")
+	assert.False(t, ok)
+	_, ok = cache.LookUp("a/c")
+	assert.False(t, ok)
 
-	vb := cache.LookUp("b")
-	require.NotNil(t, vb)
-	assert.Equal(t, uint64(15), vb.Size())
+	vb, ok := cache.LookUp("b")
+	require.True(t, ok)
+	assert.Equal(t, uint64(15), vb.dataSize)
 }
 
-func TestArenaRadixCache_UpdateSize(t *testing.T) {
+func TestArenaRadixCache_UpdateGrowSize(t *testing.T) {
 	t.Run("NonExistentKey", func(t *testing.T) {
 		// Arrange
-		cache := NewArenaRadixCache(100, WithInvariantChecking(true))
+		cache := NewArenaRadixCache[testData](100, WithInvariantChecking(true), testDataWeigher)
 
 		// Act
-		err := cache.UpdateSize("key1", 20)
+		err := cache.UpdateWithoutChangingOrder("key1", testData{value: 1, dataSize: 20})
 
 		// Assert
 		require.ErrorIs(t, err, ErrEntryNotExist)
@@ -377,7 +403,7 @@ func TestArenaRadixCache_UpdateSize(t *testing.T) {
 
 	t.Run("ImmediateEviction", func(t *testing.T) {
 		// Arrange
-		cache := NewArenaRadixCache(100, WithInvariantChecking(true))
+		cache := NewArenaRadixCache[testData](100, WithInvariantChecking(true), testDataWeigher)
 		data1 := testData{value: 1, dataSize: 10}
 		data2 := testData{value: 2, dataSize: 70}
 		_, err := cache.Insert("key1", data1)
@@ -385,34 +411,37 @@ func TestArenaRadixCache_UpdateSize(t *testing.T) {
 		_, err = cache.Insert("key2", data2)
 		require.NoError(t, err)
 
-		// Act
-		errUpdate := cache.UpdateSize("key1", 30)
+		// Act: Grow key1 (at LRU tail) from 10 to 40 -> total 110 > 100 -> key1 evicts itself!
+		errUpdate := cache.UpdateWithoutChangingOrder("key1", testData{value: 11, dataSize: 40})
 
 		// Assert
 		require.NoError(t, errUpdate)
-		assert.Nil(t, cache.LookUp("key1"))
-		assert.NotNil(t, cache.LookUp("key2"))
+		_, ok := cache.LookUp("key1")
+		assert.False(t, ok)
+		_, ok = cache.LookUp("key2")
+		assert.True(t, ok)
 	})
 }
 
-func TestArenaRadixCache_UpdateSize_ExceedsMaxSize(t *testing.T) {
+func TestArenaRadixCache_UpdateGrowSize_ExceedsMaxSize(t *testing.T) {
 	// Arrange
-	cache := NewArenaRadixCache(100, WithInvariantChecking(true))
+	cache := NewArenaRadixCache[testData](100, WithInvariantChecking(true), testDataWeigher)
 	data := testData{value: 1, dataSize: 50}
 	_, err := cache.Insert("file.txt", data)
 	require.NoError(t, err)
 
 	// Act
-	err = cache.UpdateSize("file.txt", 100)
+	err = cache.UpdateWithoutChangingOrder("file.txt", testData{value: 2, dataSize: 150})
 
-	// Assert
+	// Assert: Exceeding maxSize self-evicts the entry and returns nil.
 	require.NoError(t, err)
-	assert.Nil(t, cache.LookUp("file.txt"))
+	_, ok := cache.LookUp("file.txt")
+	assert.False(t, ok)
 }
 
-func TestArenaRadixCache_UpdateSize_MultipleEvictions(t *testing.T) {
+func TestArenaRadixCache_UpdateGrowSize_MultipleEvictions(t *testing.T) {
 	// Arrange
-	cache := NewArenaRadixCache(100, WithInvariantChecking(true))
+	cache := NewArenaRadixCache[testData](100, WithInvariantChecking(true), testDataWeigher)
 	_, err := cache.Insert("k1", testData{value: 1, dataSize: 20})
 	require.NoError(t, err)
 	_, err = cache.Insert("k2", testData{value: 2, dataSize: 20})
@@ -422,15 +451,19 @@ func TestArenaRadixCache_UpdateSize_MultipleEvictions(t *testing.T) {
 	_, err = cache.Insert("k4", testData{value: 4, dataSize: 20})
 	require.NoError(t, err)
 
-	// Act
-	err = cache.UpdateSize("k4", 50)
+	// Act: Grow k4 from 20 to 70 (+50 delta) -> evicts k1 and k2.
+	err = cache.UpdateWithoutChangingOrder("k4", testData{value: 44, dataSize: 70})
 
 	// Assert
 	require.NoError(t, err)
-	assert.Nil(t, cache.LookUp("k1"))
-	assert.Nil(t, cache.LookUp("k2"))
-	assert.NotNil(t, cache.LookUp("k3"))
-	assert.NotNil(t, cache.LookUp("k4"))
+	_, ok := cache.LookUp("k1")
+	assert.False(t, ok)
+	_, ok = cache.LookUp("k2")
+	assert.False(t, ok)
+	_, ok = cache.LookUp("k3")
+	assert.True(t, ok)
+	_, ok = cache.LookUp("k4")
+	assert.True(t, ok)
 }
 
 func TestArenaRadixCache_UpdateWhenKeyPresent(t *testing.T) {
@@ -447,9 +480,9 @@ func TestArenaRadixCache_UpdateWhenKeyPresent(t *testing.T) {
 
 	// Assert
 	require.NoError(t, err)
-	v := cache.LookUp(key)
-	require.NotNil(t, v)
-	assert.Equal(t, int64(2), v.(testData).value)
+	v, ok := cache.LookUp(key)
+	require.True(t, ok)
+	assert.Equal(t, int64(2), v.value)
 }
 
 func TestArenaRadixCache_UpdateWhenKeyNotPresent(t *testing.T) {
@@ -465,31 +498,29 @@ func TestArenaRadixCache_UpdateWhenKeyNotPresent(t *testing.T) {
 	require.ErrorIs(t, err, ErrEntryNotExist)
 }
 
-func TestArenaRadixCache_UpdateWhenSizeIsDifferent(t *testing.T) {
+func TestArenaRadixCache_UpdateWhenSizeShrinks(t *testing.T) {
 	// Arrange
 	cache := setupArenaRadixCacheTest(t)
 	key := "burrito"
-	data := testData{value: 23, dataSize: 4}
+	data := testData{value: 23, dataSize: 30}
 	_, err := cache.Insert(key, data)
 	require.NoError(t, err)
+	_, err = cache.Insert("taco", testData{value: 26, dataSize: 20})
+	require.NoError(t, err)
 
-	// Act
-	newData := testData{value: 2, dataSize: 3}
+	// Act: Shrink burrito from 30 to 10 (total size 50 -> 30).
+	newData := testData{value: 2, dataSize: 10}
 	err = cache.UpdateWithoutChangingOrder(key, newData)
+	require.NoError(t, err)
 
-	// Assert
-	require.ErrorIs(t, err, ErrInvalidUpdateEntrySize)
-}
+	// Inserting 20 more units now fits without eviction.
+	evicted, err := cache.Insert("enchilada", testData{value: 28, dataSize: 20})
+	require.NoError(t, err)
+	assertEvictedValues(t, evicted, nil)
 
-func TestArenaRadixCache_UpdateNilValue(t *testing.T) {
-	// Arrange
-	cache := setupArenaRadixCacheTest(t)
-
-	// Act
-	err := cache.UpdateWithoutChangingOrder("key", nil)
-
-	// Assert
-	require.ErrorIs(t, err, ErrInvalidEntry)
+	val, ok := cache.LookUpWithoutChangingOrder(key)
+	assert.True(t, ok)
+	assert.Equal(t, newData, val)
 }
 
 func TestArenaRadixCache_UpdateNotChangeOrder(t *testing.T) {
@@ -521,7 +552,8 @@ func TestArenaRadixCache_UpdateNotChangeOrder(t *testing.T) {
 func TestArenaRadixCache_LookUpWithoutChangingOrder(t *testing.T) {
 	// Arrange
 	cache := setupArenaRadixCacheTest(t)
-	assert.Nil(t, cache.LookUpWithoutChangingOrder("absent"))
+	_, ok := cache.LookUpWithoutChangingOrder("absent")
+	assert.False(t, ok)
 
 	key1 := "burrito1"
 	data1 := testData{value: 23, dataSize: 10}
@@ -533,9 +565,9 @@ func TestArenaRadixCache_LookUpWithoutChangingOrder(t *testing.T) {
 	require.NoError(t, err)
 
 	// Act: LookUpWithoutChangingOrder on key1, then insert key3 (size 5)
-	val := cache.LookUpWithoutChangingOrder(key1)
-	require.NotNil(t, val)
-	assert.Equal(t, int64(23), val.(testData).value)
+	val, ok := cache.LookUpWithoutChangingOrder(key1)
+	require.True(t, ok)
+	assert.Equal(t, int64(23), val.value)
 
 	key3 := "burrito3"
 	data3 := testData{value: 3, dataSize: 5}
@@ -548,7 +580,7 @@ func TestArenaRadixCache_LookUpWithoutChangingOrder(t *testing.T) {
 
 func TestArenaRadixCache_RadixEdgeSplitsAndCompression(t *testing.T) {
 	// Arrange
-	cache := NewArenaRadixCache(1000, WithInvariantChecking(true))
+	cache := NewArenaRadixCache[testData](1000, WithInvariantChecking(true), testDataWeigher)
 	keys := []string{
 		"apple",
 		"app",
@@ -566,23 +598,23 @@ func TestArenaRadixCache_RadixEdgeSplitsAndCompression(t *testing.T) {
 	}
 
 	for i, k := range keys {
-		v := cache.LookUp(k)
-		require.NotNil(t, v)
-		assert.Equal(t, int64(i+1), v.(testData).value)
+		v, ok := cache.LookUp(k)
+		require.True(t, ok)
+		assert.Equal(t, int64(i+1), v.value)
 	}
 
 	// Act: Erase leaves and intermediate nodes to exercise compressPathUpwards
-	vAppn := cache.Erase("application")
-	vApply := cache.Erase("apply")
-	vApp := cache.Erase("app")
+	vAppn, okAppn := cache.Erase("application")
+	vApply, okApply := cache.Erase("apply")
+	vApp, okApp := cache.Erase("app")
 
 	// Assert
-	require.NotNil(t, vAppn)
-	assert.Equal(t, int64(3), vAppn.(testData).value)
-	require.NotNil(t, vApply)
-	assert.Equal(t, int64(4), vApply.(testData).value)
-	require.NotNil(t, vApp)
-	assert.Equal(t, int64(2), vApp.(testData).value)
+	require.True(t, okAppn)
+	assert.Equal(t, int64(3), vAppn.value)
+	require.True(t, okApply)
+	assert.Equal(t, int64(4), vApply.value)
+	require.True(t, okApp)
+	assert.Equal(t, int64(2), vApp.value)
 
 	remaining := []struct {
 		key string
@@ -596,15 +628,15 @@ func TestArenaRadixCache_RadixEdgeSplitsAndCompression(t *testing.T) {
 	}
 
 	for _, tc := range remaining {
-		v := cache.LookUp(tc.key)
-		require.NotNil(t, v)
-		assert.Equal(t, tc.val, v.(testData).value)
+		v, ok := cache.LookUp(tc.key)
+		require.True(t, ok)
+		assert.Equal(t, tc.val, v.value)
 	}
 }
 
 func TestArenaRadixCache_FreeListRecycling(t *testing.T) {
 	// Arrange
-	cache := NewArenaRadixCache(10000, WithInvariantChecking(true))
+	cache := NewArenaRadixCache[testData](10000, WithInvariantChecking(true), testDataWeigher)
 
 	// Act & Assert
 	for range 10 {
@@ -616,15 +648,15 @@ func TestArenaRadixCache_FreeListRecycling(t *testing.T) {
 
 		for i := range 50 {
 			key := fmt.Sprintf("prefix/subdir_%d/file_%d.txt", i%5, i)
-			v := cache.Erase(key)
-			require.NotNil(t, v)
+			_, ok := cache.Erase(key)
+			require.True(t, ok)
 		}
 	}
 }
 
 func TestArenaRadixCache_DeepHierarchy(t *testing.T) {
 	// Arrange
-	cache := NewArenaRadixCache(10000, WithInvariantChecking(true))
+	cache := NewArenaRadixCache[testData](10000, WithInvariantChecking(true), testDataWeigher)
 
 	path1 := "a/b/c/d/e/f/g/h/i/j/file1.txt"
 	path2 := "a/b/c/d/e/f/g/h/i/j/file2.txt"
@@ -644,37 +676,40 @@ func TestArenaRadixCache_DeepHierarchy(t *testing.T) {
 	cache.EraseEntriesWithGivenPrefix("a/b/c/d/e/")
 
 	// Assert
-	assert.Nil(t, cache.LookUp(path1))
-	assert.Nil(t, cache.LookUp(path2))
+	_, ok := cache.LookUp(path1)
+	assert.False(t, ok)
+	_, ok = cache.LookUp(path2)
+	assert.False(t, ok)
 
-	v3 := cache.LookUp(path3)
-	require.NotNil(t, v3)
-	assert.Equal(t, int64(3), v3.(testData).value)
+	v3, ok := cache.LookUp(path3)
+	require.True(t, ok)
+	assert.Equal(t, int64(3), v3.value)
 
-	v4 := cache.LookUp(path4)
-	require.NotNil(t, v4)
-	assert.Equal(t, int64(4), v4.(testData).value)
+	v4, ok := cache.LookUp(path4)
+	require.True(t, ok)
+	assert.Equal(t, int64(4), v4.value)
 }
 
 func TestArenaRadixCache_EraseRootValue(t *testing.T) {
 	// Arrange
-	cache := NewArenaRadixCache(1000, WithInvariantChecking(true))
+	cache := NewArenaRadixCache[testData](1000, WithInvariantChecking(true), testDataWeigher)
 	_, err := cache.Insert("", testData{value: 100, dataSize: 10})
 	require.NoError(t, err)
 	_, err = cache.Insert("child", testData{value: 200, dataSize: 20})
 	require.NoError(t, err)
 
 	// Act
-	erased := cache.Erase("")
+	erased, ok := cache.Erase("")
 
 	// Assert
-	require.NotNil(t, erased)
-	assert.Equal(t, int64(100), erased.(testData).value)
-	assert.Nil(t, cache.LookUp(""))
+	require.True(t, ok)
+	assert.Equal(t, int64(100), erased.value)
+	_, ok = cache.LookUp("")
+	assert.False(t, ok)
 
-	vChild := cache.LookUp("child")
-	require.NotNil(t, vChild)
-	assert.Equal(t, int64(200), vChild.(testData).value)
+	vChild, ok := cache.LookUp("child")
+	require.True(t, ok)
+	assert.Equal(t, int64(200), vChild.value)
 }
 
 // TestArenaRadixCache_CheckInvariants_PanicScenarios verifies that checkInvariants() detects and panics
@@ -686,7 +721,7 @@ func TestArenaRadixCache_EraseRootValue(t *testing.T) {
 func TestArenaRadixCache_CheckInvariants_PanicScenarios(t *testing.T) {
 	t.Run("CurrentSizeExceedsMaxSize", func(t *testing.T) {
 		// Arrange
-		c := NewArenaRadixCache(10).(*arenaRadix)
+		c := NewArenaRadixCache[testData](10, testDataWeigher).(*arenaRadix[testData])
 		c.currentSize = 20
 
 		// Act & Assert
@@ -697,7 +732,7 @@ func TestArenaRadixCache_CheckInvariants_PanicScenarios(t *testing.T) {
 
 	t.Run("CorruptLRULinks", func(t *testing.T) {
 		// Arrange
-		c := NewArenaRadixCache(50).(*arenaRadix)
+		c := NewArenaRadixCache[testData](50, testDataWeigher).(*arenaRadix[testData])
 		_, err := c.Insert("k1", testData{value: 1, dataSize: 10})
 		require.NoError(t, err)
 		_, err = c.Insert("k2", testData{value: 2, dataSize: 10})
@@ -713,7 +748,7 @@ func TestArenaRadixCache_CheckInvariants_PanicScenarios(t *testing.T) {
 
 	t.Run("CorruptTreeParent", func(t *testing.T) {
 		// Arrange
-		c := NewArenaRadixCache(50).(*arenaRadix)
+		c := NewArenaRadixCache[testData](50, testDataWeigher).(*arenaRadix[testData])
 		_, err := c.Insert("a/b", testData{value: 1, dataSize: 10})
 		require.NoError(t, err)
 		childID := c.nodes[c.root].child
@@ -729,7 +764,7 @@ func TestArenaRadixCache_CheckInvariants_PanicScenarios(t *testing.T) {
 
 	t.Run("SizeSumMismatch", func(t *testing.T) {
 		// Arrange
-		c := NewArenaRadixCache(50).(*arenaRadix)
+		c := NewArenaRadixCache[testData](50, testDataWeigher).(*arenaRadix[testData])
 		_, err := c.Insert("k1", testData{value: 1, dataSize: 10})
 		require.NoError(t, err)
 		c.currentSize++
@@ -742,13 +777,13 @@ func TestArenaRadixCache_CheckInvariants_PanicScenarios(t *testing.T) {
 
 	t.Run("CompactnessViolation", func(t *testing.T) {
 		// Arrange
-		c := NewArenaRadixCache(50).(*arenaRadix)
+		c := NewArenaRadixCache[testData](50, testDataWeigher).(*arenaRadix[testData])
 		_, err := c.Insert("ab", testData{value: 1, dataSize: 10})
 		require.NoError(t, err)
 		_, err = c.Insert("ac", testData{value: 2, dataSize: 10})
 		require.NoError(t, err)
 		childID := c.nodes[c.root].child
-		if childID != nilNode && c.nodes[childID].value == nil {
+		if childID != nilNode && !c.nodes[childID].hasValue {
 			firstGrandchild := c.nodes[childID].child
 			if firstGrandchild != nilNode {
 				c.nodes[firstGrandchild].sibling = nilNode
@@ -763,7 +798,7 @@ func TestArenaRadixCache_CheckInvariants_PanicScenarios(t *testing.T) {
 
 	t.Run("NodeMapOutOfBounds", func(t *testing.T) {
 		// Arrange
-		c := NewArenaRadixCache(50).(*arenaRadix)
+		c := NewArenaRadixCache[testData](50, testDataWeigher).(*arenaRadix[testData])
 		_, _ = c.Insert("k1", testData{value: 1, dataSize: 10})
 		c.nodeMap[hashString("k1")] = 999
 
@@ -775,7 +810,7 @@ func TestArenaRadixCache_CheckInvariants_PanicScenarios(t *testing.T) {
 
 	t.Run("NodeMapNilValue", func(t *testing.T) {
 		// Arrange
-		c := NewArenaRadixCache(50).(*arenaRadix)
+		c := NewArenaRadixCache[testData](50, testDataWeigher).(*arenaRadix[testData])
 		_, _ = c.Insert("k1", testData{value: 1, dataSize: 10})
 		c.nodeMap[hashString("k1")] = c.root
 
@@ -787,7 +822,7 @@ func TestArenaRadixCache_CheckInvariants_PanicScenarios(t *testing.T) {
 
 	t.Run("NodeMapHashMismatch", func(t *testing.T) {
 		// Arrange
-		c := NewArenaRadixCache(50).(*arenaRadix)
+		c := NewArenaRadixCache[testData](50, testDataWeigher).(*arenaRadix[testData])
 		_, _ = c.Insert("k1", testData{value: 1, dataSize: 10})
 		id := c.nodeMap[hashString("k1")]
 		c.nodeMap[12345] = id
@@ -800,9 +835,9 @@ func TestArenaRadixCache_CheckInvariants_PanicScenarios(t *testing.T) {
 
 	t.Run("LeakedNodeAccountingMismatch", func(t *testing.T) {
 		// Arrange
-		c := NewArenaRadixCache(50).(*arenaRadix)
+		c := NewArenaRadixCache[testData](50, testDataWeigher).(*arenaRadix[testData])
 		_, _ = c.Insert("k1", testData{value: 1, dataSize: 10})
-		c.nodes = append(c.nodes, arenaRadixNode{
+		c.nodes = append(c.nodes, arenaRadixNode[testData]{
 			parent:  nilNode,
 			child:   nilNode,
 			sibling: nilNode,
@@ -818,9 +853,9 @@ func TestArenaRadixCache_CheckInvariants_PanicScenarios(t *testing.T) {
 
 	t.Run("FreeCountDriftMismatch", func(t *testing.T) {
 		// Arrange
-		c := NewArenaRadixCache(50).(*arenaRadix)
+		c := NewArenaRadixCache[testData](50, testDataWeigher).(*arenaRadix[testData])
 		_, _ = c.Insert("k1", testData{value: 1, dataSize: 10})
-		_ = c.Erase("k1")
+		_, _ = c.Erase("k1")
 		c.freeCount = 999
 
 		// Act & Assert
@@ -831,7 +866,7 @@ func TestArenaRadixCache_CheckInvariants_PanicScenarios(t *testing.T) {
 
 	t.Run("ZeroSizeCountMismatch", func(t *testing.T) {
 		// Arrange
-		c := NewArenaRadixCache(100).(*arenaRadix)
+		c := NewArenaRadixCache[testData](100, testDataWeigher).(*arenaRadix[testData])
 		_, err := c.Insert("k1", testData{value: 1, dataSize: 0})
 		require.NoError(t, err)
 		c.zeroSizeCount = 99
@@ -841,18 +876,59 @@ func TestArenaRadixCache_CheckInvariants_PanicScenarios(t *testing.T) {
 			c.checkInvariants()
 		})
 	})
+
+	t.Run("RoutingNodeRetainsNonZeroValue", func(t *testing.T) {
+		// Arrange
+		c := NewArenaRadixCache[testData](50, testDataWeigher).(*arenaRadix[testData])
+		_, err := c.Insert("ab", testData{value: 1, dataSize: 10})
+		require.NoError(t, err)
+		_, err = c.Insert("ac", testData{value: 2, dataSize: 10})
+		require.NoError(t, err)
+		routingID := c.nodes[c.root].child
+		require.NotEqual(t, nilNode, routingID)
+		require.False(t, c.nodes[routingID].hasValue)
+
+		// Act
+		c.nodes[routingID].value = testData{value: 99, dataSize: 10}
+
+		// Assert
+		assert.Panics(t, func() {
+			c.checkInvariants()
+		})
+	})
+
+	t.Run("FreeListNodeRetainsNonZeroValue", func(t *testing.T) {
+		// Arrange
+		c := NewArenaRadixCache[testData](50, testDataWeigher).(*arenaRadix[testData])
+		_, err := c.Insert("k1", testData{value: 1, dataSize: 10})
+		require.NoError(t, err)
+		_, err = c.Insert("k2", testData{value: 2, dataSize: 10})
+		require.NoError(t, err)
+		_, ok := c.Erase("k1")
+		require.True(t, ok)
+		require.NotEqual(t, nilNode, c.freeHead)
+
+		// Act
+		c.nodes[c.freeHead].value = testData{value: 99, dataSize: 10}
+
+		// Assert
+		assert.Panics(t, func() {
+			c.checkInvariants()
+		})
+	})
 }
 
 func TestArenaRadixCache_ModeratePressureLosslessCompaction(t *testing.T) {
 	// Arrange
 	pressure := 0.10
-	c := NewArenaRadixCache(
+	c := NewArenaRadixCache[testData](
 		20000,
 		WithInvariantChecking(true),
+		testDataWeigher,
 		WithPressureFunc(func() float64 { return pressure }),
 		WithCompactionThreshold(0.75),
 		WithEvictionThreshold(0.90),
-	).(PressureAwareCache)
+	).(PressureAwareCache[testData])
 
 	const totalKeys = 1000
 	const survivingStart = 900 // Keep keys 900..999 (100 keys)
@@ -864,7 +940,8 @@ func TestArenaRadixCache_ModeratePressureLosslessCompaction(t *testing.T) {
 
 	for i := range survivingStart {
 		key := fmt.Sprintf("bucket_%02d/dir_%02d/sub_%02d/obj_%04d.bin", i%10, (i/10)%10, (i/100)%10, i)
-		require.NotNil(t, c.Erase(key))
+		_, ok := c.Erase(key)
+		require.True(t, ok)
 	}
 
 	// Act
@@ -877,9 +954,9 @@ func TestArenaRadixCache_ModeratePressureLosslessCompaction(t *testing.T) {
 
 	for i := survivingStart; i < totalKeys; i++ {
 		key := fmt.Sprintf("bucket_%02d/dir_%02d/sub_%02d/obj_%04d.bin", i%10, (i/10)%10, (i/100)%10, i)
-		v := c.LookUpWithoutChangingOrder(key)
-		require.NotNil(t, v)
-		assert.Equal(t, int64(i), v.(testData).value)
+		v, ok := c.LookUpWithoutChangingOrder(key)
+		require.True(t, ok)
+		assert.Equal(t, int64(i), v.value)
 	}
 
 	pressure = 0.10
@@ -890,21 +967,22 @@ func TestArenaRadixCache_ModeratePressureLosslessCompaction(t *testing.T) {
 		ev, err := c.Insert(fmt.Sprintf("trigger_%d", expectedID), testData{value: -1, dataSize: 10})
 		require.NoError(t, err)
 		require.Len(t, ev, 1)
-		assert.Equal(t, int64(expectedID), ev[0].(testData).value)
+		assert.Equal(t, int64(expectedID), ev[0].value)
 	}
 }
 
 func TestArenaRadixCache_CriticalPressureLRUShedding(t *testing.T) {
 	// Arrange
 	pressure := 0.10
-	c := NewArenaRadixCache(
+	c := NewArenaRadixCache[testData](
 		1000,
 		WithInvariantChecking(true),
+		testDataWeigher,
 		WithPressureFunc(func() float64 { return pressure }),
 		WithCompactionThreshold(0.75),
 		WithEvictionThreshold(0.90),
 		WithEvictionRetentionRatio(0.40),
-	).(PressureAwareCache)
+	).(PressureAwareCache[testData])
 
 	for i := range 100 {
 		key := fmt.Sprintf("dir_%d/item_%03d", i%5, i)
@@ -919,37 +997,39 @@ func TestArenaRadixCache_CriticalPressureLRUShedding(t *testing.T) {
 	// Assert
 	require.Len(t, evicted, 60)
 	for i, ev := range evicted {
-		assert.Equal(t, int64(i), ev.(testData).value)
+		assert.Equal(t, int64(i), ev.value)
 	}
 	assertAlreadyCompacted(t, c)
 
 	for i := range 60 {
 		key := fmt.Sprintf("dir_%d/item_%03d", i%5, i)
-		assert.Nil(t, c.LookUpWithoutChangingOrder(key))
+		_, ok := c.LookUpWithoutChangingOrder(key)
+		assert.False(t, ok)
 	}
 	for i := 60; i < 100; i++ {
 		key := fmt.Sprintf("dir_%d/item_%03d", i%5, i)
-		v := c.LookUpWithoutChangingOrder(key)
-		require.NotNil(t, v)
-		assert.Equal(t, int64(i), v.(testData).value)
+		v, ok := c.LookUpWithoutChangingOrder(key)
+		require.True(t, ok)
+		assert.Equal(t, int64(i), v.value)
 	}
 }
 
 func TestArenaRadixCache_AutomaticPressureTriggersAndReentrancy(t *testing.T) {
 	// Arrange
 	pressure := 0.10
-	var cacheRef Cache
+	var cacheRef Cache[testData]
 	reentrantReads := 0
 
-	c := NewArenaRadixCache(
+	c := NewArenaRadixCache[testData](
 		200,
 		WithInvariantChecking(true),
+		testDataWeigher,
 		WithPressureFunc(func() float64 {
 			if cacheRef != nil {
-				_ = cacheRef.LookUpWithoutChangingOrder("probe_key")
+				_, _ = cacheRef.LookUpWithoutChangingOrder("probe_key")
 				// Also verify mutating re-entrancy is guarded against infinite recursion.
 				_, _ = cacheRef.Insert("reentrant_probe", testData{value: 1, dataSize: 0})
-				_ = cacheRef.Erase("reentrant_probe")
+				_, _ = cacheRef.Erase("reentrant_probe")
 				reentrantReads++
 			}
 			return pressure
@@ -957,7 +1037,7 @@ func TestArenaRadixCache_AutomaticPressureTriggersAndReentrancy(t *testing.T) {
 		WithCompactionThreshold(0.75),
 		WithEvictionThreshold(0.90),
 		WithEvictionRetentionRatio(0.50),
-	).(PressureAwareCache)
+	).(PressureAwareCache[testData])
 	cacheRef = c
 
 	for i := range 20 {
@@ -965,17 +1045,20 @@ func TestArenaRadixCache_AutomaticPressureTriggersAndReentrancy(t *testing.T) {
 		require.NoError(t, err)
 	}
 	for i := range 9 {
-		require.NotNil(t, c.Erase(fmt.Sprintf("k_%02d", i)))
+		_, ok := c.Erase(fmt.Sprintf("k_%02d", i))
+		require.True(t, ok)
 	}
 
 	// Act 1: Automatic Tier 1 compaction on Erase of existing key under moderate pressure.
 	pressure = 0.80
-	require.NotNil(t, c.Erase("k_09"))
+	_, ok := c.Erase("k_09")
+	require.True(t, ok)
 
 	// Assert 1
 	assertAlreadyCompacted(t, c)
 	for i := 10; i < 20; i++ {
-		require.NotNil(t, c.LookUpWithoutChangingOrder(fmt.Sprintf("k_%02d", i)))
+		_, ok := c.LookUpWithoutChangingOrder(fmt.Sprintf("k_%02d", i))
+		require.True(t, ok)
 	}
 
 	// Act 2: Automatic Tier 2 shedding on Insert under critical pressure.
@@ -989,12 +1072,15 @@ func TestArenaRadixCache_AutomaticPressureTriggersAndReentrancy(t *testing.T) {
 	assert.Len(t, evicted, 6)
 	assertAlreadyCompacted(t, c)
 	for i := 10; i < 16; i++ {
-		assert.Nil(t, c.LookUpWithoutChangingOrder(fmt.Sprintf("k_%02d", i)))
+		_, ok := c.LookUpWithoutChangingOrder(fmt.Sprintf("k_%02d", i))
+		assert.False(t, ok)
 	}
 	for i := 16; i < 20; i++ {
-		assert.NotNil(t, c.LookUpWithoutChangingOrder(fmt.Sprintf("k_%02d", i)))
+		_, ok := c.LookUpWithoutChangingOrder(fmt.Sprintf("k_%02d", i))
+		assert.True(t, ok)
 	}
-	assert.NotNil(t, c.LookUpWithoutChangingOrder("new_mru"))
+	_, ok = c.LookUpWithoutChangingOrder("new_mru")
+	assert.True(t, ok)
 	assert.Positive(t, reentrantReads)
 }
 
@@ -1002,11 +1088,12 @@ func TestArenaRadixCache_CompactionAndSheddingEdgeCases(t *testing.T) {
 	t.Run("EmptyCacheCompactionAndShedding", func(t *testing.T) {
 		// Arrange
 		pressure := 0.95
-		c := NewArenaRadixCache(
+		c := NewArenaRadixCache[testData](
 			100,
 			WithInvariantChecking(true),
+			testDataWeigher,
 			WithPressureFunc(func() float64 { return pressure }),
-		).(PressureAwareCache)
+		).(PressureAwareCache[testData])
 
 		// Act
 		c.Compact()
@@ -1015,18 +1102,20 @@ func TestArenaRadixCache_CompactionAndSheddingEdgeCases(t *testing.T) {
 		// Assert
 		assert.Empty(t, ev)
 		assertAlreadyCompacted(t, c)
-		assert.Nil(t, c.LookUpWithoutChangingOrder(""))
+		_, ok := c.LookUpWithoutChangingOrder("")
+		assert.False(t, ok)
 	})
 
 	t.Run("SingleLargeEntryShedding", func(t *testing.T) {
 		// Arrange
 		pressure := 0.0
-		c := NewArenaRadixCache(
+		c := NewArenaRadixCache[testData](
 			100,
 			WithInvariantChecking(true),
+			testDataWeigher,
 			WithPressureFunc(func() float64 { return pressure }),
 			WithEvictionRetentionRatio(0.50),
-		).(PressureAwareCache)
+		).(PressureAwareCache[testData])
 		_, err := c.Insert("only_item", testData{value: 42, dataSize: 80})
 		require.NoError(t, err)
 
@@ -1036,39 +1125,41 @@ func TestArenaRadixCache_CompactionAndSheddingEdgeCases(t *testing.T) {
 
 		// Assert
 		require.Len(t, ev, 1)
-		assert.Equal(t, int64(42), ev[0].(testData).value)
-		assert.Nil(t, c.LookUpWithoutChangingOrder("only_item"))
+		assert.Equal(t, int64(42), ev[0].value)
+		_, ok := c.LookUpWithoutChangingOrder("only_item")
+		assert.False(t, ok)
 		assertAlreadyCompacted(t, c)
 	})
 
 	t.Run("EmptyStringKeyAtRoot", func(t *testing.T) {
 		// Arrange
-		c := NewArenaRadixCache(100, WithInvariantChecking(true)).(PressureAwareCache)
+		c := NewArenaRadixCache[testData](100, WithInvariantChecking(true), testDataWeigher).(PressureAwareCache[testData])
 		_, err := c.Insert("", testData{value: 777, dataSize: 10})
 		require.NoError(t, err)
 		_, err = c.Insert("a/b/c", testData{value: 888, dataSize: 10})
 		require.NoError(t, err)
-		_ = c.Erase("a/b/c")
+		_, _ = c.Erase("a/b/c")
 
 		// Act
 		c.Compact()
-		v := c.LookUpWithoutChangingOrder("")
+		v, ok := c.LookUpWithoutChangingOrder("")
 
 		// Assert
-		require.NotNil(t, v)
-		assert.Equal(t, int64(777), v.(testData).value)
+		require.True(t, ok)
+		assert.Equal(t, int64(777), v.value)
 		assertAlreadyCompacted(t, c)
 	})
 
 	t.Run("ZeroSizeEntriesTerminationAndFullEvictionWhenRetentionZero", func(t *testing.T) {
 		// Arrange
 		pressure := 0.0
-		c := NewArenaRadixCache(
+		c := NewArenaRadixCache[testData](
 			100,
 			WithInvariantChecking(true),
+			testDataWeigher,
 			WithPressureFunc(func() float64 { return pressure }),
 			WithEvictionRetentionRatio(0.0),
-		).(PressureAwareCache)
+		).(PressureAwareCache[testData])
 
 		for i := range 5 {
 			_, err := c.Insert(fmt.Sprintf("zero_%d", i), testData{value: int64(i), dataSize: 0})
@@ -1083,9 +1174,11 @@ func TestArenaRadixCache_CompactionAndSheddingEdgeCases(t *testing.T) {
 
 		// Assert
 		assert.Len(t, ev, 6)
-		assert.Nil(t, c.LookUpWithoutChangingOrder("nonzero"))
+		_, ok := c.LookUpWithoutChangingOrder("nonzero")
+		assert.False(t, ok)
 		for i := range 5 {
-			assert.Nil(t, c.LookUpWithoutChangingOrder(fmt.Sprintf("zero_%d", i)))
+			_, ok := c.LookUpWithoutChangingOrder(fmt.Sprintf("zero_%d", i))
+			assert.False(t, ok)
 		}
 		assertAlreadyCompacted(t, c)
 	})
@@ -1094,33 +1187,35 @@ func TestArenaRadixCache_CompactionAndSheddingEdgeCases(t *testing.T) {
 func TestArenaRadixCache_PressureAndConcurrencyEdgeCases(t *testing.T) {
 	t.Run("InsertIntoEmptyOrUnderTargetCacheDoesNotSelfEvict", func(t *testing.T) {
 		// Arrange
-		c := NewArenaRadixCache(
+		c := NewArenaRadixCache[testData](
 			1000,
 			WithInvariantChecking(true),
+			testDataWeigher,
 			WithPressureFunc(func() float64 { return 0.95 }),
 			WithEvictionRetentionRatio(0.50),
 		)
 
 		// Act
 		evicted, err := c.Insert("first_key", testData{value: 42, dataSize: 10})
-		lookedUp := c.LookUpWithoutChangingOrder("first_key")
+		lookedUp, ok := c.LookUpWithoutChangingOrder("first_key")
 
 		// Assert
 		require.NoError(t, err)
 		assert.Empty(t, evicted)
-		require.NotNil(t, lookedUp)
-		assert.Equal(t, int64(42), lookedUp.(testData).value)
+		require.True(t, ok)
+		assert.Equal(t, int64(42), lookedUp.value)
 	})
 
 	t.Run("SustainedCriticalPressureConvergesIdempotentlyWithoutCompoundDecay", func(t *testing.T) {
 		// Arrange
 		pressure := 0.0
-		c := NewArenaRadixCache(
+		c := NewArenaRadixCache[testData](
 			1000,
 			WithInvariantChecking(true),
+			testDataWeigher,
 			WithPressureFunc(func() float64 { return pressure }),
 			WithEvictionRetentionRatio(0.50),
-		).(PressureAwareCache)
+		).(PressureAwareCache[testData])
 		for i := range 100 {
 			_, err := c.Insert(fmt.Sprintf("k-%03d", i), testData{value: int64(i), dataSize: 10})
 			require.NoError(t, err)
@@ -1137,16 +1232,18 @@ func TestArenaRadixCache_PressureAndConcurrencyEdgeCases(t *testing.T) {
 		// Assert: Stabilizes idempotently at maxSize * retentionRatio (500 bytes, 50 entries).
 		assert.Len(t, firstEvicted, 50)
 		for i := range 50 {
-			assert.Nil(t, c.LookUpWithoutChangingOrder(fmt.Sprintf("k-%03d", i)))
+			_, ok := c.LookUpWithoutChangingOrder(fmt.Sprintf("k-%03d", i))
+			assert.False(t, ok)
 		}
 		for i := 50; i < 100; i++ {
-			assert.NotNil(t, c.LookUpWithoutChangingOrder(fmt.Sprintf("k-%03d", i)))
+			_, ok := c.LookUpWithoutChangingOrder(fmt.Sprintf("k-%03d", i))
+			assert.True(t, ok)
 		}
 	})
 
 	t.Run("CompactFastPathPerformsZeroAllocationsWhenAlreadyCompact", func(t *testing.T) {
 		// Arrange
-		c := NewArenaRadixCache(10000, WithInvariantChecking(true)).(PressureAwareCache)
+		c := NewArenaRadixCache[testData](10000, WithInvariantChecking(true), testDataWeigher).(PressureAwareCache[testData])
 		for i := range 200 {
 			_, err := c.Insert(fmt.Sprintf("key-%03d", i), testData{value: int64(i), dataSize: 10})
 			require.NoError(t, err)
@@ -1164,13 +1261,14 @@ func TestArenaRadixCache_PressureAndConcurrencyEdgeCases(t *testing.T) {
 func TestArenaRadixCache_PressureSamplingAndReclamationBehaviors(t *testing.T) {
 	t.Run("NoCompactionThrashingOnSteadyStateInsertsUnderPressure", func(t *testing.T) {
 		// Arrange
-		var c Cache
+		var c Cache[testData]
 
 		// Act: Construct cache and insert 100 entries (1000 bytes == targetSize) inside AllocsPerRun.
 		allocsPerInsert := testing.AllocsPerRun(1, func() {
-			c = NewArenaRadixCache(
+			c = NewArenaRadixCache[testData](
 				2000,
 				WithInvariantChecking(true),
+				testDataWeigher,
 				WithPressureFunc(func() float64 { return 0.95 }),
 				WithEvictionRetentionRatio(0.50),
 			)
@@ -1183,18 +1281,20 @@ func TestArenaRadixCache_PressureSamplingAndReclamationBehaviors(t *testing.T) {
 		// Assert: Without O(N^2) compaction thrashing on every Insert, 100 inserts allocate ~252 objects total and preserve all 100 keys.
 		assert.Less(t, allocsPerInsert, 350.0)
 		for i := range 100 {
-			require.NotNil(t, c.LookUpWithoutChangingOrder(fmt.Sprintf("k-%04d", i)))
+			_, ok := c.LookUpWithoutChangingOrder(fmt.Sprintf("k-%04d", i))
+			require.True(t, ok)
 		}
 	})
 
 	t.Run("ZeroRetentionRatioDoesNotSelfEvictNewlyInsertedKey", func(t *testing.T) {
 		// Arrange
-		c := NewArenaRadixCache(
+		c := NewArenaRadixCache[testData](
 			1000,
 			WithInvariantChecking(true),
+			testDataWeigher,
 			WithPressureFunc(func() float64 { return 0.95 }),
 			WithEvictionRetentionRatio(0.0),
-		).(PressureAwareCache)
+		).(PressureAwareCache[testData])
 
 		_, err := c.Insert("old_key", testData{value: 1, dataSize: 100})
 		require.NoError(t, err)
@@ -1205,22 +1305,26 @@ func TestArenaRadixCache_PressureSamplingAndReclamationBehaviors(t *testing.T) {
 		// Assert: "old_key" is evicted, but "new_key" is preserved.
 		require.NoError(t, err)
 		require.Len(t, evicted, 1)
-		assert.Equal(t, int64(1), evicted[0].(testData).value)
-		assert.Nil(t, c.LookUpWithoutChangingOrder("old_key"))
-		assert.NotNil(t, c.LookUpWithoutChangingOrder("new_key"))
+		assert.Equal(t, int64(1), evicted[0].value)
+		_, ok := c.LookUpWithoutChangingOrder("old_key")
+		assert.False(t, ok)
+		_, ok = c.LookUpWithoutChangingOrder("new_key")
+		assert.True(t, ok)
 
 		// Explicit EvaluateMemoryPressure still flushes 100% of entries when retention == 0.0.
 		flushed := c.EvaluateMemoryPressure()
 		require.Len(t, flushed, 1)
-		assert.Nil(t, c.LookUpWithoutChangingOrder("new_key"))
+		_, ok = c.LookUpWithoutChangingOrder("new_key")
+		assert.False(t, ok)
 	})
 
-	t.Run("UpdateSizeUnderCriticalPressureTriggersTier2Shedding", func(t *testing.T) {
+	t.Run("UpdateGrowUnderCriticalPressureTriggersTier2Shedding", func(t *testing.T) {
 		// Arrange
 		pressure := 0.10
-		c := NewArenaRadixCache(
+		c := NewArenaRadixCache[testData](
 			1000,
 			WithInvariantChecking(true),
+			testDataWeigher,
 			WithPressureFunc(func() float64 { return pressure }),
 			WithEvictionRetentionRatio(0.50),
 		)
@@ -1229,27 +1333,30 @@ func TestArenaRadixCache_PressureSamplingAndReclamationBehaviors(t *testing.T) {
 			require.NoError(t, err)
 		}
 
-		// Act: Grow k-7 by 100 bytes under critical pressure (0.95).
+		// Act: Grow k-7 from 100 to 200 bytes under critical pressure (0.95).
 		pressure = 0.95
-		err := c.UpdateSize("k-7", 100)
+		err := c.UpdateWithoutChangingOrder("k-7", testData{value: 77, dataSize: 200})
 
 		// Assert: Sheds 4 oldest entries (k-0..k-3, 400B) down to targetSize (500 bytes: k-4, k-5, k-6 at 100B + k-7 at 200B).
 		require.NoError(t, err)
 		for i := range 4 {
-			assert.Nil(t, c.LookUpWithoutChangingOrder(fmt.Sprintf("k-%d", i)))
+			_, ok := c.LookUpWithoutChangingOrder(fmt.Sprintf("k-%d", i))
+			assert.False(t, ok)
 		}
 		for i := 4; i < 8; i++ {
-			assert.NotNil(t, c.LookUpWithoutChangingOrder(fmt.Sprintf("k-%d", i)))
+			_, ok := c.LookUpWithoutChangingOrder(fmt.Sprintf("k-%d", i))
+			assert.True(t, ok)
 		}
 	})
 }
 
-func TestArenaRadixCache_UpdateSizeAtMRUHeadUnderCriticalPressure(t *testing.T) {
+func TestArenaRadixCache_UpdateGrowAtMRUHeadUnderCriticalPressure(t *testing.T) {
 	// Arrange: Insert k1 (oldest, at tail), k2, k3 (newest, at MRU head).
 	pressure := 0.10
-	c := NewArenaRadixCache(
+	c := NewArenaRadixCache[testData](
 		1000,
 		WithInvariantChecking(true),
+		testDataWeigher,
 		WithPressureFunc(func() float64 { return pressure }),
 		WithEvictionRetentionRatio(0.50),
 	)
@@ -1261,16 +1368,19 @@ func TestArenaRadixCache_UpdateSizeAtMRUHeadUnderCriticalPressure(t *testing.T) 
 	_, err = c.Insert("k3", testData{value: 3, dataSize: 200})
 	require.NoError(t, err)
 
-	// Act: Grow k3 (the MRU head) by +100 bytes under critical pressure.
+	// Act: Grow k3 (the MRU head) from 200 to 300 bytes under critical pressure.
 	pressure = 0.95
-	err = c.UpdateSize("k3", 100)
+	err = c.UpdateWithoutChangingOrder("k3", testData{value: 33, dataSize: 300})
 
 	// Assert: MRU head k3 is protected and preserved (300 bytes), while oldest tail entry k1 (200 bytes)
 	// is shed so total size drops from 700 bytes down to targetSize (500 bytes: k2=200B + k3=300B).
 	require.NoError(t, err)
-	assert.Nil(t, c.LookUpWithoutChangingOrder("k1"))
-	assert.NotNil(t, c.LookUpWithoutChangingOrder("k2"))
-	assert.NotNil(t, c.LookUpWithoutChangingOrder("k3"))
+	_, ok := c.LookUpWithoutChangingOrder("k1")
+	assert.False(t, ok)
+	_, ok = c.LookUpWithoutChangingOrder("k2")
+	assert.True(t, ok)
+	_, ok = c.LookUpWithoutChangingOrder("k3")
+	assert.True(t, ok)
 }
 
 // TestArenaRadixCache_FNV1aHashCollisionAndNodeMapHealing verifies that ArenaRadixCache preserves key
@@ -1283,13 +1393,13 @@ func TestArenaRadixCache_UpdateSizeAtMRUHeadUnderCriticalPressure(t *testing.T) 
 //     requires ~2^32 (~4.29 billion) evaluations, which is computationally infeasible at unit-test runtime even
 //     though collisions can occur in production across billions of cumulative keys.
 //  2. Furthermore, c.nodeMap is an internal O(1) hash accelerator backed by an exact O(K) radix-trie walk fallback
-//     (findNodeByTrieWalk). If Erase(K1) or a self-evicting/failing UpdateSize(K1, delta) erroneously overwrites
+//     (findNodeByTrieWalk). If Erase(K1) or a self-evicting/failing UpdateWithoutChangingOrder(K1, ...) erroneously overwrites
 //     c.nodeMap[h] = idK1 before eraseInternalWithHash deletes c.nodeMap[h], public LookUp / LookUpWithoutChangingOrder
 //     calls still return functionally identical values via the slow-path trie walk while silently evicting the
 //     surviving colliding peer K2 from c.nodeMap and breaking the len(c.nodeMap) == c.len Pigeonhole Principle O(1)
 //     cache-miss fast-path across the entire cache.
 //     These subtests therefore seed a synthetic collision/displacement in c.nodeMap in setup and inspect c.nodeMap
-//     in assertions alongside public API LookUp/ LookUpWithoutChangingOrder/Insert/UpdateWithoutChangingOrder/UpdateSize/Erase/Compact calls.
+//     in assertions alongside public API LookUp/ LookUpWithoutChangingOrder/Insert/UpdateWithoutChangingOrder/Erase/Compact calls.
 func TestArenaRadixCache_FNV1aHashCollisionAndNodeMapHealing(t *testing.T) {
 	const keyA = "prefix/key-alpha"
 	const keyB = "prefix/key-beta"
@@ -1297,7 +1407,7 @@ func TestArenaRadixCache_FNV1aHashCollisionAndNodeMapHealing(t *testing.T) {
 	t.Run("HashCollisionDoesNotThrashCompactionAndPreservesInvariant", func(t *testing.T) {
 		// Arrange: Insert keyA, keyB, and a temporary key, simulate a 64-bit FNV-1a hash collision
 		// displacing keyA from nodeMap, and trigger a real deletion via Erase.
-		c := NewArenaRadixCache(10000, WithInvariantChecking(true)).(*arenaRadix)
+		c := NewArenaRadixCache[testData](10000, WithInvariantChecking(true), testDataWeigher).(*arenaRadix[testData])
 		_, err := c.Insert(keyA, testData{value: 1, dataSize: 10})
 		require.NoError(t, err)
 		_, err = c.Insert(keyB, testData{value: 2, dataSize: 10})
@@ -1306,30 +1416,31 @@ func TestArenaRadixCache_FNV1aHashCollisionAndNodeMapHealing(t *testing.T) {
 		require.NoError(t, err)
 
 		delete(c.nodeMap, hashString(keyA))
-		require.NotNil(t, c.Erase("prefix/key-temp"))
+		_, ok := c.Erase("prefix/key-temp")
+		require.True(t, ok)
 
 		// Act & Assert: Both keys remain accessible (keyA via trie fallback), and Compact() heals keyA
 		// back into nodeMap without thrashing on subsequent Compact() calls.
-		valA := c.LookUpWithoutChangingOrder(keyA)
-		require.NotNil(t, valA)
-		assert.Equal(t, int64(1), valA.(testData).value)
+		valA, ok := c.LookUpWithoutChangingOrder(keyA)
+		require.True(t, ok)
+		assert.Equal(t, int64(1), valA.value)
 
 		c.Compact()
-		_, ok := c.nodeMap[hashString(keyA)]
+		_, ok = c.nodeMap[hashString(keyA)]
 		assert.True(t, ok)
 		assertAlreadyCompacted(t, c)
 
-		valAAfter := c.LookUp(keyA)
-		valBAfter := c.LookUp(keyB)
-		require.NotNil(t, valAAfter)
-		require.NotNil(t, valBAfter)
-		assert.Equal(t, int64(1), valAAfter.(testData).value)
-		assert.Equal(t, int64(2), valBAfter.(testData).value)
+		valAAfter, okA := c.LookUp(keyA)
+		valBAfter, okB := c.LookUp(keyB)
+		require.True(t, okA)
+		require.True(t, okB)
+		assert.Equal(t, int64(1), valAAfter.value)
+		assert.Equal(t, int64(2), valBAfter.value)
 	})
 
 	t.Run("OverwriteDoesNotCorruptCollidingPeerInNodeMap", func(t *testing.T) {
 		// Arrange
-		c := NewArenaRadixCache(1000, WithInvariantChecking(true)).(*arenaRadix)
+		c := NewArenaRadixCache[testData](1000, WithInvariantChecking(true), testDataWeigher).(*arenaRadix[testData])
 		_, err := c.Insert("k1", testData{value: 10, dataSize: 10})
 		require.NoError(t, err)
 		_, err = c.Insert("k2", testData{value: 20, dataSize: 10})
@@ -1345,18 +1456,18 @@ func TestArenaRadixCache_FNV1aHashCollisionAndNodeMapHealing(t *testing.T) {
 		assert.Empty(t, evicted)
 
 		// Assert
-		v1 := c.LookUpWithoutChangingOrder("k1")
-		v2 := c.LookUpWithoutChangingOrder("k2")
-		require.NotNil(t, v1)
-		require.NotNil(t, v2)
-		assert.Equal(t, int64(11), v1.(testData).value)
-		assert.Equal(t, int64(20), v2.(testData).value)
+		v1, ok1 := c.LookUpWithoutChangingOrder("k1")
+		v2, ok2 := c.LookUpWithoutChangingOrder("k2")
+		require.True(t, ok1)
+		require.True(t, ok2)
+		assert.Equal(t, int64(11), v1.value)
+		assert.Equal(t, int64(20), v2.value)
 		assert.NotEqual(t, idK2, c.nodeMap[hashString("k1")])
 	})
 
 	t.Run("UpdateMethodsHealNodeMapOnCollisionOrMissingSlot", func(t *testing.T) {
 		// Arrange
-		c := NewArenaRadixCache(1000, WithInvariantChecking(true)).(*arenaRadix)
+		c := NewArenaRadixCache[testData](1000, WithInvariantChecking(true), testDataWeigher).(*arenaRadix[testData])
 		_, err := c.Insert("key-alpha", testData{value: 1, dataSize: 10})
 		require.NoError(t, err)
 		_, err = c.Insert("key-beta", testData{value: 2, dataSize: 10})
@@ -1369,29 +1480,29 @@ func TestArenaRadixCache_FNV1aHashCollisionAndNodeMapHealing(t *testing.T) {
 
 		// Act & Assert 1: Missing slot healed by LookUp.
 		delete(c.nodeMap, hAlpha)
-		v := c.LookUp("key-alpha")
-		require.NotNil(t, v)
+		_, ok := c.LookUp("key-alpha")
+		require.True(t, ok)
 		assert.Equal(t, idAlpha, c.nodeMap[hAlpha])
 
-		// Act & Assert 2: Missing slot healed by UpdateWithoutChangingOrder.
+		// Act & Assert 2: Missing slot healed by UpdateWithoutChangingOrder (same size).
 		delete(c.nodeMap, hAlpha)
 		err = c.UpdateWithoutChangingOrder("key-alpha", testData{value: 11, dataSize: 10})
 		require.NoError(t, err)
 		assert.Equal(t, idAlpha, c.nodeMap[hAlpha])
 
-		// Act & Assert 3: Colliding slot pointing to idBeta healed by UpdateSize("key-alpha", ...).
+		// Act & Assert 3: Colliding slot pointing to idBeta healed by UpdateWithoutChangingOrder("key-alpha", ...) with size growth.
 		c.nodeMap[hAlpha] = idBeta
-		err = c.UpdateSize("key-alpha", 5)
+		err = c.UpdateWithoutChangingOrder("key-alpha", testData{value: 12, dataSize: 15})
 		require.NoError(t, err)
 		assert.Equal(t, idAlpha, c.nodeMap[hAlpha])
 	})
 
-	t.Run("EraseAndUpdateSizeSelfEvictionOrOverflowPreserveCollidingPeerInNodeMap", func(t *testing.T) {
+	t.Run("EraseAndUpdateSelfEvictionOrExceedMaxSizePreserveCollidingPeerInNodeMap", func(t *testing.T) {
 		hA := hashString(keyA)
 		hB := hashString(keyB)
 
 		// Case 1: Erase(keyA) when collision bucket hA points to surviving peer keyB.
-		cErase := NewArenaRadixCache(1000).(*arenaRadix)
+		cErase := NewArenaRadixCache[testData](1000, testDataWeigher).(*arenaRadix[testData])
 		_, err := cErase.Insert(keyA, testData{value: 1, dataSize: 100})
 		require.NoError(t, err)
 		_, err = cErase.Insert(keyB, testData{value: 2, dataSize: 100})
@@ -1399,19 +1510,22 @@ func TestArenaRadixCache_FNV1aHashCollisionAndNodeMapHealing(t *testing.T) {
 		idB := cErase.nodeMap[hB]
 		cErase.nodeMap[hA] = idB
 
-		erased := cErase.Erase(keyA)
-		require.NotNil(t, erased)
-		assert.Equal(t, int64(1), erased.(testData).value)
+		erased, ok := cErase.Erase(keyA)
+		require.True(t, ok)
+		assert.Equal(t, int64(1), erased.value)
 		assert.Equal(t, idB, cErase.nodeMap[hA], "Erase(keyA) must not overwrite or delete surviving peer keyB from shared hash bucket")
 		delete(cErase.nodeMap, hA)
 		assert.Len(t, cErase.nodeMap, cErase.len, "len(nodeMap) == c.len bijection must hold for O(1) cache-miss fast-path")
 		cErase.checkInvariants()
-		assert.Nil(t, cErase.LookUpWithoutChangingOrder(keyA))
-		assert.Nil(t, cErase.LookUpWithoutChangingOrder("missing-key"))
-		require.NotNil(t, cErase.LookUpWithoutChangingOrder(keyB))
+		_, ok = cErase.LookUpWithoutChangingOrder(keyA)
+		assert.False(t, ok)
+		_, ok = cErase.LookUpWithoutChangingOrder("missing-key")
+		assert.False(t, ok)
+		_, ok = cErase.LookUpWithoutChangingOrder(keyB)
+		require.True(t, ok)
 
-		// Case 2: UpdateSize(keyA, math.MaxUint64) returning ErrInvalidUpdateEntrySize and self-eviction via size+delta > maxSize.
-		cMaxEvict := NewArenaRadixCache(1000).(*arenaRadix)
+		// Case 2: UpdateWithoutChangingOrder(keyA, >maxSize) self-eviction via newSize > maxSize.
+		cMaxEvict := NewArenaRadixCache[testData](1000, testDataWeigher).(*arenaRadix[testData])
 		_, err = cMaxEvict.Insert(keyA, testData{value: 1, dataSize: 100})
 		require.NoError(t, err)
 		_, err = cMaxEvict.Insert(keyB, testData{value: 2, dataSize: 100})
@@ -1419,22 +1533,21 @@ func TestArenaRadixCache_FNV1aHashCollisionAndNodeMapHealing(t *testing.T) {
 		idB = cMaxEvict.nodeMap[hB]
 		cMaxEvict.nodeMap[hA] = idB
 
-		err = cMaxEvict.UpdateSize(keyA, math.MaxUint64)
-		require.ErrorIs(t, err, ErrInvalidUpdateEntrySize)
-		assert.Equal(t, idB, cMaxEvict.nodeMap[hA], "failed UpdateSize returning ErrInvalidUpdateEntrySize must not overwrite colliding peer in nodeMap")
-
-		err = cMaxEvict.UpdateSize(keyA, 1000)
+		err = cMaxEvict.UpdateWithoutChangingOrder(keyA, testData{value: 99, dataSize: 1001})
 		require.NoError(t, err)
-		assert.Equal(t, idB, cMaxEvict.nodeMap[hA], "UpdateSize self-eviction (size+delta > maxSize) must preserve surviving peer in nodeMap")
+		assert.Equal(t, idB, cMaxEvict.nodeMap[hA], "UpdateWithoutChangingOrder self-eviction (newSize > maxSize) must preserve surviving peer in nodeMap")
 		delete(cMaxEvict.nodeMap, hA)
 		assert.Len(t, cMaxEvict.nodeMap, cMaxEvict.len)
 		cMaxEvict.checkInvariants()
-		assert.Nil(t, cMaxEvict.LookUpWithoutChangingOrder(keyA))
-		assert.Nil(t, cMaxEvict.LookUpWithoutChangingOrder("missing-key"))
-		require.NotNil(t, cMaxEvict.LookUpWithoutChangingOrder(keyB))
+		_, ok = cMaxEvict.LookUpWithoutChangingOrder(keyA)
+		assert.False(t, ok)
+		_, ok = cMaxEvict.LookUpWithoutChangingOrder("missing-key")
+		assert.False(t, ok)
+		_, ok = cMaxEvict.LookUpWithoutChangingOrder(keyB)
+		require.True(t, ok)
 
-		// Case 3: UpdateSize(keyA, delta) self-eviction via !canFit (newer entry keyB occupies capacity).
-		cCannotFit := NewArenaRadixCache(1000).(*arenaRadix)
+		// Case 3: UpdateWithoutChangingOrder(keyA, ...) self-eviction via !canFit (newer entry keyB occupies capacity).
+		cCannotFit := NewArenaRadixCache[testData](1000, testDataWeigher).(*arenaRadix[testData])
 		_, err = cCannotFit.Insert(keyA, testData{value: 1, dataSize: 100})
 		require.NoError(t, err)
 		_, err = cCannotFit.Insert(keyB, testData{value: 2, dataSize: 900})
@@ -1442,15 +1555,66 @@ func TestArenaRadixCache_FNV1aHashCollisionAndNodeMapHealing(t *testing.T) {
 		idB = cCannotFit.nodeMap[hB]
 		cCannotFit.nodeMap[hA] = idB
 
-		err = cCannotFit.UpdateSize(keyA, 200)
+		err = cCannotFit.UpdateWithoutChangingOrder(keyA, testData{value: 11, dataSize: 300})
 		require.NoError(t, err)
-		assert.Equal(t, idB, cCannotFit.nodeMap[hA], "UpdateSize self-eviction (!canFit) must preserve surviving peer in nodeMap")
+		assert.Equal(t, idB, cCannotFit.nodeMap[hA], "UpdateWithoutChangingOrder self-eviction (!canFit) must preserve surviving peer in nodeMap")
 		delete(cCannotFit.nodeMap, hA)
 		assert.Len(t, cCannotFit.nodeMap, cCannotFit.len)
 		cCannotFit.checkInvariants()
-		assert.Nil(t, cCannotFit.LookUpWithoutChangingOrder(keyA))
-		assert.Nil(t, cCannotFit.LookUpWithoutChangingOrder("missing-key"))
-		require.NotNil(t, cCannotFit.LookUpWithoutChangingOrder(keyB))
+		_, ok = cCannotFit.LookUpWithoutChangingOrder(keyA)
+		assert.False(t, ok)
+		_, ok = cCannotFit.LookUpWithoutChangingOrder("missing-key")
+		assert.False(t, ok)
+		_, ok = cCannotFit.LookUpWithoutChangingOrder(keyB)
+		require.True(t, ok)
+	})
+
+	t.Run("UpdateWithoutChangingOrderTier2SheddingRestoresCollidingPeerInNodeMap", func(t *testing.T) {
+		// Arrange: Populate 5 entries (peakEntryLen == 5 <= 8, currentSize = 560B > targetSize = 500B)
+		// with keyA (100B) at the LRU tail and keyB (115B) at the MRU head. When Tier 2 pressure (0.95)
+		// sheds only the updated tail node keyA (deletedSinceCompact = 1, deletedSinceCompact*4 = 4 < 5),
+		// full compaction does not run and nodeMap[hA] must be restored to surviving peer idB.
+		hA := hashString(keyA)
+		hB := hashString(keyB)
+		pressure := 0.10
+		c := NewArenaRadixCache[testData](
+			1000,
+			testDataWeigher,
+			WithEvictionThreshold(0.90),
+			WithEvictionRetentionRatio(0.50),
+			WithPressureFunc(func() float64 { return pressure }),
+		).(*arenaRadix[testData])
+
+		_, err := c.Insert(keyA, testData{value: 1, dataSize: 100})
+		require.NoError(t, err)
+		for i := range 3 {
+			_, err = c.Insert(fmt.Sprintf("mid-%d", i), testData{value: int64(i + 10), dataSize: 115})
+			require.NoError(t, err)
+		}
+		_, err = c.Insert(keyB, testData{value: 2, dataSize: 115})
+		require.NoError(t, err)
+
+		idB := c.nodeMap[hB]
+		c.nodeMap[hA] = idB
+
+		// Act: Raise pressure to Tier 2 (0.95) and update non-head entry keyA in place.
+		pressure = 0.95
+		err = c.UpdateWithoutChangingOrder(keyA, testData{value: 11, dataSize: 100})
+
+		// Assert: keyA was shed by Tier 2 without full compaction, and nodeMap[hA] was restored to idB.
+		require.NoError(t, err)
+		assert.True(t, c.nodeMapDirty)
+		assert.Equal(t, idB, c.nodeMap[hA], "Tier 2 shedding of updated tail node must restore colliding live peer in nodeMap")
+		delete(c.nodeMap, hA)
+		assert.Len(t, c.nodeMap, c.len)
+		c.checkInvariants()
+		_, ok := c.LookUpWithoutChangingOrder(keyA)
+		assert.False(t, ok)
+		_, ok = c.LookUpWithoutChangingOrder("missing-key")
+		assert.False(t, ok)
+		valB, ok := c.LookUpWithoutChangingOrder(keyB)
+		require.True(t, ok)
+		assert.Equal(t, int64(2), valB.value)
 	})
 
 	t.Run("DisplacedNodeMapSlotOnEraseStillTriggersChurnCompactionAndPreservesPeers", func(t *testing.T) {
@@ -1458,7 +1622,7 @@ func TestArenaRadixCache_FNV1aHashCollisionAndNodeMapHealing(t *testing.T) {
 		// whose nodeMap slots were displaced by simulated hash collisions. Because peak live entries stays
 		// at 33 (< 64) and free-list length never exceeds 32 (< 63), single-survivor auto-compaction on the
 		// 64th Erase occurs if and only if erasing displaced keys still accounts for deletion churn.
-		c := NewArenaRadixCache(10000, WithInvariantChecking(true)).(*arenaRadix)
+		c := NewArenaRadixCache[testData](10000, WithInvariantChecking(true), testDataWeigher).(*arenaRadix[testData])
 		_, err := c.Insert(keyB, testData{value: 2, dataSize: 10})
 		require.NoError(t, err)
 
@@ -1471,41 +1635,47 @@ func TestArenaRadixCache_FNV1aHashCollisionAndNodeMapHealing(t *testing.T) {
 			}
 			for i := range 32 {
 				k := fmt.Sprintf("displaced-%d-%02d", batch, i)
-				erased := c.Erase(k)
-				require.NotNil(t, erased)
-				assert.Nil(t, c.LookUp(k))
+				_, ok := c.Erase(k)
+				require.True(t, ok)
+				_, ok = c.LookUp(k)
+				assert.False(t, ok)
 			}
 		}
 
 		// Assert: The 64th displaced Erase auto-compacted the cache down to the single survivor keyB,
 		// healed nodeMap, and preserved keyB for subsequent public LookUp, Insert, and Erase calls.
 		assertAlreadyCompacted(t, c)
-		valB := c.LookUp(keyB)
-		require.NotNil(t, valB)
-		assert.Equal(t, int64(2), valB.(testData).value)
+		valB, ok := c.LookUp(keyB)
+		require.True(t, ok)
+		assert.Equal(t, int64(2), valB.value)
 
 		_, err = c.Insert(keyA, testData{value: 1, dataSize: 10})
 		require.NoError(t, err)
-		require.NotNil(t, c.LookUp(keyA))
-		require.NotNil(t, c.Erase(keyA))
-		assert.Nil(t, c.LookUp(keyA))
-		assert.NotNil(t, c.LookUp(keyB))
+		_, ok = c.LookUp(keyA)
+		require.True(t, ok)
+		_, ok = c.Erase(keyA)
+		require.True(t, ok)
+		_, ok = c.LookUp(keyA)
+		assert.False(t, ok)
+		_, ok = c.LookUp(keyB)
+		assert.True(t, ok)
 	})
 
 	t.Run("RootNodeEraseWithoutMapEntryPreservesNodeMap", func(t *testing.T) {
 		// Arrange
-		ac := NewArenaRadixCache(100, WithInvariantChecking(true)).(*arenaRadix)
-		_, err := ac.Insert("", NewStringValue("root_val"))
+		ac := NewArenaRadixCache[string](100, WithInvariantChecking(true)).(*arenaRadix[string])
+		_, err := ac.Insert("", "root_val")
 		require.NoError(t, err)
-		_, err = ac.Insert("other", NewStringValue("other_val"))
+		_, err = ac.Insert("other", "other_val")
 		require.NoError(t, err)
 		delete(ac.nodeMap, hashString(""))
 
 		// Act: Erase "" (which resides at c.root == 0) while hash("") is not in c.nodeMap.
-		erased := ac.Erase("")
+		erased, ok := ac.Erase("")
 
 		// Assert: nodeMap retains the remaining entry intact.
-		require.NotNil(t, erased)
+		require.True(t, ok)
+		assert.Equal(t, "root_val", erased)
 		assert.Len(t, ac.nodeMap, 1)
 	})
 }
@@ -1514,7 +1684,7 @@ func TestArenaRadixCache_DeepHierarchyOver64LevelsAndRoutingPrefixCloning(t *tes
 	t.Run("DeepRadixTreeOver64LevelsAndFreeSubtree", func(t *testing.T) {
 		// Arrange: Build a radix tree with > 80 branching levels so both hashNodeKey and freeSubtree exceed 64 levels.
 		probe := newPressureProbe(0.10)
-		c := NewArenaRadixCache(100000, WithInvariantChecking(true), probe.Option()).(PressureAwareCache)
+		c := NewArenaRadixCache[testData](100000, WithInvariantChecking(true), testDataWeigher, probe.Option()).(PressureAwareCache[testData])
 		const depth = 80
 		for i := 1; i <= depth; i++ {
 			key := strings.Repeat("a", i) + "b"
@@ -1523,17 +1693,17 @@ func TestArenaRadixCache_DeepHierarchyOver64LevelsAndRoutingPrefixCloning(t *tes
 		}
 
 		// Act 1: Compact the 80-level tree (exercises hashNodeKey with > 64 segments) and confirm a second Compact is a no-op.
-		assert.True(t, probe.ObserveEpochAdvance(t, c, func() {
+		assert.True(t, observeEpochAdvance(t, probe, c, func() {
 			c.Compact()
 		}))
-		assert.False(t, probe.ObserveEpochAdvance(t, c, func() {
+		assert.False(t, observeEpochAdvance(t, probe, c, func() {
 			c.Compact()
 		}))
 		for i := 1; i <= depth; i++ {
 			key := strings.Repeat("a", i) + "b"
-			val := c.LookUpWithoutChangingOrder(key)
-			require.NotNil(t, val)
-			assert.Equal(t, int64(i), val.(testData).value)
+			val, ok := c.LookUpWithoutChangingOrder(key)
+			require.True(t, ok)
+			assert.Equal(t, int64(i), val.value)
 		}
 
 		// Act 2: Erase all entries under prefix "a" (exercises iterative freeSubtree with > 64 levels).
@@ -1542,7 +1712,8 @@ func TestArenaRadixCache_DeepHierarchyOver64LevelsAndRoutingPrefixCloning(t *tes
 		// Assert
 		for i := 1; i <= depth; i++ {
 			key := strings.Repeat("a", i) + "b"
-			assert.Nil(t, c.LookUpWithoutChangingOrder(key))
+			_, ok := c.LookUpWithoutChangingOrder(key)
+			assert.False(t, ok)
 		}
 		assertAlreadyCompacted(t, c)
 	})
@@ -1555,21 +1726,21 @@ func TestArenaRadixCache_DeepHierarchyOver64LevelsAndRoutingPrefixCloning(t *tes
 		// White-box testing rationale: String backing-array aliasing on internal routing nodes is
 		// invisible to public LookUp results, so verifying that the 4-byte "dir/" routing prefix does not pin
 		// the 64 KiB key buffer requires inspecting unsafe.StringData on the internal routing node.
-		c := NewArenaRadixCache(1<<20, WithInvariantChecking(true)).(*arenaRadix)
+		c := NewArenaRadixCache[string](1<<20, WithInvariantChecking(true)).(*arenaRadix[string])
 		largeKey := strings.Clone("dir/" + strings.Repeat("X", 1<<16))
 
-		_, err := c.Insert(largeKey, NewStringValue("v"))
+		_, err := c.Insert(largeKey, "v")
 		require.NoError(t, err)
 		pinnedInitialPrefix := c.nodes[1].prefix
 		largeStart := uintptr(unsafe.Pointer(unsafe.StringData(pinnedInitialPrefix)))
 		largeEnd := largeStart + uintptr(len(pinnedInitialPrefix))
 
 		// Act: Split the edge and erase the 64 KiB key.
-		_, err = c.Insert("dir/a", NewStringValue("va"))
+		_, err = c.Insert("dir/a", "va")
 		require.NoError(t, err)
-		_, err = c.Insert("dir/b", NewStringValue("vb"))
+		_, err = c.Insert("dir/b", "vb")
 		require.NoError(t, err)
-		_ = c.Erase(largeKey)
+		_, _ = c.Erase(largeKey)
 
 		// Assert: Routing node prefix "dir/" does not alias pinnedInitialPrefix's 64 KiB backing array.
 		routingID := c.nodes[c.root].child
@@ -1591,7 +1762,7 @@ func TestArenaRadixCache_DeepHierarchyOver64LevelsAndRoutingPrefixCloning(t *tes
 //     where foregroundNoProtect == nilNode - 1 == math.MaxUint32 - 1 (4,294,967,294).
 //     Reaching this boundary through public Cache.Insert calls requires populating
 //     len(c.nodes) - int(c.freeCount) == math.MaxUint32 - 2 (4,294,967,293) active arenaRadixNode structs.
-//     Because unsafe.Sizeof(arenaRadixNode{}) == 64 bytes on 64-bit platforms, backing the c.nodes slice alone
+//     Because unsafe.Sizeof(arenaRadixNode[testData]{}) == 64 bytes on 64-bit platforms, backing the c.nodes slice alone
 //     requires 4,294,967,293 * 64 == 274,877,906,752 bytes (~274.88 GiB) of contiguous heap memory (plus >100 GiB
 //     for c.nodeMap), which is infeasible to allocate in a unit test on standard hardware.
 //  2. Why the guard is nevertheless essential for correctness:
@@ -1608,12 +1779,13 @@ func TestArenaRadixCache_DeepHierarchyOver64LevelsAndRoutingPrefixCloning(t *tes
 //     free-list slots exist (c.freeCount >= 2), Insert pops from c.freeHead without falsely evicting live entries.
 func TestArenaRadixCache_InsertSplitsPrefixAndRecyclesFreeSlot(t *testing.T) {
 	// Arrange: Populate entries that split a shared prefix ("alpha/") and recycle free-list slots via Erase.
-	c := NewArenaRadixCache(1000, WithInvariantChecking(true))
+	c := NewArenaRadixCache[testData](1000, WithInvariantChecking(true), testDataWeigher)
 	_, err := c.Insert("alpha/one", testData{value: 1, dataSize: 10})
 	require.NoError(t, err)
 	_, err = c.Insert("beta/two", testData{value: 2, dataSize: 10})
 	require.NoError(t, err)
-	require.NotNil(t, c.Erase("beta/two"))
+	_, ok := c.Erase("beta/two")
+	require.True(t, ok)
 
 	// Act: Insert a sibling key that splits "alpha/one" into routing node "alpha/" + two leaves, reusing the free slot.
 	evicted, err := c.Insert("alpha/three", testData{value: 3, dataSize: 10})
@@ -1621,7 +1793,10 @@ func TestArenaRadixCache_InsertSplitsPrefixAndRecyclesFreeSlot(t *testing.T) {
 	// Assert
 	require.NoError(t, err)
 	assert.Empty(t, evicted)
-	assert.NotNil(t, c.LookUpWithoutChangingOrder("alpha/one"))
-	assert.Nil(t, c.LookUpWithoutChangingOrder("beta/two"))
-	assert.NotNil(t, c.LookUpWithoutChangingOrder("alpha/three"))
+	_, ok = c.LookUpWithoutChangingOrder("alpha/one")
+	assert.True(t, ok)
+	_, ok = c.LookUpWithoutChangingOrder("beta/two")
+	assert.False(t, ok)
+	_, ok = c.LookUpWithoutChangingOrder("alpha/three")
+	assert.True(t, ok)
 }

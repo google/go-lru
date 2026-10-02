@@ -15,10 +15,15 @@
 package lru
 
 import (
+	"fmt"
 	"math"
+	"reflect"
 	"runtime/metrics"
 	"sync"
 )
+
+// Weigher calculates the logical or byte weight of a cache entry.
+type Weigher[V any] func(key string, value V) uint64
 
 // Backend identifies the underlying cache data structure engine constructed by New.
 type Backend uint8
@@ -98,12 +103,19 @@ var metricsSamplePool = sync.Pool{
 // Options contains configuration parameters for Cache instances.
 // Memory-pressure reclamation options (PressureFunc, MemoryBudget, CompactionThreshold,
 // EvictionThreshold, EvictionRetentionRatio) configure both automatic amortized foreground
-// reclamation (on Insert, Erase, UpdateSize, and EraseEntriesWithGivenPrefix) and explicit
+// reclamation (on Insert, Erase, UpdateWithoutChangingOrder, and EraseEntriesWithGivenPrefix) and explicit
 // EvaluateMemoryPressure() / Compact() calls across ArenaRadixCache, MapCache, and RadixCache.
 type Options struct {
 	// Backend selects the underlying cache engine when calling New.
 	// Defaults to BackendMap.
 	Backend Backend
+
+	// Weigher holds the optional entry weigher function configured via WithWeigher.
+	// When nil (or a typed-nil function), every entry defaults to a weight of 1.
+	// Prefer a typed Weigher[V] / func(string, V) uint64 matching Cache[V] for zero-allocation
+	// weighing; a type-erased Weigher[any] / func(string, any) uint64 is also accepted but boxes
+	// non-pointer concrete V values into any on each Insert and UpdateWithoutChangingOrder.
+	Weigher any
 
 	// EnableInvariantChecking enables internal data structure integrity and invariant validation.
 	// When enabled, cache operations execute comprehensive validation checks (e.g. bidirectional pointer
@@ -152,6 +164,56 @@ func WithBackend(backend Backend) Option {
 	return func(o *Options) {
 		o.Backend = backend
 	}
+}
+
+// WithWeigher configures a custom function to compute the logical or byte weight of each cache entry
+// on Insert and UpdateWithoutChangingOrder.
+// If not configured (or if fn is nil), every entry defaults to a weight of 1.
+//
+// For zero heap allocations on hot paths, pass a function whose value parameter type V matches
+// the target Cache[V]. A type-erased WithWeigher[any] is also supported for shared Options across
+// caches, but binding a Weigher[any] / func(string, any) uint64 to a concrete non-pointer Cache[V]
+// (V != any) boxes V into any on every Insert and UpdateWithoutChangingOrder call.
+func WithWeigher[V any](fn func(key string, value V) uint64) Option {
+	return func(o *Options) {
+		if fn == nil {
+			o.Weigher = nil
+			return
+		}
+		o.Weigher = fn
+	}
+}
+
+func resolveWeigher[V any](options Options) func(string, V) uint64 {
+	if options.Weigher == nil {
+		return nil
+	}
+	if fn, ok := options.Weigher.(func(string, V) uint64); ok {
+		return fn
+	}
+	if fn, ok := options.Weigher.(Weigher[V]); ok {
+		return fn
+	}
+	if fnAny, ok := options.Weigher.(func(string, any) uint64); ok {
+		if fnAny == nil {
+			return nil
+		}
+		return func(k string, v V) uint64 {
+			return fnAny(k, v)
+		}
+	}
+	if fnAny, ok := options.Weigher.(Weigher[any]); ok {
+		if fnAny == nil {
+			return nil
+		}
+		return func(k string, v V) uint64 {
+			return fnAny(k, v)
+		}
+	}
+	if v := reflect.ValueOf(options.Weigher); v.IsValid() && v.Kind() == reflect.Func && v.IsNil() {
+		return nil
+	}
+	panic(fmt.Sprintf("lru: WithWeigher function type %T does not match cache value type %s", options.Weigher, reflect.TypeFor[V]()))
 }
 
 // WithInvariantChecking returns an Option that enables or disables internal invariant checking.
@@ -320,6 +382,11 @@ func ApplyOptions(opts ...Option) Options {
 		options.EvictionRetentionRatio = 1.0
 	case options.EvictionRetentionRatio == 0:
 		options.EvictionRetentionRatio = 0.0
+	}
+	if options.Weigher != nil {
+		if v := reflect.ValueOf(options.Weigher); v.IsValid() && v.Kind() == reflect.Func && v.IsNil() {
+			options.Weigher = nil
+		}
 	}
 	if options.PressureFunc == nil {
 		options.PressureFunc = DefaultRuntimePressureFunc(options.MemoryBudget)

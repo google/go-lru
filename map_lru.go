@@ -24,9 +24,9 @@ import (
 )
 
 // entry holds the key and value pair stored in the doubly-linked list.
-type entry struct {
+type entry[V any] struct {
 	key   string
-	value ValueType
+	value V
 	size  uint64
 }
 
@@ -34,16 +34,16 @@ type entry struct {
 // using a Go hash map and tracks access order with a doubly-linked list (container/list).
 //
 // It provides O(1) time complexity for Insert, Erase, LookUp, LookUpWithoutChangingOrder,
-// UpdateWithoutChangingOrder, and UpdateSize. Prefix erasure operates in O(N) where N is
+// and UpdateWithoutChangingOrder. Prefix erasure operates in O(N) where N is
 // the total number of entries in the cache.
 //
 // mapCache is safe for concurrent use by multiple goroutines via sync.RWMutex.
-type mapCache struct {
-	// maxSize is the maximum total size of entries the cache can hold.
+type mapCache[V any] struct {
+	// maxSize is the maximum total weight/size of entries the cache can hold.
 	// Invariant: maxSize > 0
 	maxSize uint64
 
-	// currentSize is the running sum of all entry values' Size() in the cache.
+	// currentSize is the running sum of all entry weights in the cache.
 	// Invariant: currentSize <= maxSize
 	currentSize uint64
 
@@ -58,6 +58,9 @@ type mapCache struct {
 	// dirtyIndex records whether entries have been deleted since the last index reallocation.
 	dirtyIndex bool
 
+	// weigher computes the weight of a cache entry, or is nil when using the default unit weight of 1.
+	weigher func(key string, value V) uint64
+
 	// mu synchronizes access to internal state.
 	mu sync.RWMutex
 
@@ -66,21 +69,22 @@ type mapCache struct {
 
 var foregroundNoProtectElem list.Element
 
-// NewMapCache returns a new map-based LRU Cache initialized with the supplied maxSize.
-// Optional configuration parameters can be passed via opts (e.g. WithInvariantChecking).
+// NewMapCache returns a new map-based LRU Cache[V] initialized with the supplied maxSize.
+// Optional configuration parameters can be passed via opts (e.g. WithWeigher, WithInvariantChecking).
 //
 // maxSize must be greater than zero; otherwise NewMapCache panics.
-func NewMapCache(maxSize uint64, opts ...Option) Cache {
+func NewMapCache[V any](maxSize uint64, opts ...Option) Cache[V] {
 	if maxSize == 0 {
 		panic("maxSize must be greater than zero")
 	}
-	return newMapCacheWithOptions(maxSize, ApplyOptions(opts...))
+	return newMapCacheWithOptions[V](maxSize, ApplyOptions(opts...))
 }
 
-func newMapCacheWithOptions(maxSize uint64, options Options) Cache {
-	c := &mapCache{
+func newMapCacheWithOptions[V any](maxSize uint64, options Options) Cache[V] {
+	c := &mapCache[V]{
 		maxSize:       maxSize,
 		index:         make(map[string]*list.Element),
+		weigher:       resolveWeigher[V](options),
 		pressureState: pressureState{options: options},
 	}
 	if c.options.EnableInvariantChecking {
@@ -89,8 +93,15 @@ func newMapCacheWithOptions(maxSize uint64, options Options) Cache {
 	return c
 }
 
+func (c *mapCache[V]) weigh(key string, value V) uint64 {
+	if c.weigher != nil {
+		return c.weigher(key, value)
+	}
+	return 1
+}
+
 // checkInvariants validates internal data structure consistency and panics if any invariant is violated.
-func (c *mapCache) checkInvariants() {
+func (c *mapCache[V]) checkInvariants() {
 	// Invariant 1: maxSize > 0
 	if c.maxSize == 0 {
 		panic(fmt.Sprintf("Invalid maxSize: %v", c.maxSize))
@@ -117,7 +128,7 @@ func (c *mapCache) checkInvariants() {
 		}
 	}
 
-	// Invariant 3 & 6: Element payload type safety (*entry), bidirectional pointer linkage,
+	// Invariant 3 & 6: Element payload type safety (*entry[V]), bidirectional pointer linkage,
 	// map-to-list consistency, and size sum parity.
 	var prevElem *list.Element
 	var sumSize uint64
@@ -147,14 +158,11 @@ func (c *mapCache) checkInvariants() {
 		}
 		prevElem = e
 
-		entryPtr, ok := e.Value.(*entry)
+		entryPtr, ok := e.Value.(*entry[V])
 		if !ok || entryPtr == nil {
 			panic(fmt.Sprintf("Unexpected element type: %T", e.Value))
 		}
 		entryVal := *entryPtr
-		if entryVal.value == nil {
-			panic(fmt.Sprintf("mapCache invariant violation: unexpected nil value in LRU list for key '%s'", entryVal.key))
-		}
 		if c.index[entryVal.key] != e {
 			panic(fmt.Sprintf("Mismatch for key %v", entryVal.key))
 		}
@@ -181,22 +189,22 @@ func (c *mapCache) checkInvariants() {
 	}
 }
 
-func (c *mapCache) lock() {
+func (c *mapCache[V]) lock() {
 	c.mu.Lock()
 }
 
-func (c *mapCache) unlock() {
+func (c *mapCache[V]) unlock() {
 	if c.options.EnableInvariantChecking {
 		c.checkInvariants()
 	}
 	c.mu.Unlock()
 }
 
-func (c *mapCache) rLock() {
+func (c *mapCache[V]) rLock() {
 	c.mu.RLock()
 }
 
-func (c *mapCache) rUnlock() {
+func (c *mapCache[V]) rUnlock() {
 	if c.options.EnableInvariantChecking {
 		c.checkInvariants()
 	}
@@ -205,16 +213,17 @@ func (c *mapCache) rUnlock() {
 
 // evictOne removes and returns the least recently used entry from the cache.
 // Caller must hold c.mu (write lock).
-func (c *mapCache) evictOne() ValueType {
+func (c *mapCache[V]) evictOne() (V, bool) {
 	e := c.entries.Back()
 	if e == nil {
-		return nil
+		var zero V
+		return zero, false
 	}
-	entryVal := e.Value.(*entry)
+	entryVal := e.Value.(*entry[V])
 	return c.eraseInternal(entryVal.key)
 }
 
-func (c *mapCache) finishDeleteReclaimLocked(sizeBefore, sampledEpoch uint64, pressure float64) {
+func (c *mapCache[V]) finishDeleteReclaimLocked(sizeBefore, sampledEpoch uint64, pressure float64) {
 	if c.entries.Len() == 0 {
 		hadSlack := c.hasEmptyDeleteSlack(false)
 		c.clearEmptyIndexStateLocked()
@@ -234,7 +243,7 @@ func (c *mapCache) finishDeleteReclaimLocked(sizeBefore, sampledEpoch uint64, pr
 	}
 }
 
-func (c *mapCache) finishMutationReclaimLocked(evictedValues []ValueType, protectedElem *list.Element, reclaimedPre bool, sizeBefore, sampledEpoch uint64, pressure float64) []ValueType {
+func (c *mapCache[V]) finishMutationReclaimLocked(evictedValues []V, protectedElem *list.Element, reclaimedPre bool, sizeBefore, sampledEpoch uint64, pressure float64) []V {
 	evictedByPressure := c.maybeReclaimUnderPressureLocked(pressure, protectedElem)
 	if len(evictedValues) == 0 {
 		evictedValues = evictedByPressure
@@ -256,14 +265,9 @@ func (c *mapCache) finishMutationReclaimLocked(evictedValues []ValueType, protec
 // If the cache exceeds capacity after insertion, least recently used (LRU) entries are evicted
 // and returned in the slice.
 //
-// Returns ErrInvalidEntry if value is nil.
-// Returns ErrInvalidEntrySize if value.Size() exceeds maxSize.
-func (c *mapCache) Insert(key string, value ValueType) ([]ValueType, error) {
-	if value == nil {
-		return nil, ErrInvalidEntry
-	}
-
-	valueSize := value.Size()
+// Returns ErrInvalidEntrySize if the entry's weight exceeds maxSize.
+func (c *mapCache[V]) Insert(key string, value V) ([]V, error) {
+	valueSize := c.weigh(key, value)
 	if valueSize > c.maxSize {
 		return nil, ErrInvalidEntrySize
 	}
@@ -271,7 +275,7 @@ func (c *mapCache) Insert(key string, value ValueType) ([]ValueType, error) {
 	sampledEpoch, pressure := c.lockWithPressure(&c.mu, false)
 	defer c.unlock()
 
-	var evictedValues []ValueType
+	var evictedValues []V
 	sizeBefore := c.currentSize
 	reclaimedPreInsert := false
 	evictedPreInsert := false
@@ -279,13 +283,12 @@ func (c *mapCache) Insert(key string, value ValueType) ([]ValueType, error) {
 	e, ok := c.index[key]
 	if ok {
 		// Update existing entry in place (0 heap allocations).
-		entryVal := e.Value.(*entry)
+		entryVal := e.Value.(*entry[V])
 		c.onEntrySizeUpdated(entryVal.size, valueSize)
 		c.entries.MoveToFront(e)
 		c.currentSize -= entryVal.size
 		for valueSize > c.maxSize-c.currentSize && c.entries.Len() > 1 {
-			evicted := c.evictOne()
-			if evicted != nil {
+			if evicted, evictedOK := c.evictOne(); evictedOK {
 				evictedValues = append(evictedValues, evicted)
 				evictedPreInsert = true
 			}
@@ -299,8 +302,7 @@ func (c *mapCache) Insert(key string, value ValueType) ([]ValueType, error) {
 	} else {
 		// Evict prior to adding new entry if valueSize would exceed remaining capacity (prevents uint64 overflow).
 		for valueSize > c.maxSize-c.currentSize && c.entries.Len() > 0 {
-			evicted := c.evictOne()
-			if evicted != nil {
+			if evicted, evictedOK := c.evictOne(); evictedOK {
 				evictedValues = append(evictedValues, evicted)
 				evictedPreInsert = true
 			}
@@ -313,7 +315,7 @@ func (c *mapCache) Insert(key string, value ValueType) ([]ValueType, error) {
 		}
 		// Clone key to prevent substring keys from pinning large caller backing arrays.
 		clonedKey := clonePrefix(key)
-		e = c.entries.PushFront(&entry{key: clonedKey, value: value, size: valueSize})
+		e = c.entries.PushFront(&entry[V]{key: clonedKey, value: value, size: valueSize})
 		c.index[clonedKey] = e
 		c.onEntryInserted(len(c.index), valueSize)
 		c.currentSize += valueSize
@@ -324,15 +326,16 @@ func (c *mapCache) Insert(key string, value ValueType) ([]ValueType, error) {
 }
 
 // eraseInternal removes any entry for the supplied key from the cache without acquiring locks.
-// It returns the value of the erased key, or nil if not present.
+// It returns the value of the erased key and true, or the zero value of V and false if not present.
 // Caller must hold c.mu (write lock).
-func (c *mapCache) eraseInternal(key string) ValueType {
+func (c *mapCache[V]) eraseInternal(key string) (V, bool) {
 	e, ok := c.index[key]
 	if !ok {
-		return nil
+		var zero V
+		return zero, false
 	}
 
-	entryVal := e.Value.(*entry)
+	entryVal := e.Value.(*entry[V])
 	deletedEntry := entryVal.value
 	c.onEntryDeleted(entryVal.size)
 	c.currentSize -= entryVal.size
@@ -340,15 +343,16 @@ func (c *mapCache) eraseInternal(key string) ValueType {
 	delete(c.index, key)
 	c.dirtyIndex = true
 	c.entries.Remove(e)
+	var zero V
 	entryVal.key = ""
-	entryVal.value = nil
+	entryVal.value = zero
 	entryVal.size = 0
 	e.Value = nil
 
-	return deletedEntry
+	return deletedEntry, true
 }
 
-func (c *mapCache) clearEmptyIndexStateLocked() {
+func (c *mapCache[V]) clearEmptyIndexStateLocked() {
 	if c.peakEntryLen > 8 || c.deletedSinceCompact >= 64 {
 		c.index = make(map[string]*list.Element)
 	} else {
@@ -359,90 +363,65 @@ func (c *mapCache) clearEmptyIndexStateLocked() {
 }
 
 // resetEmptyIndexLocked releases peak map bucket memory when the cache transitions to empty.
-func (c *mapCache) resetEmptyIndexLocked() {
+func (c *mapCache[V]) resetEmptyIndexLocked() {
 	c.clearEmptyIndexStateLocked()
 	c.markReclaimedLocked()
 }
 
 // Erase removes the entry associated with the given key from the cache.
-// Returns the value of the erased entry, or nil if the key was not found.
-func (c *mapCache) Erase(key string) ValueType {
+// Returns the value of the erased entry and true, or the zero value of V and false if the key was not found.
+func (c *mapCache[V]) Erase(key string) (V, bool) {
 	sampledEpoch, pressure := c.lockWithPressure(&c.mu, false)
 	defer c.unlock()
 
 	sizeBefore := c.currentSize
-	deleted := c.eraseInternal(key)
-	if deleted == nil {
-		return nil
+	deleted, ok := c.eraseInternal(key)
+	if !ok {
+		return deleted, false
 	}
 	c.finishDeleteReclaimLocked(sizeBefore, sampledEpoch, pressure)
-	return deleted
+	return deleted, true
 }
 
 // LookUp retrieves the value associated with key and updates its position to MRU.
-// Returns nil if key is not found in the cache.
-func (c *mapCache) LookUp(key string) ValueType {
+// Returns the zero value of V and false if key is not found in the cache.
+func (c *mapCache[V]) LookUp(key string) (V, bool) {
 	c.lock()
 	defer c.unlock()
 
 	e, ok := c.index[key]
 	if !ok {
-		return nil
+		var zero V
+		return zero, false
 	}
 	c.entries.MoveToFront(e)
-	return e.Value.(*entry).value
+	return e.Value.(*entry[V]).value, true
 }
 
 // LookUpWithoutChangingOrder retrieves the value associated with key without altering its LRU position.
-// Returns nil if key is not found in the cache.
-func (c *mapCache) LookUpWithoutChangingOrder(key string) ValueType {
+// Returns the zero value of V and false if key is not found in the cache.
+func (c *mapCache[V]) LookUpWithoutChangingOrder(key string) (V, bool) {
 	c.rLock()
 	defer c.rUnlock()
 
 	e, ok := c.index[key]
 	if !ok {
-		return nil
+		var zero V
+		return zero, false
 	}
-	return e.Value.(*entry).value
+	return e.Value.(*entry[V]).value, true
 }
 
-// UpdateWithoutChangingOrder updates the value of an existing key without modifying its LRU position.
-//
-// Returns ErrInvalidEntry if value is nil.
-// Returns ErrEntryNotExist if key is not present in the cache.
-// Returns ErrInvalidUpdateEntrySize if value.Size() does not match the existing entry's size.
-func (c *mapCache) UpdateWithoutChangingOrder(key string, value ValueType) error {
-	if value == nil {
-		return ErrInvalidEntry
-	}
-
-	valueSize := value.Size()
-
-	c.lock()
-	defer c.unlock()
-
-	e, ok := c.index[key]
-	if !ok {
-		return ErrEntryNotExist
-	}
-
-	entryVal := e.Value.(*entry)
-	if valueSize != entryVal.size {
-		return ErrInvalidUpdateEntrySize
-	}
-
-	entryVal.value = value
-	return nil
-}
-
-// UpdateSize adjusts the size accounting for an existing key by sizeDelta without altering its LRU position.
-// If the entry's updated size exceeds maxSize (or cannot fit alongside entries more recent than key),
-// the entry itself is evicted immediately without evicting older entries. Otherwise, least recently used
-// entries are evicted to ensure the size invariant holds.
+// UpdateWithoutChangingOrder updates the value of an existing key and recomputes its weight
+// without modifying its LRU position.
+// If the entry's updated weight exceeds maxSize (or cannot fit alongside entries more recent than key),
+// the entry itself is evicted immediately without evicting older entries. Otherwise, if total cache
+// capacity is exceeded, least recently used entries are evicted to ensure the size invariant holds.
 //
 // Returns ErrEntryNotExist if key is not present in the cache.
-// Returns ErrInvalidUpdateEntrySize if sizeDelta causes uint64 integer overflow.
-func (c *mapCache) UpdateSize(key string, sizeDelta uint64) error {
+func (c *mapCache[V]) UpdateWithoutChangingOrder(key string, value V) error {
+	newSize := c.weigh(key, value)
+
 	sampledEpoch, pressure := c.lockWithPressure(&c.mu, false)
 	defer c.unlock()
 
@@ -451,71 +430,83 @@ func (c *mapCache) UpdateSize(key string, sizeDelta uint64) error {
 		return ErrEntryNotExist
 	}
 
-	entryVal := e.Value.(*entry)
-	if math.MaxUint64-entryVal.size < sizeDelta {
-		return ErrInvalidUpdateEntrySize
-	}
+	entryVal := e.Value.(*entry[V])
+	oldSize := entryVal.size
 
-	if entryVal.size+sizeDelta > c.maxSize {
+	if newSize > c.maxSize {
 		sizeBefore := c.currentSize
 		c.eraseInternal(entryVal.key)
 		c.finishDeleteReclaimLocked(sizeBefore, sampledEpoch, pressure)
 		return nil
 	}
 
-	avail := c.maxSize - c.currentSize
-	if sizeDelta > avail {
-		maxNewer := c.maxSize - (entryVal.size + sizeDelta)
-		var newerSize uint64
-		headCurr := c.entries.Front()
-		tailCurr := c.entries.Back()
-		canFit := false
-		for {
-			if headCurr == e {
-				canFit = newerSize <= maxNewer
-				break
-			}
-			if headCurr != nil {
-				newerSize += headCurr.Value.(*entry).size
-				if newerSize > maxNewer {
-					canFit = false
-					break
-				}
-				headCurr = headCurr.Next()
-			}
-			if tailCurr == nil || tailCurr == e {
-				canFit = sizeDelta <= avail
-				break
-			}
-			avail += tailCurr.Value.(*entry).size
-			if sizeDelta <= avail {
-				canFit = true
-				break
-			}
-			tailCurr = tailCurr.Prev()
-		}
-		if !canFit {
-			sizeBefore := c.currentSize
-			c.eraseInternal(entryVal.key)
-			c.finishDeleteReclaimLocked(sizeBefore, sampledEpoch, pressure)
-			return nil
-		}
-	}
-
 	sizeBefore := c.currentSize
 	evictedAny := false
 	reclaimedPreUpdate := false
-	for sizeDelta > c.maxSize-c.currentSize && c.entries.Len() > 0 {
-		if c.entries.Back() == e {
-			break
+
+	switch {
+	case newSize > oldSize:
+		sizeDelta := newSize - oldSize
+		avail := c.maxSize - c.currentSize
+		if sizeDelta > avail {
+			maxNewer := c.maxSize - newSize
+			var newerSize uint64
+			headCurr := c.entries.Front()
+			tailCurr := c.entries.Back()
+			canFit := false
+			for {
+				if headCurr == e {
+					canFit = newerSize <= maxNewer
+					break
+				}
+				if headCurr != nil {
+					newerSize += headCurr.Value.(*entry[V]).size
+					if newerSize > maxNewer {
+						canFit = false
+						break
+					}
+					headCurr = headCurr.Next()
+				}
+				if tailCurr == nil || tailCurr == e {
+					canFit = sizeDelta <= avail
+					break
+				}
+				avail += tailCurr.Value.(*entry[V]).size
+				if sizeDelta <= avail {
+					canFit = true
+					break
+				}
+				tailCurr = tailCurr.Prev()
+			}
+			if !canFit {
+				c.eraseInternal(entryVal.key)
+				c.finishDeleteReclaimLocked(sizeBefore, sampledEpoch, pressure)
+				return nil
+			}
 		}
-		c.evictOne()
-		evictedAny = true
+
+		for sizeDelta > c.maxSize-c.currentSize && c.entries.Len() > 0 {
+			if c.entries.Back() == e {
+				break
+			}
+			c.evictOne()
+			evictedAny = true
+		}
+
+		c.onEntrySizeUpdated(oldSize, newSize)
+		entryVal.value = value
+		entryVal.size = newSize
+		c.currentSize += sizeDelta
+	case newSize < oldSize:
+		sizeDiff := oldSize - newSize
+		c.onEntrySizeUpdated(oldSize, newSize)
+		entryVal.value = value
+		entryVal.size = newSize
+		c.currentSize -= sizeDiff
+	default:
+		entryVal.value = value
 	}
 
-	c.onEntrySizeUpdated(entryVal.size, entryVal.size+sizeDelta)
-	entryVal.size += sizeDelta
-	c.currentSize += sizeDelta
 	if c.shouldReclaimSingleSurvivorOnMutation(c.entries.Len(), c.dirtyIndex, false, evictedAny, c.currentSize, sizeBefore, pressure) {
 		reclaimedPreUpdate = true
 	}
@@ -531,7 +522,7 @@ func (c *mapCache) UpdateSize(key string, sizeDelta uint64) error {
 
 // EraseEntriesWithGivenPrefix removes all entries from the cache whose keys start with prefix.
 // If prefix is empty (""), all entries in the cache are erased.
-func (c *mapCache) EraseEntriesWithGivenPrefix(prefix string) {
+func (c *mapCache[V]) EraseEntriesWithGivenPrefix(prefix string) {
 	if prefix == "" {
 		c.mu.Lock()
 		defer c.unlock()
@@ -542,11 +533,12 @@ func (c *mapCache) EraseEntriesWithGivenPrefix(prefix string) {
 			return
 		}
 		hadReclaimable := c.currentSize > 0 || hadDirtySlack
+		var zero V
 		for e := c.entries.Front(); e != nil; {
 			next := e.Next()
-			if entryVal, ok := e.Value.(*entry); ok && entryVal != nil {
+			if entryVal, ok := e.Value.(*entry[V]); ok && entryVal != nil {
 				entryVal.key = ""
-				entryVal.value = nil
+				entryVal.value = zero
 				entryVal.size = 0
 			}
 			c.entries.Remove(e)
@@ -579,18 +571,18 @@ func (c *mapCache) EraseEntriesWithGivenPrefix(prefix string) {
 	c.finishDeleteReclaimLocked(sizeBefore, sampledEpoch, pressure)
 }
 
-func (c *mapCache) shouldAutoCompactLocked(protectedElem *list.Element) bool {
+func (c *mapCache[V]) shouldAutoCompactLocked(protectedElem *list.Element) bool {
 	return c.shouldAutoCompactEntryCounts(c.dirtyIndex, protectedElem == nil, len(c.index))
 }
 
 // Compact reallocates the internal hash index to reclaim Go map bucket slack while preserving all live entries.
-func (c *mapCache) Compact() {
+func (c *mapCache[V]) Compact() {
 	c.lock()
 	defer c.unlock()
 	c.compactLocked()
 }
 
-func (c *mapCache) compactDataStructuresLocked() bool {
+func (c *mapCache[V]) compactDataStructuresLocked() bool {
 	if !c.dirtyIndex {
 		return false
 	}
@@ -602,13 +594,13 @@ func (c *mapCache) compactDataStructuresLocked() bool {
 	return true
 }
 
-func (c *mapCache) compactLocked() {
+func (c *mapCache[V]) compactLocked() {
 	if c.compactDataStructuresLocked() {
 		c.markReclaimedLocked()
 	}
 }
 
-func (c *mapCache) shedAndCompactLocked(targetSize uint64, retention float64, protectedElem *list.Element) []ValueType {
+func (c *mapCache[V]) shedAndCompactLocked(targetSize uint64, retention float64, protectedElem *list.Element) []V {
 	autoCompactElem := protectedElem
 	if protectedElem != nil && (protectedElem != c.entries.Front() || protectedElem.Prev() != nil) {
 		protectedElem = nil
@@ -617,12 +609,12 @@ func (c *mapCache) shedAndCompactLocked(targetSize uint64, retention float64, pr
 	var protectedSize uint64
 	hasProtected := protectedElem != nil
 	if hasProtected {
-		protectedSize = protectedElem.Value.(*entry).size
+		protectedSize = protectedElem.Value.(*entry[V]).size
 	}
 	effectiveTarget, targetLen, targetZeroCount, unprotectedZeroTarget := c.computeShedTargets(targetSize, retention, c.entries.Len(), hasProtected, protectedSize)
 
 	needFullFlush := retention == 0.0
-	var evicted []ValueType
+	var evicted []V
 	victim := c.entries.Back()
 	for victim != nil {
 		needByteShed := c.currentSize > effectiveTarget || needFullFlush
@@ -636,11 +628,11 @@ func (c *mapCache) shedAndCompactLocked(targetSize uint64, retention float64, pr
 				victim = victim.Prev()
 			}
 		case needByteShed:
-			for victim != nil && (victim == protectedElem || victim.Value.(*entry).size == 0) {
+			for victim != nil && (victim == protectedElem || victim.Value.(*entry[V]).size == 0) {
 				victim = victim.Prev()
 			}
 		default:
-			for victim != nil && (victim == protectedElem || victim.Value.(*entry).size > 0) {
+			for victim != nil && (victim == protectedElem || victim.Value.(*entry[V]).size > 0) {
 				victim = victim.Prev()
 			}
 		}
@@ -648,7 +640,7 @@ func (c *mapCache) shedAndCompactLocked(targetSize uint64, retention float64, pr
 			break
 		}
 		nextVictim := victim.Prev()
-		if val := c.eraseInternal(victim.Value.(*entry).key); val != nil {
+		if val, ok := c.eraseInternal(victim.Value.(*entry[V]).key); ok {
 			evicted = append(evicted, val)
 		}
 		victim = nextVictim
@@ -672,7 +664,7 @@ func (c *mapCache) shedAndCompactLocked(targetSize uint64, retention float64, pr
 	return evicted
 }
 
-func (c *mapCache) maybeReclaimUnderPressureLocked(pressure float64, protectedElem *list.Element) []ValueType {
+func (c *mapCache[V]) maybeReclaimUnderPressureLocked(pressure float64, protectedElem *list.Element) []V {
 	if c.isSamplingGoroutine() {
 		return nil
 	}
@@ -690,7 +682,7 @@ func (c *mapCache) maybeReclaimUnderPressureLocked(pressure float64, protectedEl
 
 // EvaluateMemoryPressure samples the configured memory-pressure probe and executes
 // Tier 2 (LRU shedding + map compaction) or Tier 1 (lossless map compaction) if thresholds are met.
-func (c *mapCache) EvaluateMemoryPressure() []ValueType {
+func (c *mapCache[V]) EvaluateMemoryPressure() []V {
 	_, pressure := c.lockWithPressure(&c.mu, true)
 	defer c.unlock()
 

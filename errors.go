@@ -18,15 +18,8 @@ import "errors"
 
 // Predefined sentinel errors returned by Cache operations.
 var (
-	// ErrInvalidEntrySize is returned when the size of an entry exceeds the cache's maxSize.
+	// ErrInvalidEntrySize is returned when the weight/size of an entry exceeds the cache's maxSize.
 	ErrInvalidEntrySize = errors.New("size of the entry is more than the cache's maxSize")
-
-	// ErrInvalidEntry is returned when attempting to insert or update a nil value into the cache.
-	ErrInvalidEntry = errors.New("nil values are not supported")
-
-	// ErrInvalidUpdateEntrySize is returned by UpdateWithoutChangingOrder when the new value's
-	// size differs from the existing entry's size, or by UpdateSize when sizeDelta causes uint64 overflow.
-	ErrInvalidUpdateEntrySize = errors.New("size of entry to be updated is not same as existing size")
 
 	// ErrEntryNotExist is returned when attempting to update or modify an entry that does not exist in the cache.
 	ErrEntryNotExist = errors.New("entry with given key does not exist")

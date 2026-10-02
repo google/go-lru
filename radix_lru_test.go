@@ -23,9 +23,9 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-func setupRadixCacheTest(t *testing.T) Cache {
+func setupRadixCacheTest(t *testing.T) Cache[testData] {
 	t.Helper()
-	return NewRadixCache(testMaxSize, WithInvariantChecking(true))
+	return NewRadixCache[testData](testMaxSize, WithInvariantChecking(true), testDataWeigher)
 }
 
 func TestRadixCache_LookUpInEmptyCache(t *testing.T) {
@@ -33,24 +33,31 @@ func TestRadixCache_LookUpInEmptyCache(t *testing.T) {
 	cache := setupRadixCacheTest(t)
 
 	// Act
-	valEmpty := cache.LookUp("")
-	valTaco := cache.LookUp("taco")
+	valEmpty, okEmpty := cache.LookUp("")
+	valTaco, okTaco := cache.LookUp("taco")
 
 	// Assert
-	assert.Nil(t, valEmpty)
-	assert.Nil(t, valTaco)
+	assert.False(t, okEmpty)
+	assert.Equal(t, testData{}, valEmpty)
+	assert.False(t, okTaco)
+	assert.Equal(t, testData{}, valTaco)
 }
 
-func TestRadixCache_InsertNilValue(t *testing.T) {
+func TestRadixCache_InsertZeroAndNilSliceValue(t *testing.T) {
 	// Arrange
-	cache := setupRadixCacheTest(t)
+	cache := NewRadixCache[[]byte](testMaxSize, WithInvariantChecking(true), WithWeigher(func(_ string, b []byte) uint64 {
+		return uint64(len(b))
+	}))
 
-	// Act
+	// Act: nil slice is a valid value in a generic cache.
 	evicted, err := cache.Insert("taco", nil)
 
 	// Assert
-	require.ErrorIs(t, err, ErrInvalidEntry)
-	assertEvictedValues(t, evicted, nil)
+	require.NoError(t, err)
+	assert.Empty(t, evicted)
+	val, ok := cache.LookUp("taco")
+	assert.True(t, ok)
+	assert.Nil(t, val)
 }
 
 func TestRadixCache_InsertEmptyKey(t *testing.T) {
@@ -63,8 +70,11 @@ func TestRadixCache_InsertEmptyKey(t *testing.T) {
 	// Assert
 	require.NoError(t, err)
 	assertEvictedValues(t, evicted, nil)
-	assert.Equal(t, testData{value: 42, dataSize: 10}, cache.LookUp(""))
-	assert.Nil(t, cache.LookUp("taco"))
+	val, ok := cache.LookUp("")
+	assert.True(t, ok)
+	assert.Equal(t, testData{value: 42, dataSize: 10}, val)
+	_, ok = cache.LookUp("taco")
+	assert.False(t, ok)
 }
 
 func TestRadixCache_LookUpUnknownKey(t *testing.T) {
@@ -79,12 +89,14 @@ func TestRadixCache_LookUpUnknownKey(t *testing.T) {
 	assertEvictedValues(t, evicted, nil)
 
 	// Act
-	valEmpty := cache.LookUp("")
-	valEnchilada := cache.LookUp("enchilada")
+	valEmpty, okEmpty := cache.LookUp("")
+	valEnchilada, okEnchilada := cache.LookUp("enchilada")
 
 	// Assert
-	assert.Nil(t, valEmpty)
-	assert.Nil(t, valEnchilada)
+	assert.False(t, okEmpty)
+	assert.Equal(t, testData{}, valEmpty)
+	assert.False(t, okEnchilada)
+	assert.Equal(t, testData{}, valEnchilada)
 }
 
 func TestRadixCache_FillUpToCapacity(t *testing.T) {
@@ -104,9 +116,15 @@ func TestRadixCache_FillUpToCapacity(t *testing.T) {
 	require.NoError(t, err3)
 	assertEvictedValues(t, evicted3, nil)
 
-	assert.Equal(t, testData{value: 23, dataSize: 4}, cache.LookUp("burrito"))
-	assert.Equal(t, testData{value: 26, dataSize: 20}, cache.LookUp("taco"))
-	assert.Equal(t, testData{value: 28, dataSize: 26}, cache.LookUp("enchilada"))
+	val, ok := cache.LookUp("burrito")
+	assert.True(t, ok)
+	assert.Equal(t, testData{value: 23, dataSize: 4}, val)
+	val, ok = cache.LookUp("taco")
+	assert.True(t, ok)
+	assert.Equal(t, testData{value: 26, dataSize: 20}, val)
+	val, ok = cache.LookUp("enchilada")
+	assert.True(t, ok)
+	assert.Equal(t, testData{value: 28, dataSize: 26}, val)
 }
 
 func TestRadixCache_ExpiresLeastRecentlyUsed(t *testing.T) {
@@ -126,7 +144,9 @@ func TestRadixCache_ExpiresLeastRecentlyUsed(t *testing.T) {
 	require.NoError(t, err)
 	assertEvictedValues(t, evicted, nil)
 
-	assert.Equal(t, testData{value: 23, dataSize: 4}, cache.LookUp("burrito"))
+	val, ok := cache.LookUp("burrito")
+	assert.True(t, ok)
+	assert.Equal(t, testData{value: 23, dataSize: 4}, val)
 
 	// Act: Insert another, should evict taco (value 26).
 	evicted, err = cache.Insert("queso", testData{value: 34, dataSize: 5})
@@ -134,10 +154,17 @@ func TestRadixCache_ExpiresLeastRecentlyUsed(t *testing.T) {
 	// Assert
 	require.NoError(t, err)
 	assertEvictedValues(t, evicted, []int64{26})
-	assert.Nil(t, cache.LookUp("taco"))
-	assert.Equal(t, testData{value: 23, dataSize: 4}, cache.LookUp("burrito"))
-	assert.Equal(t, testData{value: 28, dataSize: 26}, cache.LookUp("enchilada"))
-	assert.Equal(t, testData{value: 34, dataSize: 5}, cache.LookUp("queso"))
+	_, ok = cache.LookUp("taco")
+	assert.False(t, ok)
+	val, ok = cache.LookUp("burrito")
+	assert.True(t, ok)
+	assert.Equal(t, testData{value: 23, dataSize: 4}, val)
+	val, ok = cache.LookUp("enchilada")
+	assert.True(t, ok)
+	assert.Equal(t, testData{value: 28, dataSize: 26}, val)
+	val, ok = cache.LookUp("queso")
+	assert.True(t, ok)
+	assert.Equal(t, testData{value: 34, dataSize: 5}, val)
 }
 
 func TestRadixCache_Overwrite(t *testing.T) {
@@ -165,9 +192,14 @@ func TestRadixCache_Overwrite(t *testing.T) {
 	// Assert
 	require.NoError(t, err)
 	assertEvictedValues(t, evicted, []int64{26})
-	assert.Nil(t, cache.LookUp("taco"))
-	assert.Equal(t, testData{value: 33, dataSize: 12}, cache.LookUp("burrito"))
-	assert.Equal(t, testData{value: 28, dataSize: 20}, cache.LookUp("enchilada"))
+	_, ok := cache.LookUp("taco")
+	assert.False(t, ok)
+	val, ok := cache.LookUp("burrito")
+	assert.True(t, ok)
+	assert.Equal(t, testData{value: 33, dataSize: 12}, val)
+	val, ok = cache.LookUp("enchilada")
+	assert.True(t, ok)
+	assert.Equal(t, testData{value: 28, dataSize: 20}, val)
 }
 
 func TestRadixCache_MultipleEviction(t *testing.T) {
@@ -191,10 +223,15 @@ func TestRadixCache_MultipleEviction(t *testing.T) {
 	// Assert
 	require.NoError(t, err)
 	assertEvictedValues(t, evicted, []int64{23, 26, 28})
-	assert.Nil(t, cache.LookUp("taco"))
-	assert.Nil(t, cache.LookUp("burrito"))
-	assert.Nil(t, cache.LookUp("enchilada"))
-	assert.Equal(t, testData{value: 33, dataSize: 45}, cache.LookUp("large_data"))
+	_, ok := cache.LookUp("taco")
+	assert.False(t, ok)
+	_, ok = cache.LookUp("burrito")
+	assert.False(t, ok)
+	_, ok = cache.LookUp("enchilada")
+	assert.False(t, ok)
+	val, ok := cache.LookUp("large_data")
+	assert.True(t, ok)
+	assert.Equal(t, testData{value: 33, dataSize: 45}, val)
 }
 
 func TestRadixCache_WhenEntrySizeMoreThanCacheMaxSize(t *testing.T) {
@@ -210,7 +247,9 @@ func TestRadixCache_WhenEntrySizeMoreThanCacheMaxSize(t *testing.T) {
 	// Assert
 	require.ErrorIs(t, err, ErrInvalidEntrySize)
 	assertEvictedValues(t, evicted, nil)
-	assert.Equal(t, testData{value: 23, dataSize: 4}, cache.LookUp("burrito"))
+	val, ok := cache.LookUp("burrito")
+	assert.True(t, ok)
+	assert.Equal(t, testData{value: 23, dataSize: 4}, val)
 }
 
 func TestRadixCache_EraseWhenKeyPresent(t *testing.T) {
@@ -221,11 +260,13 @@ func TestRadixCache_EraseWhenKeyPresent(t *testing.T) {
 	assertEvictedValues(t, evicted, nil)
 
 	// Act
-	deletedEntry := cache.Erase("burrito")
+	deletedEntry, ok := cache.Erase("burrito")
 
 	// Assert
+	assert.True(t, ok)
 	assert.Equal(t, testData{value: 23, dataSize: 4}, deletedEntry)
-	assert.Nil(t, cache.LookUp("burrito"))
+	_, ok = cache.LookUp("burrito")
+	assert.False(t, ok)
 }
 
 func TestRadixCache_EraseCacheWithGivenPrefix(t *testing.T) {
@@ -246,13 +287,17 @@ func TestRadixCache_EraseCacheWithGivenPrefix(t *testing.T) {
 	cache.EraseEntriesWithGivenPrefix("a")
 
 	// Assert
-	assert.Nil(t, cache.LookUp("a"))
-	assert.Nil(t, cache.LookUp("a/b"))
-	assert.Nil(t, cache.LookUp("a/b/d"))
-	assert.Nil(t, cache.LookUp("a/c"))
-	valB := cache.LookUp("b")
-	require.NotNil(t, valB)
-	assert.Equal(t, uint64(2), valB.Size())
+	_, ok := cache.LookUp("a")
+	assert.False(t, ok)
+	_, ok = cache.LookUp("a/b")
+	assert.False(t, ok)
+	_, ok = cache.LookUp("a/b/d")
+	assert.False(t, ok)
+	_, ok = cache.LookUp("a/c")
+	assert.False(t, ok)
+	valB, ok := cache.LookUp("b")
+	require.True(t, ok)
+	assert.Equal(t, uint64(2), valB.dataSize)
 }
 
 func TestRadixCache_EraseCacheWithEmptyPrefix(t *testing.T) {
@@ -269,9 +314,12 @@ func TestRadixCache_EraseCacheWithEmptyPrefix(t *testing.T) {
 	cache.EraseEntriesWithGivenPrefix("")
 
 	// Assert
-	assert.Nil(t, cache.LookUp("a"))
-	assert.Nil(t, cache.LookUp("a/b"))
-	assert.Nil(t, cache.LookUp("b"))
+	_, ok := cache.LookUp("a")
+	assert.False(t, ok)
+	_, ok = cache.LookUp("a/b")
+	assert.False(t, ok)
+	_, ok = cache.LookUp("b")
+	assert.False(t, ok)
 }
 
 func TestRadixCache_EraseCacheWhereNoEntriesExistWithGivenPrefix(t *testing.T) {
@@ -288,17 +336,17 @@ func TestRadixCache_EraseCacheWhereNoEntriesExistWithGivenPrefix(t *testing.T) {
 	cache.EraseEntriesWithGivenPrefix("c")
 
 	// Assert
-	valA := cache.LookUp("a")
-	require.NotNil(t, valA)
-	assert.Equal(t, uint64(4), valA.Size())
+	valA, ok := cache.LookUp("a")
+	require.True(t, ok)
+	assert.Equal(t, uint64(4), valA.dataSize)
 
-	valAB := cache.LookUp("a/b")
-	require.NotNil(t, valAB)
-	assert.Equal(t, uint64(5), valAB.Size())
+	valAB, ok := cache.LookUp("a/b")
+	require.True(t, ok)
+	assert.Equal(t, uint64(5), valAB.dataSize)
 
-	valB := cache.LookUp("b")
-	require.NotNil(t, valB)
-	assert.Equal(t, uint64(2), valB.Size())
+	valB, ok := cache.LookUp("b")
+	require.True(t, ok)
+	assert.Equal(t, uint64(2), valB.dataSize)
 }
 
 func TestRadixCache_EraseCacheWithGivenPrefixWithSomeEntriesEvictedDueToCacheSize(t *testing.T) {
@@ -320,13 +368,17 @@ func TestRadixCache_EraseCacheWithGivenPrefixWithSomeEntriesEvictedDueToCacheSiz
 	cache.EraseEntriesWithGivenPrefix("a")
 
 	// Assert
-	assert.Nil(t, cache.LookUp("a"))
-	assert.Nil(t, cache.LookUp("a/b"))
-	assert.Nil(t, cache.LookUp("a/b/d"))
-	assert.Nil(t, cache.LookUp("a/c"))
-	valB := cache.LookUp("b")
-	require.NotNil(t, valB)
-	assert.Equal(t, uint64(15), valB.Size())
+	_, ok := cache.LookUp("a")
+	assert.False(t, ok)
+	_, ok = cache.LookUp("a/b")
+	assert.False(t, ok)
+	_, ok = cache.LookUp("a/b/d")
+	assert.False(t, ok)
+	_, ok = cache.LookUp("a/c")
+	assert.False(t, ok)
+	valB, ok := cache.LookUp("b")
+	require.True(t, ok)
+	assert.Equal(t, uint64(15), valB.dataSize)
 }
 
 func TestRadixCache_EraseWhenKeyNotPresent(t *testing.T) {
@@ -336,20 +388,23 @@ func TestRadixCache_EraseWhenKeyNotPresent(t *testing.T) {
 	require.NoError(t, err)
 
 	// Act
-	deletedEntry := cache.Erase("taco")
+	deletedEntry, ok := cache.Erase("taco")
 
 	// Assert
-	assert.Nil(t, deletedEntry)
-	assert.Equal(t, testData{value: 23, dataSize: 4}, cache.LookUp("burrito"))
+	assert.False(t, ok)
+	assert.Equal(t, testData{}, deletedEntry)
+	val, ok := cache.LookUp("burrito")
+	assert.True(t, ok)
+	assert.Equal(t, testData{value: 23, dataSize: 4}, val)
 }
 
-func TestRadixCache_UpdateSize(t *testing.T) {
+func TestRadixCache_UpdateGrowSize(t *testing.T) {
 	t.Run("NonExistentKey", func(t *testing.T) {
 		// Arrange
-		cache := NewRadixCache(100, WithInvariantChecking(true))
+		cache := NewRadixCache[testData](100, WithInvariantChecking(true), testDataWeigher)
 
 		// Act
-		err := cache.UpdateSize("key1", 20)
+		err := cache.UpdateWithoutChangingOrder("key1", testData{value: 1, dataSize: 20})
 
 		// Assert
 		require.ErrorIs(t, err, ErrEntryNotExist)
@@ -357,7 +412,7 @@ func TestRadixCache_UpdateSize(t *testing.T) {
 
 	t.Run("ImmediateEviction", func(t *testing.T) {
 		// Arrange
-		cache := NewRadixCache(100, WithInvariantChecking(true))
+		cache := NewRadixCache[testData](100, WithInvariantChecking(true), testDataWeigher)
 		data1 := testData{value: 1, dataSize: 10}
 		data2 := testData{value: 2, dataSize: 70}
 		_, err := cache.Insert("key1", data1)
@@ -365,29 +420,32 @@ func TestRadixCache_UpdateSize(t *testing.T) {
 		_, err = cache.Insert("key2", data2)
 		require.NoError(t, err)
 
-		// Act
-		errUpdate := cache.UpdateSize("key1", 30)
+		// Act: Grow key1 (at LRU tail) from 10 to 40 -> total 110 > 100 -> key1 evicts itself!
+		errUpdate := cache.UpdateWithoutChangingOrder("key1", testData{value: 11, dataSize: 40})
 
 		// Assert
 		require.NoError(t, errUpdate)
-		assert.Nil(t, cache.LookUp("key1"))
-		assert.NotNil(t, cache.LookUp("key2"))
+		_, ok := cache.LookUp("key1")
+		assert.False(t, ok)
+		_, ok = cache.LookUp("key2")
+		assert.True(t, ok)
 	})
 }
 
-func TestRadixCache_UpdateSize_ExceedsMaxSize(t *testing.T) {
+func TestRadixCache_UpdateGrowSize_ExceedsMaxSize(t *testing.T) {
 	// Arrange
-	cache := NewRadixCache(100, WithInvariantChecking(true))
+	cache := NewRadixCache[testData](100, WithInvariantChecking(true), testDataWeigher)
 	data := testData{value: 1, dataSize: 50}
 	_, err := cache.Insert("file.txt", data)
 	require.NoError(t, err)
 
 	// Act
-	err = cache.UpdateSize("file.txt", 100)
+	err = cache.UpdateWithoutChangingOrder("file.txt", testData{value: 2, dataSize: 150})
 
-	// Assert
+	// Assert: Exceeding maxSize self-evicts the entry and returns nil.
 	require.NoError(t, err)
-	assert.Nil(t, cache.LookUp("file.txt"))
+	_, ok := cache.LookUp("file.txt")
+	assert.False(t, ok)
 }
 
 func TestRadixCache_UpdateWhenKeyPresent(t *testing.T) {
@@ -404,7 +462,9 @@ func TestRadixCache_UpdateWhenKeyPresent(t *testing.T) {
 
 	// Assert
 	require.NoError(t, err)
-	assert.Equal(t, newData, cache.LookUp(key))
+	val, ok := cache.LookUp(key)
+	assert.True(t, ok)
+	assert.Equal(t, newData, val)
 }
 
 func TestRadixCache_UpdateWhenKeyNotPresent(t *testing.T) {
@@ -420,20 +480,29 @@ func TestRadixCache_UpdateWhenKeyNotPresent(t *testing.T) {
 	require.ErrorIs(t, err, ErrEntryNotExist)
 }
 
-func TestRadixCache_UpdateWhenSizeIsDifferent(t *testing.T) {
+func TestRadixCache_UpdateWhenSizeShrinks(t *testing.T) {
 	// Arrange
 	cache := setupRadixCacheTest(t)
 	key := "burrito"
-	data := testData{value: 23, dataSize: 4}
+	data := testData{value: 23, dataSize: 30}
 	_, err := cache.Insert(key, data)
 	require.NoError(t, err)
-	newData := testData{value: 2, dataSize: 3}
+	_, err = cache.Insert("taco", testData{value: 26, dataSize: 20})
+	require.NoError(t, err)
 
-	// Act
+	// Act: Shrink burrito from 30 to 10 (total size 50 -> 30).
+	newData := testData{value: 2, dataSize: 10}
 	err = cache.UpdateWithoutChangingOrder(key, newData)
+	require.NoError(t, err)
 
-	// Assert
-	require.ErrorIs(t, err, ErrInvalidUpdateEntrySize)
+	// Inserting 20 more units now fits without eviction.
+	evicted, err := cache.Insert("enchilada", testData{value: 28, dataSize: 20})
+	require.NoError(t, err)
+	assertEvictedValues(t, evicted, nil)
+
+	val, ok := cache.LookUpWithoutChangingOrder(key)
+	assert.True(t, ok)
+	assert.Equal(t, newData, val)
 }
 
 func TestRadixCache_UpdateNotChangeOrder(t *testing.T) {
@@ -464,25 +533,24 @@ func TestRadixCache_UpdateNotChangeOrder(t *testing.T) {
 	assertEvictedValues(t, evicted, []int64{7})
 }
 
-func TestRadixCache_UpdateSize_DoubleCountingDivergence(t *testing.T) {
+func TestRadixCache_UpdateGrowToExactMaxSize(t *testing.T) {
 	// Arrange
 	const maxSize = 100
 	const initialSize = 50
 	const sizeDelta = 50 // New total size will be 50 + 50 = 100 (exactly at maxSize)
 
-	radixCache := NewRadixCache(maxSize, WithInvariantChecking(true))
+	radixCache := NewRadixCache[testData](maxSize, WithInvariantChecking(true), testDataWeigher)
 	_, err := radixCache.Insert("file.txt", testData{value: 1, dataSize: initialSize})
 	require.NoError(t, err)
 
-	// Act: Grow tracked size via UpdateSize first, then update value payload at the new size
-	err = radixCache.UpdateSize("file.txt", sizeDelta)
-	require.NoError(t, err)
-
+	// Act: Grow entry via UpdateWithoutChangingOrder to exact maxSize
 	err = radixCache.UpdateWithoutChangingOrder("file.txt", testData{value: 2, dataSize: initialSize + sizeDelta})
 
 	// Assert
 	require.NoError(t, err)
-	assert.Equal(t, testData{value: 2, dataSize: initialSize + sizeDelta}, radixCache.LookUp("file.txt"))
+	val, ok := radixCache.LookUp("file.txt")
+	assert.True(t, ok)
+	assert.Equal(t, testData{value: 2, dataSize: initialSize + sizeDelta}, val)
 }
 
 func TestRadixCache_LookUpWithoutChangingOrder_WhenKeyPresent(t *testing.T) {
@@ -494,9 +562,10 @@ func TestRadixCache_LookUpWithoutChangingOrder_WhenKeyPresent(t *testing.T) {
 	require.NoError(t, err)
 
 	// Act
-	value := cache.LookUpWithoutChangingOrder(key)
+	value, ok := cache.LookUpWithoutChangingOrder(key)
 
 	// Assert
+	assert.True(t, ok)
 	assert.Equal(t, data, value)
 }
 
@@ -506,10 +575,11 @@ func TestRadixCache_LookUpWithoutChangingOrder_WhenKeyNotPresent(t *testing.T) {
 	key := "burrito"
 
 	// Act
-	value := cache.LookUpWithoutChangingOrder(key)
+	value, ok := cache.LookUpWithoutChangingOrder(key)
 
 	// Assert
-	assert.Nil(t, value)
+	assert.False(t, ok)
+	assert.Equal(t, testData{}, value)
 }
 
 func TestRadixCache_LookUpWithoutChangingOrder_NotChangeOrder(t *testing.T) {
@@ -526,7 +596,8 @@ func TestRadixCache_LookUpWithoutChangingOrder_NotChangeOrder(t *testing.T) {
 	require.NoError(t, err)
 
 	// Act
-	value := cache.LookUpWithoutChangingOrder(key1)
+	value, ok := cache.LookUpWithoutChangingOrder(key1)
+	assert.True(t, ok)
 	assert.Equal(t, data1, value)
 
 	// Inserting again should evict key1 because key1 was looked up without changing order
@@ -541,7 +612,7 @@ func TestRadixCache_LookUpWithoutChangingOrder_NotChangeOrder(t *testing.T) {
 
 func TestRadixCache_ComplexEdgeSplitsAndMerges(t *testing.T) {
 	// Arrange
-	cache := NewRadixCache(1000, WithInvariantChecking(true))
+	cache := NewRadixCache[testData](1000, WithInvariantChecking(true), testDataWeigher)
 	keys := []string{
 		"car",
 		"cart",
@@ -562,7 +633,9 @@ func TestRadixCache_ComplexEdgeSplitsAndMerges(t *testing.T) {
 	}
 
 	for i, k := range keys {
-		assert.Equal(t, testData{value: int64(i + 1), dataSize: 10}, cache.LookUp(k))
+		val, ok := cache.LookUp(k)
+		assert.True(t, ok)
+		assert.Equal(t, testData{value: int64(i + 1), dataSize: 10}, val)
 	}
 
 	// Act 1: Erase prefix "car" -> should remove "car", "cart", "card", "carpet", "care", "careful"
@@ -571,29 +644,32 @@ func TestRadixCache_ComplexEdgeSplitsAndMerges(t *testing.T) {
 	// Assert 1
 	carKeys := []string{"car", "cart", "card", "carpet", "care", "careful"}
 	for _, k := range carKeys {
-		assert.Nil(t, cache.LookUp(k))
+		_, ok := cache.LookUp(k)
+		assert.False(t, ok)
 	}
 
 	nonCarKeys := []string{"cat", "catch", "dog", "door", "dorm"}
 	for _, k := range nonCarKeys {
-		assert.NotNil(t, cache.LookUp(k))
+		_, ok := cache.LookUp(k)
+		assert.True(t, ok)
 	}
 
 	// Act 2: Erase remaining keys one by one to verify compressPathUpwards in reverse
 	for _, k := range nonCarKeys {
-		v := cache.Erase(k)
-		require.NotNil(t, v)
+		_, ok := cache.Erase(k)
+		require.True(t, ok)
 	}
 
 	// Assert 2: Cache should now be completely empty
 	for _, k := range keys {
-		assert.Nil(t, cache.LookUp(k))
+		_, ok := cache.LookUp(k)
+		assert.False(t, ok)
 	}
 }
 
 func TestRadixCache_BinaryAndUnicodeKeys(t *testing.T) {
 	// Arrange
-	cache := NewRadixCache(1000, WithInvariantChecking(true))
+	cache := NewRadixCache[testData](1000, WithInvariantChecking(true), testDataWeigher)
 	unicodeKeys := []string{
 		"日本語/ディレクトリ/ファイル1",
 		"日本語/ディレクトリ/ファイル2",
@@ -611,34 +687,29 @@ func TestRadixCache_BinaryAndUnicodeKeys(t *testing.T) {
 	}
 
 	for i, k := range unicodeKeys {
-		assert.Equal(t, testData{value: int64(i + 1), dataSize: 10}, cache.LookUp(k))
+		val, ok := cache.LookUp(k)
+		assert.True(t, ok)
+		assert.Equal(t, testData{value: int64(i + 1), dataSize: 10}, val)
 	}
 
 	// Act: Erase prefix "日本語/"
 	cache.EraseEntriesWithGivenPrefix("日本語/")
 
 	// Assert
-	assert.Nil(t, cache.LookUp("日本語/ディレクトリ/ファイル1"))
-	assert.Nil(t, cache.LookUp("日本語/ディレクトリ/ファイル2"))
-	assert.Nil(t, cache.LookUp("日本語/別のディレクトリ/ファイル3"))
-	assert.NotNil(t, cache.LookUp("🚀/rocket/one"))
-}
-
-func TestRadixCache_UpdateWithoutChangingOrder_Errors(t *testing.T) {
-	// Arrange
-	cache := NewRadixCache(100, WithInvariantChecking(true))
-
-	// Act
-	err := cache.UpdateWithoutChangingOrder("any", nil)
-
-	// Assert
-	require.ErrorIs(t, err, ErrInvalidEntry)
+	_, ok := cache.LookUp("日本語/ディレクトリ/ファイル1")
+	assert.False(t, ok)
+	_, ok = cache.LookUp("日本語/ディレクトリ/ファイル2")
+	assert.False(t, ok)
+	_, ok = cache.LookUp("日本語/別のディレクトリ/ファイル3")
+	assert.False(t, ok)
+	_, ok = cache.LookUp("🚀/rocket/one")
+	assert.True(t, ok)
 }
 
 func TestRadixCache_OptionsToggle(t *testing.T) {
 	// Arrange
-	cacheProd := NewRadixCache(100, WithInvariantChecking(false))
-	cacheDebug := NewRadixCache(100, WithInvariantChecking(true))
+	cacheProd := NewRadixCache[testData](100, WithInvariantChecking(false), testDataWeigher)
+	cacheDebug := NewRadixCache[testData](100, WithInvariantChecking(true), testDataWeigher)
 
 	// Act
 	_, errProd := cacheProd.Insert("k1", testData{value: 1, dataSize: 10})
@@ -661,7 +732,7 @@ func TestRadixCache_OptionsToggle(t *testing.T) {
 func TestRadixCache_CheckInvariants_PanicScenarios(t *testing.T) {
 	t.Run("CurrentSizeExceedsMaxSize", func(t *testing.T) {
 		// Arrange
-		c := NewRadixCache(10).(*radixCache)
+		c := NewRadixCache[testData](10, testDataWeigher).(*radixCache[testData])
 		c.currentSize = 20
 
 		// Act & Assert
@@ -672,7 +743,7 @@ func TestRadixCache_CheckInvariants_PanicScenarios(t *testing.T) {
 
 	t.Run("CorruptLRULinks", func(t *testing.T) {
 		// Arrange
-		c := NewRadixCache(50).(*radixCache)
+		c := NewRadixCache[testData](50, testDataWeigher).(*radixCache[testData])
 		_, err := c.Insert("k1", testData{value: 1, dataSize: 10})
 		require.NoError(t, err)
 		_, err = c.Insert("k2", testData{value: 2, dataSize: 10})
@@ -687,7 +758,7 @@ func TestRadixCache_CheckInvariants_PanicScenarios(t *testing.T) {
 
 	t.Run("CorruptTreeParent", func(t *testing.T) {
 		// Arrange
-		c := NewRadixCache(50).(*radixCache)
+		c := NewRadixCache[testData](50, testDataWeigher).(*radixCache[testData])
 		_, err := c.Insert("a/b", testData{value: 1, dataSize: 10})
 		require.NoError(t, err)
 		if c.root.child != nil {
@@ -702,8 +773,8 @@ func TestRadixCache_CheckInvariants_PanicScenarios(t *testing.T) {
 
 	t.Run("ZeroSizeCountMismatch", func(t *testing.T) {
 		// Arrange
-		c := NewRadixCache(100).(*radixCache)
-		_, err := c.Insert("z", NewStringValue(""))
+		c := NewRadixCache[testData](100, testDataWeigher).(*radixCache[testData])
+		_, err := c.Insert("z", testData{value: 0, dataSize: 0})
 		require.NoError(t, err)
 		c.zeroSizeCount = 0
 
@@ -715,12 +786,31 @@ func TestRadixCache_CheckInvariants_PanicScenarios(t *testing.T) {
 
 	t.Run("SizeSumMismatch", func(t *testing.T) {
 		// Arrange
-		c := NewRadixCache(50).(*radixCache)
+		c := NewRadixCache[testData](50, testDataWeigher).(*radixCache[testData])
 		_, err := c.Insert("k1", testData{value: 1, dataSize: 10})
 		require.NoError(t, err)
 		c.currentSize++
 
 		// Act & Assert
+		assert.Panics(t, func() {
+			c.checkInvariants()
+		})
+	})
+
+	t.Run("RoutingNodeRetainsNonZeroValue", func(t *testing.T) {
+		// Arrange
+		c := NewRadixCache[testData](50, testDataWeigher).(*radixCache[testData])
+		_, err := c.Insert("ab", testData{value: 1, dataSize: 10})
+		require.NoError(t, err)
+		_, err = c.Insert("ac", testData{value: 2, dataSize: 10})
+		require.NoError(t, err)
+		require.NotNil(t, c.root.child)
+		require.False(t, c.root.child.hasValue)
+
+		// Act
+		c.root.child.value = testData{value: 99, dataSize: 10}
+
+		// Assert
 		assert.Panics(t, func() {
 			c.checkInvariants()
 		})
@@ -741,16 +831,16 @@ func TestRadixCache_RoutingPrefixDoesNotPinLargeKeyBackingArray(t *testing.T) {
 	largeStart := uintptr(unsafe.Pointer(unsafe.StringData(largeKey)))
 	largeEnd := largeStart + uintptr(len(largeKey))
 
-	c := NewRadixCache(1<<20, WithInvariantChecking(true)).(*radixCache)
-	_, err := c.Insert(largeKey, NewStringValue("v"))
+	c := NewRadixCache[string](1<<20, WithInvariantChecking(true)).(*radixCache[string])
+	_, err := c.Insert(largeKey, "v")
 	require.NoError(t, err)
 
 	// Act: Split "dir/..." at "dir/" and erase the large key.
-	_, err = c.Insert("dir/a", NewStringValue("va"))
+	_, err = c.Insert("dir/a", "va")
 	require.NoError(t, err)
-	_, err = c.Insert("dir/b", NewStringValue("vb"))
+	_, err = c.Insert("dir/b", "vb")
 	require.NoError(t, err)
-	_ = c.Erase(largeKey)
+	_, _ = c.Erase(largeKey)
 
 	// Assert: Routing node prefix "dir/" does not alias largeKey's backing array.
 	routingNode := c.root.child
@@ -762,11 +852,11 @@ func TestRadixCache_RoutingPrefixDoesNotPinLargeKeyBackingArray(t *testing.T) {
 
 func TestRadixCache_PreInsertEvictionAvoidsRedundantSplitAndMergeAllocations(t *testing.T) {
 	// Arrange
-	c := NewRadixCache(50)
+	c := NewRadixCache[testData](50, testDataWeigher)
 	alphaKey := "prefix/alpha"
 	betaKey := "prefix/beta"
-	v1 := ValueType(NewSizedValue("v1", 40))
-	v2 := ValueType(NewSizedValue("v2", 40))
+	v1 := testData{value: 1, dataSize: 40}
+	v2 := testData{value: 2, dataSize: 40}
 
 	_, err := c.Insert(alphaKey, v1)
 	require.NoError(t, err)
@@ -785,25 +875,27 @@ func TestRadixCache_PreInsertEvictionAvoidsRedundantSplitAndMergeAllocations(t *
 
 	// Assert: Pre-eviction avoids splitNode + prefix split + compressPathUpwards string re-concatenation.
 	assert.LessOrEqual(t, allocs, 3.0)
-	assert.Nil(t, c.LookUpWithoutChangingOrder(alphaKey))
-	assert.NotNil(t, c.LookUpWithoutChangingOrder(betaKey))
+	_, ok := c.LookUpWithoutChangingOrder(alphaKey)
+	assert.False(t, ok)
+	_, ok = c.LookUpWithoutChangingOrder(betaKey)
+	assert.True(t, ok)
 }
 
 // TestRadixCache_DetachedNodesClearPrefixesAndTreePointers verifies that detached and merged
 // radixNode structs have their prefix strings, values, tree pointers, and LRU links cleared upon removal.
 //
 // White-box testing rationale:
-// Public Cache methods return nil for erased keys regardless of whether detached radixNode structs
+// Public Cache methods return zero values for erased keys regardless of whether detached radixNode structs
 // retain non-nil parent, child, sibling, prev, next, or prefix references. Inspecting the detached
 // radixNode fields directly is necessary to deterministically verify that no pointer chains remain
 // to pin adjacent live subtrees or key buffers in the Go heap.
 func TestRadixCache_DetachedNodesClearPrefixesAndTreePointers(t *testing.T) {
 	t.Run("CompressPathUpwardsClearsDetachedLeafAndMergedRoutingNodeReferences", func(t *testing.T) {
 		// Arrange
-		rc := NewRadixCache(1000, WithInvariantChecking(true)).(*radixCache)
-		_, err := rc.Insert("group/sub/item1", NewSizedValue("v1", 10))
+		rc := NewRadixCache[testData](1000, WithInvariantChecking(true), testDataWeigher).(*radixCache[testData])
+		_, err := rc.Insert("group/sub/item1", testData{value: 1, dataSize: 10})
 		require.NoError(t, err)
-		_, err = rc.Insert("group/sub/item2", NewSizedValue("v2", 10))
+		_, err = rc.Insert("group/sub/item2", testData{value: 2, dataSize: 10})
 		require.NoError(t, err)
 
 		routingNode := rc.root.getChild('g')
@@ -812,10 +904,10 @@ func TestRadixCache_DetachedNodesClearPrefixesAndTreePointers(t *testing.T) {
 		require.NotNil(t, leaf1)
 
 		// Act: Erase "group/sub/item1", pruning leaf1 and merging routingNode into leaf2.
-		erased := rc.Erase("group/sub/item1")
+		_, ok := rc.Erase("group/sub/item1")
 
 		// Assert: Both pruned leaf1 and merged routingNode must clear prefix string headers and tree pointers.
-		require.NotNil(t, erased)
+		require.True(t, ok)
 		assert.Empty(t, leaf1.prefix)
 		assert.Nil(t, leaf1.parent)
 		assert.Empty(t, routingNode.prefix)
@@ -825,10 +917,10 @@ func TestRadixCache_DetachedNodesClearPrefixesAndTreePointers(t *testing.T) {
 
 	t.Run("EraseEntriesWithGivenPrefixClearsDetachedSubtreePrefixesAndPointers", func(t *testing.T) {
 		// Arrange
-		rc := NewRadixCache(1000, WithInvariantChecking(true)).(*radixCache)
-		_, err := rc.Insert("dir/sub/a", NewSizedValue("va", 10))
+		rc := NewRadixCache[testData](1000, WithInvariantChecking(true), testDataWeigher).(*radixCache[testData])
+		_, err := rc.Insert("dir/sub/a", testData{value: 1, dataSize: 10})
 		require.NoError(t, err)
-		_, err = rc.Insert("dir/sub/b", NewSizedValue("vb", 10))
+		_, err = rc.Insert("dir/sub/b", testData{value: 2, dataSize: 10})
 		require.NoError(t, err)
 
 		subtreeRoot := rc.root.getChild('d')
@@ -854,10 +946,10 @@ func TestRadixCache_DetachedNodesClearPrefixesAndTreePointers(t *testing.T) {
 
 	t.Run("EraseEmptyPrefixSweepsAndZeroesDetachedTrieNodes", func(t *testing.T) {
 		// Arrange
-		rc := NewRadixCache(1000, WithInvariantChecking(true)).(*radixCache)
-		_, err := rc.Insert("dir/sub/a", NewSizedValue("va", 10))
+		rc := NewRadixCache[testData](1000, WithInvariantChecking(true), testDataWeigher).(*radixCache[testData])
+		_, err := rc.Insert("dir/sub/a", testData{value: 1, dataSize: 10})
 		require.NoError(t, err)
-		_, err = rc.Insert("dir/sub/b", NewSizedValue("vb", 10))
+		_, err = rc.Insert("dir/sub/b", testData{value: 2, dataSize: 10})
 		require.NoError(t, err)
 
 		routingNode := rc.root.getChild('d')
@@ -873,7 +965,8 @@ func TestRadixCache_DetachedNodesClearPrefixesAndTreePointers(t *testing.T) {
 		assert.Nil(t, routingNode.child)
 		assert.Nil(t, routingNode.parent)
 		assert.Empty(t, leafA.prefix)
-		assert.Nil(t, leafA.value)
+		assert.False(t, leafA.hasValue)
+		assert.Equal(t, testData{}, leafA.value)
 		assert.Nil(t, leafA.parent)
 		assert.Nil(t, leafA.prev)
 		assert.Nil(t, leafA.next)

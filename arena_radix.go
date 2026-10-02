@@ -27,25 +27,26 @@ const nilNode uint32 = math.MaxUint32
 // It uses a Left-Child Right-Sibling (LCRS) tree representation and 32-bit indices
 // within a contiguous slice to eliminate per-node heap allocations and internal tree pointer
 // traversal during GC cycles, while stored values and prefixes retain standard Go GC properties.
-type arenaRadixNode struct {
-	prefix  string    // Edge label component
-	value   ValueType // Value stored at this node; nil for intermediate routing nodes
-	size    uint64    // Tracked size of the value stored at this node
-	parent  uint32    // Arena slice index of parent node
-	child   uint32    // Arena slice index of first child (LCRS)
-	sibling uint32    // Arena slice index of next sibling (LCRS)
-	prev    uint32    // Arena slice index of previous node in intrusive LRU list
-	next    uint32    // Arena slice index of next node in intrusive LRU list (or free-list)
+type arenaRadixNode[V any] struct {
+	prefix   string // Edge label component
+	size     uint64 // Tracked size of the value stored at this node
+	parent   uint32 // Arena slice index of parent node
+	child    uint32 // Arena slice index of first child (LCRS)
+	sibling  uint32 // Arena slice index of next sibling (LCRS)
+	prev     uint32 // Arena slice index of previous node in intrusive LRU list
+	next     uint32 // Arena slice index of next node in intrusive LRU list (or free-list)
+	hasValue bool   // True if this node stores a live cache entry value
+	value    V      // Value stored at this node
 }
 
-// arenaRadix implements the Cache and PressureAwareCache interfaces using a contiguous arena-backed
+// arenaRadix implements the Cache[V] and PressureAwareCache[V] interfaces using a contiguous arena-backed
 // radix tree coupled with an intrusive 32-bit doubly-linked LRU list and an O(1) FNV-1a hash lookup accelerator.
-type arenaRadix struct {
+type arenaRadix[V any] struct {
 	maxSize     uint64
 	currentSize uint64
 	mu          sync.RWMutex
 
-	nodes     []arenaRadixNode
+	nodes     []arenaRadixNode[V]
 	freeHead  uint32
 	freeCount uint32
 
@@ -58,6 +59,8 @@ type arenaRadix struct {
 	tail uint32
 
 	len int
+
+	weigher func(key string, value V) uint64
 
 	pressureState
 }
@@ -85,7 +88,7 @@ func hashStringCont(h uint64, s string) uint64 {
 // hashNodeKey computes the 64-bit FNV-1a hash of the full key for nodeID
 // by walking the ancestor chain. Uses a 64-level stack buffer for common depths
 // and seamlessly handles arbitrary depths > 64.
-func (c *arenaRadix) hashNodeKey(nodeID uint32) uint64 {
+func (c *arenaRadix[V]) hashNodeKey(nodeID uint32) uint64 {
 	var stackBuf [64]uint32
 	path := stackBuf[:0]
 	for curr := nodeID; curr != c.root && curr != nilNode; curr = c.nodes[curr].parent {
@@ -99,12 +102,12 @@ func (c *arenaRadix) hashNodeKey(nodeID uint32) uint64 {
 }
 
 // allocateNode allocates a node index from the free-list or appends to the arena slice.
-func (c *arenaRadix) allocateNode() uint32 {
+func (c *arenaRadix[V]) allocateNode() uint32 {
 	if c.freeHead != nilNode {
 		id := c.freeHead
 		c.freeHead = c.nodes[id].next
 		c.freeCount--
-		c.nodes[id] = arenaRadixNode{
+		c.nodes[id] = arenaRadixNode[V]{
 			parent:  nilNode,
 			child:   nilNode,
 			sibling: nilNode,
@@ -117,7 +120,7 @@ func (c *arenaRadix) allocateNode() uint32 {
 	if id >= foregroundNoProtect {
 		panic("arena radix capacity exceeded limit")
 	}
-	c.nodes = append(c.nodes, arenaRadixNode{
+	c.nodes = append(c.nodes, arenaRadixNode[V]{
 		parent:  nilNode,
 		child:   nilNode,
 		sibling: nilNode,
@@ -128,10 +131,12 @@ func (c *arenaRadix) allocateNode() uint32 {
 }
 
 // freeNode reclaims a node by clearing its data and linking it to the singly-linked free-list.
-func (c *arenaRadix) freeNode(id uint32) {
+func (c *arenaRadix[V]) freeNode(id uint32) {
+	var zero V
 	n := &c.nodes[id]
 	n.prefix = ""
-	n.value = nil
+	n.value = zero
+	n.hasValue = false
 	n.size = 0
 	n.parent = nilNode
 	n.child = nilNode
@@ -145,7 +150,7 @@ func (c *arenaRadix) freeNode(id uint32) {
 
 // getChild finds a child node of nID whose prefix starts with the given byte b.
 // Returns nilNode if no matching child is found.
-func (c *arenaRadix) getChild(nID uint32, b byte) uint32 {
+func (c *arenaRadix[V]) getChild(nID uint32, b byte) uint32 {
 	n := &c.nodes[nID]
 	for curr := n.child; curr != nilNode; curr = c.nodes[curr].sibling {
 		if c.nodes[curr].prefix[0] == b {
@@ -160,7 +165,7 @@ func (c *arenaRadix) getChild(nID uint32, b byte) uint32 {
 }
 
 // addChild adds a child node under nID, preserving lexicographical order by prefix[0].
-func (c *arenaRadix) addChild(nID uint32, newChildID uint32) {
+func (c *arenaRadix[V]) addChild(nID uint32, newChildID uint32) {
 	c.nodes[newChildID].parent = nID
 	pcurr := &c.nodes[nID].child
 	for *pcurr != nilNode && c.nodes[*pcurr].prefix[0] < c.nodes[newChildID].prefix[0] {
@@ -171,7 +176,7 @@ func (c *arenaRadix) addChild(nID uint32, newChildID uint32) {
 }
 
 // removeChild removes childToRemoveID from the sibling chain of nID.
-func (c *arenaRadix) removeChild(nID uint32, childToRemoveID uint32) {
+func (c *arenaRadix[V]) removeChild(nID uint32, childToRemoveID uint32) {
 	for pcurr := &c.nodes[nID].child; *pcurr != nilNode; pcurr = &c.nodes[*pcurr].sibling {
 		if *pcurr != childToRemoveID {
 			continue
@@ -185,7 +190,7 @@ func (c *arenaRadix) removeChild(nID uint32, childToRemoveID uint32) {
 }
 
 // replaceChild replaces oldChildID with newChildID in the sibling list of nID.
-func (c *arenaRadix) replaceChild(nID uint32, oldChildID uint32, newChildID uint32) {
+func (c *arenaRadix[V]) replaceChild(nID uint32, oldChildID uint32, newChildID uint32) {
 	for pcurr := &c.nodes[nID].child; *pcurr != nilNode; pcurr = &c.nodes[*pcurr].sibling {
 		if *pcurr != oldChildID {
 			continue
@@ -201,17 +206,14 @@ func (c *arenaRadix) replaceChild(nID uint32, oldChildID uint32, newChildID uint
 }
 
 // insertNode inserts key-value into the radix trie and returns the node index.
-func (c *arenaRadix) insertNode(key string, value ValueType) uint32 {
-	if value == nil {
-		return nilNode
-	}
-
+func (c *arenaRadix[V]) insertNode(key string, value V) uint32 {
 	nodeID := c.root
 	search := key
 
 	for {
 		if len(search) == 0 {
 			c.nodes[nodeID].value = value
+			c.nodes[nodeID].hasValue = true
 			return nodeID
 		}
 
@@ -220,6 +222,7 @@ func (c *arenaRadix) insertNode(key string, value ValueType) uint32 {
 			newLeafID := c.allocateNode()
 			c.nodes[newLeafID].prefix = clonePrefix(search)
 			c.nodes[newLeafID].value = value
+			c.nodes[newLeafID].hasValue = true
 			c.addChild(nodeID, newLeafID)
 			return newLeafID
 		}
@@ -246,19 +249,21 @@ func (c *arenaRadix) insertNode(key string, value ValueType) uint32 {
 
 		if lcp == len(search) {
 			c.nodes[splitNodeID].value = value
+			c.nodes[splitNodeID].hasValue = true
 			return splitNodeID
 		}
 
 		newLeafID := c.allocateNode()
 		c.nodes[newLeafID].prefix = clonePrefix(search[lcp:])
 		c.nodes[newLeafID].value = value
+		c.nodes[newLeafID].hasValue = true
 		c.addChild(splitNodeID, newLeafID)
 		return newLeafID
 	}
 }
 
 // verifyKey validates that nodeID represents key by walking upwards via parent pointers with zero heap allocations.
-func (c *arenaRadix) verifyKey(nodeID uint32, key string) bool {
+func (c *arenaRadix[V]) verifyKey(nodeID uint32, key string) bool {
 	curr := nodeID
 	end := len(key)
 
@@ -279,13 +284,13 @@ func (c *arenaRadix) verifyKey(nodeID uint32, key string) bool {
 	return end == 0 && curr == c.root
 }
 
-func (c *arenaRadix) findNodeByTrieWalk(key string) (uint32, bool) {
+func (c *arenaRadix[V]) findNodeByTrieWalk(key string) (uint32, bool) {
 	curr := c.root
 	search := key
 
 	for curr != nilNode {
 		if len(search) == 0 {
-			if c.nodes[curr].value != nil {
+			if c.nodes[curr].hasValue {
 				return curr, true
 			}
 			return nilNode, false
@@ -311,16 +316,16 @@ func (c *arenaRadix) findNodeByTrieWalk(key string) (uint32, bool) {
 // getNodeKey finds a value-bearing node index for key using O(1) FNV-1a hash lookup with zero-alloc verification,
 // falling back to top-down trie traversal only when a hash collision or dirty nodeMap state exists.
 // It does not mutate c.nodeMap, making it safe under RLock.
-func (c *arenaRadix) getNodeKey(key string) (uint32, bool) {
+func (c *arenaRadix[V]) getNodeKey(key string) (uint32, bool) {
 	return c.lookupNodeKeyWithHash(key, hashString(key))
 }
 
 // lookupNodeKeyWithHash finds a value-bearing node index for key using a precomputed FNV-1a hash
 // without mutating c.nodeMap.
-func (c *arenaRadix) lookupNodeKeyWithHash(key string, keyHash uint64) (uint32, bool) {
+func (c *arenaRadix[V]) lookupNodeKeyWithHash(key string, keyHash uint64) (uint32, bool) {
 	nodeID, ok := c.nodeMap[keyHash]
 	if ok {
-		if nodeID < uint32(len(c.nodes)) && c.nodes[nodeID].value != nil && c.verifyKey(nodeID, key) {
+		if nodeID < uint32(len(c.nodes)) && c.nodes[nodeID].hasValue && c.verifyKey(nodeID, key) {
 			return nodeID, true
 		}
 	} else if len(c.nodeMap) == c.len {
@@ -334,10 +339,10 @@ func (c *arenaRadix) lookupNodeKeyWithHash(key string, keyHash uint64) (uint32, 
 
 // getNodeKeyWithHash finds a value-bearing node index for key under exclusive write lock,
 // healing c.nodeMap[keyHash] if resolved via the slow-path trie walk.
-func (c *arenaRadix) getNodeKeyWithHash(key string, keyHash uint64) (uint32, bool) {
+func (c *arenaRadix[V]) getNodeKeyWithHash(key string, keyHash uint64) (uint32, bool) {
 	nodeID, ok := c.nodeMap[keyHash]
 	if ok {
-		if nodeID < uint32(len(c.nodes)) && c.nodes[nodeID].value != nil && c.verifyKey(nodeID, key) {
+		if nodeID < uint32(len(c.nodes)) && c.nodes[nodeID].hasValue && c.verifyKey(nodeID, key) {
 			return nodeID, true
 		}
 	} else if len(c.nodeMap) == c.len {
@@ -355,19 +360,21 @@ func (c *arenaRadix) getNodeKeyWithHash(key string, keyHash uint64) (uint32, boo
 }
 
 // deleteNode clears the value at nodeID and compresses the parent path if needed.
-func (c *arenaRadix) deleteNode(nodeID uint32) {
-	if nodeID == nilNode || c.nodes[nodeID].value == nil {
+func (c *arenaRadix[V]) deleteNode(nodeID uint32) {
+	if nodeID == nilNode || !c.nodes[nodeID].hasValue {
 		return
 	}
 
-	c.nodes[nodeID].value = nil
+	var zero V
+	c.nodes[nodeID].value = zero
+	c.nodes[nodeID].hasValue = false
 	c.compressPathUpwards(nodeID)
 }
 
 // compressPathUpwards walks up the tree, pruning empty leaf nodes and merging single-child intermediate routing nodes.
-func (c *arenaRadix) compressPathUpwards(currID uint32) {
+func (c *arenaRadix[V]) compressPathUpwards(currID uint32) {
 	for currID != nilNode && currID != c.root {
-		if c.nodes[currID].value != nil {
+		if c.nodes[currID].hasValue {
 			break
 		}
 
@@ -395,7 +402,7 @@ func (c *arenaRadix) compressPathUpwards(currID uint32) {
 }
 
 // moveToFront moves an existing node in the LRU list to the MRU position (head).
-func (c *arenaRadix) moveToFront(nodeID uint32) {
+func (c *arenaRadix[V]) moveToFront(nodeID uint32) {
 	if c.head == nodeID {
 		return
 	}
@@ -420,7 +427,7 @@ func (c *arenaRadix) moveToFront(nodeID uint32) {
 }
 
 // pushFront inserts a newly added node at the MRU position (head) of the LRU list.
-func (c *arenaRadix) pushFront(nodeID uint32) {
+func (c *arenaRadix[V]) pushFront(nodeID uint32) {
 	c.nodes[nodeID].prev = nilNode
 	c.nodes[nodeID].next = c.head
 	if c.head != nilNode {
@@ -434,7 +441,7 @@ func (c *arenaRadix) pushFront(nodeID uint32) {
 }
 
 // remove unlinks nodeID from the intrusive LRU list.
-func (c *arenaRadix) remove(nodeID uint32) {
+func (c *arenaRadix[V]) remove(nodeID uint32) {
 	if c.head != nodeID && c.nodes[nodeID].prev == nilNode {
 		return
 	}
@@ -457,10 +464,11 @@ func (c *arenaRadix) remove(nodeID uint32) {
 }
 
 // evictOne removes and returns the least recently used entry (tail) from the cache.
-func (c *arenaRadix) evictOne() ValueType {
+func (c *arenaRadix[V]) evictOne() (V, bool) {
 	nodeID := c.tail
 	if nodeID == nilNode {
-		return nil
+		var zero V
+		return zero, false
 	}
 
 	return c.eraseInternal(nodeID)
@@ -468,21 +476,23 @@ func (c *arenaRadix) evictOne() ValueType {
 
 const foregroundNoProtect uint32 = nilNode - 1
 
-func (c *arenaRadix) isDirtyLocked() bool {
+func (c *arenaRadix[V]) isDirtyLocked() bool {
 	return c.freeHead != nilNode || len(c.nodes) < cap(c.nodes) || c.nodeMapDirty
 }
 
 // eraseInternal handles unlinking from LRU, cleaning up nodeMap, and deleting from the tree.
-func (c *arenaRadix) eraseInternal(nodeID uint32) ValueType {
+func (c *arenaRadix[V]) eraseInternal(nodeID uint32) (V, bool) {
 	return c.eraseInternalWithHash(nodeID, c.hashNodeKey(nodeID))
 }
 
-func (c *arenaRadix) eraseInternalWithHash(nodeID uint32, hash uint64) ValueType {
-	deletedEntry := c.nodes[nodeID].value
-	if deletedEntry != nil {
-		c.onEntryDeleted(c.nodes[nodeID].size)
-		c.nodeMapDirty = true
+func (c *arenaRadix[V]) eraseInternalWithHash(nodeID uint32, hash uint64) (V, bool) {
+	if nodeID == nilNode || !c.nodes[nodeID].hasValue {
+		var zero V
+		return zero, false
 	}
+	deletedEntry := c.nodes[nodeID].value
+	c.onEntryDeleted(c.nodes[nodeID].size)
+	c.nodeMapDirty = true
 	c.currentSize -= c.nodes[nodeID].size
 	c.nodes[nodeID].size = 0
 
@@ -493,21 +503,21 @@ func (c *arenaRadix) eraseInternalWithHash(nodeID uint32, hash uint64) ValueType
 	c.remove(nodeID)
 	c.deleteNode(nodeID)
 
-	return deletedEntry
+	return deletedEntry, true
 }
 
-func (c *arenaRadix) clearEmptyArenaStateLocked() {
+func (c *arenaRadix[V]) clearEmptyArenaStateLocked() {
 	c.freeHead = nilNode
 	c.freeCount = 0
 
 	if cap(c.nodes) == 1 {
 		c.nodes = c.nodes[:1]
-		c.nodes[0] = arenaRadixNode{parent: nilNode, child: nilNode, sibling: nilNode, prev: nilNode, next: nilNode}
+		c.nodes[0] = arenaRadixNode[V]{parent: nilNode, child: nilNode, sibling: nilNode, prev: nilNode, next: nilNode}
 		c.root = 0
 	} else {
 		clear(c.nodes)
-		c.nodes = make([]arenaRadixNode, 1)
-		c.nodes[0] = arenaRadixNode{parent: nilNode, child: nilNode, sibling: nilNode, prev: nilNode, next: nilNode}
+		c.nodes = make([]arenaRadixNode[V], 1)
+		c.nodes[0] = arenaRadixNode[V]{parent: nilNode, child: nilNode, sibling: nilNode, prev: nilNode, next: nilNode}
 		c.root = 0
 	}
 
@@ -526,7 +536,7 @@ func (c *arenaRadix) clearEmptyArenaStateLocked() {
 
 // resetEmptyArenaLocked releases peak arena slice and hash-map allocations when the cache transitions to empty.
 // Caller MUST hold c.mu.Lock().
-func (c *arenaRadix) resetEmptyArenaLocked() {
+func (c *arenaRadix[V]) resetEmptyArenaLocked() {
 	c.clearEmptyArenaStateLocked()
 	c.markReclaimedLocked()
 }
@@ -536,7 +546,7 @@ func (c *arenaRadix) resetEmptyArenaLocked() {
 // free slots, slice slack, or unhealed hash-collision slots exist. Inline foreground mutations
 // (protectedNodeID != nilNode) only count recycled free-list fragmentation (>= 25% of len(c.nodes))
 // so Go's geometric slice growth capacity slack never triggers O(N^2) compaction thrashing.
-func (c *arenaRadix) shouldAutoCompactLocked(protectedNodeID uint32) bool {
+func (c *arenaRadix[V]) shouldAutoCompactLocked(protectedNodeID uint32) bool {
 	if protectedNodeID == nilNode {
 		return c.isDirtyLocked()
 	}
@@ -549,21 +559,21 @@ func (c *arenaRadix) shouldAutoCompactLocked(protectedNodeID uint32) bool {
 // compactDataStructuresLocked performs the physical slice and map compaction without updating
 // the reclamation epoch, returning true if any backing structure was reallocated.
 // Caller MUST hold c.mu.Lock().
-func (c *arenaRadix) compactDataStructuresLocked() bool {
+func (c *arenaRadix[V]) compactDataStructuresLocked() bool {
 	// Fast-path: when no nodes are on the free-list, node indices are already contiguous [0..len-1].
 	if c.freeHead == nilNode {
 		if len(c.nodes) == cap(c.nodes) && !c.nodeMapDirty {
 			return false
 		}
 		if len(c.nodes) < cap(c.nodes) {
-			newNodes := make([]arenaRadixNode, len(c.nodes))
+			newNodes := make([]arenaRadixNode[V], len(c.nodes))
 			copy(newNodes, c.nodes)
 			c.nodes = newNodes
 		}
 		if c.nodeMapDirty {
 			newNodeMap := make(map[uint64]uint32, c.len)
 			for id := uint32(0); id < uint32(len(c.nodes)); id++ {
-				if c.nodes[id].value != nil {
+				if c.nodes[id].hasValue {
 					newNodeMap[c.hashNodeKey(id)] = id
 				}
 			}
@@ -596,7 +606,7 @@ func (c *arenaRadix) compactDataStructuresLocked() bool {
 
 	// Allocate brand-new slice with len(newNodes) == cap(newNodes) == liveCount,
 	// and brand-new hash accelerator map healing any hash-collided surviving keys.
-	newNodes := make([]arenaRadixNode, liveCount)
+	newNodes := make([]arenaRadixNode[V], liveCount)
 	newNodeMap := make(map[uint64]uint32, c.len)
 	for oldID := uint32(0); oldID < oldLen; oldID++ {
 		newID := oldToNew[oldID]
@@ -604,18 +614,19 @@ func (c *arenaRadix) compactDataStructuresLocked() bool {
 			continue
 		}
 		oldNode := &c.nodes[oldID]
-		if oldNode.value != nil {
+		if oldNode.hasValue {
 			newNodeMap[c.hashNodeKey(oldID)] = newID
 		}
-		newNodes[newID] = arenaRadixNode{
-			prefix:  oldNode.prefix,
-			value:   oldNode.value,
-			size:    oldNode.size,
-			parent:  remap(oldNode.parent),
-			child:   remap(oldNode.child),
-			sibling: remap(oldNode.sibling),
-			prev:    remap(oldNode.prev),
-			next:    remap(oldNode.next),
+		newNodes[newID] = arenaRadixNode[V]{
+			prefix:   oldNode.prefix,
+			value:    oldNode.value,
+			size:     oldNode.size,
+			parent:   remap(oldNode.parent),
+			child:    remap(oldNode.child),
+			sibling:  remap(oldNode.sibling),
+			prev:     remap(oldNode.prev),
+			next:     remap(oldNode.next),
+			hasValue: oldNode.hasValue,
 		}
 	}
 
@@ -637,7 +648,7 @@ func (c *arenaRadix) compactDataStructuresLocked() bool {
 // remaps all 8 uint32 index pointers (root, head, tail, parent, child, sibling, prev, next),
 // and reallocates c.nodeMap to eliminate Go map bucket slack while preserving 100% of live entries and LRU order.
 // Caller MUST hold c.mu.Lock().
-func (c *arenaRadix) compactLocked() {
+func (c *arenaRadix[V]) compactLocked() {
 	if c.compactDataStructuresLocked() {
 		c.markReclaimedLocked()
 	}
@@ -648,9 +659,9 @@ func (c *arenaRadix) compactLocked() {
 // protecting protectedNodeID only when it resides at the MRU head (c.head),
 // then performs lossless arena and map compaction if fragmentation warrants it.
 // Caller MUST hold c.mu.Lock().
-func (c *arenaRadix) shedAndCompactLocked(targetSize uint64, retention float64, protectedNodeID uint32) []ValueType {
+func (c *arenaRadix[V]) shedAndCompactLocked(targetSize uint64, retention float64, protectedNodeID uint32) []V {
 	autoCompactID := protectedNodeID
-	if protectedNodeID == foregroundNoProtect || (protectedNodeID != nilNode && (protectedNodeID != c.head || c.nodes[protectedNodeID].prev != nilNode || c.nodes[protectedNodeID].value == nil)) {
+	if protectedNodeID == foregroundNoProtect || (protectedNodeID != nilNode && (protectedNodeID != c.head || c.nodes[protectedNodeID].prev != nilNode || !c.nodes[protectedNodeID].hasValue)) {
 		protectedNodeID = nilNode
 	}
 
@@ -662,7 +673,7 @@ func (c *arenaRadix) shedAndCompactLocked(targetSize uint64, retention float64, 
 	effectiveTarget, targetLen, targetZeroCount, unprotectedZeroTarget := c.computeShedTargets(targetSize, retention, c.len, hasProtected, protectedSize)
 
 	needFullFlush := retention == 0.0
-	var evicted []ValueType
+	var evicted []V
 	victimID := c.tail
 	for victimID != nilNode {
 		needByteShed := c.currentSize > effectiveTarget || needFullFlush
@@ -688,7 +699,7 @@ func (c *arenaRadix) shedAndCompactLocked(targetSize uint64, retention float64, 
 			break
 		}
 		nextVictimID := c.nodes[victimID].prev
-		if val := c.eraseInternal(victimID); val != nil {
+		if val, ok := c.eraseInternal(victimID); ok {
 			evicted = append(evicted, val)
 		}
 		victimID = nextVictimID
@@ -718,11 +729,11 @@ func (c *arenaRadix) shedAndCompactLocked(targetSize uint64, retention float64, 
 //   - Else if pressure >= CompactionThreshold (Tier 1 Moderate Pressure): perform lossless arena and map compaction.
 //
 // Caller MUST hold c.mu.Lock().
-func (c *arenaRadix) maybeReclaimUnderPressureLocked(pressure float64, protectedNodeID uint32) []ValueType {
+func (c *arenaRadix[V]) maybeReclaimUnderPressureLocked(pressure float64, protectedNodeID uint32) []V {
 	if c.isSamplingGoroutine() {
 		return nil
 	}
-	var evicted []ValueType
+	var evicted []V
 	if pressure >= c.options.EvictionThreshold {
 		retention := c.options.EvictionRetentionRatio
 		targetSize := computeTargetSize(c.maxSize, retention)
