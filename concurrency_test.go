@@ -93,7 +93,7 @@ func TestConcurrency_MixedOperations(t *testing.T) {
 						case op < 28:
 							_, err := cache.Put(key, concValue{id: key, size: 10})
 							if err != nil {
-								assert.ErrorIs(t, err, lru.ErrInvalidEntrySize)
+								assert.ErrorIs(t, err, lru.ErrInvalidEntrySize) //nolint:testifylint // wg.Go runs in a child goroutine
 							}
 						case op < 50:
 							_, _ = cache.Get(key)
@@ -102,13 +102,13 @@ func TestConcurrency_MixedOperations(t *testing.T) {
 						case op < 74:
 							err := cache.Replace(key, concValue{id: key + "_upd", size: 10})
 							if err != nil {
-								assert.ErrorIs(t, err, lru.ErrEntryNotExist)
+								assert.ErrorIs(t, err, lru.ErrEntryNotExist) //nolint:testifylint // wg.Go runs in a child goroutine
 							}
 						case op < 82:
 							sz := uint64(5 + (kIdx%3)*10) // 5, 15, or 25 (shrinks or grows weight)
 							err := cache.Replace(key, concValue{id: key + "_sz", size: sz})
 							if err != nil {
-								assert.ErrorIs(t, err, lru.ErrEntryNotExist)
+								assert.ErrorIs(t, err, lru.ErrEntryNotExist) //nolint:testifylint // wg.Go runs in a child goroutine
 							}
 						case op < 88:
 							_, _ = cache.Delete(key)
@@ -193,7 +193,7 @@ func TestConcurrency_DeletePrefixAtomicity(t *testing.T) {
 					for op := range opsPerWriter {
 						key := fmt.Sprintf("/target/w%d_%d", w, op)
 						_, err := cache.Put(key, concValue{id: key, size: 10})
-						assert.NoError(t, err)
+						assert.NoError(t, err) //nolint:testifylint // wg.Go runs in a child goroutine
 					}
 				})
 			}
@@ -404,7 +404,7 @@ func TestConcurrency_EvictionThrashingWithInvariants(t *testing.T) {
 					for i := range opsPerWorker {
 						key := fmt.Sprintf("inv/p%d/item_%d", i%5, i)
 						evicted, err := cache.Put(key, concValue{id: key, size: 10})
-						assert.NoError(t, err)
+						assert.NoError(t, err) //nolint:testifylint // wg.Go runs in a child goroutine
 						totalEvictions.Add(int64(len(evicted)))
 						if i%20 == 0 {
 							cache.DeletePrefix(fmt.Sprintf("inv/p%d/", i%5))
@@ -485,7 +485,7 @@ func TestConcurrency_MemoryPressureCompactionAndEviction(t *testing.T) {
 						case op < 28:
 							_, err := cache.Put(key, concValue{id: key, size: 10})
 							if err != nil {
-								assert.ErrorIs(t, err, lru.ErrInvalidEntrySize)
+								assert.ErrorIs(t, err, lru.ErrInvalidEntrySize) //nolint:testifylint // wg.Go runs in a child goroutine
 							}
 						case op < 48:
 							_, _ = cache.Get(key)
@@ -494,13 +494,13 @@ func TestConcurrency_MemoryPressureCompactionAndEviction(t *testing.T) {
 						case op < 72:
 							err := cache.Replace(key, concValue{id: key + "_u", size: 10})
 							if err != nil {
-								assert.ErrorIs(t, err, lru.ErrEntryNotExist)
+								assert.ErrorIs(t, err, lru.ErrEntryNotExist) //nolint:testifylint // wg.Go runs in a child goroutine
 							}
 						case op < 80:
 							sz := uint64(5 + (step%2)*10) // 5 or 15
 							err := cache.Replace(key, concValue{id: key + "_sz", size: sz})
 							if err != nil {
-								assert.ErrorIs(t, err, lru.ErrEntryNotExist)
+								assert.ErrorIs(t, err, lru.ErrEntryNotExist) //nolint:testifylint // wg.Go runs in a child goroutine
 							}
 						case op < 86:
 							_, _ = cache.Delete(key)
@@ -641,7 +641,7 @@ func TestConcurrency_EvictionCallbacksUnderRace(t *testing.T) {
 						case op < 35:
 							_, err := cache.Put(key, concValue{id: key, size: 10})
 							if err != nil {
-								assert.ErrorIs(t, err, lru.ErrInvalidEntrySize)
+								assert.ErrorIs(t, err, lru.ErrInvalidEntrySize) //nolint:testifylint // wg.Go runs in a child goroutine
 							}
 						case op < 52:
 							_, _ = cache.Get(key)
@@ -651,7 +651,7 @@ func TestConcurrency_EvictionCallbacksUnderRace(t *testing.T) {
 							sz := uint64(5 + (step%3)*10) // 5, 15, or 25
 							err := cache.Replace(key, concValue{id: key + "_r", size: sz})
 							if err != nil {
-								assert.ErrorIs(t, err, lru.ErrEntryNotExist)
+								assert.ErrorIs(t, err, lru.ErrEntryNotExist) //nolint:testifylint // wg.Go runs in a child goroutine
 							}
 						case op < 86:
 							// Self-evicting Replace (> capacity or !canFit alongside newer entries)
@@ -661,7 +661,7 @@ func TestConcurrency_EvictionCallbacksUnderRace(t *testing.T) {
 							}
 							err := cache.Replace(key, concValue{id: key + "_r", size: sz})
 							if err != nil {
-								assert.ErrorIs(t, err, lru.ErrEntryNotExist)
+								assert.ErrorIs(t, err, lru.ErrEntryNotExist) //nolint:testifylint // wg.Go runs in a child goroutine
 							}
 						case op < 92:
 							_, _ = cache.Delete(key)

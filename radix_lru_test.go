@@ -1015,7 +1015,7 @@ func TestRadixCache_Iterators(t *testing.T) {
 		vals := slices.Collect(c.Values())
 		require.Len(t, keys, depth+3)
 		require.Len(t, vals, depth+3)
-		assert.Equal(t, "", keys[0])
+		assert.Empty(t, keys[0])
 		assert.Equal(t, int64(0), vals[0].value)
 		assert.Equal(t, strings.Repeat("p", depth)+"q", keys[1])
 		assert.Equal(t, int64(100+depth), vals[1].value)

@@ -962,7 +962,7 @@ func TestMapCache_ZeroAllocHotPathsAndSingleAllocNewEntryPut(t *testing.T) {
 		idx++
 		_, _ = c.Put(k, testData{value: 2, dataSize: 10})
 	})
-	assert.Equal(t, 1.0, newPutAllocs, "MapCache new-entry Put on pre-sized map must allocate 1 heap object (entry[V])")
+	assert.InDelta(t, 1.0, newPutAllocs, 0.0, "MapCache new-entry Put on pre-sized map must allocate 1 heap object (entry[V])")
 
 	// 2. Existing-key Put, Get, Peek, Replace (without eviction), and Values()/All()/Keys() allocate 0 heap objects.
 	mc := c.(*mapCache[testData])

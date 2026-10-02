@@ -2056,7 +2056,7 @@ func TestPressure_PreSampleEpochLoadAndConcurrentSamplerOrdering(t *testing.T) {
 				var wg sync.WaitGroup
 				wg.Go(func() {
 					_, err := cache.Put("g2-key", testData{value: 1, dataSize: 10})
-					assert.NoError(t, err)
+					assert.NoError(t, err) //nolint:testifylint // wg.Go runs in a child goroutine where require.* (t.FailNow) is invalid
 				})
 
 				<-g2Sampled
