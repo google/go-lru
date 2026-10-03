@@ -871,21 +871,51 @@ func TestMapCache_CheckInvariants_PanicOnCorruption(t *testing.T) {
 }
 
 func TestPressureClampingPositiveInfinity(t *testing.T) {
-	// Arrange
-	c := NewMapCache[testData](
-		100,
-		WithInvariantChecking(true),
-		testDataWeigher,
-		WithPressureFunc(func() float64 { return math.Inf(1) }),
-	)
+	t.Run("DefaultThresholds", func(t *testing.T) {
+		// Arrange
+		c := NewMapCache[testData](
+			100,
+			WithInvariantChecking(true),
+			testDataWeigher,
+			WithPressureFunc(func() float64 { return math.Inf(1) }),
+		)
 
-	// Act
-	_, err := c.Put("k1", testData{value: 1, dataSize: 10})
-	require.NoError(t, err)
-	st := c.Stats()
+		// Act
+		_, err := c.Put("k1", testData{value: 1, dataSize: 10})
+		require.NoError(t, err)
+		st := c.Stats()
 
-	// Assert
-	assert.InDelta(t, 1.0, st.MemoryPressure, 0.0)
+		// Assert
+		assert.InDelta(t, 1.0, st.MemoryPressure, 0.0)
+	})
+
+	t.Run("DerivedEvictionThresholdAboveOne", func(t *testing.T) {
+		// Arrange: WithCompactionThreshold(0.95) derives EvictionThreshold = 1.10.
+		pressure := 0.0
+		c := NewMapCache[testData](
+			100,
+			WithInvariantChecking(true),
+			testDataWeigher,
+			WithCompactionThreshold(0.95),
+			WithPressureFunc(func() float64 { return pressure }),
+		).(PressureAwareCache[testData])
+
+		_, err := c.Put("k1", testData{value: 1, dataSize: 60})
+		require.NoError(t, err)
+		_, err = c.Put("k2", testData{value: 2, dataSize: 30})
+		require.NoError(t, err)
+
+		// Act: +Inf pressure must clamp to max(1.0, 0.95, 1.10) == 1.10 and trigger Tier 2 shedding.
+		pressure = math.Inf(1)
+		evicted := c.EvaluateMemoryPressure()
+		st := c.Stats()
+
+		// Assert
+		assert.NotEmpty(t, evicted)
+		assert.Equal(t, uint64(1), st.PressureShedsExplicit)
+		assert.False(t, math.IsInf(st.MemoryPressure, 0))
+		assert.InDelta(t, 1.10, st.MemoryPressure, 1e-9)
+	})
 }
 
 func TestMapCache_Compact(t *testing.T) {

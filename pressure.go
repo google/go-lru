@@ -370,7 +370,7 @@ func (p *pressureState) invokeAndStorePressure(gid uint64, slot int) (uint64, fl
 	if math.IsNaN(val) || val < 0.0 {
 		val = 0.0
 	} else if math.IsInf(val, 1) {
-		val = 1.0
+		val = max(1.0, p.options.CompactionThreshold, p.options.EvictionThreshold)
 	}
 	epoch, val, _ = p.storeSampledPressureWithSeq(epoch, extEpoch, invokeSeq, val, gid, slot)
 	return epoch, val, true
