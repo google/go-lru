@@ -72,14 +72,17 @@ type Cache[V any] interface {
 	// Iteration acquires a read lock (RLock) for the duration of the loop, does not
 	// alter LRU recency order, and supports early termination (break). Callers must
 	// not invoke write-locking methods (Put, Get, Delete, Replace, DeletePrefix,
-	// Compact, EvaluateMemoryPressure) on the same Cache while iterating.
+	// Compact, EvaluateMemoryPressure) or nested read-locking methods (Peek, Stats,
+	// or nested iterators when concurrent writers may contend on the cache lock)
+	// on the same Cache while iterating.
 	All() iter.Seq2[string, V]
 
 	// Keys returns an iterator over all live keys in deterministic MRU-to-LRU order.
 	//
 	// Iteration acquires a read lock (RLock) for the duration of the loop, does not
 	// alter LRU recency order, and supports early termination (break). Callers must
-	// not invoke write-locking methods on the same Cache while iterating.
+	// not invoke write-locking methods or nested read-locking methods on the same
+	// Cache while iterating.
 	Keys() iter.Seq[string]
 
 	// Values returns an iterator over all live values in deterministic MRU-to-LRU order.
@@ -87,7 +90,7 @@ type Cache[V any] interface {
 	// Iteration acquires a read lock (RLock) for the duration of the loop, does not
 	// alter LRU recency order, skips key reconstruction on radix backends (0 allocs/op),
 	// and supports early termination (break). Callers must not invoke write-locking
-	// methods on the same Cache while iterating.
+	// methods or nested read-locking methods on the same Cache while iterating.
 	Values() iter.Seq[V]
 
 	// Stats returns a point-in-time telemetry snapshot of the cache's lookups,

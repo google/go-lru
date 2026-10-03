@@ -47,11 +47,9 @@ const (
 	attrKeyState        = attribute.Key("state")
 )
 
-// StatsProvider is implemented by any lru.Cache[V] or lru.PressureAwareCache[V]
-// that exposes a point-in-time lru.Stats snapshot.
-type StatsProvider interface {
-	Stats() lru.Stats
-}
+// StatsProvider is an alias for lru.StatsProvider, implemented by any lru.Cache[V]
+// or lru.PressureAwareCache[V] that exposes a point-in-time lru.Stats snapshot.
+type StatsProvider = lru.StatsProvider
 
 type config struct {
 	meterProvider metric.MeterProvider
@@ -88,8 +86,10 @@ func WithName(name string) Option {
 }
 
 // WithAttributes appends additional static attributes to every metric observation
-// for the registered cache instance. Built-in "cache.backend" and "cache.name"
-// (when WithName is non-empty) attributes take precedence over duplicate keys.
+// for the registered cache instance. Reserved package attribute keys ("cache.backend",
+// "cache.name", "operation", "result", "reason", "outcome", "trigger", and "state")
+// in attrs are ignored so they cannot spoof cache identity or leak metric-specific
+// dimensions onto unrelated instruments.
 func WithAttributes(attrs ...attribute.KeyValue) Option {
 	return func(c *config) {
 		c.attrs = append(c.attrs, attrs...)
@@ -127,6 +127,22 @@ func isNilStatsProvider(cache StatsProvider) bool {
 	switch v.Kind() {
 	case reflect.Pointer, reflect.Interface, reflect.Func, reflect.Map, reflect.Slice, reflect.Chan:
 		return v.IsNil()
+	default:
+		return false
+	}
+}
+
+func isReservedAttributeKey(k attribute.Key) bool {
+	switch k {
+	case attrKeyCacheBackend,
+		attrKeyCacheName,
+		attrKeyOperation,
+		attrKeyResult,
+		attrKeyReason,
+		attrKeyOutcome,
+		attrKeyTrigger,
+		attrKeyState:
+		return true
 	default:
 		return false
 	}
@@ -190,9 +206,13 @@ func Register(cache StatsProvider, opts ...Option) (*Registration, error) {
 	initialStats := cache.Stats()
 	isArena := initialStats.Backend == lru.BackendArenaRadix
 
-	// Build base attributes: custom attributes first, then authoritative cache.name and cache.backend.
+	// Build base attributes: custom non-reserved attributes first, then authoritative cache.name and cache.backend.
 	baseAttrs := make([]attribute.KeyValue, 0, len(cfg.attrs)+2)
-	baseAttrs = append(baseAttrs, cfg.attrs...)
+	for _, kv := range cfg.attrs {
+		if !isReservedAttributeKey(kv.Key) {
+			baseAttrs = append(baseAttrs, kv)
+		}
+	}
 	if cfg.name != "" {
 		baseAttrs = append(baseAttrs, attrKeyCacheName.String(cfg.name))
 	}

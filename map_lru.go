@@ -643,8 +643,9 @@ func (c *mapCache[V]) DeletePrefix(prefix string) {
 		if !hadEntries && !hadDirtySlack && c.peakEntryLen == 0 {
 			return
 		}
-		hadCompactionSlack := c.hasEmptyDeleteSlack(false)
 		hadReclaimable := c.currentSize > 0 || hadDirtySlack
+		c.deletedSinceCompact += c.entries.Len()
+		hadCompactionSlack := c.hasEmptyDeleteSlack(false)
 		var zero V
 		for e := c.entries.Front(); e != nil; {
 			next := e.next

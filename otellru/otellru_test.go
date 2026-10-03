@@ -17,6 +17,7 @@ package otellru_test
 import (
 	"context"
 	"errors"
+	"fmt"
 	"math"
 	"sync"
 	"sync/atomic"
@@ -228,8 +229,26 @@ func TestRegister_AllBackendsAndInstruments(t *testing.T) {
 			_, err = cache.Put("inline/3", weightedItem{id: 10, weight: 20}) // 30+30+20=80 > 50 -> sheds inline/1
 			require.NoError(t, err)
 
+			// 12. Auto-slack inline compaction at normal pressure (peakEntryLen > 8 -> empty reset),
+			// followed by live and deleted entries so all gauges and counters are non-zero:
+			setPressure(0.10)
+			for i := range 9 {
+				_, err = cache.Put(fmt.Sprintf("slack/%d", i), weightedItem{id: 100 + i, weight: 1})
+				require.NoError(t, err)
+			}
+			cache.DeletePrefix("")
+			_, err = cache.Put("live/a", weightedItem{id: 201, weight: 25})
+			require.NoError(t, err)
+			_, err = cache.Put("live/zero", weightedItem{id: 202, weight: 0})
+			require.NoError(t, err)
+			_, err = cache.Put("live/temp", weightedItem{id: 203, weight: 10})
+			require.NoError(t, err)
+			_, ok = cache.Delete("live/temp")
+			assert.True(t, ok)
+
 			// Assert: Collect OTel metrics and compare every instrument against cache.Stats().
 			st := cache.Stats()
+			assert.Positive(t, st.CompactionsAutoSlack)
 			metricsByName := collectMetricsByName(t, reader, otellru.ScopeName)
 
 			if b.isArena {
@@ -357,6 +376,7 @@ func TestRegister_OptionsAndAttributePrecedence(t *testing.T) {
 	t.Run("NilCacheReturnsErrNilCache", func(t *testing.T) {
 		// Arrange
 		var typedNilCache lru.Cache[string]
+		var typedNilPtr *stubStatsProvider
 
 		// Act & Assert
 		reg1, err1 := otellru.Register(nil)
@@ -366,6 +386,10 @@ func TestRegister_OptionsAndAttributePrecedence(t *testing.T) {
 		reg2, err2 := otellru.Register(typedNilCache)
 		require.ErrorIs(t, err2, otellru.ErrNilCache)
 		assert.Nil(t, reg2)
+
+		reg3, err3 := otellru.Register(typedNilPtr)
+		require.ErrorIs(t, err3, otellru.ErrNilCache)
+		assert.Nil(t, reg3)
 	})
 
 	t.Run("WithMeterAndCustomAttributesAndAuthoritativePrecedence", func(t *testing.T) {
@@ -390,6 +414,13 @@ func TestRegister_OptionsAndAttributePrecedence(t *testing.T) {
 			otellru.WithAttributes(
 				attribute.String("service.env", "staging"),
 				attribute.String("cache.backend", "spoofed-backend"),
+				attribute.String("cache.name", "spoofed-name"),
+				attribute.String("operation", "spoofed-op"),
+				attribute.String("result", "spoofed-result"),
+				attribute.String("reason", "spoofed-reason"),
+				attribute.String("outcome", "spoofed-outcome"),
+				attribute.String("trigger", "spoofed-trigger"),
+				attribute.String("state", "spoofed-state"),
 			),
 		)
 		require.NoError(t, err)
@@ -397,20 +428,53 @@ func TestRegister_OptionsAndAttributePrecedence(t *testing.T) {
 			_ = reg.Unregister()
 		})
 
-		// Act
+		// Act 1: Scrape with empty WithName("") and spoofed reserved attributes
 		metricsByName := collectMetricsByName(t, reader, "custom.instrumentation.scope")
 
-		// Assert: service.env="staging" is present, cache.backend="map" is authoritative, and cache.name is omitted.
+		// Assert 1: service.env="staging" is present, cache.backend="map" is authoritative,
+		// cache.name is omitted, and reserved keys (reason, state, etc.) are stripped from baseOpts gauges.
 		expectedSet := attribute.NewSet(
 			attribute.String("service.env", "staging"),
 			attribute.String("cache.backend", "map"),
 		)
 		entriesPts := requireInt64GaugePoints(t, metricsByName["lru.cache.entries"], "{entry}")
+		assert.Len(t, entriesPts, 1)
 		assert.Equal(t, int64(1), entriesPts[expectedSet])
+
+		// Act 2: Unregister first registration and register with non-empty WithName("authoritative-name")
+		// alongside spoofed cache.name in WithAttributes.
+		require.NoError(t, reg.Unregister())
+
+		namedReg, err := otellru.Register(
+			cache,
+			otellru.WithMeter(customMeter),
+			otellru.WithName("authoritative-name"),
+			otellru.WithAttributes(
+				attribute.String("service.env", "staging"),
+				attribute.String("cache.name", "spoofed-name"),
+			),
+		)
+		require.NoError(t, err)
+		t.Cleanup(func() {
+			_ = namedReg.Unregister()
+		})
+
+		namedMetricsByName := collectMetricsByName(t, reader, "custom.instrumentation.scope")
+
+		// Assert 2: cache.name="authoritative-name" takes precedence over WithAttributes.
+		expectedNamedSet := attribute.NewSet(
+			attribute.String("service.env", "staging"),
+			attribute.String("cache.backend", "map"),
+			attribute.String("cache.name", "authoritative-name"),
+		)
+		namedEntriesPts := requireInt64GaugePoints(t, namedMetricsByName["lru.cache.entries"], "{entry}")
+		assert.Len(t, namedEntriesPts, 1)
+		assert.Equal(t, int64(1), namedEntriesPts[expectedNamedSet])
 	})
 
 	t.Run("DefaultGlobalMeterProviderAndUnknownBackendSaturation", func(t *testing.T) {
-		// Arrange: stubStatsProvider with unknown Backend enum and MaxUint64 gauge values
+		// Arrange: stubStatsProvider with unknown Backend enum and MaxUint64 gauge values,
+		// plus an ArenaRadix stubStatsProvider with non-zero CompactionsAutoSlack and ArenaHashFallbacks.
 		reader := sdkmetric.NewManualReader()
 		mp := sdkmetric.NewMeterProvider(sdkmetric.WithReader(reader))
 		t.Cleanup(func() {
@@ -439,6 +503,22 @@ func TestRegister_OptionsAndAttributePrecedence(t *testing.T) {
 			_ = reg.Unregister()
 		})
 
+		arenaStub := stubStatsProvider{
+			stats: lru.Stats{
+				Backend:              lru.BackendArenaRadix,
+				CompactionsAutoSlack: 17,
+				ArenaLiveNodes:       12,
+				ArenaFreeNodes:       3,
+				ArenaUnallocatedCap:  49,
+				ArenaHashFallbacks:   29,
+			},
+		}
+		arenaReg, err := otellru.Register(arenaStub, otellru.WithMeterProvider(mp), otellru.WithName("arena-stub"))
+		require.NoError(t, err)
+		t.Cleanup(func() {
+			_ = arenaReg.Unregister()
+		})
+
 		// Act
 		metricsByName := collectMetricsByName(t, reader, otellru.ScopeName)
 
@@ -457,6 +537,22 @@ func TestRegister_OptionsAndAttributePrecedence(t *testing.T) {
 			attribute.String("result", "hit"),
 		)
 		assert.Equal(t, int64(42), reqPts[hitSet])
+
+		// Assert non-zero CompactionsAutoSlack and ArenaHashFallbacks on the ArenaRadix stub.
+		arenaBaseSet := attribute.NewSet(
+			attribute.String("cache.backend", "arena_radix"),
+			attribute.String("cache.name", "arena-stub"),
+		)
+		autoSlackSet := attribute.NewSet(
+			attribute.String("cache.backend", "arena_radix"),
+			attribute.String("cache.name", "arena-stub"),
+			attribute.String("trigger", "auto_slack"),
+		)
+		compactPts := requireInt64SumPoints(t, metricsByName["lru.cache.compactions"], "{compaction}")
+		assert.Equal(t, int64(17), compactPts[autoSlackSet])
+
+		fallbackPts := requireInt64SumPoints(t, metricsByName["lru.cache.arena.hash_fallbacks"], "{lookup}")
+		assert.Equal(t, int64(29), fallbackPts[arenaBaseSet])
 	})
 }
 
@@ -565,7 +661,16 @@ func TestRegister_ConcurrentOperationsAndScrapesUnderRace(t *testing.T) {
 		_ = mp.Shutdown(context.Background())
 	})
 
-	cache := lru.NewArenaRadixCache[weightedItem](50, lru.WithWeigher(itemWeigher))
+	cache := lru.NewArenaRadixCache[weightedItem](
+		50,
+		lru.WithWeigher(itemWeigher),
+		lru.WithPressureFunc(func() float64 { return 0.80 }),
+		lru.WithCompactionThreshold(0.75),
+		lru.WithEvictionThreshold(0.90),
+	)
+	paCache, ok := cache.(lru.PressureAwareCache[weightedItem])
+	require.True(t, ok)
+
 	reg, err := otellru.Register(cache, otellru.WithMeterProvider(mp), otellru.WithName("race-cache"))
 	require.NoError(t, err)
 	t.Cleanup(func() {
@@ -588,6 +693,12 @@ func TestRegister_ConcurrentOperationsAndScrapesUnderRace(t *testing.T) {
 				}
 				if i%25 == 0 {
 					cache.DeletePrefix("a/")
+				}
+				if i%20 == 0 {
+					paCache.Compact()
+				}
+				if i%30 == 0 {
+					_ = paCache.EvaluateMemoryPressure()
 				}
 			}
 		})

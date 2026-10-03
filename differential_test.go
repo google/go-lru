@@ -93,9 +93,13 @@ func newDifferentialHarnessWithOpts(t *testing.T, maxSize uint64, unitWeight boo
 		{"ArenaRadixCache", lru.NewArenaRadixCache[*diffValue]},
 	}
 
+	baseOpts := slices.Concat([]lru.Option{
+		lru.WithPressureFunc(func() float64 { return 0.0 }),
+	}, opts)
+
 	for _, cfg := range configs {
 		for _, inv := range []bool{false, true} {
-			c := cfg.constructor(maxSize, slices.Concat([]lru.Option{lru.WithInvariantChecking(inv)}, opts)...)
+			c := cfg.constructor(maxSize, slices.Concat([]lru.Option{lru.WithInvariantChecking(inv)}, baseOpts)...)
 			h.instances = append(h.instances, diffInstance{
 				name:       cfg.name,
 				invariants: inv,
@@ -418,6 +422,8 @@ func (h *differentialHarness) VerifyFullCompactionStatsParity(op string) {
 		require.Equalf(h.t, base.CompactionsPressureTier2, st.CompactionsPressureTier2, "[%s] CompactionsPressureTier2 mismatch with %s (inv=%v)", op, inst.name, inst.invariants)
 		require.Equalf(h.t, base.CompactionsAutoSlack, st.CompactionsAutoSlack, "[%s] CompactionsAutoSlack mismatch with %s (inv=%v)", op, inst.name, inst.invariants)
 		require.Equalf(h.t, base.ReclaimEpoch, st.ReclaimEpoch, "[%s] ReclaimEpoch mismatch with %s (inv=%v)", op, inst.name, inst.invariants)
+		require.Equalf(h.t, base.DeletedSinceCompact, st.DeletedSinceCompact, "[%s] DeletedSinceCompact mismatch with %s (inv=%v)", op, inst.name, inst.invariants)
+		require.Equalf(h.t, base.PeakEntryLen, st.PeakEntryLen, "[%s] PeakEntryLen mismatch with %s (inv=%v)", op, inst.name, inst.invariants)
 	}
 }
 
@@ -1625,4 +1631,31 @@ func TestDifferential_StatsFullLifecycleParity(t *testing.T) {
 	assert.Equal(t, baseAutoSlack+1, st.CompactionsAutoSlack)
 	assert.Zero(t, st.Len)
 	assert.Zero(t, st.CurrentSize)
+
+	// 13. Auto-slack compaction on DeletePrefix("") when peakEntryLen <= 8 and len(nodes) < 64,
+	// crossing deletedSinceCompact >= 64 via the deleted live entries.
+	h.Put("anchor/1", &diffValue{id: "a1", size: 1})
+	h.Put("anchor/2", &diffValue{id: "a2", size: 1})
+	h.Put("anchor/3", &diffValue{id: "a3", size: 1})
+	h.Put("anchor/4", &diffValue{id: "a4", size: 1})
+	for range 60 {
+		h.Put("churn/k", &diffValue{id: "ck", size: 1})
+		h.Delete("churn/k")
+	}
+	h.Put("tail/1", &diffValue{id: "t1", size: 1})
+	h.Put("tail/2", &diffValue{id: "t2", size: 1})
+	h.Put("tail/3", &diffValue{id: "t3", size: 1})
+	h.VerifyFullCompactionStatsParity("before_delete_prefix_all_small_peak")
+	st = h.instances[0].cache.Stats()
+	assert.Equal(t, 7, st.PeakEntryLen)
+	assert.Equal(t, 60, st.DeletedSinceCompact)
+	baseAutoSlack = st.CompactionsAutoSlack
+
+	h.DeletePrefix("")
+	h.VerifyFullCompactionStatsParity("after_delete_prefix_all_small_peak")
+	st = h.instances[0].cache.Stats()
+	assert.Equal(t, baseAutoSlack+1, st.CompactionsAutoSlack)
+	assert.Zero(t, st.Len)
+	assert.Zero(t, st.DeletedSinceCompact)
+	assert.Zero(t, st.PeakEntryLen)
 }

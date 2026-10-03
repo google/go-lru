@@ -16,6 +16,7 @@ package lru
 
 import (
 	"fmt"
+	"math"
 	"slices"
 	"testing"
 
@@ -740,6 +741,151 @@ func TestMapCache_CheckInvariants_PanicOnCorruption(t *testing.T) {
 			c.checkInvariants()
 		})
 	})
+
+	t.Run("Telemetry_ZeroSizeCountOutOfBounds", func(t *testing.T) {
+		// Arrange
+		c := NewMapCache[testData](100, testDataWeigher).(*mapCache[testData])
+		c.zeroSizeCount = -1
+
+		// Act & Assert
+		assert.Panics(t, func() {
+			c.checkTelemetryInvariants(0)
+		})
+
+		c.zeroSizeCount = 2
+		assert.Panics(t, func() {
+			c.checkTelemetryInvariants(1)
+		})
+	})
+
+	t.Run("Telemetry_NegativeDeletedSinceCompact", func(t *testing.T) {
+		// Arrange
+		c := NewMapCache[testData](100, testDataWeigher).(*mapCache[testData])
+		c.deletedSinceCompact = -1
+
+		// Act & Assert
+		assert.Panics(t, func() {
+			c.checkInvariants()
+		})
+	})
+
+	t.Run("Telemetry_NegativePeakEntryLen", func(t *testing.T) {
+		// Arrange
+		c := NewMapCache[testData](100, testDataWeigher).(*mapCache[testData])
+		c.peakEntryLen = -1
+
+		// Act & Assert
+		assert.Panics(t, func() {
+			c.checkInvariants()
+		})
+	})
+
+	t.Run("Telemetry_CurrentLenExceedsPeakEntryLen", func(t *testing.T) {
+		// Arrange
+		c := NewMapCache[testData](100, testDataWeigher).(*mapCache[testData])
+		_, err := c.Put("k1", testData{value: 1, dataSize: 10})
+		require.NoError(t, err)
+		c.peakEntryLen = 0
+
+		// Act & Assert
+		assert.Panics(t, func() {
+			c.checkInvariants()
+		})
+	})
+
+	t.Run("Telemetry_InvalidLastSampledPressure", func(t *testing.T) {
+		// Arrange
+		c := NewMapCache[testData](100, testDataWeigher).(*mapCache[testData])
+
+		// Act & Assert: NaN, +Inf, -Inf, and negative values must panic
+		for _, bad := range []float64{math.NaN(), math.Inf(1), math.Inf(-1), -0.01} {
+			c.lastSampledPressureBits.Store(math.Float64bits(bad))
+			assert.Panics(t, func() {
+				c.checkInvariants()
+			})
+		}
+	})
+
+	t.Run("Telemetry_DeleteDeletedExceedsEvictionsDeleted", func(t *testing.T) {
+		// Arrange
+		c := NewMapCache[testData](100, testDataWeigher).(*mapCache[testData])
+		c.deleteDeleted = 2
+		c.evictionsDeleted = 1
+
+		// Act & Assert
+		assert.Panics(t, func() {
+			c.checkInvariants()
+		})
+	})
+
+	t.Run("Telemetry_ReplaceSelfEvictedExceedsEvictionsCapacity", func(t *testing.T) {
+		// Arrange
+		c := NewMapCache[testData](100, testDataWeigher).(*mapCache[testData])
+		c.replaceSelfEvicted = 2
+		c.evictionsCapacity = 1
+
+		// Act & Assert
+		assert.Panics(t, func() {
+			c.checkInvariants()
+		})
+	})
+
+	t.Run("Telemetry_UpdatesMismatchEvictionsReplaced", func(t *testing.T) {
+		// Arrange
+		c := NewMapCache[testData](100, testDataWeigher).(*mapCache[testData])
+		c.putUpdated = 1
+		c.replaceUpdated = 1
+		c.evictionsReplaced = 1
+
+		// Act & Assert
+		assert.Panics(t, func() {
+			c.checkInvariants()
+		})
+	})
+
+	t.Run("Telemetry_PressureShedsExceedsEvictionsPressure", func(t *testing.T) {
+		// Arrange
+		c := NewMapCache[testData](100, testDataWeigher).(*mapCache[testData])
+		c.pressureShedsInline = 1
+		c.pressureShedsExplicit = 1
+		c.evictionsPressure = 1
+
+		// Act & Assert
+		assert.Panics(t, func() {
+			c.checkInvariants()
+		})
+	})
+
+	t.Run("Telemetry_ConservationEquationMismatch", func(t *testing.T) {
+		// Arrange
+		c := NewMapCache[testData](100, testDataWeigher).(*mapCache[testData])
+		_, err := c.Put("k1", testData{value: 1, dataSize: 10})
+		require.NoError(t, err)
+		c.putInserted = 5
+
+		// Act & Assert
+		assert.Panics(t, func() {
+			c.checkInvariants()
+		})
+	})
+}
+
+func TestPressureClampingPositiveInfinity(t *testing.T) {
+	// Arrange
+	c := NewMapCache[testData](
+		100,
+		WithInvariantChecking(true),
+		testDataWeigher,
+		WithPressureFunc(func() float64 { return math.Inf(1) }),
+	)
+
+	// Act
+	_, err := c.Put("k1", testData{value: 1, dataSize: 10})
+	require.NoError(t, err)
+	st := c.Stats()
+
+	// Assert
+	assert.InDelta(t, 1.0, st.MemoryPressure, 0.0)
 }
 
 func TestMapCache_Compact(t *testing.T) {

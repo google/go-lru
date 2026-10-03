@@ -116,18 +116,23 @@ jobs:
       - name: Generate Code Coverage Report & Summary
         run: |
           go tool cover -func=coverage.out | tee coverage.txt
+          go tool cover -func=otellru/coverage-otellru.out | tee coverage-otellru.txt
           TOTAL_COV=$(tail -n 1 coverage.txt | awk '{print $3}')
+          OTEL_COV=$(tail -n 1 coverage-otellru.txt | awk '{print $3}')
           {
             echo "## ✅ Correctness, Concurrency & Coverage Summary"
             echo ""
             echo "- **Race Detector (\`-race\`)**: Passed"
             echo "- **Unit, Differential & Concurrency Suites**: Passed"
-            echo "- **Total Statement Coverage**: **${TOTAL_COV}**"
+            echo "- **Root Statement Coverage**: **${TOTAL_COV}**"
+            echo "- **otellru Statement Coverage**: **${OTEL_COV}**"
             echo ""
             echo "<details><summary>Per-Function Coverage Breakdown</summary>"
             echo ""
             echo '```text'
             cat coverage.txt
+            echo ""
+            cat coverage-otellru.txt
             echo '```'
             echo "</details>"
           } >> "$GITHUB_STEP_SUMMARY"
@@ -139,4 +144,6 @@ jobs:
           path: |
             coverage.out
             coverage.txt
+            otellru/coverage-otellru.out
+            coverage-otellru.txt
           retention-days: 14

@@ -157,6 +157,7 @@ type pressureState struct {
 	pressureSampleSeq        atomic.Uint64
 	pressureInvokeSeq        atomic.Uint64
 	pressureMaxStoredSeq     atomic.Uint64
+	lastSampledSeq           atomic.Uint64
 	cachedPressureBits       atomic.Uint64
 	cachedPressureEpoch      atomic.Uint64
 	reclaimEpoch             atomic.Uint64
@@ -274,9 +275,6 @@ func (p *pressureState) resolvePostRetryPressureLocked(sampledEpoch uint64, pres
 		resolvedEpoch = currentEpoch
 		resolvedPressure = 0.0
 	}
-	if p.hasValidSample {
-		p.lastSampledPressureBits.Store(math.Float64bits(resolvedPressure))
-	}
 	p.resetZeroWatermarkBelowTier2(resolvedPressure)
 	return resolvedEpoch, resolvedPressure
 }
@@ -307,7 +305,10 @@ func (p *pressureState) storeSampledPressureWithSeq(epoch, extEpoch, invokeSeq u
 	p.pressureWriteMu.Lock()
 	defer p.pressureWriteMu.Unlock()
 
-	if invokeSeq == 0 || invokeSeq >= p.pressureMaxStoredSeq.Load() {
+	if invokeSeq == 0 || invokeSeq >= p.lastSampledSeq.Load() {
+		if invokeSeq > p.lastSampledSeq.Load() {
+			p.lastSampledSeq.Store(invokeSeq)
+		}
 		p.lastSampledPressureBits.Store(math.Float64bits(val))
 	}
 
@@ -368,6 +369,8 @@ func (p *pressureState) invokeAndStorePressure(gid uint64, slot int) (uint64, fl
 	val := p.options.PressureFunc()
 	if math.IsNaN(val) || val < 0.0 {
 		val = 0.0
+	} else if math.IsInf(val, 1) {
+		val = 1.0
 	}
 	epoch, val, _ = p.storeSampledPressureWithSeq(epoch, extEpoch, invokeSeq, val, gid, slot)
 	return epoch, val, true
@@ -673,7 +676,7 @@ func (p *pressureState) checkTelemetryInvariants(currentLen int) {
 		panic(fmt.Sprintf("lru invariant violation: currentLen %d exceeds peakEntryLen %d", currentLen, p.peakEntryLen))
 	}
 	lastPressure := math.Float64frombits(p.lastSampledPressureBits.Load())
-	if math.IsNaN(lastPressure) || lastPressure < 0.0 {
+	if math.IsNaN(lastPressure) || math.IsInf(lastPressure, 0) || lastPressure < 0.0 {
 		panic(fmt.Sprintf("lru invariant violation: invalid lastSampledPressure %v", lastPressure))
 	}
 	totalRemovals := p.evictionsCapacity + p.evictionsPressure + p.evictionsDeleted

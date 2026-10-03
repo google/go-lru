@@ -971,7 +971,6 @@ func (c *radixCache[V]) DeletePrefix(prefix string) {
 		if !hadEntries && !hadDirtySlack && c.peakEntryLen == 0 {
 			return
 		}
-		hadCompactionSlack := c.hasEmptyDeleteSlack(false)
 		hadReclaimable := c.currentSize > 0 || hadDirtySlack
 		if c.root != nil {
 			c.sweepAndUnlink(c.root)
@@ -982,6 +981,7 @@ func (c *radixCache[V]) DeletePrefix(prefix string) {
 		c.tail = nil
 		c.currentSize = 0
 		c.len = 0
+		hadCompactionSlack := c.hasEmptyDeleteSlack(false)
 		c.clearEmptyTreeStateLocked()
 		if hadCompactionSlack {
 			c.compactionsAutoSlack++

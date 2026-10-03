@@ -540,7 +540,7 @@ func TestConcurrency_MemoryPressureCompactionAndEviction(t *testing.T) {
 							cache.DeletePrefix(prefix)
 						case op < 97:
 							st := cache.Stats()
-							assert.Equal(t, uint64(capacity), st.MaxSize) //nolint:testifylint // wg.Go runs in a child goroutine
+							assert.Equal(t, uint64(capacity), st.MaxSize)
 						case op < 99:
 							reclaimer.Compact()
 						default:
@@ -758,7 +758,7 @@ func TestConcurrency_StatsAndPressureUnderRace(t *testing.T) {
 					var prev lru.Stats
 					for !stopReaders.Load() {
 						cur := cache.Stats()
-						assert.Equal(t, uint64(capacity), cur.MaxSize) //nolint:testifylint // wg.Go runs in a child goroutine
+						assert.Equal(t, uint64(capacity), cur.MaxSize)
 						assert.LessOrEqual(t, cur.CurrentSize, cur.MaxSize)
 						assert.GreaterOrEqual(t, cur.Len, 0)
 						assert.GreaterOrEqual(t, cur.ZeroSizeCount, 0)

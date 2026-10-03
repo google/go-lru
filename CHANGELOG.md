@@ -51,21 +51,25 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## Release & Versioning Workflow
 
-To cut a new semantic version release (e.g. `v0.0.1`):
+To cut a new semantic version release (e.g. `v0.0.1` and `otellru/v0.0.1`):
 
 ```bash
-# 1. Verify formatting, static analysis, race-enabled test suite, and examples
+# 1. Verify formatting, static analysis, race-enabled test suite, and examples (root and otellru)
 test -z "$(gofmt -s -l .)"
 test -z "$(goimports -l .)"
 go vet ./...
 golangci-lint run
 go test -race ./...
 go test -v -run=^Example ./...
+(cd otellru && go vet ./... && golangci-lint run && go test -race ./... && go test -v -run=^Example ./...)
 
 # 2. Verify benchmark & resource usage suite
 go test -run=^$ -bench=. -benchmem -benchtime=10ms ./...
+(cd otellru && go test -run=^$ -bench=. -benchmem -benchtime=10ms ./...)
 
-# 3. Create and push annotated semantic version tag
+# 3. Update otellru/go.mod to require github.com/google/go-lru v0.0.1 (if releasing together),
+#    then create and push annotated semantic version tags
 git tag -a v0.0.1 -m "Release v0.0.1"
+git tag -a otellru/v0.0.1 -m "Release otellru/v0.0.1"
 git push origin --tags
 ```

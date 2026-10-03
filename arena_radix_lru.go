@@ -658,8 +658,9 @@ func (c *arenaRadix[V]) DeletePrefix(prefix string) {
 		if !hadEntries && !hadDirtySlack && c.peakEntryLen == 0 && len(c.nodes) <= 1 {
 			return
 		}
-		hadCompactionSlack := c.hasEmptyDeleteSlack(c.freeCount >= 64)
 		hadReclaimable := c.currentSize > 0 || hadDirtySlack
+		c.deletedSinceCompact += c.len
+		hadCompactionSlack := c.hasEmptyDeleteSlack(len(c.nodes)-1 >= 64)
 		if (c.onEvictValue != nil || c.onEvictEntry != nil) && c.len > 0 {
 			var zero V
 			for currID := c.head; currID != nilNode; {
