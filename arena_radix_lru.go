@@ -299,6 +299,8 @@ func (c *arenaRadix[V]) checkInvariants() {
 	if treeNodeCount+freeCount != len(c.nodes) {
 		panic(fmt.Sprintf("arenaRadix invariant violation: live tree nodes (%d) + free list nodes (%d) != len(nodes) (%d)", treeNodeCount, freeCount, len(c.nodes)))
 	}
+
+	c.checkTelemetryInvariants(c.len)
 }
 
 func (c *arenaRadix[V]) unlock() {
@@ -337,6 +339,9 @@ func (c *arenaRadix[V]) EvaluateMemoryPressure() []V {
 func (c *arenaRadix[V]) finishDeleteReclaimLocked(sizeBefore, sampledEpoch uint64, pressure float64) {
 	if c.len == 0 {
 		hadSlack := c.hasEmptyDeleteSlack(c.freeCount >= 64)
+		if hadSlack {
+			c.recordCompactionByPressure(pressure)
+		}
 		c.clearEmptyArenaStateLocked()
 		if (hadSlack || sizeBefore > 0) && c.reclaimEpoch.Load() == sampledEpoch && c.hasElevatedPressureToInvalidate(pressure) {
 			c.markReclaimedLocked()
@@ -345,7 +350,9 @@ func (c *arenaRadix[V]) finishDeleteReclaimLocked(sizeBefore, sampledEpoch uint6
 	}
 	reclaimedSingleSurvivor := false
 	if c.shouldReclaimSingleSurvivorOnDelete(c.len, c.freeCount > 0 || c.nodeMapDirty, c.freeCount >= 63) {
-		c.compactDataStructuresLocked()
+		if c.compactDataStructuresLocked() {
+			c.recordCompactionByPressure(pressure)
+		}
 		reclaimedSingleSurvivor = true
 	}
 	c.maybeReclaimUnderPressureLocked(pressure, foregroundNoProtect)
@@ -354,7 +361,7 @@ func (c *arenaRadix[V]) finishDeleteReclaimLocked(sizeBefore, sampledEpoch uint6
 	}
 }
 
-func (c *arenaRadix[V]) finishMutationReclaimLocked(evictedValues []V, protectedID uint32, reclaimedPre bool, sizeBefore, sampledEpoch uint64, pressure float64) []V {
+func (c *arenaRadix[V]) finishMutationReclaimLocked(evictedValues []V, protectedID uint32, reclaimedPre, compactedPre bool, sizeBefore, sampledEpoch uint64, pressure float64) []V {
 	evictedByPressure := c.maybeReclaimUnderPressureLocked(pressure, protectedID)
 	if len(evictedValues) == 0 {
 		evictedValues = evictedByPressure
@@ -363,7 +370,9 @@ func (c *arenaRadix[V]) finishMutationReclaimLocked(evictedValues []V, protected
 	}
 	netByteReduced := c.currentSize < sizeBefore
 	if c.shouldCompactAfterMutation(reclaimedPre, netByteReduced, c.isDirtyLocked(), pressure) {
-		c.compactDataStructuresLocked()
+		if c.compactDataStructuresLocked() && !compactedPre {
+			c.recordCompactionByPressure(pressure)
+		}
 	}
 	if c.shouldMarkReclaimedAfterMutation(reclaimedPre, netByteReduced, sampledEpoch, pressure) {
 		c.markReclaimedLocked()
@@ -379,6 +388,7 @@ func (c *arenaRadix[V]) finishMutationReclaimLocked(evictedValues []V, protected
 func (c *arenaRadix[V]) Put(key string, value V) ([]V, error) {
 	valueSize := c.weigh(key, value)
 	if valueSize > c.maxSize {
+		c.putRejectedOversized.Add(1)
 		return nil, ErrInvalidEntrySize
 	}
 
@@ -388,6 +398,7 @@ func (c *arenaRadix[V]) Put(key string, value V) ([]V, error) {
 	var evictedValues []V
 	sizeBefore := c.currentSize
 	reclaimedPrePut := false
+	compactedPrePut := false
 	evictedPrePut := false
 	keyHash := hashString(key)
 
@@ -395,9 +406,10 @@ func (c *arenaRadix[V]) Put(key string, value V) ([]V, error) {
 	if exists {
 		// Updating an existing key requires 0 new node allocations and 0 trie walks.
 		oldValue := c.nodes[nodeID].value
-		c.onEntrySizeUpdated(c.nodes[nodeID].size, valueSize)
+		oldSize := c.nodes[nodeID].size
+		c.onEntrySizeUpdated(oldSize, valueSize)
 		c.moveToFront(nodeID)
-		c.currentSize -= c.nodes[nodeID].size
+		c.currentSize -= oldSize
 		for valueSize > c.maxSize-c.currentSize && c.tail != nilNode && c.tail != nodeID {
 			if evicted, ok := c.evictOne(); ok {
 				evictedValues = append(evictedValues, evicted)
@@ -411,7 +423,8 @@ func (c *arenaRadix[V]) Put(key string, value V) ([]V, error) {
 		if evictedPrePut {
 			c.nodeMap[keyHash] = nodeID
 		}
-		c.notifyEvict(key, oldValue, EvictionReasonReplaced)
+		c.putUpdated++
+		c.notifyEvict(key, oldValue, oldSize, EvictionReasonReplaced)
 		reclaimedPrePut = c.shouldReclaimSingleSurvivorOnMutation(c.len, c.freeCount > 0 || c.nodeMapDirty, c.freeCount >= 63, evictedPrePut, c.currentSize, sizeBefore, pressure)
 	} else {
 		// A single new-key insert can allocate up to 2 nodes (one routing node, one leaf).
@@ -432,8 +445,10 @@ func (c *arenaRadix[V]) Put(key string, value V) ([]V, error) {
 			}
 		}
 		if c.shouldReclaimEmptyPrePut(c.len, c.freeCount >= 64, evictedPrePut, valueSize, sizeBefore, pressure) {
+			c.recordCompactionByPressure(pressure)
 			c.clearEmptyArenaStateLocked()
 			reclaimedPrePut = true
+			compactedPrePut = true
 		} else if c.shouldReclaimSingleSurvivorOnMutation(c.len, c.freeCount > 0 || c.nodeMapDirty, c.freeCount >= 63, evictedPrePut, c.currentSize+valueSize, sizeBefore, pressure) {
 			reclaimedPrePut = true
 		}
@@ -441,12 +456,13 @@ func (c *arenaRadix[V]) Put(key string, value V) ([]V, error) {
 		nodeID = c.insertNode(key, value)
 		c.nodes[nodeID].size = valueSize
 		c.pushFront(nodeID)
+		c.putInserted++
 		c.onEntryPut(c.len, valueSize)
 		c.currentSize += valueSize
 		c.nodeMap[keyHash] = nodeID
 	}
 
-	evictedValues = c.finishMutationReclaimLocked(evictedValues, nodeID, reclaimedPrePut, sizeBefore, sampledEpoch, pressure)
+	evictedValues = c.finishMutationReclaimLocked(evictedValues, nodeID, reclaimedPrePut, compactedPrePut, sizeBefore, sampledEpoch, pressure)
 	return evictedValues, nil
 }
 
@@ -458,14 +474,17 @@ func (c *arenaRadix[V]) Delete(key string) (value V, ok bool) {
 	keyHash := hashString(key)
 	nodeID, found := c.lookupNodeKeyWithHash(key, keyHash)
 	if !found {
+		c.deleteNotFound++
 		return value, false
 	}
 
 	sizeBefore := c.currentSize
 	deleted, erased := c.eraseInternalWithHash(nodeID, keyHash, key, EvictionReasonDeleted)
 	if !erased {
+		c.deleteNotFound++
 		return value, false
 	}
+	c.deleteDeleted++
 	c.finishDeleteReclaimLocked(sizeBefore, sampledEpoch, pressure)
 	return deleted, true
 }
@@ -479,8 +498,10 @@ func (c *arenaRadix[V]) Get(key string) (value V, ok bool) {
 	keyHash := hashString(key)
 	nodeID, found := c.getNodeKeyWithHash(key, keyHash)
 	if !found {
+		c.getMisses++
 		return value, false
 	}
+	c.getHits++
 	c.moveToFront(nodeID)
 
 	return c.nodes[nodeID].value, true
@@ -494,8 +515,10 @@ func (c *arenaRadix[V]) Peek(key string) (value V, ok bool) {
 
 	nodeID, found := c.getNodeKey(key)
 	if !found {
+		c.peekMisses.Add(1)
 		return value, false
 	}
+	c.peekHits.Add(1)
 
 	return c.nodes[nodeID].value, true
 }
@@ -516,6 +539,7 @@ func (c *arenaRadix[V]) Replace(key string, value V) error {
 	keyHash := hashString(key)
 	nodeID, ok := c.lookupNodeKeyWithHash(key, keyHash)
 	if !ok {
+		c.replaceNotFound++
 		return ErrEntryNotExist
 	}
 
@@ -523,6 +547,7 @@ func (c *arenaRadix[V]) Replace(key string, value V) error {
 	oldValue := c.nodes[nodeID].value
 
 	if newSize > c.maxSize {
+		c.replaceSelfEvicted++
 		sizeBefore := c.currentSize
 		c.eraseInternalWithHash(nodeID, keyHash, key, EvictionReasonCapacity)
 		c.finishDeleteReclaimLocked(sizeBefore, sampledEpoch, pressure)
@@ -568,6 +593,7 @@ func (c *arenaRadix[V]) Replace(key string, value V) error {
 				tailCurr = c.nodes[tailCurr].prev
 			}
 			if !canFit {
+				c.replaceSelfEvicted++
 				c.eraseInternalWithHash(nodeID, keyHash, key, EvictionReasonCapacity)
 				c.finishDeleteReclaimLocked(sizeBefore, sampledEpoch, pressure)
 				return nil
@@ -603,14 +629,15 @@ func (c *arenaRadix[V]) Replace(key string, value V) error {
 	if !hadPrevMapped || prevMappedID != nodeID {
 		c.nodeMap[keyHash] = nodeID
 	}
-	c.notifyEvict(key, oldValue, EvictionReasonReplaced)
+	c.replaceUpdated++
+	c.notifyEvict(key, oldValue, oldSize, EvictionReasonReplaced)
 	reclaimedPreUpdate = c.shouldReclaimSingleSurvivorOnMutation(c.len, c.freeCount > 0 || c.nodeMapDirty, c.freeCount >= 63, evictedAny, c.currentSize, sizeBefore, pressure)
 
 	protectedID := foregroundNoProtect
 	if nodeID == c.head && c.nodes[nodeID].hasValue {
 		protectedID = nodeID
 	}
-	c.finishMutationReclaimLocked(nil, protectedID, reclaimedPreUpdate, sizeBefore, sampledEpoch, pressure)
+	c.finishMutationReclaimLocked(nil, protectedID, reclaimedPreUpdate, false, sizeBefore, sampledEpoch, pressure)
 	if c.nodeMapDirty && (nodeID >= uint32(len(c.nodes)) || !c.nodes[nodeID].hasValue) &&
 		hadPrevMapped && prevMappedID != nodeID && prevMappedID < uint32(len(c.nodes)) && c.nodes[prevMappedID].hasValue {
 		c.nodeMap[keyHash] = prevMappedID
@@ -625,11 +652,13 @@ func (c *arenaRadix[V]) DeletePrefix(prefix string) {
 		c.mu.Lock()
 		defer c.unlock()
 
+		c.deletePrefixExecuted++
 		hadEntries := c.len > 0
 		hadDirtySlack := c.freeCount > 0 || c.nodeMapDirty || c.peakEntryLen > 8 || c.deletedSinceCompact > 0 || (c.len == 0 && cap(c.nodes) > 1)
 		if !hadEntries && !hadDirtySlack && c.peakEntryLen == 0 && len(c.nodes) <= 1 {
 			return
 		}
+		hadCompactionSlack := c.hasEmptyDeleteSlack(c.freeCount >= 64)
 		hadReclaimable := c.currentSize > 0 || hadDirtySlack
 		if (c.onEvictValue != nil || c.onEvictEntry != nil) && c.len > 0 {
 			var zero V
@@ -640,16 +669,23 @@ func (c *arenaRadix[V]) DeletePrefix(prefix string) {
 					key = c.reconstructKey(currID)
 				}
 				evictedVal := c.nodes[currID].value
-				c.currentSize -= c.nodes[currID].size
+				evictedSize := c.nodes[currID].size
+				c.currentSize -= evictedSize
 				c.remove(currID)
 				c.nodes[currID].value = zero
 				c.nodes[currID].hasValue = false
 				c.nodes[currID].size = 0
-				c.notifyEvict(key, evictedVal, EvictionReasonDeleted)
+				c.notifyEvict(key, evictedVal, evictedSize, EvictionReasonDeleted)
 				currID = nextID
 			}
+		} else if c.len > 0 {
+			c.evictionsDeleted += uint64(c.len)
+			c.evictedWeightDeleted += c.currentSize
 		}
 		c.clearEmptyArenaStateLocked()
+		if hadCompactionSlack {
+			c.compactionsAutoSlack++
+		}
 		if hadReclaimable && c.hasElevatedPressureToInvalidate(0.0) {
 			c.markReclaimedLocked()
 		}
@@ -659,6 +695,7 @@ func (c *arenaRadix[V]) DeletePrefix(prefix string) {
 	sampledEpoch, pressure := c.lockWithPressure(&c.mu, false)
 	defer c.unlock()
 
+	c.deletePrefixExecuted++
 	nodeID := c.root
 	search := prefix
 
@@ -717,8 +754,9 @@ func (c *arenaRadix[V]) freeSubtree(nodeID uint32) {
 				key = c.reconstructKey(currID)
 			}
 			evictedVal := c.nodes[currID].value
-			c.onEntryDeleted(c.nodes[currID].size)
-			c.currentSize -= c.nodes[currID].size
+			evictedSize := c.nodes[currID].size
+			c.onEntryDeleted(evictedSize)
+			c.currentSize -= evictedSize
 			c.remove(currID)
 			c.nodeMapDirty = true
 			if mappedID, ok := c.nodeMap[currHash]; ok && mappedID == currID {
@@ -727,7 +765,7 @@ func (c *arenaRadix[V]) freeSubtree(nodeID uint32) {
 			c.nodes[currID].value = zero
 			c.nodes[currID].hasValue = false
 			c.nodes[currID].size = 0
-			c.notifyEvict(key, evictedVal, EvictionReasonDeleted)
+			c.notifyEvict(key, evictedVal, evictedSize, EvictionReasonDeleted)
 		}
 
 		if c.nodes[currID].child != nilNode {
@@ -804,4 +842,20 @@ func (c *arenaRadix[V]) values(yield func(V) bool) {
 			return
 		}
 	}
+}
+
+// Stats returns a point-in-time, zero-allocation telemetry snapshot of the cache's
+// occupancy, lookup performance, mutations, evictions, compactions, memory pressure,
+// and contiguous arena node mechanics.
+func (c *arenaRadix[V]) Stats() Stats {
+	c.mu.RLock()
+	defer c.rUnlock()
+
+	st := c.snapshotBaseStats(BackendArenaRadix, c.currentSize, c.maxSize, c.len)
+	freeCount := int(c.freeCount)
+	st.ArenaLiveNodes = max(len(c.nodes)-1-freeCount, 0)
+	st.ArenaFreeNodes = freeCount
+	st.ArenaUnallocatedCap = max(cap(c.nodes)-len(c.nodes), 0)
+	st.ArenaHashFallbacks = c.arenaHashFallbacks.Load()
+	return st
 }

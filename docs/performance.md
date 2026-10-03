@@ -20,6 +20,7 @@ All reference benchmarks were collected on an **Intel Xeon CPU @ 2.60GHz (96 vCP
 | **Put (`Benchmark_Put_*`, 50%-Capacity Turnover)**¹ | **383–466 ns/op** (96–144 B, 3 allocs/op) | 472–511 ns/op (132–135 B, 3 allocs/op) | 515–822 ns/op (49–65 B, 2 allocs/op) |
 | **Replace Value (`Replace`)**² | **71.3 ns/op** (0 B internal, 0 allocs) | 121.4 ns/op (0 B, 0 allocs) | 124.4 ns/op (0 B, 0 allocs) |
 | **Individual Delete (`Delete`)** | 237.9 ns/op (0 B, 0 allocs) | **147.7 ns/op** (0 B, 0 allocs) | 310.6 ns/op (0 B, 0 allocs) |
+| **Stats Snapshot (`Stats()`)** | **~16 ns/op** (0 B, 0 allocs) | **~16 ns/op** (0 B, 0 allocs) | **~17 ns/op** (0 B, 0 allocs) |
 
 > ¹ **Existing-key overwrite `Put`** (when the working set fits within `maxSize`) updates the entry in place with **0 B, 0 allocs/op** across `MapCache`, `RadixCache`, and `ArenaRadixCache`, and a new-entry `Put` into a warm `MapCache` allocates only **1 heap node (`*entry[V]`)** thanks to its generic intrusive doubly-linked list (`entryList[V]`). By contrast, `Benchmark_Put_*` configures `capacity := uint64(len(keys) * 5)` (50,000 B for a 10,000-key × 10 B working set, holding 5,000 of the 10,000 keys), exercising **50%-capacity turnover `Put`** where every `Put` after warmup is a new-key write paired with an LRU tail eviction: `MapCache` and `RadixCache` perform **3 allocs/op** (`strings.Clone` + intrusive `*entry[V]` or `*radixNode[V]` + evicted `[]V` slice), whereas `ArenaRadixCache` performs **2 allocs/op** (`strings.Clone` + evicted `[]V` slice, with **0 node allocations** thanks to intrusive free-list node recycling).
 >
@@ -28,7 +29,7 @@ All reference benchmarks were collected on an **Intel Xeon CPU @ 2.60GHz (96 vCP
 ### Key Takeaways
 - **`MapCache`** achieves the lowest single-key point lookup (~50 ns) and write (~98 ns in-place overwrite; ~383–466 ns under 50%-capacity turnover) latency when keys are flat and prefix operations are rare.
 - **`ArenaRadixCache`** accelerates radix lookups by **1.6x–1.7x** over `RadixCache` (~100 ns vs ~170 ns) via its 64-bit FNV-1a index and zero-allocation bottom-up key verifier (`verifyKey`).
-- All three backends (**`MapCache`**, **`RadixCache`**, and **`ArenaRadixCache`**) perform in-place value updates (`Replace` and existing-key `Put` overwrites) with **0 internal heap allocations per operation**, and `ArenaRadixCache` recycles deleted node indices in steady state via its intrusive free-list (`2 allocs/op` vs `3 allocs/op` during 50%-capacity turnover).
+- All three backends (**`MapCache`**, **`RadixCache`**, and **`ArenaRadixCache`**) perform in-place value updates (`Replace` and existing-key `Put` overwrites) and telemetry snapshots (`Stats()`) with **0 internal heap allocations per operation**, and `ArenaRadixCache` recycles deleted node indices in steady state via its intrusive free-list (`2 allocs/op` vs `3 allocs/op` during 50%-capacity turnover).
 
 ---
 
@@ -64,8 +65,8 @@ In addition to reported `b.ReportAllocs()` (`B/op` and `allocs/op`), `Benchmark_
 # Run the complete benchmark suite with memory & custom resource metrics
 go test -run=^$ -bench=. -benchmem ./...
 
-# Run point get, peek, put, replace, and delete benchmarks
-go test -run=^$ -bench="Benchmark_(Put|Get|Peek|Replace|Delete)" -benchmem ./...
+# Run point get, peek, put, replace, delete, and stats snapshot benchmarks
+go test -run=^$ -bench="Benchmark_(Put|Get|Peek|Replace|Delete|Stats)" -benchmem ./...
 
 # Run multi-core parallel throughput benchmarks (Mixed, ReadHeavy, WriteHeavy)
 go test -run=^$ -bench="Benchmark_ParallelThroughput" -benchmem ./...

@@ -1921,3 +1921,147 @@ func TestArenaRadixCache_Iterators(t *testing.T) {
 		assertEvictedValues(t, evicted, []int64{1})
 	})
 }
+
+func TestArenaRadixCache_StatsArenaNodesAndHashFallbacks(t *testing.T) {
+	t.Run("ArenaLiveFreeAndUnallocatedCapLifecycle", func(t *testing.T) {
+		// Arrange
+		c := NewArenaRadixCache[testData](1000, WithInvariantChecking(true), testDataWeigher).(PressureAwareCache[testData])
+
+		// 1. Initial empty state: root node at index 0 is excluded from ArenaLiveNodes.
+		st0 := c.Stats()
+		assert.Equal(t, BackendArenaRadix, st0.Backend)
+		assert.Zero(t, st0.ArenaLiveNodes)
+		assert.Zero(t, st0.ArenaFreeNodes)
+		assert.GreaterOrEqual(t, st0.ArenaUnallocatedCap, 0)
+
+		// 2. Insert two keys sharing a prefix ("dir/alpha" and "dir/beta"):
+		// creates 1 intermediate routing node ("dir/") + 2 leaf value nodes = 3 ArenaLiveNodes, Len = 2.
+		_, err := c.Put("dir/alpha", testData{value: 1, dataSize: 10})
+		require.NoError(t, err)
+		_, err = c.Put("dir/beta", testData{value: 2, dataSize: 10})
+		require.NoError(t, err)
+
+		stAfterPut := c.Stats()
+		assert.Equal(t, 2, stAfterPut.Len)
+		assert.Equal(t, 3, stAfterPut.ArenaLiveNodes)
+		assert.Zero(t, stAfterPut.ArenaFreeNodes)
+
+		// 3. Delete "dir/beta": leaf is freed AND "dir/" + "alpha" compress into a single leaf "dir/alpha",
+		// leaving 1 live node ("dir/alpha") and 2 free nodes on the arena free-list.
+		_, ok := c.Delete("dir/beta")
+		require.True(t, ok)
+
+		stAfterDelete := c.Stats()
+		assert.Equal(t, 1, stAfterDelete.Len)
+		assert.Equal(t, 1, stAfterDelete.ArenaLiveNodes)
+		assert.Equal(t, 2, stAfterDelete.ArenaFreeNodes)
+
+		// 4. Re-insert "dir/gamma": splits "dir/alpha" into routing "dir/" + 2 leaves,
+		// recycling both free-list nodes so ArenaFreeNodes drains back to 0 and ArenaLiveNodes becomes 3.
+		_, err = c.Put("dir/gamma", testData{value: 3, dataSize: 10})
+		require.NoError(t, err)
+
+		stAfterReuse := c.Stats()
+		assert.Equal(t, 2, stAfterReuse.Len)
+		assert.Equal(t, 3, stAfterReuse.ArenaLiveNodes)
+		assert.Zero(t, stAfterReuse.ArenaFreeNodes)
+
+		// 5. Delete "dir/gamma" again to create free-list slack, then Compact() to reset ArenaFreeNodes to 0.
+		_, ok = c.Delete("dir/gamma")
+		require.True(t, ok)
+		require.Equal(t, 2, c.Stats().ArenaFreeNodes)
+
+		c.Compact()
+		stAfterCompact := c.Stats()
+		assert.Equal(t, 1, stAfterCompact.Len)
+		assert.Equal(t, 1, stAfterCompact.ArenaLiveNodes)
+		assert.Zero(t, stAfterCompact.ArenaFreeNodes)
+		assert.Equal(t, uint64(1), stAfterCompact.CompactionsExplicit)
+	})
+
+	t.Run("DisplacedAndCollidingNodeMapSlotsTriggerArenaHashFallbacks", func(t *testing.T) {
+		// White-box testing rationale: FNV-1a 64-bit hash collisions are astronomically rare for natural
+		// keys, so verifying that displaced or colliding nodeMap entries fall back to radix tree traversal
+		// and increment Stats().ArenaHashFallbacks across Peek, Get, Replace, Put, and Delete requires
+		// directly mutating c.nodeMap in a package-internal test.
+
+		// Part A: Displaced slot (delete from nodeMap) with invariant checking enabled.
+		cDisplaced := NewArenaRadixCache[testData](1000, WithInvariantChecking(true), testDataWeigher).(*arenaRadix[testData])
+		_, err := cDisplaced.Put("dir/alpha", testData{value: 10, dataSize: 10})
+		require.NoError(t, err)
+		_, err = cDisplaced.Put("dir/beta", testData{value: 20, dataSize: 10})
+		require.NoError(t, err)
+
+		hAlpha := hashString("dir/alpha")
+
+		// Displace "dir/alpha" from nodeMap and verify Peek falls back to radix tree and increments ArenaHashFallbacks.
+		delete(cDisplaced.nodeMap, hAlpha)
+		v, ok := cDisplaced.Peek("dir/alpha")
+		require.True(t, ok)
+		assert.Equal(t, int64(10), v.value)
+		assert.Equal(t, uint64(1), cDisplaced.Stats().ArenaHashFallbacks)
+
+		// Verify Get falls back to radix tree, heals nodeMap[hAlpha], and increments ArenaHashFallbacks.
+		v, ok = cDisplaced.Get("dir/alpha")
+		require.True(t, ok)
+		assert.Equal(t, int64(10), v.value)
+		assert.Equal(t, uint64(2), cDisplaced.Stats().ArenaHashFallbacks)
+
+		// Re-displace after Get healed nodeMap[hAlpha], then verify Replace falls back to radix tree and increments ArenaHashFallbacks.
+		delete(cDisplaced.nodeMap, hAlpha)
+		err = cDisplaced.Replace("dir/alpha", testData{value: 11, dataSize: 10})
+		require.NoError(t, err)
+		assert.Equal(t, uint64(3), cDisplaced.Stats().ArenaHashFallbacks)
+
+		// Re-displace after Replace healed nodeMap[hAlpha], then verify Delete falls back to radix tree and increments ArenaHashFallbacks.
+		delete(cDisplaced.nodeMap, hAlpha)
+		v, ok = cDisplaced.Delete("dir/alpha")
+		require.True(t, ok)
+		assert.Equal(t, int64(11), v.value)
+		assert.Equal(t, uint64(4), cDisplaced.Stats().ArenaHashFallbacks)
+
+		// Part B: Colliding slot (nodeMap[hAlpha] points to "dir/beta"'s node ID) across Peek, Get, Replace, Put, and Delete.
+		cCollide := NewArenaRadixCache[testData](1000, testDataWeigher).(*arenaRadix[testData])
+		_, err = cCollide.Put("dir/alpha", testData{value: 100, dataSize: 10})
+		require.NoError(t, err)
+		_, err = cCollide.Put("dir/beta", testData{value: 200, dataSize: 10})
+		require.NoError(t, err)
+
+		idBeta := cCollide.nodeMap[hashString("dir/beta")]
+		require.NotZero(t, idBeta)
+
+		// Point hAlpha at idBeta so verifyKey(idBeta, "dir/alpha") returns false.
+		cCollide.nodeMap[hAlpha] = idBeta
+
+		v, ok = cCollide.Peek("dir/alpha")
+		require.True(t, ok)
+		assert.Equal(t, int64(100), v.value)
+		assert.Equal(t, uint64(1), cCollide.Stats().ArenaHashFallbacks)
+
+		v, ok = cCollide.Get("dir/alpha")
+		require.True(t, ok)
+		assert.Equal(t, int64(100), v.value)
+		assert.Equal(t, uint64(2), cCollide.Stats().ArenaHashFallbacks)
+
+		cCollide.nodeMap[hAlpha] = idBeta
+		err = cCollide.Replace("dir/alpha", testData{value: 101, dataSize: 10})
+		require.NoError(t, err)
+		assert.Equal(t, uint64(3), cCollide.Stats().ArenaHashFallbacks)
+
+		// In-place Put on existing "dir/alpha" when nodeMap[hAlpha] collides with idBeta:
+		// traverses the radix tree to update "dir/alpha" in place, heals nodeMap[hAlpha], and increments ArenaHashFallbacks.
+		cCollide.nodeMap[hAlpha] = idBeta
+		evicted, err := cCollide.Put("dir/alpha", testData{value: 102, dataSize: 10})
+		require.NoError(t, err)
+		assert.Empty(t, evicted)
+		assert.Equal(t, uint64(1), cCollide.Stats().PutUpdated)
+		assert.Equal(t, uint64(4), cCollide.Stats().ArenaHashFallbacks)
+
+		// Re-inject collision before Delete to exercise eraseInternalWithHash fallback.
+		cCollide.nodeMap[hAlpha] = idBeta
+		v, ok = cCollide.Delete("dir/alpha")
+		require.True(t, ok)
+		assert.Equal(t, int64(102), v.value)
+		assert.Equal(t, uint64(5), cCollide.Stats().ArenaHashFallbacks)
+	})
+}

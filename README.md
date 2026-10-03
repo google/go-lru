@@ -14,6 +14,9 @@
 
 ```bash
 go get github.com/google/go-lru
+
+# Optional OpenTelemetry asynchronous metric instrumentation submodule:
+go get github.com/google/go-lru/otellru
 ```
 
 ---
@@ -64,6 +67,11 @@ func main() {
 	// 6. Fast O(prefix + subtree) prefix deletion and individual key deletion.
 	cache.DeletePrefix("bucket/dirA/")
 	_, _ = cache.Delete("bucket/dirB/inode-42")
+
+	// 7. Inspect zero-allocation point-in-time telemetry snapshot.
+	st := cache.Stats()
+	fmt.Printf("hits=%d misses=%d entries=%d size=%d/%d\n",
+		st.GetHits, st.GetMisses, st.Len, st.CurrentSize, st.MaxSize)
 }
 ```
 
@@ -81,7 +89,7 @@ Select an engine via `lru.New[V](maxSize, lru.WithBackend(...))` or call its ded
 | **`RadixCache`** | `lru.NewRadixCache[V]` / `WithBackend(BackendRadix)` | `O(K)` (~170 ns / ~172–230 ns in-place, ~472–511 ns turnover) | `O(P + S)` subtree (**20x–88x faster**) | ~94–96 B/entry (**~30–41% less heap**), 0-alloc updates | File paths, object storage namespaces, frequent prefix purges |
 | **`ArenaRadixCache`** | `lru.NewArenaRadixCache[V]` / `WithBackend(BackendArenaRadix)` | `O(1)` hash-accelerated (~100 ns / ~271–472 ns in-place, ~515–822 ns turnover) | `O(P + S)` subtree (**4x–29x faster**) | ~107–111 B/entry, `uint32` slice indices, **two-tier pressure compaction** | 1M+ hierarchical entries, strict GC latency & `GOMEMLIMIT` budgets |
 
-All three backends (`MapCache`, `RadixCache`, and `ArenaRadixCache`) also implement `lru.PressureAwareCache[V]` (exposing `Compact()` and `EvaluateMemoryPressure()`) and provide Go 1.23+ range-over-function iterators (`All() iter.Seq2[string, V]`, `Keys() iter.Seq[string]`, and `Values() iter.Seq[V]`) that traverse live entries in deterministic MRU-to-LRU order under `RLock` without modifying recency (with `0 allocs/op` on `Values()` across all backends). Callers must not invoke write-locking methods on the same `Cache` instance from inside an iterator loop body.
+All three backends (`MapCache`, `RadixCache`, and `ArenaRadixCache`) also implement `lru.PressureAwareCache[V]` (exposing `Compact()` and `EvaluateMemoryPressure()`), expose `Stats() Stats` (`0 allocs/op` point-in-time telemetry snapshot), and provide Go 1.23+ range-over-function iterators (`All() iter.Seq2[string, V]`, `Keys() iter.Seq[string]`, and `Values() iter.Seq[V]`) that traverse live entries in deterministic MRU-to-LRU order under `RLock` without modifying recency (with `0 allocs/op` on `Values()` across all backends). Callers must not invoke write-locking methods on the same `Cache` instance from inside an iterator loop body.
 
 ---
 
@@ -104,9 +112,46 @@ Eviction callbacks receive an `EvictionReason` (`EvictionReasonCapacity`, `Evict
 
 ---
 
+## Observability: `Stats()` & OpenTelemetry (`otellru`)
+
+Every `Cache[V]` exposes a zero-allocation `Stats() lru.Stats` snapshot while keeping the root `github.com/google/go-lru` module 100% dependency-free. For OpenTelemetry metric export, the standalone `github.com/google/go-lru/otellru` submodule registers a single batch `Meter.RegisterCallback` using **exclusively asynchronous/observable counters and gauges** (`0 allocs/op` per scrape, zero synchronous OTel calls on cache hot paths):
+
+```go
+reg, err := otellru.Register(
+	cache,
+	otellru.WithName("metadata-cache"),
+	otellru.WithMeterProvider(meterProvider),
+)
+if err != nil {
+	panic(err)
+}
+defer func() { _ = reg.Unregister() }()
+```
+
+| Metric Name | Instrument | Unit | Attributes (in addition to `cache.backend` & optional `cache.name`) |
+| :--- | :--- | :--- | :--- |
+| `lru.cache.requests` | `Int64ObservableCounter` | `{request}` | `operation`: `"get"` \| `"peek"`, `result`: `"hit"` \| `"miss"` |
+| `lru.cache.evictions` | `Int64ObservableCounter` | `{entry}` | `reason`: `"capacity"` \| `"pressure"` \| `"deleted"` \| `"replaced"` |
+| `lru.cache.evicted_weight` | `Int64ObservableCounter` | `{weight}` | `reason`: `"capacity"` \| `"pressure"` \| `"deleted"` \| `"replaced"` |
+| `lru.cache.size` | `Int64ObservableGauge` | `{weight}` | — |
+| `lru.cache.max_size` | `Int64ObservableGauge` | `{weight}` | — |
+| `lru.cache.entries` | `Int64ObservableGauge` | `{entry}` | — |
+| `lru.cache.zero_weight_entries` | `Int64ObservableGauge` | `{entry}` | — |
+| `lru.cache.mutations` | `Int64ObservableCounter` | `{operation}` | `operation`: `"put"` \| `"replace"` \| `"delete"` \| `"delete_prefix"`, `outcome`: `"inserted"` \| `"updated"` \| `"not_found"` \| `"rejected_oversized"` \| `"self_evicted"` \| `"deleted"` \| `"executed"` |
+| `lru.cache.memory_pressure` | `Float64ObservableGauge` | `1` | — |
+| `lru.cache.compactions` | `Int64ObservableCounter` | `{compaction}` | `trigger`: `"explicit"` \| `"pressure_tier1"` \| `"pressure_tier2"` \| `"auto_slack"` |
+| `lru.cache.pressure_sheds` | `Int64ObservableCounter` | `{event}` | `trigger`: `"inline"` \| `"explicit"` |
+| `lru.cache.reclaim_epochs` | `Int64ObservableCounter` | `{epoch}` | — |
+| `lru.cache.deleted_since_compact` | `Int64ObservableGauge` | `{entry}` | — |
+| `lru.cache.peak_entries` | `Int64ObservableGauge` | `{entry}` | — |
+| `lru.cache.arena.nodes` *(ArenaRadixCache)* | `Int64ObservableGauge` | `{node}` | `state`: `"live"` \| `"free"` \| `"unallocated_cap"` |
+| `lru.cache.arena.hash_fallbacks` *(ArenaRadixCache)* | `Int64ObservableCounter` | `{lookup}` | — |
+
+---
+
 ## Documentation & Verification
 
-- **[Architecture & Memory-Pressure Reclamation (`docs/architecture.md`)](docs/architecture.md)**: Deep dive into `MapCache`, `RadixCache`, and `ArenaRadixCache` node layouts, 32-bit slice arena indexing, FNV-1a lookup acceleration, and Two-Tier Memory-Pressure Reclamation.
+- **[Architecture & Memory-Pressure Reclamation (`docs/architecture.md`)](docs/architecture.md)**: Deep dive into `MapCache`, `RadixCache`, and `ArenaRadixCache` node layouts, 32-bit slice arena indexing, FNV-1a lookup acceleration, Two-Tier Memory-Pressure Reclamation, and `Stats()` / `otellru` observability.
 - **[Benchmarks & Heap Footprint (`docs/performance.md`)](docs/performance.md)**: Empirical latency, prefix deletion speedups, 1M-key true heap footprint tables, and CLI reproduction commands.
 - **[Changelog & Versioning (`CHANGELOG.md`)](CHANGELOG.md)**: Release history and semantic versioning guide.
 
@@ -114,6 +159,7 @@ Eviction callbacks receive an `EvictionReason` (`EvictionReasonCapacity`, `Evict
 # Run unit, differential, concurrency (-race), and runnable Example tests
 go test -race ./...
 go test -v -run=^Example ./...
+cd otellru && go test -race ./... && go test -v -run=^Example ./...
 ```
 
 ---

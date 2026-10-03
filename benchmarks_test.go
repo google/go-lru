@@ -753,3 +753,50 @@ func Benchmark_Values_RadixCache(b *testing.B) { runBenchmarkValues(b, lru.NewRa
 func Benchmark_Values_ArenaRadixCache(b *testing.B) {
 	runBenchmarkValues(b, lru.NewArenaRadixCache[benchValue])
 }
+
+// ============================================================================
+// 12. Stats() Snapshot Benchmarks
+// ============================================================================
+
+var benchSinkStats lru.Stats
+
+func runBenchmarkStats(b *testing.B, constructor func(uint64, ...lru.Option) lru.Cache[benchValue]) {
+	b.Helper()
+	const numKeys = 1000
+	keys, _, _ := generateBenchmarkKeys(20, 50, 2)
+	data := benchValue{val: 1, dataSize: 10}
+	cache := constructor(uint64(numKeys*100), benchWeigher)
+	for _, key := range keys[:numKeys] {
+		_, _ = cache.Put(key, data)
+	}
+
+	b.Run("Sequential", func(b *testing.B) {
+		b.ReportAllocs()
+		b.ResetTimer()
+		var lastStats lru.Stats
+		for b.Loop() {
+			lastStats = cache.Stats()
+		}
+		benchSinkStats = lastStats
+	})
+
+	b.Run("Parallel", func(b *testing.B) {
+		b.ReportAllocs()
+		b.ResetTimer()
+		b.RunParallel(func(pb *testing.PB) {
+			var localStats lru.Stats
+			for pb.Next() {
+				localStats = cache.Stats()
+			}
+			if localStats.Len < 0 {
+				b.Fatal("unreachable negative Len")
+			}
+		})
+	})
+}
+
+func Benchmark_Stats_MapCache(b *testing.B)   { runBenchmarkStats(b, lru.NewMapCache[benchValue]) }
+func Benchmark_Stats_RadixCache(b *testing.B) { runBenchmarkStats(b, lru.NewRadixCache[benchValue]) }
+func Benchmark_Stats_ArenaRadixCache(b *testing.B) {
+	runBenchmarkStats(b, lru.NewArenaRadixCache[benchValue])
+}

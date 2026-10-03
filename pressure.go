@@ -15,6 +15,7 @@
 package lru
 
 import (
+	"fmt"
 	"math"
 	"runtime"
 	"strings"
@@ -107,6 +108,39 @@ type pressureState struct {
 	lastReclaimedZeroCount int
 	lastReclaimedLen       int
 	hasValidSample         bool
+
+	// Telemetry counters protected by the embedding cache's exclusive write lock (mu.Lock).
+	getHits                  uint64
+	getMisses                uint64
+	evictionsCapacity        uint64
+	evictionsPressure        uint64
+	evictionsDeleted         uint64
+	evictionsReplaced        uint64
+	evictedWeightCapacity    uint64
+	evictedWeightPressure    uint64
+	evictedWeightDeleted     uint64
+	evictedWeightReplaced    uint64
+	putInserted              uint64
+	putUpdated               uint64
+	replaceUpdated           uint64
+	replaceNotFound          uint64
+	replaceSelfEvicted       uint64
+	deleteDeleted            uint64
+	deleteNotFound           uint64
+	deletePrefixExecuted     uint64
+	compactionsExplicit      uint64
+	compactionsPressureTier1 uint64
+	compactionsPressureTier2 uint64
+	compactionsAutoSlack     uint64
+	pressureShedsInline      uint64
+	pressureShedsExplicit    uint64
+
+	// Atomic telemetry fields mutated under RLock (Peek) or outside mu.Lock (oversized Put, pressure sampling).
+	peekHits                atomic.Uint64
+	peekMisses              atomic.Uint64
+	putRejectedOversized    atomic.Uint64
+	arenaHashFallbacks      atomic.Uint64
+	lastSampledPressureBits atomic.Uint64
 
 	pressureWriteMu          sync.Mutex
 	samplingPressure         atomic.Bool
@@ -240,6 +274,9 @@ func (p *pressureState) resolvePostRetryPressureLocked(sampledEpoch uint64, pres
 		resolvedEpoch = currentEpoch
 		resolvedPressure = 0.0
 	}
+	if p.hasValidSample {
+		p.lastSampledPressureBits.Store(math.Float64bits(resolvedPressure))
+	}
 	p.resetZeroWatermarkBelowTier2(resolvedPressure)
 	return resolvedEpoch, resolvedPressure
 }
@@ -269,6 +306,10 @@ func (p *pressureState) lockWithPressure(mu *sync.RWMutex, fresh bool) (uint64, 
 func (p *pressureState) storeSampledPressureWithSeq(epoch, extEpoch, invokeSeq uint64, val float64, gid uint64, slot int) (uint64, float64, bool) {
 	p.pressureWriteMu.Lock()
 	defer p.pressureWriteMu.Unlock()
+
+	if invokeSeq == 0 || invokeSeq >= p.pressureMaxStoredSeq.Load() {
+		p.lastSampledPressureBits.Store(math.Float64bits(val))
+	}
 
 	var stored bool
 	if p.reclaimEpoch.Load() == epoch {
@@ -546,5 +587,109 @@ func (p *pressureState) resetZeroWatermarkBelowTier2(pressure float64) {
 	if p.options.PressureFunc == nil || (p.hasValidSample && pressure < p.options.EvictionThreshold && !p.isSamplingGoroutine()) {
 		p.lastReclaimedZeroCount = 0
 		p.lastReclaimedLen = 0
+	}
+}
+
+func (p *pressureState) recordEviction(reason EvictionReason, weight uint64) {
+	switch reason {
+	case EvictionReasonCapacity:
+		p.evictionsCapacity++
+		p.evictedWeightCapacity += weight
+	case EvictionReasonPressure:
+		p.evictionsPressure++
+		p.evictedWeightPressure += weight
+	case EvictionReasonDeleted:
+		p.evictionsDeleted++
+		p.evictedWeightDeleted += weight
+	case EvictionReasonReplaced:
+		p.evictionsReplaced++
+		p.evictedWeightReplaced += weight
+	}
+}
+
+func (p *pressureState) recordCompactionByPressure(pressure float64) {
+	switch {
+	case pressure >= p.options.EvictionThreshold:
+		p.compactionsPressureTier2++
+	case pressure >= p.options.CompactionThreshold:
+		p.compactionsPressureTier1++
+	default:
+		p.compactionsAutoSlack++
+	}
+}
+
+func (p *pressureState) snapshotBaseStats(backend Backend, currentSize, maxSize uint64, entryLen int) Stats {
+	return Stats{
+		Backend:                  backend,
+		GetHits:                  p.getHits,
+		GetMisses:                p.getMisses,
+		PeekHits:                 p.peekHits.Load(),
+		PeekMisses:               p.peekMisses.Load(),
+		EvictionsCapacity:        p.evictionsCapacity,
+		EvictionsPressure:        p.evictionsPressure,
+		EvictionsDeleted:         p.evictionsDeleted,
+		EvictionsReplaced:        p.evictionsReplaced,
+		EvictedWeightCapacity:    p.evictedWeightCapacity,
+		EvictedWeightPressure:    p.evictedWeightPressure,
+		EvictedWeightDeleted:     p.evictedWeightDeleted,
+		EvictedWeightReplaced:    p.evictedWeightReplaced,
+		CurrentSize:              currentSize,
+		MaxSize:                  maxSize,
+		Len:                      entryLen,
+		ZeroSizeCount:            p.zeroSizeCount,
+		PutInserted:              p.putInserted,
+		PutUpdated:               p.putUpdated,
+		PutRejectedOversized:     p.putRejectedOversized.Load(),
+		ReplaceUpdated:           p.replaceUpdated,
+		ReplaceNotFound:          p.replaceNotFound,
+		ReplaceSelfEvicted:       p.replaceSelfEvicted,
+		DeleteDeleted:            p.deleteDeleted,
+		DeleteNotFound:           p.deleteNotFound,
+		DeletePrefixExecuted:     p.deletePrefixExecuted,
+		MemoryPressure:           math.Float64frombits(p.lastSampledPressureBits.Load()),
+		CompactionsExplicit:      p.compactionsExplicit,
+		CompactionsPressureTier1: p.compactionsPressureTier1,
+		CompactionsPressureTier2: p.compactionsPressureTier2,
+		CompactionsAutoSlack:     p.compactionsAutoSlack,
+		PressureShedsInline:      p.pressureShedsInline,
+		PressureShedsExplicit:    p.pressureShedsExplicit,
+		ReclaimEpoch:             p.reclaimEpoch.Load(),
+		DeletedSinceCompact:      p.deletedSinceCompact,
+		PeakEntryLen:             p.peakEntryLen,
+	}
+}
+
+func (p *pressureState) checkTelemetryInvariants(currentLen int) {
+	if p.zeroSizeCount < 0 || p.zeroSizeCount > currentLen {
+		panic(fmt.Sprintf("lru invariant violation: invalid zeroSizeCount %d for len %d", p.zeroSizeCount, currentLen))
+	}
+	if p.deletedSinceCompact < 0 {
+		panic(fmt.Sprintf("lru invariant violation: negative deletedSinceCompact %d", p.deletedSinceCompact))
+	}
+	if p.peakEntryLen < 0 {
+		panic(fmt.Sprintf("lru invariant violation: negative peakEntryLen %d", p.peakEntryLen))
+	}
+	if p.putInserted > 0 && currentLen > p.peakEntryLen {
+		panic(fmt.Sprintf("lru invariant violation: currentLen %d exceeds peakEntryLen %d", currentLen, p.peakEntryLen))
+	}
+	lastPressure := math.Float64frombits(p.lastSampledPressureBits.Load())
+	if math.IsNaN(lastPressure) || lastPressure < 0.0 {
+		panic(fmt.Sprintf("lru invariant violation: invalid lastSampledPressure %v", lastPressure))
+	}
+	totalRemovals := p.evictionsCapacity + p.evictionsPressure + p.evictionsDeleted
+	if p.deleteDeleted > p.evictionsDeleted {
+		panic(fmt.Sprintf("lru invariant violation: deleteDeleted %d exceeds evictionsDeleted %d", p.deleteDeleted, p.evictionsDeleted))
+	}
+	if p.replaceSelfEvicted > p.evictionsCapacity {
+		panic(fmt.Sprintf("lru invariant violation: replaceSelfEvicted %d exceeds evictionsCapacity %d", p.replaceSelfEvicted, p.evictionsCapacity))
+	}
+	if p.putUpdated+p.replaceUpdated != p.evictionsReplaced {
+		panic(fmt.Sprintf("lru invariant violation: putUpdated (%d) + replaceUpdated (%d) != evictionsReplaced (%d)", p.putUpdated, p.replaceUpdated, p.evictionsReplaced))
+	}
+	if p.pressureShedsInline+p.pressureShedsExplicit > p.evictionsPressure {
+		panic(fmt.Sprintf("lru invariant violation: pressureSheds (%d) exceeds evictionsPressure (%d)", p.pressureShedsInline+p.pressureShedsExplicit, p.evictionsPressure))
+	}
+	if p.putInserted > 0 && uint64(currentLen)+totalRemovals != p.putInserted {
+		panic(fmt.Sprintf("lru invariant violation: currentLen (%d) + totalRemovals (%d) != putInserted (%d)", currentLen, totalRemovals, p.putInserted))
 	}
 }

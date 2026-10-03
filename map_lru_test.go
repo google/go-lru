@@ -964,12 +964,13 @@ func TestMapCache_ZeroAllocHotPathsAndSingleAllocNewEntryPut(t *testing.T) {
 	})
 	assert.InDelta(t, 1.0, newPutAllocs, 0.0, "MapCache new-entry Put on pre-sized map must allocate 1 heap object (entry[V])")
 
-	// 2. Existing-key Put, Get, Peek, Replace (without eviction), and Values()/All()/Keys() allocate 0 heap objects.
+	// 2. Existing-key Put, Get, Peek, Replace (without eviction), Stats(), and Values()/All()/Keys() allocate 0 heap objects.
 	mc := c.(*mapCache[testData])
 	valSeq := c.Values()
 	allSeq := c.All()
 	keySeq := c.Keys()
 	hotAllocs := testing.AllocsPerRun(100, func() {
+		_ = c.Stats()
 		_, _ = c.Get(keys[0])
 		_, _ = c.Peek(keys[1])
 		_, _ = c.Put(keys[0], testData{value: 3, dataSize: 10})
@@ -999,5 +1000,50 @@ func TestMapCache_ZeroAllocHotPathsAndSingleAllocNewEntryPut(t *testing.T) {
 			}
 		}
 	})
-	assert.Zero(t, hotAllocs, "MapCache Get, Peek, overwrite Put, Replace, and iterators must allocate 0 heap objects")
+	assert.Zero(t, hotAllocs, "MapCache Stats, Get, Peek, overwrite Put, Replace, and iterators must allocate 0 heap objects")
+}
+
+func TestZeroAllocHotPathsAndStatsAcrossBackends(t *testing.T) {
+	backends := []struct {
+		name        string
+		backend     Backend
+		constructor func(uint64, ...Option) Cache[testData]
+	}{
+		{"MapCache", BackendMap, NewMapCache[testData]},
+		{"RadixCache", BackendRadix, NewRadixCache[testData]},
+		{"ArenaRadixCache", BackendArenaRadix, NewArenaRadixCache[testData]},
+	}
+
+	for _, b := range backends {
+		t.Run(b.name, func(t *testing.T) {
+			// Arrange: Pre-populate keys without invariant checking so hot-path allocations are measured cleanly.
+			c := b.constructor(1000, testDataWeigher, WithPressureFunc(func() float64 { return 0.25 }))
+			_, err := c.Put("dir/alpha", testData{value: 1, dataSize: 10})
+			require.NoError(t, err)
+			_, err = c.Put("dir/beta", testData{value: 2, dataSize: 10})
+			require.NoError(t, err)
+
+			var provider StatsProvider = c
+			valSeq := c.Values()
+
+			// Act
+			allocs := testing.AllocsPerRun(100, func() {
+				st := c.Stats()
+				if st.Backend != b.backend {
+					panic("unexpected backend")
+				}
+				_ = provider.Stats()
+				_, _ = c.Get("dir/alpha")
+				_, _ = c.Peek("dir/beta")
+				_, _ = c.Put("dir/alpha", testData{value: 3, dataSize: 10})
+				_ = c.Replace("dir/beta", testData{value: 4, dataSize: 10})
+				valSeq(func(v testData) bool {
+					return v.value >= 0
+				})
+			})
+
+			// Assert
+			assert.Zero(t, allocs, "%s Stats(), Get, Peek, in-place Put, Replace, and Values() must allocate 0 heap objects", b.name)
+		})
+	}
 }

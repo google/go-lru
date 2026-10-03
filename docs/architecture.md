@@ -20,6 +20,7 @@ This document details the internal data structures, concurrency models, and memo
 | **Prefix Delete (50K/100K items)** | ~21.6 ms | **~1.05 ms** (**20.5x faster**) | **~5.1 ms** (**4.2x faster**) |
 | **Live Heap Memory** | ~135.9 B/entry at 1M (~163.0 `heap-B/entry` at 100K) | **~94.2 B/entry at 1M** (~96.0 `heap-B/entry` at 100K, **~30.7%–41.1% reduction**) | **~106.9 B/entry at 1M** (~111.2 `heap-B/entry` at 100K, **~21.4%–31.8% reduction**) |
 | **GC Pressure & Overhead** | High (millions of distinct heap objects) | Moderate (heap nodes with pointers) | **Ultra-Low** (flat slice; internal tree indices invisible to GC) |
+| **Telemetry & Introspection** | `Stats()` (`0 allocs/op`) + `otellru` (14 instruments) | `Stats()` (`0 allocs/op`) + `otellru` (14 instruments) | `Stats()` (`0 allocs/op`) + `otellru` (**16 instruments**, incl. arena node states & hash fallbacks) |
 | **Concurrency Lock** | `sync.RWMutex` | `sync.RWMutex` | `sync.RWMutex` |
 | **Best Used For** | Flat keys, maximum read/write throughput | File systems, directory trees, prefix purges | Large-scale hierarchical caches (1M+ items) under strict memory limits |
 
@@ -78,6 +79,7 @@ Enabling `WithInvariantChecking(true)` validates structural integrity across eve
 2. **Iterative Tree Walk**: Uses parent/sibling pointers (`radixCache`) or `uint32` index links (`ArenaRadixCache`) to traverse the entire LCRS tree in `O(1)` auxiliary space without recursion, verifying parent-child symmetry and absence of cycles.
 3. **LRU List Bijection**: Verifies that every value-bearing tree node appears in the doubly-linked `head`/`tail` list with matching forward and reverse traversal counts and exact `currentSize` sum parity.
 4. **Free-List & Hash Index Integrity (`ArenaRadixCache`)**: Confirms `len(nodes) - freeCount == treeNodeCount`, verifies zero overlap between free-list slots and live tree nodes, and checks `nodeMap` index consistency.
+5. **Telemetry & Watermark Parity**: Verifies `deletedSinceCompact >= 0`, `peakEntryLen >= len`, and counter-to-entry-balance parity (`PutInserted - EvictionsCapacity - EvictionsPressure - EvictionsDeleted == len`, `EvictionsDeleted >= DeleteDeleted`, `EvictionsReplaced == PutUpdated + ReplaceUpdated`).
 
 ---
 
@@ -92,3 +94,21 @@ All three engines support synchronous entry removal/replacement callbacks via `W
   - Because `RadixCache` and `ArenaRadixCache` store compressed prefix segments across tree ancestors rather than full key strings per node, `WithOnEvictValue` and `Values()` never reconstruct keys (`0` string allocations).
   - Even when `WithOnEvictEntry` is configured, operations that already have `key` in hand (`Delete(key)`, `Put(key, ...)` overwrite, `Replace(key, ...)` overwrite, and `Replace` self-eviction) forward `key` directly without walking the tree (and `MapCache` always passes the `clonePrefix`-cloned `entry.key`).
   - When `WithOnEvictEntry`, `All()`, or `Keys()` needs to materialize a node's full key on `RadixCache` or `ArenaRadixCache`, `reconstructKey` returns single-segment keys (`node.parent == root`) in `0` allocations and walks deeper parent links using a 64-element stack buffer (`[64]*radixNode[V]` / `[64]uint32`), `slices.Backward`, and a pre-sized `strings.Builder`.
+
+---
+
+## 6. Zero-Allocation Telemetry (`Stats()`) & Asynchronous OpenTelemetry Instrumentation (`otellru`)
+
+### 6.1 Hybrid Synchronization in `pressureState` (`Stats()`)
+Every cache instance embeds telemetry counters inside `pressureState` (`pressure.go`) and exposes a value-type `Stats() Stats` snapshot on `Cache[V]` (`0 allocs/op`):
+- **Write-Locked Scalar Counters**: Operations that already hold the cache's exclusive write lock (`Get`, `Put` insertions/updates, `Replace`, `Delete`, `DeletePrefix`, eviction counts/weights across all four `EvictionReason` values, compaction trigger counters, and Tier 2 pressure shed counters) increment plain `uint64` fields with zero atomic bus-lock overhead.
+- **`atomic.Uint64` Counters for `RLock` & Pre-Lock Paths**: Operations that execute under `RLock` (`Peek` hits/misses and `ArenaRadixCache` FNV-1a hash-collision/displacement trie fallbacks in `lookupNodeKeyWithHash`), pre-lock oversized rejections (`PutRejectedOversized`), and lock-free pressure probes (`lastSampledPressureBits`) use `atomic.Uint64` so `Peek` never upgrades to a write lock.
+- **Compaction & Shed Trigger Classification**:
+  - Compactions are attributed to `CompactionsExplicit` (`Compact()`), `CompactionsPressureTier1` (Tier 1 moderate pressure), `CompactionsPressureTier2` (Tier 2 critical pressure), or `CompactionsAutoSlack` (normal-pressure $\ge 25\%$ post-peak shrinkage or `ArenaRadixCache` 64-free-node churn compaction).
+  - Tier 2 critical-pressure shedding events (incremented when $\ge 1$ entry is evicted due to pressure) are attributed to `PressureShedsInline` (triggered inline during foreground `Put`, `Replace`, `Delete`, or `DeletePrefix`) or `PressureShedsExplicit` (triggered via `EvaluateMemoryPressure()`).
+
+### 6.2 Purely Asynchronous OpenTelemetry Submodule (`otellru`)
+`github.com/google/go-lru/otellru` isolates OpenTelemetry dependencies (`go.opentelemetry.io/otel/metric`) in a separate `otellru/go.mod` submodule:
+- **Single Batch Callback**: `otellru.Register(cache, opts...)` registers a single `Meter.RegisterCallback` closure that calls `cache.Stats()` once per collection cycle and records all 14 general instruments (plus 2 `ArenaRadixCache`-only instruments: `lru.cache.arena.nodes` and `lru.cache.arena.hash_fallbacks`).
+- **Pre-Allocated `attribute.Set` & `[]metric.ObserveOption` Slices**: At `Register()` time, `otellru` pre-computes every immutable `attribute.Set` (combining `cache.backend`, optional `cache.name`, user-supplied `WithAttributes`, and metric-specific attributes `operation`, `result`, `reason`, `outcome`, `trigger`, `state`) and wraps each in a 1-element `[]metric.ObserveOption{metric.WithAttributeSet(set)}` slice. Unpacking these slices (`opts...`) inside the scrape callback achieves **`0 allocs/op` per collection cycle**.
+

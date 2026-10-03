@@ -68,6 +68,22 @@ jobs:
           go mod tidy
           git diff --exit-code go.mod go.sum
 
+      - name: Run go vet (otellru)
+        working-directory: otellru
+        run: go vet ./...
+
+      - name: Run golangci-lint (otellru)
+        uses: golangci/golangci-lint-action@9fae48acfc02a90574d7c304a1758ef9895495fa # v7
+        with:
+          version: v2.13.1
+          working-directory: otellru
+
+      - name: Verify otellru go.mod and go.sum are tidy
+        working-directory: otellru
+        run: |
+          go mod tidy
+          git diff --exit-code go.mod go.sum
+
   test:
     name: Correctness, Concurrency & Coverage
     runs-on: ubuntu-latest
@@ -87,6 +103,14 @@ jobs:
         run: go test -v -race -covermode=atomic -coverprofile=coverage.out ./...
 
       - name: Run Documentation Examples
+        run: go test -v -run=^Example ./...
+
+      - name: Run otellru Tests with Race Detector
+        working-directory: otellru
+        run: go test -v -race -covermode=atomic -coverprofile=coverage-otellru.out ./...
+
+      - name: Run otellru Documentation Examples
+        working-directory: otellru
         run: go test -v -run=^Example ./...
 
       - name: Generate Code Coverage Report & Summary
