@@ -538,7 +538,10 @@ func TestConcurrency_MemoryPressureCompactionAndEviction(t *testing.T) {
 						case op < 95:
 							prefix := fmt.Sprintf("mp_dir_%02d/", dirIdx)
 							cache.DeletePrefix(prefix)
-						case op < 98:
+						case op < 97:
+							st := cache.Stats()
+							assert.Equal(t, uint64(capacity), st.MaxSize)
+						case op < 99:
 							reclaimer.Compact()
 						default:
 							_ = reclaimer.EvaluateMemoryPressure()
@@ -551,6 +554,8 @@ func TestConcurrency_MemoryPressureCompactionAndEviction(t *testing.T) {
 
 			// Assert: Final compaction and invariant check on quiescent cache succeed cleanly.
 			reclaimer.Compact()
+			st := cache.Stats()
+			assert.LessOrEqual(t, st.CurrentSize, st.MaxSize)
 		})
 	}
 }
@@ -582,6 +587,7 @@ func TestConcurrency_EvictionCallbacksUnderRace(t *testing.T) {
 
 			var valReasonCounts [4]atomic.Uint64
 			var entryReasonCounts [4]atomic.Uint64
+			var entryReasonWeights [4]atomic.Uint64
 			var lastVal concValue
 			var lastReason lru.EvictionReason
 
@@ -605,6 +611,7 @@ func TestConcurrency_EvictionCallbacksUnderRace(t *testing.T) {
 					assert.True(t, v.id == k || v.id == k+"_r", "reconstructed key %q must match evicted value id %q", k, v.id)
 					if int(r) < len(entryReasonCounts) {
 						entryReasonCounts[r].Add(1)
+						entryReasonWeights[r].Add(v.size)
 					}
 				}),
 			)
@@ -682,13 +689,179 @@ func TestConcurrency_EvictionCallbacksUnderRace(t *testing.T) {
 			cache.DeletePrefix("")
 			reclaimer.Compact()
 
-			// Assert: Value and entry callback counts match for every EvictionReason, and all 4 reasons fired.
+			// Assert: Value and entry callback counts and weights match Stats() for every EvictionReason, and all 4 reasons fired.
+			st := cache.Stats()
 			for reason := range 4 {
+				r := lru.EvictionReason(reason)
 				vCount := valReasonCounts[reason].Load()
 				eCount := entryReasonCounts[reason].Load()
-				assert.Equalf(t, vCount, eCount, "reason %s count mismatch between OnEvictValue and OnEvictEntry", lru.EvictionReason(reason))
-				assert.Positivef(t, eCount, "expected EvictionReason %s to be exercised under concurrency", lru.EvictionReason(reason))
+				eWeight := entryReasonWeights[reason].Load()
+				assert.Equalf(t, vCount, eCount, "reason %s count mismatch between OnEvictValue and OnEvictEntry", r)
+				assert.Equalf(t, eCount, st.Evictions(r), "reason %s count mismatch between OnEvictEntry and Stats()", r)
+				assert.Equalf(t, eWeight, st.EvictedWeight(r), "reason %s weight mismatch between OnEvictEntry and Stats()", r)
+				assert.Positivef(t, eCount, "expected EvictionReason %s to be exercised under concurrency", r)
 			}
+		})
+	}
+}
+
+// TestConcurrency_StatsAndPressureUnderRace verifies that dedicated reader goroutines
+// continuously polling cache.Stats() observe monotonic counter progression and zero data
+// races while writer goroutines concurrently execute Put, Get, Peek, Replace, Delete,
+// DeletePrefix, Compact, and EvaluateMemoryPressure across all three backends.
+func TestConcurrency_StatsAndPressureUnderRace(t *testing.T) {
+	for _, eng := range allEngines() {
+		t.Run(eng.name, func(t *testing.T) {
+			// Arrange
+			const (
+				numWriters   = 12
+				numReaders   = 4
+				opsPerWorker = 250
+				numKeys      = 80
+				capacity     = 300
+			)
+
+			var pressureBits atomic.Uint64
+			setPressure := func(p float64) {
+				pressureBits.Store(uint64(p * 1000))
+			}
+			getPressure := func() float64 {
+				return float64(pressureBits.Load()) / 1000.0
+			}
+			setPressure(0.25)
+
+			var evictCounts [4]atomic.Uint64
+			var evictWeights [4]atomic.Uint64
+
+			cache := eng.constructor(
+				capacity,
+				lru.WithInvariantChecking(true),
+				lru.WithPressureFunc(getPressure),
+				lru.WithCompactionThreshold(0.75),
+				lru.WithEvictionThreshold(0.90),
+				lru.WithEvictionRetentionRatio(0.50),
+				lru.WithOnEvictEntry(func(_ string, v concValue, r lru.EvictionReason) {
+					if int(r) < len(evictCounts) {
+						evictCounts[r].Add(1)
+						evictWeights[r].Add(v.size)
+					}
+				}),
+			)
+
+			reclaimer, ok := cache.(lru.PressureAwareCache[concValue])
+			require.True(t, ok)
+
+			var stopReaders atomic.Bool
+			var readerWg sync.WaitGroup
+			for range numReaders {
+				readerWg.Go(func() {
+					var prev lru.Stats
+					for !stopReaders.Load() {
+						cur := cache.Stats()
+						assert.Equal(t, uint64(capacity), cur.MaxSize)
+						assert.LessOrEqual(t, cur.CurrentSize, cur.MaxSize)
+						assert.GreaterOrEqual(t, cur.Len, 0)
+						assert.GreaterOrEqual(t, cur.ZeroSizeCount, 0)
+						assert.LessOrEqual(t, cur.ZeroSizeCount, cur.Len)
+
+						// Monotonic cumulative counters within a single reader timeline:
+						assert.GreaterOrEqual(t, cur.GetHits, prev.GetHits)
+						assert.GreaterOrEqual(t, cur.GetMisses, prev.GetMisses)
+						assert.GreaterOrEqual(t, cur.PeekHits, prev.PeekHits)
+						assert.GreaterOrEqual(t, cur.PeekMisses, prev.PeekMisses)
+						assert.GreaterOrEqual(t, cur.EvictionsCapacity, prev.EvictionsCapacity)
+						assert.GreaterOrEqual(t, cur.EvictionsPressure, prev.EvictionsPressure)
+						assert.GreaterOrEqual(t, cur.EvictionsDeleted, prev.EvictionsDeleted)
+						assert.GreaterOrEqual(t, cur.EvictionsReplaced, prev.EvictionsReplaced)
+						assert.GreaterOrEqual(t, cur.EvictedWeightCapacity, prev.EvictedWeightCapacity)
+						assert.GreaterOrEqual(t, cur.EvictedWeightPressure, prev.EvictedWeightPressure)
+						assert.GreaterOrEqual(t, cur.EvictedWeightDeleted, prev.EvictedWeightDeleted)
+						assert.GreaterOrEqual(t, cur.EvictedWeightReplaced, prev.EvictedWeightReplaced)
+						assert.GreaterOrEqual(t, cur.PutInserted, prev.PutInserted)
+						assert.GreaterOrEqual(t, cur.PutUpdated, prev.PutUpdated)
+						assert.GreaterOrEqual(t, cur.PutRejectedOversized, prev.PutRejectedOversized)
+						assert.GreaterOrEqual(t, cur.ReplaceUpdated, prev.ReplaceUpdated)
+						assert.GreaterOrEqual(t, cur.ReplaceNotFound, prev.ReplaceNotFound)
+						assert.GreaterOrEqual(t, cur.ReplaceSelfEvicted, prev.ReplaceSelfEvicted)
+						assert.GreaterOrEqual(t, cur.DeleteDeleted, prev.DeleteDeleted)
+						assert.GreaterOrEqual(t, cur.DeleteNotFound, prev.DeleteNotFound)
+						assert.GreaterOrEqual(t, cur.DeletePrefixExecuted, prev.DeletePrefixExecuted)
+						assert.GreaterOrEqual(t, cur.CompactionsExplicit, prev.CompactionsExplicit)
+						assert.GreaterOrEqual(t, cur.CompactionsPressureTier1, prev.CompactionsPressureTier1)
+						assert.GreaterOrEqual(t, cur.CompactionsPressureTier2, prev.CompactionsPressureTier2)
+						assert.GreaterOrEqual(t, cur.CompactionsAutoSlack, prev.CompactionsAutoSlack)
+						assert.GreaterOrEqual(t, cur.PressureShedsInline, prev.PressureShedsInline)
+						assert.GreaterOrEqual(t, cur.PressureShedsExplicit, prev.PressureShedsExplicit)
+						assert.GreaterOrEqual(t, cur.ReclaimEpoch, prev.ReclaimEpoch)
+						prev = cur
+					}
+				})
+			}
+
+			// Act
+			var writerWg sync.WaitGroup
+			for g := range numWriters {
+				writerWg.Go(func() {
+					r := rand.New(rand.NewPCG(uint64(g*31337+7), 0))
+					for step := range opsPerWorker {
+						switch (g + step) % 3 {
+						case 0:
+							setPressure(0.25)
+						case 1:
+							setPressure(0.80)
+						case 2:
+							setPressure(0.95)
+						}
+
+						op := r.IntN(100)
+						kIdx := r.IntN(numKeys)
+						key := fmt.Sprintf("st_dir_%02d/item_%03d", kIdx%5, kIdx)
+
+						switch {
+						case op < 30:
+							sz := uint64(10)
+							if step%15 == 0 {
+								sz = 0
+							} else if step%19 == 0 {
+								sz = capacity + 50
+							}
+							_, _ = cache.Put(key, concValue{id: key, size: sz})
+						case op < 50:
+							_, _ = cache.Get(key)
+						case op < 65:
+							_, _ = cache.Peek(key)
+						case op < 80:
+							sz := uint64(15)
+							if step%11 == 0 {
+								sz = capacity + 20
+							}
+							_ = cache.Replace(key, concValue{id: key + "_u", size: sz})
+						case op < 90:
+							_, _ = cache.Delete(key)
+						case op < 95:
+							cache.DeletePrefix(fmt.Sprintf("st_dir_%02d/", kIdx%5))
+						case op < 98:
+							reclaimer.Compact()
+						default:
+							_ = reclaimer.EvaluateMemoryPressure()
+						}
+					}
+				})
+			}
+
+			writerWg.Wait()
+			stopReaders.Store(true)
+			readerWg.Wait()
+
+			// Assert final quiescent state parity with eviction callbacks
+			st := cache.Stats()
+			for reason := range 4 {
+				r := lru.EvictionReason(reason)
+				assert.Equalf(t, evictCounts[reason].Load(), st.Evictions(r), "final Evictions(%s) mismatch", r)
+				assert.Equalf(t, evictWeights[reason].Load(), st.EvictedWeight(r), "final EvictedWeight(%s) mismatch", r)
+			}
+			assert.Zero(t, st.Evictions(lru.EvictionReason(99)))
+			assert.Zero(t, st.EvictedWeight(lru.EvictionReason(99)))
 		})
 	}
 }

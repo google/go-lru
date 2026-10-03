@@ -72,14 +72,17 @@ type Cache[V any] interface {
 	// Iteration acquires a read lock (RLock) for the duration of the loop, does not
 	// alter LRU recency order, and supports early termination (break). Callers must
 	// not invoke write-locking methods (Put, Get, Delete, Replace, DeletePrefix,
-	// Compact, EvaluateMemoryPressure) on the same Cache while iterating.
+	// Compact, EvaluateMemoryPressure) or nested read-locking methods (Peek, Stats,
+	// or nested iterators when concurrent writers may contend on the cache lock)
+	// on the same Cache while iterating.
 	All() iter.Seq2[string, V]
 
 	// Keys returns an iterator over all live keys in deterministic MRU-to-LRU order.
 	//
 	// Iteration acquires a read lock (RLock) for the duration of the loop, does not
 	// alter LRU recency order, and supports early termination (break). Callers must
-	// not invoke write-locking methods on the same Cache while iterating.
+	// not invoke write-locking methods or nested read-locking methods on the same
+	// Cache while iterating.
 	Keys() iter.Seq[string]
 
 	// Values returns an iterator over all live values in deterministic MRU-to-LRU order.
@@ -87,8 +90,108 @@ type Cache[V any] interface {
 	// Iteration acquires a read lock (RLock) for the duration of the loop, does not
 	// alter LRU recency order, skips key reconstruction on radix backends (0 allocs/op),
 	// and supports early termination (break). Callers must not invoke write-locking
-	// methods on the same Cache while iterating.
+	// methods or nested read-locking methods on the same Cache while iterating.
 	Values() iter.Seq[V]
+
+	// Stats returns a point-in-time telemetry snapshot of the cache's lookups,
+	// mutations, evictions, capacity, memory-pressure compactions, and structural state.
+	Stats() Stats
+}
+
+// StatsProvider is a non-generic interface implemented by all Cache[V] instances,
+// allowing observability integrations (such as otellru) to read telemetry snapshots
+// without depending on the cache's value type parameter V.
+type StatsProvider interface {
+	Stats() Stats
+}
+
+// Stats captures a point-in-time, zero-allocation telemetry snapshot of a Cache instance.
+type Stats struct {
+	// Backend identifies the underlying cache engine (BackendMap, BackendRadix, or BackendArenaRadix).
+	Backend Backend
+
+	// 1. Lookups
+	GetHits    uint64
+	GetMisses  uint64
+	PeekHits   uint64
+	PeekMisses uint64
+
+	// 2. Evictions & Removals (entry counts and total weight by EvictionReason)
+	EvictionsCapacity     uint64
+	EvictionsPressure     uint64
+	EvictionsDeleted      uint64
+	EvictionsReplaced     uint64
+	EvictedWeightCapacity uint64
+	EvictedWeightPressure uint64
+	EvictedWeightDeleted  uint64
+	EvictedWeightReplaced uint64
+
+	// 3. Capacity & State
+	CurrentSize   uint64
+	MaxSize       uint64
+	Len           int
+	ZeroSizeCount int
+
+	// 4. Mutations & Outcomes
+	PutInserted          uint64
+	PutUpdated           uint64
+	PutRejectedOversized uint64
+	ReplaceUpdated       uint64
+	ReplaceNotFound      uint64
+	ReplaceSelfEvicted   uint64
+	DeleteDeleted        uint64
+	DeleteNotFound       uint64
+	DeletePrefixExecuted uint64
+
+	// 5. Two-Tier Memory Pressure & Compaction
+	MemoryPressure           float64
+	CompactionsExplicit      uint64
+	CompactionsPressureTier1 uint64
+	CompactionsPressureTier2 uint64
+	CompactionsAutoSlack     uint64
+	PressureShedsInline      uint64
+	PressureShedsExplicit    uint64
+	ReclaimEpoch             uint64
+
+	// 6. Backend Structural & Fragmentation State
+	DeletedSinceCompact int
+	PeakEntryLen        int
+	ArenaLiveNodes      int
+	ArenaFreeNodes      int
+	ArenaUnallocatedCap int
+	ArenaHashFallbacks  uint64
+}
+
+// Evictions returns the cumulative eviction/removal entry count for the given EvictionReason.
+func (s Stats) Evictions(reason EvictionReason) uint64 {
+	switch reason {
+	case EvictionReasonCapacity:
+		return s.EvictionsCapacity
+	case EvictionReasonPressure:
+		return s.EvictionsPressure
+	case EvictionReasonDeleted:
+		return s.EvictionsDeleted
+	case EvictionReasonReplaced:
+		return s.EvictionsReplaced
+	default:
+		return 0
+	}
+}
+
+// EvictedWeight returns the cumulative evicted/removed entry weight for the given EvictionReason.
+func (s Stats) EvictedWeight(reason EvictionReason) uint64 {
+	switch reason {
+	case EvictionReasonCapacity:
+		return s.EvictedWeightCapacity
+	case EvictionReasonPressure:
+		return s.EvictedWeightPressure
+	case EvictionReasonDeleted:
+		return s.EvictedWeightDeleted
+	case EvictionReasonReplaced:
+		return s.EvictedWeightReplaced
+	default:
+		return 0
+	}
 }
 
 // PressureAwareCache extends Cache[V] with explicit arena/map compaction and memory-pressure reclamation.

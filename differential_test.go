@@ -93,9 +93,13 @@ func newDifferentialHarnessWithOpts(t *testing.T, maxSize uint64, unitWeight boo
 		{"ArenaRadixCache", lru.NewArenaRadixCache[*diffValue]},
 	}
 
+	baseOpts := slices.Concat([]lru.Option{
+		lru.WithPressureFunc(func() float64 { return 0.0 }),
+	}, opts)
+
 	for _, cfg := range configs {
 		for _, inv := range []bool{false, true} {
-			c := cfg.constructor(maxSize, slices.Concat([]lru.Option{lru.WithInvariantChecking(inv)}, opts)...)
+			c := cfg.constructor(maxSize, slices.Concat([]lru.Option{lru.WithInvariantChecking(inv)}, baseOpts)...)
 			h.instances = append(h.instances, diffInstance{
 				name:       cfg.name,
 				invariants: inv,
@@ -302,6 +306,124 @@ func (h *differentialHarness) VerifyIterators() {
 				h.compareValues(fmt.Sprintf("VerifyIterators.EarlyBreakValues[%d]", j), baseVals[j], true, prefixVals[j], true, inst.name, inst.invariants)
 			}
 		}
+	}
+	h.VerifyStatsParity("VerifyIterators")
+}
+
+func (h *differentialHarness) VerifyStatsParity(op string) {
+	h.t.Helper()
+	var base lru.Stats
+	var prevSameBackend lru.Stats
+
+	for i, inst := range h.instances {
+		st := inst.cache.Stats()
+		var provider lru.StatsProvider = inst.cache
+		require.Equalf(h.t, st, provider.Stats(), "[%s] StatsProvider.Stats() mismatch on %s (inv=%v)", op, inst.name, inst.invariants)
+
+		// Verify Evictions(reason) and EvictedWeight(reason) helper methods match flat fields.
+		require.Equalf(h.t, st.EvictionsCapacity, st.Evictions(lru.EvictionReasonCapacity), "[%s] Evictions(Capacity) mismatch on %s", op, inst.name)
+		require.Equalf(h.t, st.EvictionsPressure, st.Evictions(lru.EvictionReasonPressure), "[%s] Evictions(Pressure) mismatch on %s", op, inst.name)
+		require.Equalf(h.t, st.EvictionsDeleted, st.Evictions(lru.EvictionReasonDeleted), "[%s] Evictions(Deleted) mismatch on %s", op, inst.name)
+		require.Equalf(h.t, st.EvictionsReplaced, st.Evictions(lru.EvictionReasonReplaced), "[%s] Evictions(Replaced) mismatch on %s", op, inst.name)
+		require.Zero(h.t, st.Evictions(lru.EvictionReason(99)))
+
+		require.Equalf(h.t, st.EvictedWeightCapacity, st.EvictedWeight(lru.EvictionReasonCapacity), "[%s] EvictedWeight(Capacity) mismatch on %s", op, inst.name)
+		require.Equalf(h.t, st.EvictedWeightPressure, st.EvictedWeight(lru.EvictionReasonPressure), "[%s] EvictedWeight(Pressure) mismatch on %s", op, inst.name)
+		require.Equalf(h.t, st.EvictedWeightDeleted, st.EvictedWeight(lru.EvictionReasonDeleted), "[%s] EvictedWeight(Deleted) mismatch on %s", op, inst.name)
+		require.Equalf(h.t, st.EvictedWeightReplaced, st.EvictedWeight(lru.EvictionReasonReplaced), "[%s] EvictedWeight(Replaced) mismatch on %s", op, inst.name)
+		require.Zero(h.t, st.EvictedWeight(lru.EvictionReason(99)))
+
+		// Verify backend identity and backend-specific arena fields.
+		switch inst.name {
+		case "MapCache":
+			require.Equalf(h.t, lru.BackendMap, st.Backend, "[%s] Backend mismatch on %s", op, inst.name)
+			require.Zerof(h.t, st.ArenaLiveNodes, "[%s] ArenaLiveNodes must be 0 on %s", op, inst.name)
+			require.Zerof(h.t, st.ArenaFreeNodes, "[%s] ArenaFreeNodes must be 0 on %s", op, inst.name)
+			require.Zerof(h.t, st.ArenaUnallocatedCap, "[%s] ArenaUnallocatedCap must be 0 on %s", op, inst.name)
+			require.Zerof(h.t, st.ArenaHashFallbacks, "[%s] ArenaHashFallbacks must be 0 on %s", op, inst.name)
+		case "RadixCache":
+			require.Equalf(h.t, lru.BackendRadix, st.Backend, "[%s] Backend mismatch on %s", op, inst.name)
+			require.Zerof(h.t, st.ArenaLiveNodes, "[%s] ArenaLiveNodes must be 0 on %s", op, inst.name)
+			require.Zerof(h.t, st.ArenaFreeNodes, "[%s] ArenaFreeNodes must be 0 on %s", op, inst.name)
+			require.Zerof(h.t, st.ArenaUnallocatedCap, "[%s] ArenaUnallocatedCap must be 0 on %s", op, inst.name)
+			require.Zerof(h.t, st.ArenaHashFallbacks, "[%s] ArenaHashFallbacks must be 0 on %s", op, inst.name)
+		case "ArenaRadixCache":
+			require.Equalf(h.t, lru.BackendArenaRadix, st.Backend, "[%s] Backend mismatch on %s", op, inst.name)
+			if st.Len == 0 {
+				require.Zerof(h.t, st.ArenaLiveNodes, "[%s] ArenaLiveNodes must be 0 when Len==0 on %s", op, inst.name)
+			} else {
+				// Non-empty keys allocate at least 1 node in c.nodes[1:], whereas the empty key "" is stored
+				// directly on the root node (index 0, excluded from ArenaLiveNodes).
+				require.GreaterOrEqualf(h.t, st.ArenaLiveNodes, max(st.Len-1, 0), "[%s] ArenaLiveNodes (%d) must be >= Len-1 (%d) on %s", op, st.ArenaLiveNodes, st.Len-1, inst.name)
+			}
+			require.GreaterOrEqualf(h.t, st.ArenaFreeNodes, 0, "[%s] ArenaFreeNodes must be >= 0 on %s", op, inst.name)
+			require.GreaterOrEqualf(h.t, st.ArenaUnallocatedCap, 0, "[%s] ArenaUnallocatedCap must be >= 0 on %s", op, inst.name)
+		}
+
+		// Instances come in (inv=false, inv=true) pairs per backend; both must produce identical Stats structs.
+		if i%2 == 0 {
+			prevSameBackend = st
+		} else {
+			require.Equalf(h.t, prevSameBackend, st, "[%s] full Stats mismatch between inv=false and inv=true on %s", op, inst.name)
+		}
+
+		if i == 0 {
+			base = st
+			continue
+		}
+
+		// Cross-backend parity on all backend-independent fields:
+		require.Equalf(h.t, base.GetHits, st.GetHits, "[%s] GetHits mismatch with %s (inv=%v)", op, inst.name, inst.invariants)
+		require.Equalf(h.t, base.GetMisses, st.GetMisses, "[%s] GetMisses mismatch with %s (inv=%v)", op, inst.name, inst.invariants)
+		require.Equalf(h.t, base.PeekHits, st.PeekHits, "[%s] PeekHits mismatch with %s (inv=%v)", op, inst.name, inst.invariants)
+		require.Equalf(h.t, base.PeekMisses, st.PeekMisses, "[%s] PeekMisses mismatch with %s (inv=%v)", op, inst.name, inst.invariants)
+
+		require.Equalf(h.t, base.EvictionsCapacity, st.EvictionsCapacity, "[%s] EvictionsCapacity mismatch with %s (inv=%v)", op, inst.name, inst.invariants)
+		require.Equalf(h.t, base.EvictionsPressure, st.EvictionsPressure, "[%s] EvictionsPressure mismatch with %s (inv=%v)", op, inst.name, inst.invariants)
+		require.Equalf(h.t, base.EvictionsDeleted, st.EvictionsDeleted, "[%s] EvictionsDeleted mismatch with %s (inv=%v)", op, inst.name, inst.invariants)
+		require.Equalf(h.t, base.EvictionsReplaced, st.EvictionsReplaced, "[%s] EvictionsReplaced mismatch with %s (inv=%v)", op, inst.name, inst.invariants)
+
+		require.Equalf(h.t, base.EvictedWeightCapacity, st.EvictedWeightCapacity, "[%s] EvictedWeightCapacity mismatch with %s (inv=%v)", op, inst.name, inst.invariants)
+		require.Equalf(h.t, base.EvictedWeightPressure, st.EvictedWeightPressure, "[%s] EvictedWeightPressure mismatch with %s (inv=%v)", op, inst.name, inst.invariants)
+		require.Equalf(h.t, base.EvictedWeightDeleted, st.EvictedWeightDeleted, "[%s] EvictedWeightDeleted mismatch with %s (inv=%v)", op, inst.name, inst.invariants)
+		require.Equalf(h.t, base.EvictedWeightReplaced, st.EvictedWeightReplaced, "[%s] EvictedWeightReplaced mismatch with %s (inv=%v)", op, inst.name, inst.invariants)
+
+		require.Equalf(h.t, base.CurrentSize, st.CurrentSize, "[%s] CurrentSize mismatch with %s (inv=%v)", op, inst.name, inst.invariants)
+		require.Equalf(h.t, base.MaxSize, st.MaxSize, "[%s] MaxSize mismatch with %s (inv=%v)", op, inst.name, inst.invariants)
+		require.Equalf(h.t, base.Len, st.Len, "[%s] Len mismatch with %s (inv=%v)", op, inst.name, inst.invariants)
+		require.Equalf(h.t, base.ZeroSizeCount, st.ZeroSizeCount, "[%s] ZeroSizeCount mismatch with %s (inv=%v)", op, inst.name, inst.invariants)
+
+		require.Equalf(h.t, base.PutInserted, st.PutInserted, "[%s] PutInserted mismatch with %s (inv=%v)", op, inst.name, inst.invariants)
+		require.Equalf(h.t, base.PutUpdated, st.PutUpdated, "[%s] PutUpdated mismatch with %s (inv=%v)", op, inst.name, inst.invariants)
+		require.Equalf(h.t, base.PutRejectedOversized, st.PutRejectedOversized, "[%s] PutRejectedOversized mismatch with %s (inv=%v)", op, inst.name, inst.invariants)
+
+		require.Equalf(h.t, base.ReplaceUpdated, st.ReplaceUpdated, "[%s] ReplaceUpdated mismatch with %s (inv=%v)", op, inst.name, inst.invariants)
+		require.Equalf(h.t, base.ReplaceNotFound, st.ReplaceNotFound, "[%s] ReplaceNotFound mismatch with %s (inv=%v)", op, inst.name, inst.invariants)
+		require.Equalf(h.t, base.ReplaceSelfEvicted, st.ReplaceSelfEvicted, "[%s] ReplaceSelfEvicted mismatch with %s (inv=%v)", op, inst.name, inst.invariants)
+
+		require.Equalf(h.t, base.DeleteDeleted, st.DeleteDeleted, "[%s] DeleteDeleted mismatch with %s (inv=%v)", op, inst.name, inst.invariants)
+		require.Equalf(h.t, base.DeleteNotFound, st.DeleteNotFound, "[%s] DeleteNotFound mismatch with %s (inv=%v)", op, inst.name, inst.invariants)
+		require.Equalf(h.t, base.DeletePrefixExecuted, st.DeletePrefixExecuted, "[%s] DeletePrefixExecuted mismatch with %s (inv=%v)", op, inst.name, inst.invariants)
+
+		require.Equalf(h.t, base.PressureShedsInline, st.PressureShedsInline, "[%s] PressureShedsInline mismatch with %s (inv=%v)", op, inst.name, inst.invariants)
+		require.Equalf(h.t, base.PressureShedsExplicit, st.PressureShedsExplicit, "[%s] PressureShedsExplicit mismatch with %s (inv=%v)", op, inst.name, inst.invariants)
+		require.InDeltaf(h.t, base.MemoryPressure, st.MemoryPressure, 0.0, "[%s] MemoryPressure mismatch with %s (inv=%v)", op, inst.name, inst.invariants)
+	}
+}
+
+func (h *differentialHarness) VerifyFullCompactionStatsParity(op string) {
+	h.t.Helper()
+	h.VerifyStatsParity(op)
+	base := h.instances[0].cache.Stats()
+	for _, inst := range h.instances[1:] {
+		st := inst.cache.Stats()
+		require.Equalf(h.t, base.CompactionsExplicit, st.CompactionsExplicit, "[%s] CompactionsExplicit mismatch with %s (inv=%v)", op, inst.name, inst.invariants)
+		require.Equalf(h.t, base.CompactionsPressureTier1, st.CompactionsPressureTier1, "[%s] CompactionsPressureTier1 mismatch with %s (inv=%v)", op, inst.name, inst.invariants)
+		require.Equalf(h.t, base.CompactionsPressureTier2, st.CompactionsPressureTier2, "[%s] CompactionsPressureTier2 mismatch with %s (inv=%v)", op, inst.name, inst.invariants)
+		require.Equalf(h.t, base.CompactionsAutoSlack, st.CompactionsAutoSlack, "[%s] CompactionsAutoSlack mismatch with %s (inv=%v)", op, inst.name, inst.invariants)
+		require.Equalf(h.t, base.ReclaimEpoch, st.ReclaimEpoch, "[%s] ReclaimEpoch mismatch with %s (inv=%v)", op, inst.name, inst.invariants)
+		require.Equalf(h.t, base.DeletedSinceCompact, st.DeletedSinceCompact, "[%s] DeletedSinceCompact mismatch with %s (inv=%v)", op, inst.name, inst.invariants)
+		require.Equalf(h.t, base.PeakEntryLen, st.PeakEntryLen, "[%s] PeakEntryLen mismatch with %s (inv=%v)", op, inst.name, inst.invariants)
 	}
 }
 
@@ -1315,4 +1437,225 @@ func TestDifferential_IteratorsParity(t *testing.T) {
 
 	// 4. Verify DrainAndVerifyEvictionOrder (including reverse Values() == eviction order).
 	h.DrainAndVerifyEvictionOrder(append(allKeys, "dir/c/item1", "dir/c/item2"))
+}
+
+func TestDifferential_StatsFullLifecycleParity(t *testing.T) {
+	// Arrange
+	pressure := 0.10
+	h := newDifferentialHarness(
+		t,
+		100,
+		lru.WithPressureFunc(func() float64 { return pressure }),
+		lru.WithCompactionThreshold(0.75),
+		lru.WithEvictionThreshold(0.90),
+		lru.WithEvictionRetentionRatio(0.50),
+	)
+
+	// 1. Initial empty state
+	h.VerifyStatsParity("initial")
+	st := h.instances[0].cache.Stats()
+	assert.Equal(t, uint64(100), st.MaxSize)
+	assert.Zero(t, st.CurrentSize)
+	assert.Zero(t, st.Len)
+	assert.Zero(t, st.ZeroSizeCount)
+
+	// 2. Put new entries (including a zero-weight entry)
+	h.Put("dir/a", &diffValue{id: "a", size: 20})
+	h.Put("dir/b", &diffValue{id: "b0", size: 0})
+	h.Put("dir/c", &diffValue{id: "c", size: 30})
+	h.VerifyStatsParity("after_initial_puts")
+	st = h.instances[0].cache.Stats()
+	assert.Equal(t, uint64(3), st.PutInserted)
+	assert.Equal(t, 3, st.Len)
+	assert.Equal(t, 1, st.ZeroSizeCount)
+	assert.Equal(t, uint64(50), st.CurrentSize)
+
+	// 3. Put updates (zero -> non-zero -> zero weight transitions)
+	h.Put("dir/b", &diffValue{id: "b10", size: 10})
+	h.VerifyStatsParity("after_put_update_nonzero")
+	st = h.instances[0].cache.Stats()
+	assert.Equal(t, uint64(1), st.PutUpdated)
+	assert.Zero(t, st.ZeroSizeCount)
+	assert.Equal(t, uint64(60), st.CurrentSize)
+	assert.Equal(t, uint64(1), st.EvictionsReplaced)
+	assert.Zero(t, st.EvictedWeightReplaced)
+
+	h.Put("dir/b", &diffValue{id: "b0_again", size: 0})
+	h.VerifyStatsParity("after_put_update_zero")
+	st = h.instances[0].cache.Stats()
+	assert.Equal(t, uint64(2), st.PutUpdated)
+	assert.Equal(t, 1, st.ZeroSizeCount)
+	assert.Equal(t, uint64(50), st.CurrentSize)
+	assert.Equal(t, uint64(2), st.EvictionsReplaced)
+	assert.Equal(t, uint64(10), st.EvictedWeightReplaced)
+
+	// 4. Put rejected oversized (> maxSize)
+	h.Put("oversized", &diffValue{id: "big", size: 101})
+	h.VerifyStatsParity("after_put_rejected_oversized")
+	st = h.instances[0].cache.Stats()
+	assert.Equal(t, uint64(1), st.PutRejectedOversized)
+	assert.Equal(t, 3, st.Len)
+
+	// 5. Put triggering capacity eviction (evicts LRU "dir/a" of size 20)
+	h.Put("dir/d", &diffValue{id: "d", size: 60})
+	h.VerifyStatsParity("after_put_capacity_eviction")
+	st = h.instances[0].cache.Stats()
+	assert.Equal(t, uint64(4), st.PutInserted)
+	assert.Equal(t, uint64(1), st.EvictionsCapacity)
+	assert.Equal(t, uint64(20), st.EvictedWeightCapacity)
+	assert.Equal(t, uint64(90), st.CurrentSize)
+	assert.Equal(t, 3, st.Len)
+
+	// 6. Get and Peek hits and misses
+	h.Get("dir/c")
+	h.Get("missing")
+	h.Peek("dir/d")
+	h.Peek("missing")
+	h.VerifyStatsParity("after_get_peek")
+	st = h.instances[0].cache.Stats()
+	assert.Equal(t, uint64(1), st.GetHits)
+	assert.Equal(t, uint64(1), st.GetMisses)
+	assert.Equal(t, uint64(1), st.PeekHits)
+	assert.Equal(t, uint64(1), st.PeekMisses)
+
+	// 7. Replace: not found, shrink, grow with older eviction, self-eviction (> maxSize and !canFit)
+	h.Replace("missing", &diffValue{id: "m", size: 10})
+	h.Replace("dir/d", &diffValue{id: "d50", size: 50})
+	h.Replace("dir/c", &diffValue{id: "c60", size: 60}) // evicts older "dir/b" (0) and "dir/d" (50)
+	h.Replace("dir/c", &diffValue{id: "c150", size: 150})
+	h.VerifyStatsParity("after_replace_self_evict_max")
+	st = h.instances[0].cache.Stats()
+	assert.Equal(t, uint64(1), st.ReplaceNotFound)
+	assert.Equal(t, uint64(2), st.ReplaceUpdated)
+	assert.Equal(t, uint64(1), st.ReplaceSelfEvicted)
+	assert.Zero(t, st.Len)
+	assert.Zero(t, st.CurrentSize)
+
+	// Replace !canFit self-eviction (LRU entry grows and cannot fit alongside newer entry)
+	h.Put("k1", &diffValue{id: "k1", size: 40})
+	h.Put("k2", &diffValue{id: "k2", size: 40})
+	h.Replace("k1", &diffValue{id: "k1_grow", size: 70})
+	h.VerifyStatsParity("after_replace_self_evict_canfit")
+	st = h.instances[0].cache.Stats()
+	assert.Equal(t, uint64(2), st.ReplaceSelfEvicted)
+	assert.Equal(t, 1, st.Len)
+	assert.Equal(t, uint64(40), st.CurrentSize)
+
+	// 8. Delete hit and miss, then DeletePrefix
+	h.Delete("missing")
+	h.Delete("k2")
+	h.Put("p/1", &diffValue{id: "p1", size: 10})
+	h.Put("p/2", &diffValue{id: "p2", size: 15})
+	h.Put("q/1", &diffValue{id: "q1", size: 20})
+	h.DeletePrefix("p/")
+	h.DeletePrefix("nonexistent/")
+	h.VerifyStatsParity("after_delete_and_prefix")
+	st = h.instances[0].cache.Stats()
+	assert.Equal(t, uint64(1), st.DeleteNotFound)
+	assert.Equal(t, uint64(1), st.DeleteDeleted)
+	assert.Equal(t, uint64(2), st.DeletePrefixExecuted)
+	assert.Equal(t, uint64(3), st.EvictionsDeleted)
+	assert.Equal(t, uint64(65), st.EvictedWeightDeleted)
+
+	// 9. Explicit Compact() on dirty state followed by clean no-op Compact()
+	for _, inst := range h.instances {
+		inst.cache.(lru.PressureAwareCache[*diffValue]).Compact()
+	}
+	h.VerifyFullCompactionStatsParity("after_explicit_compact_dirty")
+	assert.Equal(t, uint64(1), h.instances[0].cache.Stats().CompactionsExplicit)
+	assert.Zero(t, h.instances[0].cache.Stats().DeletedSinceCompact)
+
+	for _, inst := range h.instances {
+		inst.cache.(lru.PressureAwareCache[*diffValue]).Compact()
+	}
+	h.VerifyFullCompactionStatsParity("after_explicit_compact_clean_noop")
+	assert.Equal(t, uint64(1), h.instances[0].cache.Stats().CompactionsExplicit)
+
+	// 10. EvaluateMemoryPressure: Tier 1 compaction and Tier 2 explicit shed + compaction
+	h.Put("m/1", &diffValue{id: "m1", size: 30})
+	h.Put("m/2", &diffValue{id: "m2", size: 20})
+	h.Put("m/3", &diffValue{id: "m3", size: 20})
+	h.Delete("m/3") // all backends now have deletion slack and CurrentSize == 70 ("q/1"=20, "m/1"=30, "m/2"=20)
+	assert.Equal(t, 1, h.instances[0].cache.Stats().DeletedSinceCompact)
+	assert.Equal(t, 4, h.instances[0].cache.Stats().PeakEntryLen)
+
+	pressure = 0.80
+	for _, inst := range h.instances {
+		ev := inst.cache.(lru.PressureAwareCache[*diffValue]).EvaluateMemoryPressure()
+		require.Empty(t, ev)
+	}
+	h.VerifyFullCompactionStatsParity("after_tier1_pressure_eval")
+	st = h.instances[0].cache.Stats()
+	assert.Equal(t, uint64(1), st.CompactionsPressureTier1)
+	assert.InDelta(t, 0.80, st.MemoryPressure, 1e-9)
+
+	pressure = 0.95
+	for _, inst := range h.instances {
+		ev := inst.cache.(lru.PressureAwareCache[*diffValue]).EvaluateMemoryPressure()
+		require.Len(t, ev, 1)
+	}
+	h.VerifyFullCompactionStatsParity("after_tier2_pressure_eval")
+	st = h.instances[0].cache.Stats()
+	assert.Equal(t, uint64(1), st.PressureShedsExplicit)
+	assert.Equal(t, uint64(1), st.CompactionsPressureTier2)
+	assert.Equal(t, uint64(1), st.EvictionsPressure)
+	assert.Equal(t, uint64(20), st.EvictedWeightPressure)
+	assert.InDelta(t, 0.95, st.MemoryPressure, 1e-9)
+
+	// 11. Inline Tier 2 pressure shedding during Put (inserting 15 brings CurrentSize from 50 to 65 > 50,
+	// shedding "m/1" of size 30 so post-shed CurrentSize == 35 < sizeBefore 50, triggering inline Tier 2 compaction!)
+	h.Put("m/4", &diffValue{id: "m4", size: 15})
+	h.VerifyFullCompactionStatsParity("after_inline_tier2_shed")
+	st = h.instances[0].cache.Stats()
+	assert.Equal(t, uint64(1), st.PressureShedsInline)
+	assert.Equal(t, uint64(2), st.CompactionsPressureTier2)
+	assert.Equal(t, uint64(2), st.EvictionsPressure)
+	assert.Equal(t, uint64(50), st.EvictedWeightPressure)
+
+	// 12. Auto-slack compaction on callback-free DeletePrefix("") fast path when > 64 entries are removed
+	pressure = 0.10
+	for _, inst := range h.instances {
+		_ = inst.cache.(lru.PressureAwareCache[*diffValue]).EvaluateMemoryPressure()
+	}
+	h.DeletePrefix("")
+	for _, inst := range h.instances {
+		inst.cache.(lru.PressureAwareCache[*diffValue]).Compact()
+	}
+	baseAutoSlack := h.instances[0].cache.Stats().CompactionsAutoSlack
+	for i := range 70 {
+		h.Put(fmt.Sprintf("slack/item_%03d", i), &diffValue{id: "s", size: 1})
+	}
+	h.DeletePrefix("")
+	h.VerifyFullCompactionStatsParity("after_delete_prefix_all_auto_slack")
+	st = h.instances[0].cache.Stats()
+	assert.Equal(t, baseAutoSlack+1, st.CompactionsAutoSlack)
+	assert.Zero(t, st.Len)
+	assert.Zero(t, st.CurrentSize)
+
+	// 13. Auto-slack compaction on DeletePrefix("") when peakEntryLen <= 8 and len(nodes) < 64,
+	// crossing deletedSinceCompact >= 64 via the deleted live entries.
+	h.Put("anchor/1", &diffValue{id: "a1", size: 1})
+	h.Put("anchor/2", &diffValue{id: "a2", size: 1})
+	h.Put("anchor/3", &diffValue{id: "a3", size: 1})
+	h.Put("anchor/4", &diffValue{id: "a4", size: 1})
+	for range 60 {
+		h.Put("churn/k", &diffValue{id: "ck", size: 1})
+		h.Delete("churn/k")
+	}
+	h.Put("tail/1", &diffValue{id: "t1", size: 1})
+	h.Put("tail/2", &diffValue{id: "t2", size: 1})
+	h.Put("tail/3", &diffValue{id: "t3", size: 1})
+	h.VerifyFullCompactionStatsParity("before_delete_prefix_all_small_peak")
+	st = h.instances[0].cache.Stats()
+	assert.Equal(t, 7, st.PeakEntryLen)
+	assert.Equal(t, 60, st.DeletedSinceCompact)
+	baseAutoSlack = st.CompactionsAutoSlack
+
+	h.DeletePrefix("")
+	h.VerifyFullCompactionStatsParity("after_delete_prefix_all_small_peak")
+	st = h.instances[0].cache.Stats()
+	assert.Equal(t, baseAutoSlack+1, st.CompactionsAutoSlack)
+	assert.Zero(t, st.Len)
+	assert.Zero(t, st.DeletedSinceCompact)
+	assert.Zero(t, st.PeakEntryLen)
 }

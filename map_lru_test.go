@@ -16,6 +16,7 @@ package lru
 
 import (
 	"fmt"
+	"math"
 	"slices"
 	"testing"
 
@@ -740,6 +741,181 @@ func TestMapCache_CheckInvariants_PanicOnCorruption(t *testing.T) {
 			c.checkInvariants()
 		})
 	})
+
+	t.Run("Telemetry_ZeroSizeCountOutOfBounds", func(t *testing.T) {
+		// Arrange
+		c := NewMapCache[testData](100, testDataWeigher).(*mapCache[testData])
+		c.zeroSizeCount = -1
+
+		// Act & Assert
+		assert.Panics(t, func() {
+			c.checkTelemetryInvariants(0)
+		})
+
+		c.zeroSizeCount = 2
+		assert.Panics(t, func() {
+			c.checkTelemetryInvariants(1)
+		})
+	})
+
+	t.Run("Telemetry_NegativeDeletedSinceCompact", func(t *testing.T) {
+		// Arrange
+		c := NewMapCache[testData](100, testDataWeigher).(*mapCache[testData])
+		c.deletedSinceCompact = -1
+
+		// Act & Assert
+		assert.Panics(t, func() {
+			c.checkInvariants()
+		})
+	})
+
+	t.Run("Telemetry_NegativePeakEntryLen", func(t *testing.T) {
+		// Arrange
+		c := NewMapCache[testData](100, testDataWeigher).(*mapCache[testData])
+		c.peakEntryLen = -1
+
+		// Act & Assert
+		assert.Panics(t, func() {
+			c.checkInvariants()
+		})
+	})
+
+	t.Run("Telemetry_CurrentLenExceedsPeakEntryLen", func(t *testing.T) {
+		// Arrange
+		c := NewMapCache[testData](100, testDataWeigher).(*mapCache[testData])
+		_, err := c.Put("k1", testData{value: 1, dataSize: 10})
+		require.NoError(t, err)
+		c.peakEntryLen = 0
+
+		// Act & Assert
+		assert.Panics(t, func() {
+			c.checkInvariants()
+		})
+	})
+
+	t.Run("Telemetry_InvalidLastSampledPressure", func(t *testing.T) {
+		// Arrange
+		c := NewMapCache[testData](100, testDataWeigher).(*mapCache[testData])
+
+		// Act & Assert: NaN, +Inf, -Inf, and negative values must panic
+		for _, bad := range []float64{math.NaN(), math.Inf(1), math.Inf(-1), -0.01} {
+			c.lastSampledPressureBits.Store(math.Float64bits(bad))
+			assert.Panics(t, func() {
+				c.checkInvariants()
+			})
+		}
+	})
+
+	t.Run("Telemetry_DeleteDeletedExceedsEvictionsDeleted", func(t *testing.T) {
+		// Arrange
+		c := NewMapCache[testData](100, testDataWeigher).(*mapCache[testData])
+		c.deleteDeleted = 2
+		c.evictionsDeleted = 1
+
+		// Act & Assert
+		assert.Panics(t, func() {
+			c.checkInvariants()
+		})
+	})
+
+	t.Run("Telemetry_ReplaceSelfEvictedExceedsEvictionsCapacity", func(t *testing.T) {
+		// Arrange
+		c := NewMapCache[testData](100, testDataWeigher).(*mapCache[testData])
+		c.replaceSelfEvicted = 2
+		c.evictionsCapacity = 1
+
+		// Act & Assert
+		assert.Panics(t, func() {
+			c.checkInvariants()
+		})
+	})
+
+	t.Run("Telemetry_UpdatesMismatchEvictionsReplaced", func(t *testing.T) {
+		// Arrange
+		c := NewMapCache[testData](100, testDataWeigher).(*mapCache[testData])
+		c.putUpdated = 1
+		c.replaceUpdated = 1
+		c.evictionsReplaced = 1
+
+		// Act & Assert
+		assert.Panics(t, func() {
+			c.checkInvariants()
+		})
+	})
+
+	t.Run("Telemetry_PressureShedsExceedsEvictionsPressure", func(t *testing.T) {
+		// Arrange
+		c := NewMapCache[testData](100, testDataWeigher).(*mapCache[testData])
+		c.pressureShedsInline = 1
+		c.pressureShedsExplicit = 1
+		c.evictionsPressure = 1
+
+		// Act & Assert
+		assert.Panics(t, func() {
+			c.checkInvariants()
+		})
+	})
+
+	t.Run("Telemetry_ConservationEquationMismatch", func(t *testing.T) {
+		// Arrange
+		c := NewMapCache[testData](100, testDataWeigher).(*mapCache[testData])
+		_, err := c.Put("k1", testData{value: 1, dataSize: 10})
+		require.NoError(t, err)
+		c.putInserted = 5
+
+		// Act & Assert
+		assert.Panics(t, func() {
+			c.checkInvariants()
+		})
+	})
+}
+
+func TestPressureClampingPositiveInfinity(t *testing.T) {
+	t.Run("DefaultThresholds", func(t *testing.T) {
+		// Arrange
+		c := NewMapCache[testData](
+			100,
+			WithInvariantChecking(true),
+			testDataWeigher,
+			WithPressureFunc(func() float64 { return math.Inf(1) }),
+		)
+
+		// Act
+		_, err := c.Put("k1", testData{value: 1, dataSize: 10})
+		require.NoError(t, err)
+		st := c.Stats()
+
+		// Assert
+		assert.InDelta(t, 1.0, st.MemoryPressure, 0.0)
+	})
+
+	t.Run("DerivedEvictionThresholdAboveOne", func(t *testing.T) {
+		// Arrange: WithCompactionThreshold(0.95) derives EvictionThreshold = 1.10.
+		pressure := 0.0
+		c := NewMapCache[testData](
+			100,
+			WithInvariantChecking(true),
+			testDataWeigher,
+			WithCompactionThreshold(0.95),
+			WithPressureFunc(func() float64 { return pressure }),
+		).(PressureAwareCache[testData])
+
+		_, err := c.Put("k1", testData{value: 1, dataSize: 60})
+		require.NoError(t, err)
+		_, err = c.Put("k2", testData{value: 2, dataSize: 30})
+		require.NoError(t, err)
+
+		// Act: +Inf pressure must clamp to max(1.0, 0.95, 1.10) == 1.10 and trigger Tier 2 shedding.
+		pressure = math.Inf(1)
+		evicted := c.EvaluateMemoryPressure()
+		st := c.Stats()
+
+		// Assert
+		assert.NotEmpty(t, evicted)
+		assert.Equal(t, uint64(1), st.PressureShedsExplicit)
+		assert.False(t, math.IsInf(st.MemoryPressure, 0))
+		assert.InDelta(t, 1.10, st.MemoryPressure, 1e-9)
+	})
 }
 
 func TestMapCache_Compact(t *testing.T) {
@@ -964,12 +1140,13 @@ func TestMapCache_ZeroAllocHotPathsAndSingleAllocNewEntryPut(t *testing.T) {
 	})
 	assert.InDelta(t, 1.0, newPutAllocs, 0.0, "MapCache new-entry Put on pre-sized map must allocate 1 heap object (entry[V])")
 
-	// 2. Existing-key Put, Get, Peek, Replace (without eviction), and Values()/All()/Keys() allocate 0 heap objects.
+	// 2. Existing-key Put, Get, Peek, Replace (without eviction), Stats(), and Values()/All()/Keys() allocate 0 heap objects.
 	mc := c.(*mapCache[testData])
 	valSeq := c.Values()
 	allSeq := c.All()
 	keySeq := c.Keys()
 	hotAllocs := testing.AllocsPerRun(100, func() {
+		_ = c.Stats()
 		_, _ = c.Get(keys[0])
 		_, _ = c.Peek(keys[1])
 		_, _ = c.Put(keys[0], testData{value: 3, dataSize: 10})
@@ -999,5 +1176,50 @@ func TestMapCache_ZeroAllocHotPathsAndSingleAllocNewEntryPut(t *testing.T) {
 			}
 		}
 	})
-	assert.Zero(t, hotAllocs, "MapCache Get, Peek, overwrite Put, Replace, and iterators must allocate 0 heap objects")
+	assert.Zero(t, hotAllocs, "MapCache Stats, Get, Peek, overwrite Put, Replace, and iterators must allocate 0 heap objects")
+}
+
+func TestZeroAllocHotPathsAndStatsAcrossBackends(t *testing.T) {
+	backends := []struct {
+		name        string
+		backend     Backend
+		constructor func(uint64, ...Option) Cache[testData]
+	}{
+		{"MapCache", BackendMap, NewMapCache[testData]},
+		{"RadixCache", BackendRadix, NewRadixCache[testData]},
+		{"ArenaRadixCache", BackendArenaRadix, NewArenaRadixCache[testData]},
+	}
+
+	for _, b := range backends {
+		t.Run(b.name, func(t *testing.T) {
+			// Arrange: Pre-populate keys without invariant checking so hot-path allocations are measured cleanly.
+			c := b.constructor(1000, testDataWeigher, WithPressureFunc(func() float64 { return 0.25 }))
+			_, err := c.Put("dir/alpha", testData{value: 1, dataSize: 10})
+			require.NoError(t, err)
+			_, err = c.Put("dir/beta", testData{value: 2, dataSize: 10})
+			require.NoError(t, err)
+
+			var provider StatsProvider = c
+			valSeq := c.Values()
+
+			// Act
+			allocs := testing.AllocsPerRun(100, func() {
+				st := c.Stats()
+				if st.Backend != b.backend {
+					panic("unexpected backend")
+				}
+				_ = provider.Stats()
+				_, _ = c.Get("dir/alpha")
+				_, _ = c.Peek("dir/beta")
+				_, _ = c.Put("dir/alpha", testData{value: 3, dataSize: 10})
+				_ = c.Replace("dir/beta", testData{value: 4, dataSize: 10})
+				valSeq(func(v testData) bool {
+					return v.value >= 0
+				})
+			})
+
+			// Assert
+			assert.Zero(t, allocs, "%s Stats(), Get, Peek, in-place Put, Replace, and Values() must allocate 0 heap objects", b.name)
+		})
+	}
 }

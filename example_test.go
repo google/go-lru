@@ -190,3 +190,33 @@ func ExampleNew_iterators() {
 	// mru=dir/a
 	// sum=6
 }
+
+// ExampleNew_stats demonstrates inspecting point-in-time cache telemetry via Stats()
+// and the non-generic StatsProvider interface.
+func ExampleNew_stats() {
+	cache := lru.New[string](10, lru.WithWeigher(func(_ string, v string) uint64 {
+		return uint64(len(v))
+	}))
+
+	_, _ = cache.Put("a", "1234") // size 4 (total 4)
+	_, _ = cache.Put("b", "5678") // size 4 (total 8)
+	_, _ = cache.Get("a")         // hit ("a" becomes MRU)
+	_, _ = cache.Get("missing")   // miss
+
+	// Inserting "c" (size 4) exceeds maxSize (10), evicting LRU entry "b" (size 4).
+	_, _ = cache.Put("c", "9012")
+
+	var provider lru.StatsProvider = cache
+	st := provider.Stats()
+
+	fmt.Printf("backend=%s len=%d size=%d/%d\n", st.Backend, st.Len, st.CurrentSize, st.MaxSize)
+	fmt.Printf("hits=%d misses=%d\n", st.GetHits, st.GetMisses)
+	fmt.Printf("capacity_evictions=%d capacity_evicted_weight=%d\n",
+		st.Evictions(lru.EvictionReasonCapacity),
+		st.EvictedWeight(lru.EvictionReasonCapacity),
+	)
+	// Output:
+	// backend=MapCache len=2 size=8/10
+	// hits=1 misses=1
+	// capacity_evictions=1 capacity_evicted_weight=4
+}

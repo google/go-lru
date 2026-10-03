@@ -68,7 +68,8 @@ type arenaRadix[V any] struct {
 	pressureState
 }
 
-func (c *arenaRadix[V]) notifyEvict(key string, value V, reason EvictionReason) {
+func (c *arenaRadix[V]) notifyEvict(key string, value V, size uint64, reason EvictionReason) {
+	c.recordEviction(reason, size)
 	if c.onEvictValue != nil {
 		c.onEvictValue(value, reason)
 	}
@@ -371,6 +372,7 @@ func (c *arenaRadix[V]) lookupNodeKeyWithHash(key string, keyHash uint64) (uint3
 		// so a map miss is a guaranteed cache miss.
 		return nilNode, false
 	}
+	c.arenaHashFallbacks.Add(1)
 	return c.findNodeByTrieWalk(key)
 }
 
@@ -389,6 +391,7 @@ func (c *arenaRadix[V]) getNodeKeyWithHash(key string, keyHash uint64) (uint32, 
 		return nilNode, false
 	}
 
+	c.arenaHashFallbacks.Add(1)
 	curr, found := c.findNodeByTrieWalk(key)
 	if found {
 		c.nodeMap[keyHash] = curr
@@ -537,9 +540,10 @@ func (c *arenaRadix[V]) eraseInternalWithHash(nodeID uint32, hash uint64, key st
 		return zero, false
 	}
 	deletedEntry := c.nodes[nodeID].value
-	c.onEntryDeleted(c.nodes[nodeID].size)
+	evictedSize := c.nodes[nodeID].size
+	c.onEntryDeleted(evictedSize)
 	c.nodeMapDirty = true
-	c.currentSize -= c.nodes[nodeID].size
+	c.currentSize -= evictedSize
 	c.nodes[nodeID].size = 0
 
 	if mappedID, ok := c.nodeMap[hash]; ok && mappedID == nodeID {
@@ -549,7 +553,7 @@ func (c *arenaRadix[V]) eraseInternalWithHash(nodeID uint32, hash uint64, key st
 	c.remove(nodeID)
 	c.deleteNode(nodeID)
 
-	c.notifyEvict(key, deletedEntry, reason)
+	c.notifyEvict(key, deletedEntry, evictedSize, reason)
 	return deletedEntry, true
 }
 
@@ -697,6 +701,7 @@ func (c *arenaRadix[V]) compactDataStructuresLocked() bool {
 // Caller MUST hold c.mu.Lock().
 func (c *arenaRadix[V]) compactLocked() {
 	if c.compactDataStructuresLocked() {
+		c.compactionsExplicit++
 		c.markReclaimedLocked()
 	}
 }
@@ -752,7 +757,18 @@ func (c *arenaRadix[V]) shedAndCompactLocked(targetSize uint64, retention float6
 		victimID = nextVictimID
 	}
 
+	if len(evicted) > 0 {
+		if autoCompactID == nilNode {
+			c.pressureShedsExplicit++
+		} else {
+			c.pressureShedsInline++
+		}
+	}
+
 	if len(evicted) > 0 && c.len == 0 {
+		if c.shouldAutoCompactEntryCounts(true, autoCompactID == nilNode, 0) || c.freeCount >= 64 {
+			c.compactionsPressureTier2++
+		}
 		c.resetEmptyArenaLocked()
 		return evicted
 	}
@@ -763,6 +779,9 @@ func (c *arenaRadix[V]) shedAndCompactLocked(targetSize uint64, retention float6
 	compacted := false
 	if c.shouldAutoCompactLocked(autoCompactID) {
 		compacted = c.compactDataStructuresLocked()
+		if compacted {
+			c.compactionsPressureTier2++
+		}
 	}
 	if len(evicted) > 0 || compacted {
 		c.markReclaimedLocked()
@@ -789,7 +808,10 @@ func (c *arenaRadix[V]) maybeReclaimUnderPressureLocked(pressure float64, protec
 		c.resetZeroWatermarkBelowTier2(pressure)
 		if pressure >= c.options.CompactionThreshold {
 			if c.shouldAutoCompactLocked(protectedNodeID) {
-				c.compactLocked()
+				if c.compactDataStructuresLocked() {
+					c.compactionsPressureTier1++
+					c.markReclaimedLocked()
+				}
 			}
 		}
 	}

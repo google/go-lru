@@ -9,6 +9,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 ## [Unreleased]
 
 ### Added
+- **Zero-Allocation `Stats()` Telemetry Snapshot (`Cache.Stats()`)**:
+  - Extended `Cache[V any]` with `Stats() Stats` (and `StatsProvider` interface) across `MapCache`, `RadixCache`, and `ArenaRadixCache`, exposing `Get`/`Peek` hits & misses, eviction counts & weights by `EvictionReason` (`Evictions(reason)` and `EvictedWeight(reason)` helpers), capacity & zero-weight entry gauges, mutation outcomes (`Put`, `Replace`, `Delete`, `DeletePrefix`), two-tier memory pressure & compaction/shed triggers, watermark gauges (`DeletedSinceCompact`, `PeakEntryLen`), and `ArenaRadixCache` node state & FNV-1a hash-fallback counters with `0 allocs/op`.
+- **Asynchronous OpenTelemetry Submodule (`github.com/google/go-lru/otellru`)**:
+  - Added standalone `otellru` Go submodule registering 16 asynchronous/observable OTel counters and gauges (`lru.cache.requests`, `lru.cache.evictions`, `lru.cache.evicted_weight`, `lru.cache.size`, `lru.cache.max_size`, `lru.cache.entries`, `lru.cache.zero_weight_entries`, `lru.cache.mutations`, `lru.cache.memory_pressure`, `lru.cache.compactions`, `lru.cache.pressure_sheds`, `lru.cache.reclaim_epochs`, `lru.cache.deleted_since_compact`, `lru.cache.peak_entries`, `lru.cache.arena.nodes`, `lru.cache.arena.hash_fallbacks`) via a single batch `Meter.RegisterCallback` with pre-allocated `attribute.Set` options (`0 allocs/op` per scrape) while keeping the root `go.mod` zero-dependency.
 - **Range-Over-Function Iterators (`All`, `Keys`, `Values`, Go 1.23+)**:
   - Extended `Cache[V any]` and implemented `All() iter.Seq2[string, V]`, `Keys() iter.Seq[string]`, and `Values() iter.Seq[V]` across `MapCache`, `RadixCache`, and `ArenaRadixCache`, traversing live entries in deterministic MRU-to-LRU order under `RLock` without altering recency (with `0 allocs/op` on `Values()` across all backends and `0 allocs/op` on `MapCache.All()` / `MapCache.Keys()`).
 - **Eviction & Removal Callbacks (`WithOnEvictValue` & `WithOnEvictEntry`)**:
@@ -47,21 +51,25 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## Release & Versioning Workflow
 
-To cut a new semantic version release (e.g. `v0.0.1`):
+To cut a new semantic version release (e.g. `v0.0.1` and `otellru/v0.0.1`):
 
 ```bash
-# 1. Verify formatting, static analysis, race-enabled test suite, and examples
+# 1. Verify formatting, static analysis, race-enabled test suite, and examples (root and otellru)
 test -z "$(gofmt -s -l .)"
 test -z "$(goimports -l .)"
 go vet ./...
 golangci-lint run
 go test -race ./...
 go test -v -run=^Example ./...
+(cd otellru && go vet ./... && golangci-lint run && go test -race ./... && go test -v -run=^Example ./...)
 
 # 2. Verify benchmark & resource usage suite
 go test -run=^$ -bench=. -benchmem -benchtime=10ms ./...
+(cd otellru && go test -run=^$ -bench=. -benchmem -benchtime=10ms ./...)
 
-# 3. Create and push annotated semantic version tag
+# 3. Update otellru/go.mod to require github.com/google/go-lru v0.0.1 (if releasing together),
+#    then create and push annotated semantic version tags
 git tag -a v0.0.1 -m "Release v0.0.1"
+git tag -a otellru/v0.0.1 -m "Release otellru/v0.0.1"
 git push origin --tags
 ```
