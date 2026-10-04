@@ -20,6 +20,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
+	"unsafe"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -3041,4 +3042,142 @@ func TestPressure_EvictionCallbacks_Tier2ExplicitAndForeground(t *testing.T) {
 			})
 		})
 	}
+}
+
+func TestClonePrefix_AllByteValuesAndZeroAllocations(t *testing.T) {
+	t.Run("All256SingleByteStringsPreserveExactByteAndBackingIsolation", func(t *testing.T) {
+		// Arrange
+		var raw [256]byte
+		for i := range 256 {
+			raw[i] = byte(i)
+		}
+		callerBacking := string(raw[:])
+
+		// Act
+		var cloned [256]string
+		for i := range 256 {
+			cloned[i] = clonePrefix(callerBacking[i : i+1])
+		}
+		clonedEmpty := clonePrefix("")
+		clonedMulti := clonePrefix(callerBacking[128:132])
+
+		// Assert
+		assert.Empty(t, clonedEmpty)
+		assert.Equal(t, callerBacking[128:132], clonedMulti)
+		assert.NotSame(t, unsafe.StringData(callerBacking[128:132]), unsafe.StringData(clonedMulti))
+		for i := range 256 {
+			sub := callerBacking[i : i+1]
+			require.Len(t, byteStrings[i], 1, "byteStrings[%d] must be 1 byte", i)
+			require.Equal(t, byte(i), byteStrings[i][0], "byteStrings[%d] byte mismatch", i)
+			require.Len(t, cloned[i], 1, "clonePrefix for byte 0x%02x must have length 1", i)
+			require.Equal(t, sub, cloned[i], "clonePrefix for byte 0x%02x must equal input", i)
+			assert.Equal(t, byte(i), cloned[i][0], "clonePrefix for byte 0x%02x must preserve exact raw byte", i)
+			assert.NotSame(t, unsafe.StringData(callerBacking), unsafe.StringData(cloned[i]),
+				"clonePrefix for byte 0x%02x must not alias callerBacking", i)
+			assert.NotSame(t, unsafe.StringData(sub), unsafe.StringData(cloned[i]),
+				"clonePrefix for byte 0x%02x must not alias substring slice data pointer", i)
+		}
+	})
+
+	t.Run("ZeroAllocationsAcrossAll256SingleBytePrefixes", func(t *testing.T) {
+		// Arrange
+		var raw [256]byte
+		for i := range 256 {
+			raw[i] = byte(i)
+		}
+		callerBacking := string(raw[:])
+
+		// Act
+		var sink string
+		allocsAll := testing.AllocsPerRun(100, func() {
+			for i := range 256 {
+				sink = clonePrefix(callerBacking[i : i+1])
+			}
+		})
+		allocsHighBytes := testing.AllocsPerRun(100, func() {
+			for i := 128; i < 256; i++ {
+				sink = clonePrefix(callerBacking[i : i+1])
+			}
+		})
+		_ = sink
+
+		// Assert
+		assert.Zero(t, allocsAll, "clonePrefix across all 256 1-byte strings (0x00..0xFF) must allocate 0 objects")
+		assert.Zero(t, allocsHighBytes, "clonePrefix across high-bit 1-byte strings (0x80..0xFF) must allocate 0 objects")
+	})
+
+	t.Run("ZeroAllocationsOnHotPathsWithNonASCIIAndUTF8Keys", func(t *testing.T) {
+		backends := []struct {
+			name string
+			newC func() Cache[int]
+		}{
+			{name: "MapCache", newC: func() Cache[int] { return NewMapCache[int](64) }},
+			{name: "RadixCache", newC: func() Cache[int] { return NewRadixCache[int](64) }},
+			{name: "ArenaRadixCache", newC: func() Cache[int] { return NewArenaRadixCache[int](64) }},
+		}
+
+		for _, b := range backends {
+			t.Run(b.name, func(t *testing.T) {
+				// Arrange
+				cache := b.newC()
+				keys := []string{"\x80", "\xaf", "\xff", "café", "cafè"}
+				for idx, k := range keys {
+					_, err := cache.Put(k, idx+1)
+					require.NoError(t, err)
+				}
+				valSeq := cache.Values()
+
+				// Act
+				getAllocs := testing.AllocsPerRun(100, func() {
+					for _, k := range keys {
+						v, ok := cache.Get(k)
+						if !ok || v == 0 {
+							panic("unexpected Get miss")
+						}
+					}
+				})
+				peekAllocs := testing.AllocsPerRun(100, func() {
+					for _, k := range keys {
+						v, ok := cache.Peek(k)
+						if !ok || v == 0 {
+							panic("unexpected Peek miss")
+						}
+					}
+				})
+				putInPlaceAllocs := testing.AllocsPerRun(100, func() {
+					for _, k := range keys {
+						if _, err := cache.Put(k, 42); err != nil {
+							panic(err)
+						}
+					}
+				})
+				replaceAllocs := testing.AllocsPerRun(100, func() {
+					for _, k := range keys {
+						if err := cache.Replace(k, 99); err != nil {
+							panic(err)
+						}
+					}
+				})
+				valuesAllocs := testing.AllocsPerRun(100, func() {
+					valSeq(func(v int) bool {
+						return v > 0
+					})
+				})
+				statsAllocs := testing.AllocsPerRun(100, func() {
+					st := cache.Stats()
+					if st.Len != len(keys) {
+						panic("unexpected Stats().Len")
+					}
+				})
+
+				// Assert
+				assert.Zero(t, getAllocs, "%s Get must be 0 allocs/op", b.name)
+				assert.Zero(t, peekAllocs, "%s Peek must be 0 allocs/op", b.name)
+				assert.Zero(t, putInPlaceAllocs, "%s in-place Put must be 0 allocs/op", b.name)
+				assert.Zero(t, replaceAllocs, "%s Replace must be 0 allocs/op", b.name)
+				assert.Zero(t, valuesAllocs, "%s Values() must be 0 allocs/op", b.name)
+				assert.Zero(t, statsAllocs, "%s Stats() must be 0 allocs/op", b.name)
+			})
+		}
+	})
 }

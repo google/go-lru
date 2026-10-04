@@ -1659,3 +1659,254 @@ func TestDifferential_StatsFullLifecycleParity(t *testing.T) {
 	assert.Zero(t, st.DeletedSinceCompact)
 	assert.Zero(t, st.PeakEntryLen)
 }
+
+func TestDifferential_NonASCIISingleByteKeysAndUTF8PrefixSplits(t *testing.T) {
+	t.Run("All256SingleByteKeys", func(t *testing.T) {
+		// Arrange
+		var valEvents []diffEvictEvent
+		var entryEvents []diffEvictEvent
+		h := newDifferentialHarness(
+			t,
+			3000,
+			lru.WithOnEvictValue(func(v *diffValue, reason lru.EvictionReason) {
+				ev := diffEvictEvent{reason: reason, isNil: v == nil}
+				if v != nil {
+					ev.valID = v.id
+					ev.valSz = v.size
+				}
+				valEvents = append(valEvents, ev)
+			}),
+			lru.WithOnEvictEntry(func(k string, v *diffValue, reason lru.EvictionReason) {
+				ev := diffEvictEvent{key: k, reason: reason, isNil: v == nil}
+				if v != nil {
+					ev.valID = v.id
+					ev.valSz = v.size
+				}
+				entryEvents = append(entryEvents, ev)
+			}),
+		)
+
+		var raw [256]byte
+		for i := range 256 {
+			raw[i] = byte(i)
+		}
+		backing := string(raw[:])
+		keys := make([]string, 256)
+		for i := range 256 {
+			keys[i] = backing[i : i+1]
+		}
+		highByteKeys := []string{"\x80", "\xaf", "\xff"}
+
+		// Act
+		for i, k := range keys {
+			evicted := h.Put(k, &diffValue{id: fmt.Sprintf("init_%02x", i), size: 10})
+			require.Empty(t, evicted)
+		}
+		for _, k := range highByteKeys {
+			evicted := h.Put(k, &diffValue{id: fmt.Sprintf("put_%02x", k[0]), size: 10})
+			require.Empty(t, evicted)
+		}
+		for _, k := range highByteKeys {
+			h.Replace(k, &diffValue{id: fmt.Sprintf("rep_%02x", k[0]), size: 10})
+		}
+
+		var gotGet [256]*diffValue
+		var gotPeek [256]*diffValue
+		for i, k := range keys {
+			gotGet[i] = h.Get(k)
+			gotPeek[i] = h.Peek(k)
+		}
+		h.VerifyIterators()
+
+		del80 := h.Delete("\x80")
+		delAF := h.Delete("\xaf")
+		h.DeletePrefix("\xff")
+		miss80 := h.Get("\x80")
+		missAF := h.Peek("\xaf")
+		missFF := h.Get("\xff")
+
+		// Assert
+		for i := range 256 {
+			require.NotNil(t, gotGet[i], "Get must hit for byte 0x%02x", i)
+			require.NotNil(t, gotPeek[i], "Peek must hit for byte 0x%02x", i)
+			expectedID := fmt.Sprintf("init_%02x", i)
+			if i == 0x80 || i == 0xaf || i == 0xff {
+				expectedID = fmt.Sprintf("rep_%02x", i)
+			}
+			assert.Equal(t, expectedID, gotGet[i].id)
+			assert.Equal(t, expectedID, gotPeek[i].id)
+		}
+		require.NotNil(t, del80)
+		assert.Equal(t, "rep_80", del80.id)
+		require.NotNil(t, delAF)
+		assert.Equal(t, "rep_af", delAF.id)
+		assert.Nil(t, miss80)
+		assert.Nil(t, missAF)
+		assert.Nil(t, missFF)
+
+		h.VerifyIterators()
+		h.VerifyStatsParity("All256SingleByteKeys")
+		st := h.instances[0].cache.Stats()
+		assert.Equal(t, 253, st.Len)
+		assert.Equal(t, uint64(2530), st.CurrentSize)
+		assert.Equal(t, uint64(256), st.PutInserted)
+		assert.Equal(t, uint64(3), st.PutUpdated)
+		assert.Equal(t, uint64(3), st.ReplaceUpdated)
+		assert.Equal(t, uint64(6), st.EvictionsReplaced)
+		assert.Equal(t, uint64(2), st.DeleteDeleted)
+		assert.Equal(t, uint64(1), st.DeletePrefixExecuted)
+		assert.Equal(t, uint64(3), st.EvictionsDeleted)
+
+		numInstances := len(h.instances)
+		require.Len(t, valEvents, 9*numInstances)
+		require.Len(t, entryEvents, 9*numInstances)
+		for idx, ev := range entryEvents {
+			expectedVal := ev
+			expectedVal.key = ""
+			assert.Equal(t, expectedVal, valEvents[idx])
+		}
+	})
+
+	t.Run("MultiByteUTF8AndHighByteRadixPrefixSplits", func(t *testing.T) {
+		// Arrange
+		var valEvents []diffEvictEvent
+		var entryEvents []diffEvictEvent
+		h := newDifferentialHarness(
+			t,
+			160,
+			lru.WithOnEvictValue(func(v *diffValue, reason lru.EvictionReason) {
+				ev := diffEvictEvent{reason: reason, isNil: v == nil}
+				if v != nil {
+					ev.valID = v.id
+					ev.valSz = v.size
+				}
+				valEvents = append(valEvents, ev)
+			}),
+			lru.WithOnEvictEntry(func(k string, v *diffValue, reason lru.EvictionReason) {
+				ev := diffEvictEvent{key: k, reason: reason, isNil: v == nil}
+				if v != nil {
+					ev.valID = v.id
+					ev.valSz = v.size
+				}
+				entryEvents = append(entryEvents, ev)
+			}),
+		)
+
+		// Keys ordered to exercise all 4 insertNode clonePrefix call sites on 1-byte segments >= 0x80:
+		// 1. "dir\xaf" followed by "dir" -> splits existing child with 1-byte suffix oldPrefix[lcp:] == "\xaf"
+		// 2. "dir\x80", "dir\xff" -> inserts 1-byte child leaves search == "\x80", "\xff" under "dir"
+		// 3. "\x80alpha", "\x80beta" -> splits 1-byte shared prefix oldPrefix[:lcp] == "\x80"
+		// 4. Multi-byte UTF-8 continuation-byte splits: "café", "cafè", "cafê", "cafë", "é", "è", "naïve", "naïf", "🚀", "🛸"
+		initialKeys := []string{
+			"dir\xaf",
+			"dir",
+			"dir\x80",
+			"dir\xff",
+			"\x80alpha",
+			"\x80beta",
+			"café",
+			"cafè",
+			"cafê",
+			"cafë",
+			"é",
+			"è",
+			"naïve",
+			"naïf",
+			"🚀",
+			"🛸",
+		}
+
+		// Act
+		for i, k := range initialKeys {
+			evicted := h.Put(k, &diffValue{id: fmt.Sprintf("v_%d", i), size: 10})
+			require.Empty(t, evicted)
+		}
+
+		for _, k := range initialKeys {
+			require.NotNil(t, h.Peek(k))
+			require.NotNil(t, h.Get(k))
+		}
+		h.Replace("dir\xaf", &diffValue{id: "v_dir_af_rep", size: 10})
+		h.Replace("café", &diffValue{id: "v_cafe_rep", size: 10})
+		h.VerifyIterators()
+
+		// Trigger capacity eviction of the 2 oldest LRU keys ("dir\xaf" and "dir") by inserting a 20-byte entry.
+		valEvents = nil
+		entryEvents = nil
+		evictedCap := h.Put("overflow_trigger", &diffValue{id: "v_overflow", size: 20})
+
+		capEntryEvents := slices.Clone(entryEvents)
+		valEvents = nil
+		entryEvents = nil
+
+		// DeletePrefix("caf") removes "café", "cafè", "cafê", "cafë" and reconstructs their UTF-8 keys for WithOnEvictEntry.
+		h.DeletePrefix("caf")
+		prefixEntryEvents := slices.Clone(entryEvents)
+		valEvents = nil
+		entryEvents = nil
+
+		// Delete individual keys to exercise upward path compression (compressPathUpwards) on 1-byte high-bit segments.
+		delRocket := h.Delete("🚀")
+		delAlpha := h.Delete("\x80alpha")
+		delDir80 := h.Delete("dir\x80")
+		delNaive := h.Delete("naïve")
+		singleDeleteEvents := slices.Clone(entryEvents)
+
+		// Compact all instances (rebuilding ArenaRadixCache nodeMap via hashNodeKey on split/compressed high-bit prefixes).
+		for _, inst := range h.instances {
+			inst.cache.(lru.PressureAwareCache[*diffValue]).Compact()
+		}
+
+		// Assert
+		require.Len(t, evictedCap, 2)
+		assert.Equal(t, "v_dir_af_rep", evictedCap[0].id)
+		assert.Equal(t, "v_1", evictedCap[1].id)
+
+		numInstances := len(h.instances)
+		require.Len(t, capEntryEvents, 2*numInstances)
+		for i := range numInstances {
+			instEvents := capEntryEvents[i*2 : (i+1)*2]
+			assert.Equal(t, []diffEvictEvent{
+				{key: "dir\xaf", valID: "v_dir_af_rep", valSz: 10, reason: lru.EvictionReasonCapacity},
+				{key: "dir", valID: "v_1", valSz: 10, reason: lru.EvictionReasonCapacity},
+			}, instEvents)
+		}
+
+		require.Len(t, prefixEntryEvents, 4*numInstances)
+		for i := range numInstances {
+			instEvents := prefixEntryEvents[i*4 : (i+1)*4]
+			assert.ElementsMatch(t, []diffEvictEvent{
+				{key: "café", valID: "v_cafe_rep", valSz: 10, reason: lru.EvictionReasonDeleted},
+				{key: "cafè", valID: "v_7", valSz: 10, reason: lru.EvictionReasonDeleted},
+				{key: "cafê", valID: "v_8", valSz: 10, reason: lru.EvictionReasonDeleted},
+				{key: "cafë", valID: "v_9", valSz: 10, reason: lru.EvictionReasonDeleted},
+			}, instEvents)
+		}
+
+		require.NotNil(t, delRocket)
+		require.NotNil(t, delAlpha)
+		require.NotNil(t, delDir80)
+		require.NotNil(t, delNaive)
+		require.Len(t, singleDeleteEvents, 4*numInstances)
+
+		survivingKeys := []string{"dir\xff", "\x80beta", "é", "è", "naïf", "🛸", "overflow_trigger"}
+		for _, k := range survivingKeys {
+			assert.NotNil(t, h.Peek(k), "expected surviving key %q to be present on Peek", k)
+			assert.NotNil(t, h.Get(k), "expected surviving key %q to be present on Get", k)
+		}
+
+		removedKeys := []string{"dir\xaf", "dir", "dir\x80", "\x80alpha", "café", "cafè", "cafê", "cafë", "naïve", "🚀"}
+		for _, k := range removedKeys {
+			assert.Nil(t, h.Peek(k), "expected removed key %q to miss on Peek", k)
+			assert.Nil(t, h.Get(k), "expected removed key %q to miss on Get", k)
+		}
+
+		h.VerifyIterators()
+		h.VerifyFullCompactionStatsParity("MultiByteUTF8AndHighByteRadixPrefixSplits")
+		st := h.instances[0].cache.Stats()
+		assert.Equal(t, len(survivingKeys), st.Len)
+		assert.Equal(t, uint64(80), st.CurrentSize)
+		assert.Equal(t, uint64(1), st.CompactionsExplicit)
+		assert.Zero(t, st.DeletedSinceCompact)
+	})
+}

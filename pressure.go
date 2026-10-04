@@ -50,8 +50,13 @@ func currentGoroutineID() uint64 {
 var byteStrings [256]string
 
 func init() {
+	var raw [256]byte
 	for i := range 256 {
-		byteStrings[i] = string(byte(i))
+		raw[i] = byte(i)
+	}
+	all := string(raw[:])
+	for i := range 256 {
+		byteStrings[i] = all[i : i+1]
 	}
 }
 
