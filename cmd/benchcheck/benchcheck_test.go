@@ -33,8 +33,8 @@ cpu: Intel(R) Xeon(R) CPU @ 2.60GHz
 Benchmark_Put_MapCache/Flat-96                                	  355476	       334.6 ns/op	     106 B/op	       2 allocs/op
 Benchmark_Put_MapCache/Nested_Depth2-96                       	  356649	       333.6 ns/op	     106 B/op	       2 allocs/op
 Benchmark_Put_MapCache/DeeplyNested_Depth10-96                	  286614	       411.6 ns/op	     163 B/op	       2 allocs/op
-Benchmark_Put_RadixCache/Flat-96                              	  231214	       478.8 ns/op	     119 B/op	       3 allocs/op
-Benchmark_Put_RadixCache/Nested_Depth2-96                     	  243220	       470.6 ns/op	     119 B/op	       3 allocs/op
+Benchmark_Put_RadixCache/Flat-96                              	  231214	       478.8 ns/op	     119 B/op	       2 allocs/op
+Benchmark_Put_RadixCache/Nested_Depth2-96                     	  243220	       470.6 ns/op	     119 B/op	       2 allocs/op
 Benchmark_Put_RadixCache/DeeplyNested_Depth10-96              	  218532	       520.5 ns/op	     119 B/op	       2 allocs/op
 Benchmark_Put_ArenaRadixCache/Flat-96                         	  218076	       535.0 ns/op	      37 B/op	       1 allocs/op
 Benchmark_Put_ArenaRadixCache/Nested_Depth2-96                	  206865	       552.0 ns/op	      38 B/op	       1 allocs/op
@@ -93,7 +93,7 @@ Benchmark_LargeScale_DeletePrefix_100K/ArenaRadixCache-96     	      15	   40812
 Benchmark_ArenaRadixCache_Compact-96                          	     102	    523567 ns/op	    816664 reclaimed-B/op	  718251 B/op	     215 allocs/op
 Benchmark_ArenaRadixCache_PutUnderPressure-96                 	    8185	      7330 ns/op	     382 B/op	       2 allocs/op
 Benchmark_Put_WithOnEvictValue/MapCache-96                    	  172410	       348.0 ns/op	     105 B/op	       2 allocs/op
-Benchmark_Put_WithOnEvictValue/RadixCache-96                  	  115096	       521.3 ns/op	     119 B/op	       3 allocs/op
+Benchmark_Put_WithOnEvictValue/RadixCache-96                  	  115096	       521.3 ns/op	     119 B/op	       2 allocs/op
 Benchmark_Put_WithOnEvictValue/ArenaRadixCache-96             	  105188	       570.4 ns/op	      35 B/op	       1 allocs/op
 Benchmark_Put_WithOnEvictEntry/MapCache-96                    	  170988	       350.9 ns/op	     105 B/op	       2 allocs/op
 Benchmark_Put_WithOnEvictEntry/RadixCache-96                  	   97292	       616.7 ns/op	     142 B/op	       3 allocs/op
@@ -603,15 +603,15 @@ Benchmark_ArenaRadixCache_Compact-96              	     100	    520000 ns/op	   
 	assert.Equal(t, "Benchmark_Get_MapCache/Flat", rep.Violations[1].Benchmark)
 	assert.Equal(t, UnitAllocsPerOp, rep.Violations[1].Metric)
 
-	// 3: Benchmark_Peek_MapCache violates MaxNsPerOp (950 > 400)
+	// 3: Benchmark_Peek_MapCache violates MaxNsPerOp (950 > 75)
 	assert.Equal(t, "Benchmark_Peek_MapCache", rep.Violations[2].Benchmark)
 	assert.Equal(t, UnitNsPerOp, rep.Violations[2].Metric)
 
-	// 4: Benchmark_LargeScale_Put_100K/RadixCache violates MaxHeapBytesPerEnt (185 > 140)
+	// 4: Benchmark_LargeScale_Put_100K/RadixCache violates MaxHeapBytesPerEnt (185 > 108)
 	assert.Equal(t, "Benchmark_LargeScale_Put_100K/RadixCache", rep.Violations[3].Benchmark)
 	assert.Equal(t, UnitHeapBytesPerEnt, rep.Violations[3].Metric)
 
-	// 5: Benchmark_ArenaRadixCache_Compact violates MinReclaimedBytesOp (200000 < 400000)
+	// 5: Benchmark_ArenaRadixCache_Compact violates MinReclaimedBytesOp (200000 < 750000)
 	assert.Equal(t, "Benchmark_ArenaRadixCache_Compact", rep.Violations[4].Benchmark)
 	assert.Equal(t, UnitReclaimedBytesOp, rep.Violations[4].Metric)
 
