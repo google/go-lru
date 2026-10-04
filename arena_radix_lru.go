@@ -63,18 +63,7 @@ func (c *arenaRadix[V]) weigh(key string, value V) uint64 {
 // 4. LCRS tree hierarchy (parent-child links, prefix non-emptiness, sorted siblings, compactness)
 // 5. Value-bearing node reachability and tree-to-LRU bijection
 // Uses non-recursive O(1)-space pre-order tree traversal to prevent stack overflows.
-func (c *arenaRadix[V]) checkInvariants() {
-	// INVARIANT 1: maxSize > 0
-	if c.maxSize == 0 {
-		panic("arenaRadix invariant violation: maxSize must be greater than 0")
-	}
-
-	// INVARIANT 2: currentSize <= maxSize
-	if c.currentSize > c.maxSize {
-		panic(fmt.Sprintf("arenaRadix invariant violation: currentSize %d exceeds maxSize %d", c.currentSize, c.maxSize))
-	}
-
-	// INVARIANT 3: LRU list validation
+func (c *arenaRadix[V]) checkLRUListWalkInvariants() {
 	lruCount := 0
 	zeroCount := 0
 	var sumSize uint64
@@ -104,16 +93,12 @@ func (c *arenaRadix[V]) checkInvariants() {
 			if c.head != currID {
 				panic("arenaRadix invariant violation: head mismatch in LRU list")
 			}
-		} else {
-			if c.nodes[prevID].next != currID {
-				panic(fmt.Sprintf("arenaRadix invariant violation: corrupt next pointer in LRU list for prefix '%s'", c.nodes[prevID].prefix))
-			}
+		} else if c.nodes[prevID].next != currID {
+			panic(fmt.Sprintf("arenaRadix invariant violation: corrupt next pointer in LRU list for prefix '%s'", c.nodes[prevID].prefix))
 		}
 
-		if c.nodes[currID].next == nilNode {
-			if c.tail != currID {
-				panic("arenaRadix invariant violation: tail mismatch in LRU list")
-			}
+		if c.nodes[currID].next == nilNode && c.tail != currID {
+			panic("arenaRadix invariant violation: tail mismatch in LRU list")
 		}
 
 		prevID = currID
@@ -130,27 +115,30 @@ func (c *arenaRadix[V]) checkInvariants() {
 	if sumSize != c.currentSize {
 		panic(fmt.Sprintf("arenaRadix: currentSize drift: currentSize=%d sumSize=%d", c.currentSize, sumSize))
 	}
+}
 
+func (c *arenaRadix[V]) checkLRUEndpointsInvariants() {
 	if c.len == 0 {
 		if c.head != nilNode || c.tail != nilNode {
 			panic("arenaRadix invariant violation: head or tail is non-nilNode when len is 0")
 		}
-	} else {
-		if c.head == nilNode || c.tail == nilNode {
-			panic("arenaRadix invariant violation: head or tail is nilNode when len > 0")
-		}
-		if c.head >= uint32(len(c.nodes)) || c.tail >= uint32(len(c.nodes)) {
-			panic("arenaRadix invariant violation: head or tail index out of bounds")
-		}
-		if c.nodes[c.head].prev != nilNode {
-			panic("arenaRadix invariant violation: head prev pointer is not nilNode")
-		}
-		if c.nodes[c.tail].next != nilNode {
-			panic("arenaRadix invariant violation: tail next pointer is not nilNode")
-		}
+		return
 	}
+	if c.head == nilNode || c.tail == nilNode {
+		panic("arenaRadix invariant violation: head or tail is nilNode when len > 0")
+	}
+	if c.head >= uint32(len(c.nodes)) || c.tail >= uint32(len(c.nodes)) {
+		panic("arenaRadix invariant violation: head or tail index out of bounds")
+	}
+	if c.nodes[c.head].prev != nilNode {
+		panic("arenaRadix invariant violation: head prev pointer is not nilNode")
+	}
+	if c.nodes[c.tail].next != nilNode {
+		panic("arenaRadix invariant violation: tail next pointer is not nilNode")
+	}
+}
 
-	// INVARIANT 4: Root structure checks
+func (c *arenaRadix[V]) checkRootInvariants() {
 	if c.root == nilNode || c.root >= uint32(len(c.nodes)) {
 		panic("arenaRadix invariant violation: root node is nilNode or out of bounds")
 	}
@@ -163,8 +151,57 @@ func (c *arenaRadix[V]) checkInvariants() {
 	if c.nodes[c.root].sibling != nilNode {
 		panic("arenaRadix invariant violation: root node must not have siblings")
 	}
+}
 
-	// INVARIANT 5: Iterative pre-order traversal using parent/sibling pointers (O(1) space).
+func (c *arenaRadix[V]) checkTreeNodeInvariants(currID uint32) {
+	if c.nodes[currID].hasValue {
+		// A node is verifiably in the LRU list iff it is the head (with nilNode prev) or its prev's next points back to it.
+		prev := c.nodes[currID].prev
+		inLRU := (c.head == currID && prev == nilNode) || (prev != nilNode && prev < uint32(len(c.nodes)) && c.nodes[prev].next == currID)
+		if !inLRU {
+			panic(fmt.Sprintf("arenaRadix invariant violation: node with prefix '%s' has value but is missing from LRU list", c.nodes[currID].prefix))
+		}
+		return
+	}
+	if c.nodes[currID].size != 0 {
+		panic(fmt.Sprintf("arenaRadix invariant violation: routing node %d has non-zero size %d", currID, c.nodes[currID].size))
+	}
+	if c.nodes[currID].prev != nilNode || c.nodes[currID].next != nilNode || c.head == currID || c.tail == currID {
+		panic(fmt.Sprintf("arenaRadix invariant violation: routing node %d has non-nilNode LRU pointers", currID))
+	}
+	if !isZeroValue(&c.nodes[currID].value) {
+		panic(fmt.Sprintf("arenaRadix invariant violation: routing node %d with prefix '%s' retains non-zero value", currID, c.nodes[currID].prefix))
+	}
+}
+
+func (c *arenaRadix[V]) checkChildrenAndCompactness(currID uint32) {
+	// Validate child pointers and sibling ordering
+	prevSiblingID := nilNode
+	for chID := c.nodes[currID].child; chID != nilNode; chID = c.nodes[chID].sibling {
+		if chID >= uint32(len(c.nodes)) {
+			panic(fmt.Sprintf("arenaRadix invariant violation: child index %d out of bounds (len=%d)", chID, len(c.nodes)))
+		}
+		if c.nodes[chID].parent != currID {
+			panic(fmt.Sprintf("arenaRadix invariant violation: child with prefix '%s' has incorrect parent pointer", c.nodes[chID].prefix))
+		}
+		if len(c.nodes[chID].prefix) == 0 {
+			panic("arenaRadix invariant violation: non-root child node has empty prefix")
+		}
+		if prevSiblingID != nilNode && c.nodes[prevSiblingID].prefix[0] >= c.nodes[chID].prefix[0] {
+			panic(fmt.Sprintf("arenaRadix invariant violation: siblings not sorted lexicographically ('%s' >= '%s')", c.nodes[prevSiblingID].prefix, c.nodes[chID].prefix))
+		}
+		prevSiblingID = chID
+	}
+
+	// Validate tree compactness: non-root routing nodes without a value must have >= 2 children.
+	if currID != c.root && !c.nodes[currID].hasValue &&
+		(c.nodes[currID].child == nilNode || c.nodes[c.nodes[currID].child].sibling == nilNode) {
+		panic(fmt.Sprintf("arenaRadix invariant violation: intermediate routing node with prefix '%s' has fewer than 2 children", c.nodes[currID].prefix))
+	}
+}
+
+func (c *arenaRadix[V]) checkTreeInvariants() int {
+	// Iterative pre-order traversal using parent/sibling pointers (O(1) space).
 	// Validates tree integrity, sibling sorted order, parent pointers, compactness,
 	// and 1:1 bijection between value-bearing nodes and LRU list elements.
 	treeCount := 0
@@ -182,48 +219,9 @@ func (c *arenaRadix[V]) checkInvariants() {
 				panic("arenaRadix invariant violation: treeSumSize uint64 overflow")
 			}
 			treeSumSize += c.nodes[currID].size
-			// A node is verifiably in the LRU list iff it is the head (with nilNode prev) or its prev's next points back to it.
-			prev := c.nodes[currID].prev
-			inLRU := (c.head == currID && prev == nilNode) || (prev != nilNode && prev < uint32(len(c.nodes)) && c.nodes[prev].next == currID)
-			if !inLRU {
-				panic(fmt.Sprintf("arenaRadix invariant violation: node with prefix '%s' has value but is missing from LRU list", c.nodes[currID].prefix))
-			}
-		} else {
-			if c.nodes[currID].size != 0 {
-				panic(fmt.Sprintf("arenaRadix invariant violation: routing node %d has non-zero size %d", currID, c.nodes[currID].size))
-			}
-			if c.nodes[currID].prev != nilNode || c.nodes[currID].next != nilNode || c.head == currID || c.tail == currID {
-				panic(fmt.Sprintf("arenaRadix invariant violation: routing node %d has non-nilNode LRU pointers", currID))
-			}
-			if !isZeroValue(&c.nodes[currID].value) {
-				panic(fmt.Sprintf("arenaRadix invariant violation: routing node %d with prefix '%s' retains non-zero value", currID, c.nodes[currID].prefix))
-			}
 		}
-
-		// Validate child pointers and sibling ordering
-		prevSiblingID := nilNode
-		for chID := c.nodes[currID].child; chID != nilNode; chID = c.nodes[chID].sibling {
-			if chID >= uint32(len(c.nodes)) {
-				panic(fmt.Sprintf("arenaRadix invariant violation: child index %d out of bounds (len=%d)", chID, len(c.nodes)))
-			}
-			if c.nodes[chID].parent != currID {
-				panic(fmt.Sprintf("arenaRadix invariant violation: child with prefix '%s' has incorrect parent pointer", c.nodes[chID].prefix))
-			}
-			if len(c.nodes[chID].prefix) == 0 {
-				panic("arenaRadix invariant violation: non-root child node has empty prefix")
-			}
-			if prevSiblingID != nilNode && c.nodes[prevSiblingID].prefix[0] >= c.nodes[chID].prefix[0] {
-				panic(fmt.Sprintf("arenaRadix invariant violation: siblings not sorted lexicographically ('%s' >= '%s')", c.nodes[prevSiblingID].prefix, c.nodes[chID].prefix))
-			}
-			prevSiblingID = chID
-		}
-
-		// Validate tree compactness: non-root routing nodes without a value must have >= 2 children.
-		if currID != c.root && !c.nodes[currID].hasValue {
-			if c.nodes[currID].child == nilNode || c.nodes[c.nodes[currID].child].sibling == nilNode {
-				panic(fmt.Sprintf("arenaRadix invariant violation: intermediate routing node with prefix '%s' has fewer than 2 children", c.nodes[currID].prefix))
-			}
-		}
+		c.checkTreeNodeInvariants(currID)
+		c.checkChildrenAndCompactness(currID)
 
 		// Advance to child if present
 		if c.nodes[currID].child != nilNode {
@@ -249,7 +247,10 @@ func (c *arenaRadix[V]) checkInvariants() {
 		panic(fmt.Sprintf("arenaRadix: currentSize drift in tree: currentSize=%d treeSumSize=%d", c.currentSize, treeSumSize))
 	}
 
-	// INVARIANT 6: Hash accelerator map (nodeMap) index bounds, value presence, and hash consistency.
+	return treeNodeCount
+}
+
+func (c *arenaRadix[V]) checkNodeMapInvariants() {
 	for h, id := range c.nodeMap {
 		if id >= uint32(len(c.nodes)) {
 			panic(fmt.Sprintf("arenaRadix invariant violation: nodeMap contains out-of-bounds index %d (len=%d)", id, len(c.nodes)))
@@ -261,8 +262,9 @@ func (c *arenaRadix[V]) checkInvariants() {
 			panic(fmt.Sprintf("arenaRadix invariant violation: nodeMap hash mismatch for node %d", id))
 		}
 	}
+}
 
-	// INVARIANT 7: Free-list integrity and total node accounting (liveTreeNodes + freeListCount == len(nodes)).
+func (c *arenaRadix[V]) checkFreeListInvariants(treeNodeCount int) {
 	freeCount := 0
 	for freeID := c.freeHead; freeID != nilNode; freeID = c.nodes[freeID].next {
 		if freeID >= uint32(len(c.nodes)) {
@@ -299,6 +301,34 @@ func (c *arenaRadix[V]) checkInvariants() {
 	if treeNodeCount+freeCount != len(c.nodes) {
 		panic(fmt.Sprintf("arenaRadix invariant violation: live tree nodes (%d) + free list nodes (%d) != len(nodes) (%d)", treeNodeCount, freeCount, len(c.nodes)))
 	}
+}
+
+func (c *arenaRadix[V]) checkInvariants() {
+	// INVARIANT 1: maxSize > 0
+	if c.maxSize == 0 {
+		panic("arenaRadix invariant violation: maxSize must be greater than 0")
+	}
+
+	// INVARIANT 2: currentSize <= maxSize
+	if c.currentSize > c.maxSize {
+		panic(fmt.Sprintf("arenaRadix invariant violation: currentSize %d exceeds maxSize %d", c.currentSize, c.maxSize))
+	}
+
+	// INVARIANT 3: LRU list validation
+	c.checkLRUListWalkInvariants()
+	c.checkLRUEndpointsInvariants()
+
+	// INVARIANT 4: Root structure checks
+	c.checkRootInvariants()
+
+	// INVARIANT 5: Tree traversal & bijection checks
+	treeNodeCount := c.checkTreeInvariants()
+
+	// INVARIANT 6: Hash accelerator map (nodeMap) index bounds, value presence, and hash consistency.
+	c.checkNodeMapInvariants()
+
+	// INVARIANT 7: Free-list integrity and total node accounting (liveTreeNodes + freeListCount == len(nodes)).
+	c.checkFreeListInvariants(treeNodeCount)
 
 	c.checkTelemetryInvariants(c.len)
 }

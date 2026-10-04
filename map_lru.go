@@ -187,35 +187,7 @@ func (c *mapCache[V]) notifyEvict(key string, value V, size uint64, reason Evict
 	}
 }
 
-// checkInvariants validates internal data structure consistency and panics if any invariant is violated.
-func (c *mapCache[V]) checkInvariants() {
-	// Invariant 1: maxSize > 0
-	if c.maxSize == 0 {
-		panic(fmt.Sprintf("Invalid maxSize: %v", c.maxSize))
-	}
-
-	// Invariant 2: currentSize <= maxSize
-	if c.currentSize > c.maxSize {
-		panic(fmt.Sprintf("CurrentSize %v over maxSize %v", c.currentSize, c.maxSize))
-	}
-
-	// Invariant 3: Map-to-list cardinality bijection
-	if c.entries.Len() != len(c.index) {
-		panic(fmt.Sprintf("Length mismatch: %v vs. %v", c.entries.Len(), len(c.index)))
-	}
-
-	// Invariant 4: List pointer integrity (empty vs non-empty state)
-	if c.entries.Len() == 0 {
-		if c.entries.Front() != nil || c.entries.Back() != nil {
-			panic("mapCache invariant violation: Front or Back is non-nil when entries.Len() == 0")
-		}
-	} else {
-		if c.entries.Front() == nil || c.entries.Back() == nil {
-			panic("mapCache invariant violation: Front or Back is nil when entries.Len() > 0")
-		}
-	}
-
-	// Invariant 5: Bidirectional pointer linkage, map-to-list consistency, and size sum parity.
+func (c *mapCache[V]) checkListAndIndexInvariants() {
 	var prevElem *entry[V]
 	var sumSize uint64
 	lruCount := 0
@@ -232,15 +204,11 @@ func (c *mapCache[V]) checkInvariants() {
 			if c.entries.Front() != e {
 				panic("mapCache invariant violation: head mismatch in LRU list")
 			}
-		} else {
-			if prevElem.next != e {
-				panic("mapCache invariant violation: corrupt next pointer in LRU list")
-			}
+		} else if prevElem.next != e {
+			panic("mapCache invariant violation: corrupt next pointer in LRU list")
 		}
-		if e.next == nil {
-			if c.entries.Back() != e {
-				panic("mapCache invariant violation: tail mismatch in LRU list")
-			}
+		if e.next == nil && c.entries.Back() != e {
+			panic("mapCache invariant violation: tail mismatch in LRU list")
 		}
 		prevElem = e
 
@@ -268,6 +236,36 @@ func (c *mapCache[V]) checkInvariants() {
 	if sumSize != c.currentSize {
 		panic(fmt.Sprintf("Size sum mismatch: sum of entry sizes %d vs. currentSize %d", sumSize, c.currentSize))
 	}
+}
+
+// checkInvariants validates internal data structure consistency and panics if any invariant is violated.
+func (c *mapCache[V]) checkInvariants() {
+	// Invariant 1: maxSize > 0
+	if c.maxSize == 0 {
+		panic(fmt.Sprintf("Invalid maxSize: %v", c.maxSize))
+	}
+
+	// Invariant 2: currentSize <= maxSize
+	if c.currentSize > c.maxSize {
+		panic(fmt.Sprintf("CurrentSize %v over maxSize %v", c.currentSize, c.maxSize))
+	}
+
+	// Invariant 3: Map-to-list cardinality bijection
+	if c.entries.Len() != len(c.index) {
+		panic(fmt.Sprintf("Length mismatch: %v vs. %v", c.entries.Len(), len(c.index)))
+	}
+
+	// Invariant 4: List pointer integrity (empty vs non-empty state)
+	if c.entries.Len() == 0 {
+		if c.entries.Front() != nil || c.entries.Back() != nil {
+			panic("mapCache invariant violation: Front or Back is non-nil when entries.Len() == 0")
+		}
+	} else if c.entries.Front() == nil || c.entries.Back() == nil {
+		panic("mapCache invariant violation: Front or Back is nil when entries.Len() > 0")
+	}
+
+	// Invariant 5 & 6: Bidirectional pointer linkage, map-to-list consistency, and size sum parity.
+	c.checkListAndIndexInvariants()
 
 	c.checkTelemetryInvariants(c.entries.Len())
 }

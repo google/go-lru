@@ -142,18 +142,7 @@ func (c *radixCache[V]) reconstructKey(node *radixNode[V]) string {
 	return b.String()
 }
 
-func (c *radixCache[V]) checkInvariants() {
-	// INVARIANT 1: maxSize > 0
-	if c.maxSize == 0 {
-		panic("radixCache invariant violation: maxSize must be greater than 0")
-	}
-
-	// INVARIANT 2: currentSize <= maxSize
-	if c.currentSize > c.maxSize {
-		panic(fmt.Sprintf("radixCache invariant violation: currentSize %d exceeds maxSize %d", c.currentSize, c.maxSize))
-	}
-
-	// INVARIANT 3: LRU list validation
+func (c *radixCache[V]) checkLRUListInvariants() {
 	lruCount := 0
 	zeroCount := 0
 	var sumSize uint64
@@ -180,16 +169,12 @@ func (c *radixCache[V]) checkInvariants() {
 			if c.head != curr {
 				panic("radixCache invariant violation: head mismatch in LRU list")
 			}
-		} else {
-			if prevNode.next != curr {
-				panic(fmt.Sprintf("radixCache invariant violation: corrupt next pointer in LRU list for prefix '%s'", prevNode.prefix))
-			}
+		} else if prevNode.next != curr {
+			panic(fmt.Sprintf("radixCache invariant violation: corrupt next pointer in LRU list for prefix '%s'", prevNode.prefix))
 		}
 
-		if curr.next == nil {
-			if c.tail != curr {
-				panic("radixCache invariant violation: tail mismatch in LRU list")
-			}
+		if curr.next == nil && c.tail != curr {
+			panic("radixCache invariant violation: tail mismatch in LRU list")
 		}
 
 		prevNode = curr
@@ -211,13 +196,12 @@ func (c *radixCache[V]) checkInvariants() {
 		if c.head != nil || c.tail != nil {
 			panic("radixCache invariant violation: head or tail is non-nil when len is 0")
 		}
-	} else {
-		if c.head == nil || c.tail == nil {
-			panic("radixCache invariant violation: head or tail is nil when len > 0")
-		}
+	} else if c.head == nil || c.tail == nil {
+		panic("radixCache invariant violation: head or tail is nil when len > 0")
 	}
+}
 
-	// INVARIANT 4: Root structure checks
+func (c *radixCache[V]) checkRootInvariants() {
 	if c.root == nil {
 		panic("radixCache invariant violation: root node is nil")
 	}
@@ -230,8 +214,52 @@ func (c *radixCache[V]) checkInvariants() {
 	if c.root.sibling != nil {
 		panic("radixCache invariant violation: root node must not have siblings")
 	}
+}
 
-	// INVARIANT 5: Iterative pre-order traversal using parent/sibling pointers (O(1) space).
+func (c *radixCache[V]) checkTreeNodeInvariants(curr *radixNode[V]) {
+	if curr.hasValue {
+		// A node is verifiably in the LRU list iff it is the head (with nil prev) or its prev's next points back to it.
+		inLRU := (c.head == curr && curr.prev == nil) || (curr.prev != nil && curr.prev.next == curr)
+		if !inLRU {
+			panic(fmt.Sprintf("radixCache invariant violation: node with prefix '%s' has value but is missing from LRU list", curr.prefix))
+		}
+		return
+	}
+	if curr.size != 0 {
+		panic(fmt.Sprintf("radixCache invariant violation: routing node with prefix '%s' has non-zero size %d", curr.prefix, curr.size))
+	}
+	if curr.prev != nil || curr.next != nil || c.head == curr || c.tail == curr {
+		panic(fmt.Sprintf("radixCache invariant violation: routing node with prefix '%s' has non-nil LRU pointers", curr.prefix))
+	}
+	if !isZeroValue(&curr.value) {
+		panic(fmt.Sprintf("radixCache invariant violation: routing node with prefix '%s' retains non-zero value", curr.prefix))
+	}
+}
+
+func (c *radixCache[V]) checkChildrenAndCompactness(curr *radixNode[V]) {
+	// Validate child pointers and sibling ordering
+	var prevSibling *radixNode[V]
+	for ch := curr.child; ch != nil; ch = ch.sibling {
+		if ch.parent != curr {
+			panic(fmt.Sprintf("radixCache invariant violation: child with prefix '%s' has incorrect parent pointer", ch.prefix))
+		}
+		if len(ch.prefix) == 0 {
+			panic("radixCache invariant violation: non-root child node has empty prefix")
+		}
+		if prevSibling != nil && prevSibling.prefix[0] >= ch.prefix[0] {
+			panic(fmt.Sprintf("radixCache invariant violation: siblings not sorted lexicographically ('%s' >= '%s')", prevSibling.prefix, ch.prefix))
+		}
+		prevSibling = ch
+	}
+
+	// Validate tree compactness: non-root routing nodes without a value must have >= 2 children.
+	if curr != c.root && !curr.hasValue && (curr.child == nil || curr.child.sibling == nil) {
+		panic(fmt.Sprintf("radixCache invariant violation: intermediate routing node with prefix '%s' has fewer than 2 children", curr.prefix))
+	}
+}
+
+func (c *radixCache[V]) checkTreeInvariants() {
+	// Iterative pre-order traversal using parent/sibling pointers (O(1) space).
 	// Validates tree integrity, sibling sorted order, parent pointers, compactness,
 	// and 1:1 bijection between value-bearing nodes and LRU list elements.
 	treeCount := 0
@@ -244,44 +272,9 @@ func (c *radixCache[V]) checkInvariants() {
 				panic("radixCache invariant violation: treeSumSize uint64 overflow")
 			}
 			treeSumSize += curr.size
-			// A node is verifiably in the LRU list iff it is the head (with nil prev) or its prev's next points back to it.
-			inLRU := (c.head == curr && curr.prev == nil) || (curr.prev != nil && curr.prev.next == curr)
-			if !inLRU {
-				panic(fmt.Sprintf("radixCache invariant violation: node with prefix '%s' has value but is missing from LRU list", curr.prefix))
-			}
-		} else {
-			if curr.size != 0 {
-				panic(fmt.Sprintf("radixCache invariant violation: routing node with prefix '%s' has non-zero size %d", curr.prefix, curr.size))
-			}
-			if curr.prev != nil || curr.next != nil || c.head == curr || c.tail == curr {
-				panic(fmt.Sprintf("radixCache invariant violation: routing node with prefix '%s' has non-nil LRU pointers", curr.prefix))
-			}
-			if !isZeroValue(&curr.value) {
-				panic(fmt.Sprintf("radixCache invariant violation: routing node with prefix '%s' retains non-zero value", curr.prefix))
-			}
 		}
-
-		// Validate child pointers and sibling ordering
-		var prevSibling *radixNode[V]
-		for ch := curr.child; ch != nil; ch = ch.sibling {
-			if ch.parent != curr {
-				panic(fmt.Sprintf("radixCache invariant violation: child with prefix '%s' has incorrect parent pointer", ch.prefix))
-			}
-			if len(ch.prefix) == 0 {
-				panic("radixCache invariant violation: non-root child node has empty prefix")
-			}
-			if prevSibling != nil && prevSibling.prefix[0] >= ch.prefix[0] {
-				panic(fmt.Sprintf("radixCache invariant violation: siblings not sorted lexicographically ('%s' >= '%s')", prevSibling.prefix, ch.prefix))
-			}
-			prevSibling = ch
-		}
-
-		// Validate tree compactness: non-root routing nodes without a value must have >= 2 children.
-		if curr != c.root && !curr.hasValue {
-			if curr.child == nil || curr.child.sibling == nil {
-				panic(fmt.Sprintf("radixCache invariant violation: intermediate routing node with prefix '%s' has fewer than 2 children", curr.prefix))
-			}
-		}
+		c.checkTreeNodeInvariants(curr)
+		c.checkChildrenAndCompactness(curr)
 
 		// Advance to child if present
 		if curr.child != nil {
@@ -306,6 +299,27 @@ func (c *radixCache[V]) checkInvariants() {
 	if treeSumSize != c.currentSize {
 		panic(fmt.Sprintf("radixCache: currentSize drift in tree: currentSize=%d treeSumSize=%d", c.currentSize, treeSumSize))
 	}
+}
+
+func (c *radixCache[V]) checkInvariants() {
+	// INVARIANT 1: maxSize > 0
+	if c.maxSize == 0 {
+		panic("radixCache invariant violation: maxSize must be greater than 0")
+	}
+
+	// INVARIANT 2: currentSize <= maxSize
+	if c.currentSize > c.maxSize {
+		panic(fmt.Sprintf("radixCache invariant violation: currentSize %d exceeds maxSize %d", c.currentSize, c.maxSize))
+	}
+
+	// INVARIANT 3: LRU list validation
+	c.checkLRUListInvariants()
+
+	// INVARIANT 4: Root structure checks
+	c.checkRootInvariants()
+
+	// INVARIANT 5: Tree traversal & bijection checks
+	c.checkTreeInvariants()
 
 	c.checkTelemetryInvariants(c.len)
 }
