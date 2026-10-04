@@ -88,9 +88,9 @@ jobs:
       - name: Enforce Performance Targets & Regression Thresholds
         run: |
           if [ -f benchmark-base.txt ]; then
-            go run ./cmd/benchcheck -base benchmark-base.txt -head benchmark-head.txt -format markdown -summary "$GITHUB_STEP_SUMMARY" | tee benchcheck-report.md
+            go run ./cmd/benchcheck -base benchmark-base.txt -head benchmark-head.txt -strict-missing -format markdown -summary "$GITHUB_STEP_SUMMARY" | tee benchcheck-report.md
           else
-            go run ./cmd/benchcheck -head benchmark-head.txt -format markdown -summary "$GITHUB_STEP_SUMMARY" | tee benchcheck-report.md
+            go run ./cmd/benchcheck -head benchmark-head.txt -strict-missing -format markdown -summary "$GITHUB_STEP_SUMMARY" | tee benchcheck-report.md
           fi
 
       - name: Upload Benchmark Artifacts
