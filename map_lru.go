@@ -270,19 +270,11 @@ func (c *mapCache[V]) checkInvariants() {
 	c.checkTelemetryInvariants(c.entries.Len())
 }
 
-func (c *mapCache[V]) lock() {
-	c.mu.Lock()
-}
-
 func (c *mapCache[V]) unlock() {
 	if c.options.EnableInvariantChecking {
 		c.checkInvariants()
 	}
 	c.mu.Unlock()
-}
-
-func (c *mapCache[V]) rLock() {
-	c.mu.RLock()
 }
 
 func (c *mapCache[V]) rUnlock() {
@@ -476,7 +468,7 @@ func (c *mapCache[V]) Delete(key string) (V, bool) {
 // Get retrieves the value associated with key and updates its position to MRU.
 // Returns the zero value of V and false if key is not found in the cache.
 func (c *mapCache[V]) Get(key string) (V, bool) {
-	c.lock()
+	c.mu.Lock()
 	defer c.unlock()
 
 	e, ok := c.index[key]
@@ -493,7 +485,7 @@ func (c *mapCache[V]) Get(key string) (V, bool) {
 // Peek retrieves the value associated with key without altering its LRU position.
 // Returns the zero value of V and false if key is not found in the cache.
 func (c *mapCache[V]) Peek(key string) (V, bool) {
-	c.rLock()
+	c.mu.RLock()
 	defer c.rUnlock()
 
 	e, ok := c.index[key]
@@ -645,7 +637,7 @@ func (c *mapCache[V]) deleteAllPrefixLocked() {
 // If prefix is empty (""), all entries in the cache are deleted.
 func (c *mapCache[V]) DeletePrefix(prefix string) {
 	if prefix == "" {
-		c.lock()
+		c.mu.Lock()
 		defer c.unlock()
 		c.deleteAllPrefixLocked()
 		return
@@ -675,7 +667,7 @@ func (c *mapCache[V]) All() iter.Seq2[string, V] {
 }
 
 func (c *mapCache[V]) all(yield func(string, V) bool) {
-	c.rLock()
+	c.mu.RLock()
 	defer c.rUnlock()
 
 	for e := c.entries.Front(); e != nil; e = e.next {
@@ -691,7 +683,7 @@ func (c *mapCache[V]) Keys() iter.Seq[string] {
 }
 
 func (c *mapCache[V]) keys(yield func(string) bool) {
-	c.rLock()
+	c.mu.RLock()
 	defer c.rUnlock()
 
 	for e := c.entries.Front(); e != nil; e = e.next {
@@ -707,7 +699,7 @@ func (c *mapCache[V]) Values() iter.Seq[V] {
 }
 
 func (c *mapCache[V]) values(yield func(V) bool) {
-	c.rLock()
+	c.mu.RLock()
 	defer c.rUnlock()
 
 	for e := c.entries.Front(); e != nil; e = e.next {
@@ -719,7 +711,7 @@ func (c *mapCache[V]) values(yield func(V) bool) {
 
 // Stats returns a point-in-time telemetry snapshot of the cache.
 func (c *mapCache[V]) Stats() Stats {
-	c.rLock()
+	c.mu.RLock()
 	defer c.rUnlock()
 	return c.snapshotBaseStats(BackendMap, c.currentSize, c.maxSize, c.entries.Len())
 }
@@ -730,7 +722,7 @@ func (c *mapCache[V]) shouldAutoCompactLocked(isBackground bool) bool {
 
 // Compact reallocates the internal hash index to reclaim Go map bucket slack while preserving all live entries.
 func (c *mapCache[V]) Compact() {
-	c.lock()
+	c.mu.Lock()
 	defer c.unlock()
 	c.compactLocked()
 }

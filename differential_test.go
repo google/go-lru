@@ -316,6 +316,7 @@ func (h *differentialHarness) verifyIteratorEarlyBreaks(inst diffInstance, baseK
 }
 
 func (h *differentialHarness) CompactAll() {
+	h.t.Helper()
 	for _, inst := range h.instances {
 		inst.cache.(lru.PressureAwareCache[*diffValue]).Compact()
 	}
@@ -648,6 +649,7 @@ func TestDifferential_CapacityThrashingAndSizeUpdates(t *testing.T) {
 }
 
 func replaceBoundaryExistingEntry(h *differentialHarness, r *rand.Rand, k string, existing *diffValue, op int) {
+	h.t.Helper()
 	if existing == nil {
 		h.Replace(k, &diffValue{id: fmt.Sprintf("noent_%d", op), size: 10})
 		return
@@ -667,6 +669,7 @@ func replaceBoundaryExistingEntry(h *differentialHarness, r *rand.Rand, k string
 }
 
 func execBoundaryWorkloadStep(h *differentialHarness, r *rand.Rand, adversarialKeys []string, op int, cacheCapacity uint64) {
+	h.t.Helper()
 	k := adversarialKeys[r.IntN(len(adversarialKeys))]
 	dice := r.IntN(100)
 
@@ -946,6 +949,7 @@ func TestDifferential_ReplaceLockstepParity(t *testing.T) {
 }
 
 func execDefaultWeigherStep(h *differentialHarness, r *rand.Rand, keys []string, op int) {
+	h.t.Helper()
 	k := keys[r.IntN(len(keys))]
 	dice := r.IntN(100)
 	switch {
@@ -1019,6 +1023,7 @@ func TestDifferential_DefaultWeigherWorkload(t *testing.T) {
 }
 
 func pickCustomWeigherReplaceSize(h *differentialHarness, r *rand.Rand, k string, cacheCapacity uint64) uint64 {
+	h.t.Helper()
 	// Exercise all 4 Replace weight transitions:
 	// 0: shrink to 0; 1: shrink to smaller positive; 2: same size; 3: grow within capacity; 4: grow > maxSize.
 	switch r.IntN(5) {
@@ -1039,6 +1044,7 @@ func pickCustomWeigherReplaceSize(h *differentialHarness, r *rand.Rand, k string
 }
 
 func execCustomWeigherStep(h *differentialHarness, r *rand.Rand, keys []string, op int, cacheCapacity uint64) {
+	h.t.Helper()
 	k := keys[r.IntN(len(keys))]
 	dice := r.IntN(100)
 	switch {
@@ -1253,6 +1259,7 @@ func pickCallbackReplaceSize(r *rand.Rand, cacheCapacity uint64) uint64 {
 }
 
 func execCallbackParityStep(h *differentialHarness, r *rand.Rand, keys []string, op int, cacheCapacity uint64) bool {
+	h.t.Helper()
 	k := keys[r.IntN(len(keys))]
 	dice := r.IntN(100)
 	switch {

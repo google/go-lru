@@ -89,6 +89,22 @@ func exerciseConcurrentIterators(t *testing.T, cache lru.Cache[concValue], step,
 	}
 }
 
+func putConcurrentEntry(t *testing.T, cache lru.Cache[concValue], key string) {
+	t.Helper()
+	_, err := cache.Put(key, concValue{id: key, size: 10})
+	if err != nil {
+		assert.ErrorIs(t, err, lru.ErrInvalidEntrySize) //nolint:testifylint // wg.Go runs in a child goroutine
+	}
+}
+
+func replaceConcurrentEntry(t *testing.T, cache lru.Cache[concValue], key, id string, size uint64) {
+	t.Helper()
+	err := cache.Replace(key, concValue{id: id, size: size})
+	if err != nil {
+		assert.ErrorIs(t, err, lru.ErrEntryNotExist) //nolint:testifylint // wg.Go runs in a child goroutine
+	}
+}
+
 func runMixedOpStep(t *testing.T, cache lru.Cache[concValue], r *rand.Rand, step, numKeys int) {
 	t.Helper()
 	op := r.IntN(100)
@@ -99,25 +115,16 @@ func runMixedOpStep(t *testing.T, cache lru.Cache[concValue], r *rand.Rand, step
 
 	switch {
 	case op < 28:
-		_, err := cache.Put(key, concValue{id: key, size: 10})
-		if err != nil {
-			assert.ErrorIs(t, err, lru.ErrInvalidEntrySize) //nolint:testifylint // wg.Go runs in a child goroutine
-		}
+		putConcurrentEntry(t, cache, key)
 	case op < 50:
 		_, _ = cache.Get(key)
 	case op < 64:
 		_, _ = cache.Peek(key)
 	case op < 74:
-		err := cache.Replace(key, concValue{id: key + "_upd", size: 10})
-		if err != nil {
-			assert.ErrorIs(t, err, lru.ErrEntryNotExist) //nolint:testifylint // wg.Go runs in a child goroutine
-		}
+		replaceConcurrentEntry(t, cache, key, key+"_upd", 10)
 	case op < 82:
 		sz := uint64(5 + (kIdx%3)*10) // 5, 15, or 25 (shrinks or grows weight)
-		err := cache.Replace(key, concValue{id: key + "_sz", size: sz})
-		if err != nil {
-			assert.ErrorIs(t, err, lru.ErrEntryNotExist) //nolint:testifylint // wg.Go runs in a child goroutine
-		}
+		replaceConcurrentEntry(t, cache, key, key+"_sz", sz)
 	case op < 88:
 		_, _ = cache.Delete(key)
 	case op < 94:
@@ -466,25 +473,16 @@ func runPressureCompactionStep(t *testing.T, cache lru.Cache[concValue], reclaim
 
 	switch {
 	case op < 28:
-		_, err := cache.Put(key, concValue{id: key, size: 10})
-		if err != nil {
-			assert.ErrorIs(t, err, lru.ErrInvalidEntrySize) //nolint:testifylint // wg.Go runs in a child goroutine
-		}
+		putConcurrentEntry(t, cache, key)
 	case op < 48:
 		_, _ = cache.Get(key)
 	case op < 64:
 		_, _ = cache.Peek(key)
 	case op < 72:
-		err := cache.Replace(key, concValue{id: key + "_u", size: 10})
-		if err != nil {
-			assert.ErrorIs(t, err, lru.ErrEntryNotExist) //nolint:testifylint // wg.Go runs in a child goroutine
-		}
+		replaceConcurrentEntry(t, cache, key, key+"_u", 10)
 	case op < 80:
 		sz := uint64(5 + (step%2)*10) // 5 or 15
-		err := cache.Replace(key, concValue{id: key + "_sz", size: sz})
-		if err != nil {
-			assert.ErrorIs(t, err, lru.ErrEntryNotExist) //nolint:testifylint // wg.Go runs in a child goroutine
-		}
+		replaceConcurrentEntry(t, cache, key, key+"_sz", sz)
 	case op < 86:
 		_, _ = cache.Delete(key)
 	case op < 91:
@@ -573,30 +571,21 @@ func runEvictionCallbackRaceStep(t *testing.T, cache lru.Cache[concValue], recla
 
 	switch {
 	case op < 35:
-		_, err := cache.Put(key, concValue{id: key, size: 10})
-		if err != nil {
-			assert.ErrorIs(t, err, lru.ErrInvalidEntrySize) //nolint:testifylint // wg.Go runs in a child goroutine
-		}
+		putConcurrentEntry(t, cache, key)
 	case op < 52:
 		_, _ = cache.Get(key)
 	case op < 65:
 		_, _ = cache.Peek(key)
 	case op < 78:
 		sz := uint64(5 + (step%3)*10) // 5, 15, or 25
-		err := cache.Replace(key, concValue{id: key + "_r", size: sz})
-		if err != nil {
-			assert.ErrorIs(t, err, lru.ErrEntryNotExist) //nolint:testifylint // wg.Go runs in a child goroutine
-		}
+		replaceConcurrentEntry(t, cache, key, key+"_r", sz)
 	case op < 86:
 		// Self-evicting Replace (> capacity or !canFit alongside newer entries)
 		sz := capacity + 10
 		if step%2 == 1 {
 			sz = capacity - 15
 		}
-		err := cache.Replace(key, concValue{id: key + "_r", size: sz})
-		if err != nil {
-			assert.ErrorIs(t, err, lru.ErrEntryNotExist) //nolint:testifylint // wg.Go runs in a child goroutine
-		}
+		replaceConcurrentEntry(t, cache, key, key+"_r", sz)
 	case op < 92:
 		_, _ = cache.Delete(key)
 	case op < 96:
