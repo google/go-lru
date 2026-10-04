@@ -171,14 +171,13 @@ func allBackends[V any]() []struct {
 	}
 }
 
-func testBackends() []struct {
+type backendDef struct {
 	name string
 	fn   func(uint64, ...Option) Cache[testData]
-} {
-	return []struct {
-		name string
-		fn   func(uint64, ...Option) Cache[testData]
-	}{
+}
+
+func testBackends() []backendDef {
+	return []backendDef{
 		{"MapCache", func(maxSize uint64, opts ...Option) Cache[testData] {
 			return NewMapCache[testData](maxSize, slices.Concat([]Option{testDataWeigher}, opts)...)
 		}},
@@ -708,239 +707,377 @@ func TestCompaction_CrossBackendParityOnSingleSurvivorAndShrinkageWatermarks(t *
 		}
 	})
 
-	t.Run("ValueBearingInternalNodeShrinkage", func(t *testing.T) {
-		for _, b := range testBackends() {
-			t.Run(b.name, func(t *testing.T) {
+	t.Run("ValueBearingInternalNodeShrinkage", testValueBearingInternalNodeShrinkage)
+	t.Run("Tier2ShedAndAutoCompactAdvancesReclaimEpochOncePerOperation", testTier2ShedAndAutoCompactAdvancesReclaimEpochOnce)
+	t.Run("Exact25PercentShrinkageAutoCompactionParityAcrossBackends", testExact25PercentShrinkageAutoCompactionParity)
+	t.Run("SmallCacheWithRoutingNodesRespects8EntryHysteresis", testSmallCacheWithRoutingNodesRespects8EntryHysteresis)
+	t.Run("Tier1AndTier2AutoCompactionParityAcrossBackends", testTier1AndTier2AutoCompactionParityAcrossBackends)
+}
+
+func testValueBearingInternalNodeShrinkage(t *testing.T) {
+	for _, b := range testBackends() {
+		t.Run(b.name, func(t *testing.T) {
+			probe := newPressureProbe(0.10)
+			pac := b.fn(10000, WithInvariantChecking(true), probe.Option()).(PressureAwareCache[testData])
+
+			for i := range 20 {
+				parentKey := fmt.Sprintf("p%02d", i)
+				childA := fmt.Sprintf("p%02d/a", i)
+				childB := fmt.Sprintf("p%02d/b", i)
+				for _, k := range []string{parentKey, childA, childB} {
+					_, err := pac.Put(k, testData{value: int64(i), dataSize: 10})
+					require.NoError(t, err)
+				}
+			}
+
+			for i := range 20 {
+				_, ok := pac.Delete(fmt.Sprintf("p%02d", i))
+				require.True(t, ok)
+			}
+
+			// Act: Raise pressure to Tier 1 (0.80) and call EvaluateMemoryPressure().
+			probe.Set(0.80)
+			advanced := observeEpochAdvance(t, probe, pac, func() {
+				pac.EvaluateMemoryPressure()
+			})
+
+			// Assert
+			assert.True(t, advanced)
+			assertAlreadyCompacted(t, pac, probe)
+		})
+	}
+}
+
+func testTier2ShedAndAutoCompactAdvancesReclaimEpochOnce(t *testing.T) {
+	for _, b := range testBackends() {
+		t.Run(b.name, func(t *testing.T) {
+			probe := newPressureProbe(0.10)
+			pac := b.fn(
+				1000,
+				WithInvariantChecking(true),
+				WithEvictionThreshold(0.90),
+				WithEvictionRetentionRatio(0.50),
+				probe.Option(),
+			).(PressureAwareCache[testData])
+
+			for i := range 20 {
+				_, err := pac.Put(fmt.Sprintf("k-%02d", i), testData{value: int64(i), dataSize: 50})
+				require.NoError(t, err)
+			}
+
+			// Act
+			probe.Set(0.95)
+			var evicted []testData
+			advanced := observeEpochAdvance(t, probe, pac, func() {
+				evicted = pac.EvaluateMemoryPressure()
+			})
+
+			// Assert: Tier 2 shed+compact evicted 10 entries, compacted slack, and an immediate repeat is a no-op.
+			require.Len(t, evicted, 10)
+			assert.True(t, advanced)
+			assertAlreadyCompacted(t, pac, probe)
+
+			advancedRepeat := observeEpochAdvance(t, probe, pac, func() {
+				assert.Empty(t, pac.EvaluateMemoryPressure())
+			})
+			assert.False(t, advancedRepeat)
+		})
+	}
+}
+
+func testExact25PercentShrinkageAutoCompactionParity(t *testing.T) {
+	for _, b := range testBackends() {
+		t.Run(b.name, func(t *testing.T) {
+			probe := newPressureProbe(0.0)
+			pac := b.fn(
+				1000,
+				WithInvariantChecking(true),
+				probe.Option(),
+				WithCompactionThreshold(0.75),
+				WithEvictionThreshold(0.90),
+			).(PressureAwareCache[testData])
+
+			for i := range 20 {
+				_, err := pac.Put(fmt.Sprintf("k%02d", i), testData{value: int64(i), dataSize: 0})
+				require.NoError(t, err)
+			}
+			for i := range 4 {
+				_, ok := pac.Delete(fmt.Sprintf("k%02d", i))
+				require.True(t, ok)
+			}
+			probe.Set(0.80)
+
+			// Act 1: 5th deletion under Tier 1 pressure reaches exact 25% shrinkage from peak (20 -> 15).
+			advancedFifth := observeEpochAdvance(t, probe, pac, func() {
+				_, ok := pac.Delete("k04")
+				require.True(t, ok)
+			})
+
+			// Assert 1
+			assert.True(t, advancedFifth)
+			assertAlreadyCompacted(t, pac, probe)
+
+			// Act 2: Delete 1 more zero-byte key ("k05", 15 -> 14, 1/15 < 25% shrinkage) at Tier 1 pressure;
+			// because watermarks were reset to 15 on the 5th deletion, it does not re-compact.
+			advancedSixth := observeEpochAdvance(t, probe, pac, func() {
+				_, ok := pac.Delete("k05")
+				require.True(t, ok)
+			})
+			assert.False(t, advancedSixth)
+		})
+	}
+}
+
+func testSmallCacheWithRoutingNodesRespects8EntryHysteresis(t *testing.T) {
+	for _, b := range testBackends() {
+		t.Run(b.name, func(t *testing.T) {
+			// Arrange: Put 6 zero-byte hierarchical keys (6 entries <= 8 hysteresis floor, even though the radix tree
+			// allocates 10 arena nodes > 8 due to root + 3 intermediate routing nodes "a/", "b/", "c/").
+			probe := newPressureProbe(0.10)
+			pac := b.fn(1000, WithInvariantChecking(true), probe.Option()).(PressureAwareCache[testData])
+
+			for _, k := range []string{"a/1", "a/2", "b/1", "b/2", "c/1", "c/2"} {
+				_, err := pac.Put(k, testData{value: 1, dataSize: 0})
+				require.NoError(t, err)
+			}
+
+			// Act: Under Tier 1 pressure (0.80), erase 2 zero-byte keys ("a/1", "a/2") while observing epoch advancement.
+			probe.Set(0.80)
+			advanced := observeEpochAdvance(t, probe, pac, func() {
+				_, ok := pac.Delete("a/1")
+				require.True(t, ok)
+				_, ok = pac.Delete("a/2")
+				require.True(t, ok)
+			})
+
+			// Assert: Because peak entry count is 6 <= 8 (below the 8-entry small-cache hysteresis floor) and 0 bytes were freed,
+			// all backends refrain from auto-compacting or advancing reclamation epoch.
+			assert.False(t, advanced)
+			_, ok := pac.Peek("a/1")
+			assert.False(t, ok)
+			_, ok = pac.Peek("a/2")
+			assert.False(t, ok)
+			for _, k := range []string{"b/1", "b/2", "c/1", "c/2"} {
+				_, ok := pac.Peek(k)
+				assert.True(t, ok)
+			}
+		})
+	}
+}
+
+func testTier1AndTier2AutoCompactionParityAcrossBackends(t *testing.T) {
+	for _, b := range testBackends() {
+		t.Run(b.name, func(t *testing.T) {
+			t.Run("Tier1InlineShrinkageAndExplicitEvaluateAdvanceEpochAndResetSlack", func(t *testing.T) {
 				probe := newPressureProbe(0.10)
 				pac := b.fn(10000, WithInvariantChecking(true), probe.Option()).(PressureAwareCache[testData])
 
 				for i := range 20 {
-					parentKey := fmt.Sprintf("p%02d", i)
-					childA := fmt.Sprintf("p%02d/a", i)
-					childB := fmt.Sprintf("p%02d/b", i)
-					for _, k := range []string{parentKey, childA, childB} {
-						_, err := pac.Put(k, testData{value: int64(i), dataSize: 10})
-						require.NoError(t, err)
-					}
+					_, err := pac.Put(fmt.Sprintf("k/%02d", i), testData{value: int64(i), dataSize: 10})
+					require.NoError(t, err)
 				}
-
-				for i := range 20 {
-					_, ok := pac.Delete(fmt.Sprintf("p%02d", i))
+				for i := range 5 {
+					_, ok := pac.Delete(fmt.Sprintf("k/%02d", i))
 					require.True(t, ok)
 				}
 
-				// Act: Raise pressure to Tier 1 (0.80) and call EvaluateMemoryPressure().
+				// Act 1: Delete the 6th of 20 entries (30% >= 25% shrinkage) under Tier 1 pressure (0.80).
 				probe.Set(0.80)
-				advanced := observeEpochAdvance(t, probe, pac, func() {
+				advancedInline := observeEpochAdvance(t, probe, pac, func() {
+					_, ok := pac.Delete("k/05")
+					require.True(t, ok)
+				})
+				assert.True(t, advancedInline)
+				assertAlreadyCompacted(t, pac, probe)
+
+				advancedFollowUp := observeEpochAdvance(t, probe, pac, func() {
 					pac.EvaluateMemoryPressure()
 				})
+				assert.False(t, advancedFollowUp)
 
-				// Assert
-				assert.True(t, advanced)
+				// Act 2: Delete 1 more entry at normal pressure (0.10), then invoke EvaluateMemoryPressure() under Tier 1 (0.80).
+				probe.Set(0.10)
+				_, ok := pac.Delete("k/06")
+				require.True(t, ok)
+
+				probe.Set(0.80)
+				advancedExplicit := observeEpochAdvance(t, probe, pac, func() {
+					pac.EvaluateMemoryPressure()
+				})
+				assert.True(t, advancedExplicit)
 				assertAlreadyCompacted(t, pac, probe)
-			})
-		}
-	})
 
-	t.Run("Tier2ShedAndAutoCompactAdvancesReclaimEpochOncePerOperation", func(t *testing.T) {
-		for _, b := range testBackends() {
-			t.Run(b.name, func(t *testing.T) {
+				advancedSecondEval := observeEpochAdvance(t, probe, pac, func() {
+					pac.EvaluateMemoryPressure()
+				})
+				assert.False(t, advancedSecondEval)
+			})
+
+			t.Run("Tier2NoShedEvaluateCompactsPendingSlack", func(t *testing.T) {
 				probe := newPressureProbe(0.10)
 				pac := b.fn(
 					1000,
 					WithInvariantChecking(true),
-					WithEvictionThreshold(0.90),
 					WithEvictionRetentionRatio(0.50),
 					probe.Option(),
 				).(PressureAwareCache[testData])
 
 				for i := range 20 {
-					_, err := pac.Put(fmt.Sprintf("k-%02d", i), testData{value: int64(i), dataSize: 50})
+					_, err := pac.Put(fmt.Sprintf("k/%02d", i), testData{value: int64(i), dataSize: 10})
 					require.NoError(t, err)
 				}
+				for i := range 6 {
+					_, ok := pac.Delete(fmt.Sprintf("k/%02d", i))
+					require.True(t, ok)
+				}
 
-				// Act
+				// Act: Spike pressure to Tier 2 (0.95) and call EvaluateMemoryPressure() while currentSize (140B) <= targetSize (500B).
 				probe.Set(0.95)
-				var evicted []testData
 				advanced := observeEpochAdvance(t, probe, pac, func() {
-					evicted = pac.EvaluateMemoryPressure()
+					pac.EvaluateMemoryPressure()
 				})
-
-				// Assert: Tier 2 shed+compact evicted 10 entries, compacted slack, and an immediate repeat is a no-op.
-				require.Len(t, evicted, 10)
 				assert.True(t, advanced)
 				assertAlreadyCompacted(t, pac, probe)
 
 				advancedRepeat := observeEpochAdvance(t, probe, pac, func() {
-					assert.Empty(t, pac.EvaluateMemoryPressure())
+					pac.EvaluateMemoryPressure()
 				})
 				assert.False(t, advancedRepeat)
 			})
-		}
-	})
+		})
+	}
+}
 
-	t.Run("Exact25PercentShrinkageAutoCompactionParityAcrossBackends", func(t *testing.T) {
-		for _, b := range testBackends() {
-			t.Run(b.name, func(t *testing.T) {
-				probe := newPressureProbe(0.0)
-				pac := b.fn(
-					1000,
-					WithInvariantChecking(true),
-					probe.Option(),
-					WithCompactionThreshold(0.75),
-					WithEvictionThreshold(0.90),
-				).(PressureAwareCache[testData])
+func testEmptyCacheDrainDoesNotSpuriouslyAdvanceEpoch(t *testing.T) {
+	for _, b := range testBackends() {
+		t.Run(b.name, func(t *testing.T) {
+			t.Run("ZeroByteLastEntryUnderTier1Pressure", func(t *testing.T) {
+				probeDelete := newPressureProbe(0.80)
+				probeSelfEvict := newPressureProbe(0.80)
+				probePrefixEmpty := newPressureProbe(0.80)
+				cacheDelete := b.fn(100, WithInvariantChecking(true), probeDelete.Option()).(PressureAwareCache[testData])
+				cacheSelfEvict := b.fn(100, WithInvariantChecking(true), probeSelfEvict.Option()).(PressureAwareCache[testData])
+				cachePrefixEmpty := b.fn(100, WithInvariantChecking(true), probePrefixEmpty.Option()).(PressureAwareCache[testData])
 
-				for i := range 20 {
-					_, err := pac.Put(fmt.Sprintf("k%02d", i), testData{value: int64(i), dataSize: 0})
-					require.NoError(t, err)
-				}
-				for i := range 4 {
-					_, ok := pac.Delete(fmt.Sprintf("k%02d", i))
-					require.True(t, ok)
-				}
-				probe.Set(0.80)
+				_, err := cacheDelete.Put("z1", testData{value: 1, dataSize: 0})
+				require.NoError(t, err)
+				_, err = cacheSelfEvict.Put("z1", testData{value: 1, dataSize: 0})
+				require.NoError(t, err)
+				_, err = cacheSelfEvict.Put("mru_full", testData{value: 2, dataSize: 100})
+				require.NoError(t, err)
+				_, err = cachePrefixEmpty.Put("z1", testData{value: 1, dataSize: 0})
+				require.NoError(t, err)
 
-				// Act 1: 5th deletion under Tier 1 pressure reaches exact 25% shrinkage from peak (20 -> 15).
-				advancedFifth := observeEpochAdvance(t, probe, pac, func() {
-					_, ok := pac.Delete("k04")
+				advancedDelete := observeEpochAdvance(t, probeDelete, cacheDelete, func() {
+					_, ok := cacheDelete.Delete("z1")
 					require.True(t, ok)
 				})
+				advancedSelfEvict := observeEpochAdvance(t, probeSelfEvict, cacheSelfEvict, func() {
+					require.NoError(t, cacheSelfEvict.Replace("z1", testData{value: 11, dataSize: 10}))
+				})
+				advancedPrefixEmpty := observeEpochAdvance(t, probePrefixEmpty, cachePrefixEmpty, func() {
+					cachePrefixEmpty.DeletePrefix("")
+				})
 
-				// Assert 1
-				assert.True(t, advancedFifth)
+				assert.False(t, advancedDelete)
+				assert.False(t, advancedSelfEvict)
+				assert.False(t, advancedPrefixEmpty)
+			})
+
+			t.Run("NormalPressureLastEntryDeleteAndEmptyPrefixClearDoNotAdvanceEpoch", func(t *testing.T) {
+				var eraseSamples, prefixSamples, emptyPrefixSamples atomic.Int32
+				cacheDelete := b.fn(100, WithInvariantChecking(true), WithPressureFunc(func() float64 {
+					eraseSamples.Add(1)
+					return 0.10
+				})).(PressureAwareCache[testData])
+				cachePrefix := b.fn(100, WithInvariantChecking(true), WithPressureFunc(func() float64 {
+					prefixSamples.Add(1)
+					return 0.10
+				})).(PressureAwareCache[testData])
+				cachePrefixEmpty := b.fn(100, WithInvariantChecking(true), WithPressureFunc(func() float64 {
+					emptyPrefixSamples.Add(1)
+					return 0.10
+				})).(PressureAwareCache[testData])
+
+				_, err := cacheDelete.Put("k1", testData{value: 1, dataSize: 10})
+				require.NoError(t, err)
+				_, err = cachePrefix.Put("k1", testData{value: 1, dataSize: 10})
+				require.NoError(t, err)
+				_, err = cachePrefixEmpty.Put("k1", testData{value: 1, dataSize: 10})
+				require.NoError(t, err)
+
+				eraseBefore := eraseSamples.Load()
+				_, ok := cacheDelete.Delete("k1")
+				require.True(t, ok)
+				assert.Equal(t, int32(1), eraseSamples.Load()-eraseBefore)
+
+				prefixBefore := prefixSamples.Load()
+				cachePrefix.DeletePrefix("k")
+				assert.Equal(t, int32(1), prefixSamples.Load()-prefixBefore)
+
+				emptyBefore := emptyPrefixSamples.Load()
+				cachePrefixEmpty.DeletePrefix("")
+				assert.Equal(t, int32(0), emptyPrefixSamples.Load()-emptyBefore)
+
+				_, ok = cacheDelete.Peek("k1")
+				assert.False(t, ok)
+				_, ok = cachePrefix.Peek("k1")
+				assert.False(t, ok)
+				_, ok = cachePrefixEmpty.Peek("k1")
+				assert.False(t, ok)
+				assertAlreadyCompacted(t, cacheDelete)
+				assertAlreadyCompacted(t, cachePrefix)
+				assertAlreadyCompacted(t, cachePrefixEmpty)
+			})
+
+			t.Run("FreshCacheAndEmptyPrefixClearAreAlreadyCompactedAndDoNotAdvanceEpoch", func(t *testing.T) {
+				probe := newPressureProbe(0.80)
+				pac := b.fn(100, WithInvariantChecking(true), probe.Option()).(PressureAwareCache[testData])
+
+				assertAlreadyCompacted(t, pac, probe)
+				advancedFreshEval := observeEpochAdvance(t, probe, pac, func() {
+					pac.EvaluateMemoryPressure()
+				})
+				assert.False(t, advancedFreshEval)
+
+				// Populate and clear via DeletePrefix(""); resulting empty cache must already be compacted.
+				probe.Set(0.10)
+				for i := range 10 {
+					_, err := pac.Put(fmt.Sprintf("k-%02d", i), testData{value: int64(i), dataSize: 5})
+					require.NoError(t, err)
+				}
+				probe.Set(0.80)
+				advancedClear := observeEpochAdvance(t, probe, pac, func() {
+					pac.DeletePrefix("")
+				})
+				assert.True(t, advancedClear)
 				assertAlreadyCompacted(t, pac, probe)
 
-				// Act 2: Delete 1 more zero-byte key ("k05", 15 -> 14, 1/15 < 25% shrinkage) at Tier 1 pressure;
-				// because watermarks were reset to 15 on the 5th deletion, it does not re-compact.
-				advancedSixth := observeEpochAdvance(t, probe, pac, func() {
-					_, ok := pac.Delete("k05")
-					require.True(t, ok)
+				advancedPostClearEval := observeEpochAdvance(t, probe, pac, func() {
+					pac.EvaluateMemoryPressure()
 				})
-				assert.False(t, advancedSixth)
+				assert.False(t, advancedPostClearEval)
 			})
-		}
-	})
 
-	t.Run("SmallCacheWithRoutingNodesRespects8EntryHysteresis", func(t *testing.T) {
-		for _, b := range testBackends() {
-			t.Run(b.name, func(t *testing.T) {
-				// Arrange: Put 6 zero-byte hierarchical keys (6 entries <= 8 hysteresis floor, even though the radix tree
-				// allocates 10 arena nodes > 8 due to root + 3 intermediate routing nodes "a/", "b/", "c/").
+			t.Run("Draining20ZeroSizeEntriesToEmptyUnderTier1AdvancesEpoch", func(t *testing.T) {
 				probe := newPressureProbe(0.10)
 				pac := b.fn(1000, WithInvariantChecking(true), probe.Option()).(PressureAwareCache[testData])
-
-				for _, k := range []string{"a/1", "a/2", "b/1", "b/2", "c/1", "c/2"} {
-					_, err := pac.Put(k, testData{value: 1, dataSize: 0})
+				for i := range 20 {
+					_, err := pac.Put(fmt.Sprintf("z/%02d", i), testData{value: int64(i), dataSize: 0})
 					require.NoError(t, err)
 				}
 
-				// Act: Under Tier 1 pressure (0.80), erase 2 zero-byte keys ("a/1", "a/2") while observing epoch advancement.
 				probe.Set(0.80)
 				advanced := observeEpochAdvance(t, probe, pac, func() {
-					_, ok := pac.Delete("a/1")
-					require.True(t, ok)
-					_, ok = pac.Delete("a/2")
-					require.True(t, ok)
+					pac.DeletePrefix("z/")
 				})
-
-				// Assert: Because peak entry count is 6 <= 8 (below the 8-entry small-cache hysteresis floor) and 0 bytes were freed,
-				// all backends refrain from auto-compacting or advancing reclamation epoch.
-				assert.False(t, advanced)
-				_, ok := pac.Peek("a/1")
+				assert.True(t, advanced)
+				_, ok := pac.Peek("z/00")
 				assert.False(t, ok)
-				_, ok = pac.Peek("a/2")
-				assert.False(t, ok)
-				for _, k := range []string{"b/1", "b/2", "c/1", "c/2"} {
-					_, ok := pac.Peek(k)
-					assert.True(t, ok)
-				}
+				assertAlreadyCompacted(t, pac, probe)
 			})
-		}
-	})
-
-	t.Run("Tier1AndTier2AutoCompactionParityAcrossBackends", func(t *testing.T) {
-		for _, b := range testBackends() {
-			t.Run(b.name, func(t *testing.T) {
-				t.Run("Tier1InlineShrinkageAndExplicitEvaluateAdvanceEpochAndResetSlack", func(t *testing.T) {
-					probe := newPressureProbe(0.10)
-					pac := b.fn(10000, WithInvariantChecking(true), probe.Option()).(PressureAwareCache[testData])
-
-					for i := range 20 {
-						_, err := pac.Put(fmt.Sprintf("k/%02d", i), testData{value: int64(i), dataSize: 10})
-						require.NoError(t, err)
-					}
-					for i := range 5 {
-						_, ok := pac.Delete(fmt.Sprintf("k/%02d", i))
-						require.True(t, ok)
-					}
-
-					// Act 1: Delete the 6th of 20 entries (30% >= 25% shrinkage) under Tier 1 pressure (0.80).
-					probe.Set(0.80)
-					advancedInline := observeEpochAdvance(t, probe, pac, func() {
-						_, ok := pac.Delete("k/05")
-						require.True(t, ok)
-					})
-					assert.True(t, advancedInline)
-					assertAlreadyCompacted(t, pac, probe)
-
-					advancedFollowUp := observeEpochAdvance(t, probe, pac, func() {
-						pac.EvaluateMemoryPressure()
-					})
-					assert.False(t, advancedFollowUp)
-
-					// Act 2: Delete 1 more entry at normal pressure (0.10), then invoke EvaluateMemoryPressure() under Tier 1 (0.80).
-					probe.Set(0.10)
-					_, ok := pac.Delete("k/06")
-					require.True(t, ok)
-
-					probe.Set(0.80)
-					advancedExplicit := observeEpochAdvance(t, probe, pac, func() {
-						pac.EvaluateMemoryPressure()
-					})
-					assert.True(t, advancedExplicit)
-					assertAlreadyCompacted(t, pac, probe)
-
-					advancedSecondEval := observeEpochAdvance(t, probe, pac, func() {
-						pac.EvaluateMemoryPressure()
-					})
-					assert.False(t, advancedSecondEval)
-				})
-
-				t.Run("Tier2NoShedEvaluateCompactsPendingSlack", func(t *testing.T) {
-					probe := newPressureProbe(0.10)
-					pac := b.fn(
-						1000,
-						WithInvariantChecking(true),
-						WithEvictionRetentionRatio(0.50),
-						probe.Option(),
-					).(PressureAwareCache[testData])
-
-					for i := range 20 {
-						_, err := pac.Put(fmt.Sprintf("k/%02d", i), testData{value: int64(i), dataSize: 10})
-						require.NoError(t, err)
-					}
-					for i := range 6 {
-						_, ok := pac.Delete(fmt.Sprintf("k/%02d", i))
-						require.True(t, ok)
-					}
-
-					// Act: Spike pressure to Tier 2 (0.95) and call EvaluateMemoryPressure() while currentSize (140B) <= targetSize (500B).
-					probe.Set(0.95)
-					advanced := observeEpochAdvance(t, probe, pac, func() {
-						pac.EvaluateMemoryPressure()
-					})
-					assert.True(t, advanced)
-					assertAlreadyCompacted(t, pac, probe)
-
-					advancedRepeat := observeEpochAdvance(t, probe, pac, func() {
-						pac.EvaluateMemoryPressure()
-					})
-					assert.False(t, advancedRepeat)
-				})
-			})
-		}
-	})
+		})
+	}
 }
 
 func TestCompaction_PreReclaimSlackAndEpochConsistencyAcrossMutations(t *testing.T) {
@@ -972,137 +1109,7 @@ func TestCompaction_PreReclaimSlackAndEpochConsistencyAcrossMutations(t *testing
 		}
 	})
 
-	t.Run("EmptyCacheDrainDoesNotSpuriouslyAdvanceEpochOnZeroByteOrNormalPressure", func(t *testing.T) {
-		for _, b := range testBackends() {
-			t.Run(b.name, func(t *testing.T) {
-				t.Run("ZeroByteLastEntryUnderTier1Pressure", func(t *testing.T) {
-					probeDelete := newPressureProbe(0.80)
-					probeSelfEvict := newPressureProbe(0.80)
-					probePrefixEmpty := newPressureProbe(0.80)
-					cacheDelete := b.fn(100, WithInvariantChecking(true), probeDelete.Option()).(PressureAwareCache[testData])
-					cacheSelfEvict := b.fn(100, WithInvariantChecking(true), probeSelfEvict.Option()).(PressureAwareCache[testData])
-					cachePrefixEmpty := b.fn(100, WithInvariantChecking(true), probePrefixEmpty.Option()).(PressureAwareCache[testData])
-
-					_, err := cacheDelete.Put("z1", testData{value: 1, dataSize: 0})
-					require.NoError(t, err)
-					_, err = cacheSelfEvict.Put("z1", testData{value: 1, dataSize: 0})
-					require.NoError(t, err)
-					_, err = cacheSelfEvict.Put("mru_full", testData{value: 2, dataSize: 100})
-					require.NoError(t, err)
-					_, err = cachePrefixEmpty.Put("z1", testData{value: 1, dataSize: 0})
-					require.NoError(t, err)
-
-					advancedDelete := observeEpochAdvance(t, probeDelete, cacheDelete, func() {
-						_, ok := cacheDelete.Delete("z1")
-						require.True(t, ok)
-					})
-					advancedSelfEvict := observeEpochAdvance(t, probeSelfEvict, cacheSelfEvict, func() {
-						require.NoError(t, cacheSelfEvict.Replace("z1", testData{value: 11, dataSize: 10}))
-					})
-					advancedPrefixEmpty := observeEpochAdvance(t, probePrefixEmpty, cachePrefixEmpty, func() {
-						cachePrefixEmpty.DeletePrefix("")
-					})
-
-					assert.False(t, advancedDelete)
-					assert.False(t, advancedSelfEvict)
-					assert.False(t, advancedPrefixEmpty)
-				})
-
-				t.Run("NormalPressureLastEntryDeleteAndEmptyPrefixClearDoNotAdvanceEpoch", func(t *testing.T) {
-					var eraseSamples, prefixSamples, emptyPrefixSamples atomic.Int32
-					cacheDelete := b.fn(100, WithInvariantChecking(true), WithPressureFunc(func() float64 {
-						eraseSamples.Add(1)
-						return 0.10
-					})).(PressureAwareCache[testData])
-					cachePrefix := b.fn(100, WithInvariantChecking(true), WithPressureFunc(func() float64 {
-						prefixSamples.Add(1)
-						return 0.10
-					})).(PressureAwareCache[testData])
-					cachePrefixEmpty := b.fn(100, WithInvariantChecking(true), WithPressureFunc(func() float64 {
-						emptyPrefixSamples.Add(1)
-						return 0.10
-					})).(PressureAwareCache[testData])
-
-					_, err := cacheDelete.Put("k1", testData{value: 1, dataSize: 10})
-					require.NoError(t, err)
-					_, err = cachePrefix.Put("k1", testData{value: 1, dataSize: 10})
-					require.NoError(t, err)
-					_, err = cachePrefixEmpty.Put("k1", testData{value: 1, dataSize: 10})
-					require.NoError(t, err)
-
-					eraseBefore := eraseSamples.Load()
-					_, ok := cacheDelete.Delete("k1")
-					require.True(t, ok)
-					assert.Equal(t, int32(1), eraseSamples.Load()-eraseBefore)
-
-					prefixBefore := prefixSamples.Load()
-					cachePrefix.DeletePrefix("k")
-					assert.Equal(t, int32(1), prefixSamples.Load()-prefixBefore)
-
-					emptyBefore := emptyPrefixSamples.Load()
-					cachePrefixEmpty.DeletePrefix("")
-					assert.Equal(t, int32(0), emptyPrefixSamples.Load()-emptyBefore)
-
-					_, ok = cacheDelete.Peek("k1")
-					assert.False(t, ok)
-					_, ok = cachePrefix.Peek("k1")
-					assert.False(t, ok)
-					_, ok = cachePrefixEmpty.Peek("k1")
-					assert.False(t, ok)
-					assertAlreadyCompacted(t, cacheDelete)
-					assertAlreadyCompacted(t, cachePrefix)
-					assertAlreadyCompacted(t, cachePrefixEmpty)
-				})
-
-				t.Run("FreshCacheAndEmptyPrefixClearAreAlreadyCompactedAndDoNotAdvanceEpoch", func(t *testing.T) {
-					probe := newPressureProbe(0.80)
-					pac := b.fn(100, WithInvariantChecking(true), probe.Option()).(PressureAwareCache[testData])
-
-					assertAlreadyCompacted(t, pac, probe)
-					advancedFreshEval := observeEpochAdvance(t, probe, pac, func() {
-						pac.EvaluateMemoryPressure()
-					})
-					assert.False(t, advancedFreshEval)
-
-					// Populate and clear via DeletePrefix(""); resulting empty cache must already be compacted.
-					probe.Set(0.10)
-					for i := range 10 {
-						_, err := pac.Put(fmt.Sprintf("k-%02d", i), testData{value: int64(i), dataSize: 5})
-						require.NoError(t, err)
-					}
-					probe.Set(0.80)
-					advancedClear := observeEpochAdvance(t, probe, pac, func() {
-						pac.DeletePrefix("")
-					})
-					assert.True(t, advancedClear)
-					assertAlreadyCompacted(t, pac, probe)
-
-					advancedPostClearEval := observeEpochAdvance(t, probe, pac, func() {
-						pac.EvaluateMemoryPressure()
-					})
-					assert.False(t, advancedPostClearEval)
-				})
-
-				t.Run("Draining20ZeroSizeEntriesToEmptyUnderTier1AdvancesEpoch", func(t *testing.T) {
-					probe := newPressureProbe(0.10)
-					pac := b.fn(1000, WithInvariantChecking(true), probe.Option()).(PressureAwareCache[testData])
-					for i := range 20 {
-						_, err := pac.Put(fmt.Sprintf("z/%02d", i), testData{value: int64(i), dataSize: 0})
-						require.NoError(t, err)
-					}
-
-					probe.Set(0.80)
-					advanced := observeEpochAdvance(t, probe, pac, func() {
-						pac.DeletePrefix("z/")
-					})
-					assert.True(t, advanced)
-					_, ok := pac.Peek("z/00")
-					assert.False(t, ok)
-					assertAlreadyCompacted(t, pac, probe)
-				})
-			})
-		}
-	})
+	t.Run("EmptyCacheDrainDoesNotSpuriouslyAdvanceEpochOnZeroByteOrNormalPressure", testEmptyCacheDrainDoesNotSpuriouslyAdvanceEpoch)
 
 	t.Run("PutNewKeySingleSurvivorPreCompactionDirtiedByTier2Shed", func(t *testing.T) {
 		for _, b := range testBackends() {

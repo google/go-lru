@@ -268,46 +268,70 @@ func (h *differentialHarness) VerifyIterators() {
 			}
 		}
 
-		for _, limit := range []int{1, len(allKeys) / 2} {
-			if limit <= 0 || limit > len(allKeys) {
-				continue
-			}
-			var prefixAllKeys []string
-			var prefixAllVals []*diffValue
-			for k, v := range inst.cache.All() {
-				prefixAllKeys = append(prefixAllKeys, k)
-				prefixAllVals = append(prefixAllVals, v)
-				if len(prefixAllKeys) == limit {
-					break
-				}
-			}
-			require.Equalf(h.t, baseKeys[:limit], prefixAllKeys, "[VerifyIterators] early break All() keys mismatch on %s (inv=%v)", inst.name, inst.invariants)
-			for j := range limit {
-				h.compareValues(fmt.Sprintf("VerifyIterators.EarlyBreakAll[%d]", j), baseVals[j], true, prefixAllVals[j], true, inst.name, inst.invariants)
-			}
-
-			var prefixKeys []string
-			for k := range inst.cache.Keys() {
-				prefixKeys = append(prefixKeys, k)
-				if len(prefixKeys) == limit {
-					break
-				}
-			}
-			require.Equalf(h.t, baseKeys[:limit], prefixKeys, "[VerifyIterators] early break Keys() mismatch on %s (inv=%v)", inst.name, inst.invariants)
-
-			var prefixVals []*diffValue
-			for v := range inst.cache.Values() {
-				prefixVals = append(prefixVals, v)
-				if len(prefixVals) == limit {
-					break
-				}
-			}
-			for j := range limit {
-				h.compareValues(fmt.Sprintf("VerifyIterators.EarlyBreakValues[%d]", j), baseVals[j], true, prefixVals[j], true, inst.name, inst.invariants)
-			}
-		}
+		h.verifyIteratorEarlyBreaks(inst, baseKeys, baseVals)
 	}
 	h.VerifyStatsParity("VerifyIterators")
+}
+
+func (h *differentialHarness) verifyIteratorEarlyBreaks(inst diffInstance, baseKeys []string, baseVals []*diffValue) {
+	h.t.Helper()
+	for _, limit := range []int{1, len(baseKeys) / 2} {
+		if limit <= 0 || limit > len(baseKeys) {
+			continue
+		}
+		var prefixAllKeys []string
+		var prefixAllVals []*diffValue
+		for k, v := range inst.cache.All() {
+			prefixAllKeys = append(prefixAllKeys, k)
+			prefixAllVals = append(prefixAllVals, v)
+			if len(prefixAllKeys) == limit {
+				break
+			}
+		}
+		require.Equalf(h.t, baseKeys[:limit], prefixAllKeys, "[VerifyIterators] early break All() keys mismatch on %s (inv=%v)", inst.name, inst.invariants)
+		for j := range limit {
+			h.compareValues(fmt.Sprintf("VerifyIterators.EarlyBreakAll[%d]", j), baseVals[j], true, prefixAllVals[j], true, inst.name, inst.invariants)
+		}
+
+		var prefixKeys []string
+		for k := range inst.cache.Keys() {
+			prefixKeys = append(prefixKeys, k)
+			if len(prefixKeys) == limit {
+				break
+			}
+		}
+		require.Equalf(h.t, baseKeys[:limit], prefixKeys, "[VerifyIterators] early break Keys() mismatch on %s (inv=%v)", inst.name, inst.invariants)
+
+		var prefixVals []*diffValue
+		for v := range inst.cache.Values() {
+			prefixVals = append(prefixVals, v)
+			if len(prefixVals) == limit {
+				break
+			}
+		}
+		for j := range limit {
+			h.compareValues(fmt.Sprintf("VerifyIterators.EarlyBreakValues[%d]", j), baseVals[j], true, prefixVals[j], true, inst.name, inst.invariants)
+		}
+	}
+}
+
+func (h *differentialHarness) CompactAll() {
+	for _, inst := range h.instances {
+		inst.cache.(lru.PressureAwareCache[*diffValue]).Compact()
+	}
+}
+
+func (h *differentialHarness) EvaluateMemoryPressureAll() {
+	h.t.Helper()
+	var baseEvicted []*diffValue
+	for i, inst := range h.instances {
+		ev := inst.cache.(lru.PressureAwareCache[*diffValue]).EvaluateMemoryPressure()
+		if i == 0 {
+			baseEvicted = ev
+		} else {
+			h.compareEvicted("EvaluateMemoryPressure()", baseEvicted, ev, inst.name, inst.invariants)
+		}
+	}
 }
 
 func (h *differentialHarness) VerifyStatsParity(op string) {
@@ -511,17 +535,9 @@ func TestDifferential_FlatWorkload(t *testing.T) {
 	h.DrainAndVerifyEvictionOrder(keys)
 }
 
-func TestDifferential_HierarchicalDirectoryWorkload(t *testing.T) {
-	// Arrange
-	r := rand.New(rand.NewPCG(4242, 0))
-	const (
-		numOps        = 5000
-		cacheCapacity = 3000
-	)
-
-	var paths []string
-	topDirs := []string{"/var", "/usr", "/home", "/opt"}
-	subDirs := []string{"log", "local", "bin", "lib", "data"}
+func buildHierarchicalTestPaths() (paths, topDirs, subDirs []string) {
+	topDirs = []string{"/var", "/usr", "/home", "/opt"}
+	subDirs = []string{"log", "local", "bin", "lib", "data"}
 
 	for _, top := range topDirs {
 		for _, sub1 := range subDirs {
@@ -532,7 +548,18 @@ func TestDifferential_HierarchicalDirectoryWorkload(t *testing.T) {
 			}
 		}
 	}
+	return paths, topDirs, subDirs
+}
 
+func TestDifferential_HierarchicalDirectoryWorkload(t *testing.T) {
+	// Arrange
+	r := rand.New(rand.NewPCG(4242, 0))
+	const (
+		numOps        = 5000
+		cacheCapacity = 3000
+	)
+
+	paths, topDirs, subDirs := buildHierarchicalTestPaths()
 	h := newDifferentialHarness(t, cacheCapacity)
 
 	// Act
@@ -620,6 +647,59 @@ func TestDifferential_CapacityThrashingAndSizeUpdates(t *testing.T) {
 	h.DrainAndVerifyEvictionOrder(keys)
 }
 
+func replaceBoundaryExistingEntry(h *differentialHarness, r *rand.Rand, k string, existing *diffValue, op int) {
+	if existing == nil {
+		h.Replace(k, &diffValue{id: fmt.Sprintf("noent_%d", op), size: 10})
+		return
+	}
+	switch r.IntN(3) {
+	case 0:
+		h.Replace(k, &diffValue{id: fmt.Sprintf("upd_%d", op), size: existing.weight()})
+	case 1:
+		h.Replace(k, &diffValue{id: fmt.Sprintf("grow_%d", op), size: existing.weight() + 5})
+	default:
+		var shrunk uint64
+		if existing.weight() > 5 {
+			shrunk = existing.weight() - 5
+		}
+		h.Replace(k, &diffValue{id: fmt.Sprintf("shrink_%d", op), size: shrunk})
+	}
+}
+
+func execBoundaryWorkloadStep(h *differentialHarness, r *rand.Rand, adversarialKeys []string, op int, cacheCapacity uint64) {
+	k := adversarialKeys[r.IntN(len(adversarialKeys))]
+	dice := r.IntN(100)
+
+	switch {
+	case dice < 30:
+		var sz uint64
+		switch r.IntN(10) {
+		case 0:
+			sz = 0
+		case 1:
+			sz = cacheCapacity + 100
+		default:
+			sz = uint64(r.IntN(100) + 1)
+		}
+		h.Put(k, &diffValue{id: fmt.Sprintf("adv_%d", op), size: sz})
+	case dice < 35:
+		h.Put(k, nil)
+	case dice < 55:
+		h.Get(k)
+	case dice < 70:
+		h.Peek(k)
+	case dice < 80:
+		replaceBoundaryExistingEntry(h, r, k, h.Peek(k), op)
+	case dice < 88:
+		h.Replace(k, &diffValue{id: fmt.Sprintf("rand_sz_%d", op), size: uint64(r.IntN(150))})
+	case dice < 94:
+		h.Delete(k)
+	default:
+		prefix := adversarialKeys[r.IntN(len(adversarialKeys))]
+		h.DeletePrefix(prefix)
+	}
+}
+
 func TestDifferential_BoundaryAndEdgeCases(t *testing.T) {
 	// Arrange
 	r := rand.New(rand.NewPCG(12345, 0))
@@ -645,54 +725,7 @@ func TestDifferential_BoundaryAndEdgeCases(t *testing.T) {
 
 	// Act
 	for op := range numOps {
-		k := adversarialKeys[r.IntN(len(adversarialKeys))]
-		dice := r.IntN(100)
-
-		switch {
-		case dice < 30:
-			szRoll := r.IntN(10)
-			var sz uint64
-			switch szRoll {
-			case 0:
-				sz = 0
-			case 1:
-				sz = cacheCapacity + 100
-			default:
-				sz = uint64(r.IntN(100) + 1)
-			}
-			h.Put(k, &diffValue{id: fmt.Sprintf("adv_%d", op), size: sz})
-		case dice < 35:
-			h.Put(k, nil)
-		case dice < 55:
-			h.Get(k)
-		case dice < 70:
-			h.Peek(k)
-		case dice < 80:
-			existing := h.Peek(k)
-			if existing != nil {
-				switch r.IntN(3) {
-				case 0:
-					h.Replace(k, &diffValue{id: fmt.Sprintf("upd_%d", op), size: existing.weight()})
-				case 1:
-					h.Replace(k, &diffValue{id: fmt.Sprintf("grow_%d", op), size: existing.weight() + 5})
-				default:
-					var shrunk uint64
-					if existing.weight() > 5 {
-						shrunk = existing.weight() - 5
-					}
-					h.Replace(k, &diffValue{id: fmt.Sprintf("shrink_%d", op), size: shrunk})
-				}
-			} else {
-				h.Replace(k, &diffValue{id: fmt.Sprintf("noent_%d", op), size: 10})
-			}
-		case dice < 88:
-			h.Replace(k, &diffValue{id: fmt.Sprintf("rand_sz_%d", op), size: uint64(r.IntN(150))})
-		case dice < 94:
-			h.Delete(k)
-		default:
-			prefix := adversarialKeys[r.IntN(len(adversarialKeys))]
-			h.DeletePrefix(prefix)
-		}
+		execBoundaryWorkloadStep(h, r, adversarialKeys, op, cacheCapacity)
 		if (op+1)%250 == 0 {
 			h.VerifyIterators()
 		}
@@ -766,19 +799,9 @@ func TestDifferential_PressureAwareAndCompactionParity(t *testing.T) {
 			newSz := uint64(r.IntN(60))
 			h.Replace(k, &diffValue{id: fmt.Sprintf("pu_%d", op), size: newSz})
 		case dice < 93:
-			for _, inst := range h.instances {
-				inst.cache.(lru.PressureAwareCache[*diffValue]).Compact()
-			}
+			h.CompactAll()
 		default:
-			var baseEvicted []*diffValue
-			for i, inst := range h.instances {
-				ev := inst.cache.(lru.PressureAwareCache[*diffValue]).EvaluateMemoryPressure()
-				if i == 0 {
-					baseEvicted = ev
-				} else {
-					h.compareEvicted("EvaluateMemoryPressure()", baseEvicted, ev, inst.name, inst.invariants)
-				}
-			}
+			h.EvaluateMemoryPressureAll()
 		}
 		if (op+1)%250 == 0 {
 			h.VerifyIterators()
@@ -922,6 +945,34 @@ func TestDifferential_ReplaceLockstepParity(t *testing.T) {
 	assert.NotNil(t, h6.Peek("k3"))
 }
 
+func execDefaultWeigherStep(h *differentialHarness, r *rand.Rand, keys []string, op int) {
+	k := keys[r.IntN(len(keys))]
+	dice := r.IntN(100)
+	switch {
+	case dice < 35:
+		if r.IntN(10) == 0 {
+			h.Put(k, nil) // nil pointer value still weighs 1 under default weigher
+		} else {
+			h.Put(k, &diffValue{id: fmt.Sprintf("def_%d", op), size: uint64(r.IntN(10000))})
+		}
+	case dice < 55:
+		h.Get(k)
+	case dice < 70:
+		h.Peek(k)
+	case dice < 82:
+		h.Replace(k, &diffValue{id: fmt.Sprintf("def_upd_%d", op), size: uint64(r.IntN(10000))})
+	case dice < 90:
+		h.Delete(k)
+	case dice < 95:
+		prefix := fmt.Sprintf("ns_%d/dir_%d/", r.IntN(4), r.IntN(5))
+		h.DeletePrefix(prefix)
+	case dice < 98:
+		h.CompactAll()
+	default:
+		h.EvaluateMemoryPressureAll()
+	}
+}
+
 func TestDifferential_DefaultWeigherWorkload(t *testing.T) {
 	// Arrange: 6 instances (MapCache, RadixCache, ArenaRadixCache x invariants={false,true})
 	// configured WITHOUT WithWeigher so every entry has default weight 1.
@@ -956,41 +1007,7 @@ func TestDifferential_DefaultWeigherWorkload(t *testing.T) {
 			pressure = 0.10
 		}
 
-		k := keys[r.IntN(len(keys))]
-		dice := r.IntN(100)
-		switch {
-		case dice < 35:
-			if r.IntN(10) == 0 {
-				h.Put(k, nil) // nil pointer value still weighs 1 under default weigher
-			} else {
-				h.Put(k, &diffValue{id: fmt.Sprintf("def_%d", op), size: uint64(r.IntN(10000))})
-			}
-		case dice < 55:
-			h.Get(k)
-		case dice < 70:
-			h.Peek(k)
-		case dice < 82:
-			h.Replace(k, &diffValue{id: fmt.Sprintf("def_upd_%d", op), size: uint64(r.IntN(10000))})
-		case dice < 90:
-			h.Delete(k)
-		case dice < 95:
-			prefix := fmt.Sprintf("ns_%d/dir_%d/", r.IntN(4), r.IntN(5))
-			h.DeletePrefix(prefix)
-		case dice < 98:
-			for _, inst := range h.instances {
-				inst.cache.(lru.PressureAwareCache[*diffValue]).Compact()
-			}
-		default:
-			var baseEvicted []*diffValue
-			for i, inst := range h.instances {
-				ev := inst.cache.(lru.PressureAwareCache[*diffValue]).EvaluateMemoryPressure()
-				if i == 0 {
-					baseEvicted = ev
-				} else {
-					h.compareEvicted("EvaluateMemoryPressure()", baseEvicted, ev, inst.name, inst.invariants)
-				}
-			}
-		}
+		execDefaultWeigherStep(h, r, keys, op)
 		if (op+1)%250 == 0 {
 			h.VerifyIterators()
 		}
@@ -999,6 +1016,56 @@ func TestDifferential_DefaultWeigherWorkload(t *testing.T) {
 	// Assert
 	pressure = 0.10
 	h.DrainAndVerifyEvictionOrder(keys)
+}
+
+func pickCustomWeigherReplaceSize(h *differentialHarness, r *rand.Rand, k string, cacheCapacity uint64) uint64 {
+	// Exercise all 4 Replace weight transitions:
+	// 0: shrink to 0; 1: shrink to smaller positive; 2: same size; 3: grow within capacity; 4: grow > maxSize.
+	switch r.IntN(5) {
+	case 0:
+		return 0
+	case 1:
+		return uint64(r.IntN(15) + 1)
+	case 2:
+		if cur := h.Peek(k); cur != nil {
+			return cur.size
+		}
+		return 20
+	case 3:
+		return uint64(r.IntN(180) + 30)
+	default:
+		return cacheCapacity + uint64(r.IntN(100)+1)
+	}
+}
+
+func execCustomWeigherStep(h *differentialHarness, r *rand.Rand, keys []string, op int, cacheCapacity uint64) {
+	k := keys[r.IntN(len(keys))]
+	dice := r.IntN(100)
+	switch {
+	case dice < 35:
+		var sz uint64
+		switch r.IntN(8) {
+		case 0:
+			sz = 0
+		case 1:
+			sz = cacheCapacity + 50
+		default:
+			sz = uint64(r.IntN(80) + 1)
+		}
+		h.Put(k, &diffValue{id: fmt.Sprintf("ins_%d", op), size: sz})
+	case dice < 50:
+		h.Get(k)
+	case dice < 60:
+		h.Peek(k)
+	case dice < 88:
+		targetSz := pickCustomWeigherReplaceSize(h, r, k, cacheCapacity)
+		h.Replace(k, &diffValue{id: fmt.Sprintf("upd_%d", op), size: targetSz})
+	case dice < 95:
+		h.Delete(k)
+	default:
+		prefix := fmt.Sprintf("tree/%02d/", r.IntN(3))
+		h.DeletePrefix(prefix)
+	}
 }
 
 func TestDifferential_CustomWeigherGrowAndShrinkReplace(t *testing.T) {
@@ -1013,10 +1080,7 @@ func TestDifferential_CustomWeigherGrowAndShrinkReplace(t *testing.T) {
 		cacheCapacity,
 		false,
 		lru.WithWeigher(func(key string, v *diffValue) uint64 {
-			if v == nil {
-				return 0
-			}
-			if v.size == 0 {
+			if v == nil || v.size == 0 {
 				return 0
 			}
 			return uint64(len(key)) + v.size
@@ -1030,51 +1094,7 @@ func TestDifferential_CustomWeigherGrowAndShrinkReplace(t *testing.T) {
 
 	// Act
 	for op := range numOps {
-		k := keys[r.IntN(len(keys))]
-		dice := r.IntN(100)
-		switch {
-		case dice < 35:
-			var sz uint64
-			switch r.IntN(8) {
-			case 0:
-				sz = 0
-			case 1:
-				sz = cacheCapacity + 50
-			default:
-				sz = uint64(r.IntN(80) + 1)
-			}
-			h.Put(k, &diffValue{id: fmt.Sprintf("ins_%d", op), size: sz})
-		case dice < 50:
-			h.Get(k)
-		case dice < 60:
-			h.Peek(k)
-		case dice < 88:
-			// Exercise all 4 Replace weight transitions:
-			// 0: shrink to 0; 1: shrink to smaller positive; 2: same size; 3: grow within capacity; 4: grow > maxSize.
-			var targetSz uint64
-			switch r.IntN(5) {
-			case 0:
-				targetSz = 0
-			case 1:
-				targetSz = uint64(r.IntN(15) + 1)
-			case 2:
-				if cur := h.Peek(k); cur != nil {
-					targetSz = cur.size
-				} else {
-					targetSz = 20
-				}
-			case 3:
-				targetSz = uint64(r.IntN(180) + 30)
-			default:
-				targetSz = cacheCapacity + uint64(r.IntN(100)+1)
-			}
-			h.Replace(k, &diffValue{id: fmt.Sprintf("upd_%d", op), size: targetSz})
-		case dice < 95:
-			h.Delete(k)
-		default:
-			prefix := fmt.Sprintf("tree/%02d/", r.IntN(3))
-			h.DeletePrefix(prefix)
-		}
+		execCustomWeigherStep(h, r, keys, op, cacheCapacity)
 		if (op+1)%250 == 0 {
 			h.VerifyIterators()
 		}
@@ -1092,16 +1112,24 @@ type diffEvictEvent struct {
 	reason lru.EvictionReason
 }
 
-func TestDifferential_EvictionCallbacksParity(t *testing.T) {
-	// Arrange: 6 instances (MapCache, RadixCache, ArenaRadixCache x invariants={false,true})
-	// configured with both WithOnEvictValue and WithOnEvictEntry under oscillating memory pressure.
-	r := rand.New(rand.NewPCG(20261002, 0))
-	const (
-		numOps        = 6000
-		cacheCapacity = 300
-	)
-	pressure := 0.10
+type callbackInstance struct {
+	diffInstance
+	valEvents   []diffEvictEvent
+	entryEvents []diffEvictEvent
+	orderCheck  []string
+}
 
+func newDiffEvictEvent(key string, v *diffValue, reason lru.EvictionReason) diffEvictEvent {
+	ev := diffEvictEvent{key: key, reason: reason, isNil: v == nil}
+	if v != nil {
+		ev.valID = v.id
+		ev.valSz = v.size
+	}
+	return ev
+}
+
+func setupCallbackParityHarness(t *testing.T, cacheCapacity uint64, pressure *float64) (*differentialHarness, []*callbackInstance) {
+	t.Helper()
 	configs := []struct {
 		name        string
 		constructor func(uint64, ...lru.Option) lru.Cache[*diffValue]
@@ -1109,13 +1137,6 @@ func TestDifferential_EvictionCallbacksParity(t *testing.T) {
 		{"MapCache", lru.NewMapCache[*diffValue]},
 		{"RadixCache", lru.NewRadixCache[*diffValue]},
 		{"ArenaRadixCache", lru.NewArenaRadixCache[*diffValue]},
-	}
-
-	type callbackInstance struct {
-		diffInstance
-		valEvents   []diffEvictEvent
-		entryEvents []diffEvictEvent
-		orderCheck  []string
 	}
 
 	var instances []*callbackInstance
@@ -1131,26 +1152,16 @@ func TestDifferential_EvictionCallbacksParity(t *testing.T) {
 				cacheCapacity,
 				lru.WithInvariantChecking(inv),
 				diffWeigher,
-				lru.WithPressureFunc(func() float64 { return pressure }),
+				lru.WithPressureFunc(func() float64 { return *pressure }),
 				lru.WithCompactionThreshold(0.75),
 				lru.WithEvictionThreshold(0.90),
 				lru.WithEvictionRetentionRatio(0.50),
 				lru.WithOnEvictValue(func(v *diffValue, reason lru.EvictionReason) {
-					ev := diffEvictEvent{reason: reason, isNil: v == nil}
-					if v != nil {
-						ev.valID = v.id
-						ev.valSz = v.size
-					}
-					ci.valEvents = append(ci.valEvents, ev)
+					ci.valEvents = append(ci.valEvents, newDiffEvictEvent("", v, reason))
 					ci.orderCheck = append(ci.orderCheck, "V")
 				}),
 				lru.WithOnEvictEntry(func(k string, v *diffValue, reason lru.EvictionReason) {
-					ev := diffEvictEvent{key: k, reason: reason, isNil: v == nil}
-					if v != nil {
-						ev.valID = v.id
-						ev.valSz = v.size
-					}
-					ci.entryEvents = append(ci.entryEvents, ev)
+					ci.entryEvents = append(ci.entryEvents, newDiffEvictEvent(k, v, reason))
 					ci.orderCheck = append(ci.orderCheck, "E")
 				}),
 			)
@@ -1163,52 +1174,124 @@ func TestDifferential_EvictionCallbacksParity(t *testing.T) {
 			h.instances = append(h.instances, ci.diffInstance)
 		}
 	}
+	return h, instances
+}
 
-	verifyStepCallbacks := func(opDesc string, isDeletePrefix bool) {
-		t.Helper()
-		base := instances[0]
-		for idx, ci := range instances {
-			require.Lenf(t, ci.valEvents, len(ci.entryEvents), "[%s] valEvents/entryEvents len mismatch on %s (inv=%v)", opDesc, ci.name, ci.invariants)
-			require.Lenf(t, ci.orderCheck, 2*len(ci.entryEvents), "[%s] orderCheck len mismatch on %s (inv=%v)", opDesc, ci.name, ci.invariants)
-			for j := range ci.entryEvents {
-				require.Equalf(t, "V", ci.orderCheck[2*j], "[%s] OnEvictValue must precede OnEvictEntry on %s", opDesc, ci.name)
-				require.Equalf(t, "E", ci.orderCheck[2*j+1], "[%s] OnEvictEntry must follow OnEvictValue on %s", opDesc, ci.name)
-				expectedValEv := ci.entryEvents[j]
-				expectedValEv.key = ""
-				require.Equalf(t, expectedValEv, ci.valEvents[j], "[%s] valEvent != entryEvent on %s", opDesc, ci.name)
-			}
-
-			if idx > 0 {
-				if !isDeletePrefix {
-					require.Equalf(t, base.entryEvents, ci.entryEvents, "[%s] entryEvents sequence mismatch on %s (inv=%v)", opDesc, ci.name, ci.invariants)
-				} else {
-					var baseDeleted, basePressure []diffEvictEvent
-					for _, e := range base.entryEvents {
-						if e.reason == lru.EvictionReasonDeleted {
-							baseDeleted = append(baseDeleted, e)
-						} else {
-							basePressure = append(basePressure, e)
-						}
-					}
-					var ciDeleted, ciPressure []diffEvictEvent
-					for _, e := range ci.entryEvents {
-						if e.reason == lru.EvictionReasonDeleted {
-							ciDeleted = append(ciDeleted, e)
-						} else {
-							ciPressure = append(ciPressure, e)
-						}
-					}
-					require.ElementsMatchf(t, baseDeleted, ciDeleted, "[%s] DeletePrefix Deleted multiset mismatch on %s (inv=%v)", opDesc, ci.name, ci.invariants)
-					require.Equalf(t, basePressure, ciPressure, "[%s] DeletePrefix Pressure sequence mismatch on %s (inv=%v)", opDesc, ci.name, ci.invariants)
-				}
-			}
-		}
-		for _, ci := range instances {
-			ci.valEvents = ci.valEvents[:0]
-			ci.entryEvents = ci.entryEvents[:0]
-			ci.orderCheck = ci.orderCheck[:0]
+func verifyDeletePrefixCallbackParity(t *testing.T, base, ci *callbackInstance, opDesc string) {
+	t.Helper()
+	var baseDeleted, basePressure []diffEvictEvent
+	for _, e := range base.entryEvents {
+		if e.reason == lru.EvictionReasonDeleted {
+			baseDeleted = append(baseDeleted, e)
+		} else {
+			basePressure = append(basePressure, e)
 		}
 	}
+	var ciDeleted, ciPressure []diffEvictEvent
+	for _, e := range ci.entryEvents {
+		if e.reason == lru.EvictionReasonDeleted {
+			ciDeleted = append(ciDeleted, e)
+		} else {
+			ciPressure = append(ciPressure, e)
+		}
+	}
+	require.ElementsMatchf(t, baseDeleted, ciDeleted, "[%s] DeletePrefix Deleted multiset mismatch on %s (inv=%v)", opDesc, ci.name, ci.invariants)
+	require.Equalf(t, basePressure, ciPressure, "[%s] DeletePrefix Pressure sequence mismatch on %s (inv=%v)", opDesc, ci.name, ci.invariants)
+}
+
+func verifyStepCallbacks(t *testing.T, instances []*callbackInstance, opDesc string, isDeletePrefix bool) {
+	t.Helper()
+	base := instances[0]
+	for idx, ci := range instances {
+		require.Lenf(t, ci.valEvents, len(ci.entryEvents), "[%s] valEvents/entryEvents len mismatch on %s (inv=%v)", opDesc, ci.name, ci.invariants)
+		require.Lenf(t, ci.orderCheck, 2*len(ci.entryEvents), "[%s] orderCheck len mismatch on %s (inv=%v)", opDesc, ci.name, ci.invariants)
+		for j := range ci.entryEvents {
+			require.Equalf(t, "V", ci.orderCheck[2*j], "[%s] OnEvictValue must precede OnEvictEntry on %s", opDesc, ci.name)
+			require.Equalf(t, "E", ci.orderCheck[2*j+1], "[%s] OnEvictEntry must follow OnEvictValue on %s", opDesc, ci.name)
+			expectedValEv := ci.entryEvents[j]
+			expectedValEv.key = ""
+			require.Equalf(t, expectedValEv, ci.valEvents[j], "[%s] valEvent != entryEvent on %s", opDesc, ci.name)
+		}
+
+		if idx > 0 {
+			if !isDeletePrefix {
+				require.Equalf(t, base.entryEvents, ci.entryEvents, "[%s] entryEvents sequence mismatch on %s (inv=%v)", opDesc, ci.name, ci.invariants)
+			} else {
+				verifyDeletePrefixCallbackParity(t, base, ci, opDesc)
+			}
+		}
+	}
+	for _, ci := range instances {
+		ci.valEvents = ci.valEvents[:0]
+		ci.entryEvents = ci.entryEvents[:0]
+		ci.orderCheck = ci.orderCheck[:0]
+	}
+}
+
+func pickCallbackPutSize(r *rand.Rand, cacheCapacity uint64) uint64 {
+	switch r.IntN(8) {
+	case 0:
+		return 0
+	case 1:
+		return cacheCapacity + 20
+	default:
+		return uint64(r.IntN(80) + 1)
+	}
+}
+
+func pickCallbackReplaceSize(r *rand.Rand, cacheCapacity uint64) uint64 {
+	switch r.IntN(5) {
+	case 0:
+		return 0
+	case 1:
+		return uint64(r.IntN(20) + 1)
+	case 2:
+		return uint64(r.IntN(120) + 20)
+	default:
+		return cacheCapacity + 20
+	}
+}
+
+func execCallbackParityStep(h *differentialHarness, r *rand.Rand, keys []string, op int, cacheCapacity uint64) bool {
+	k := keys[r.IntN(len(keys))]
+	dice := r.IntN(100)
+	switch {
+	case dice < 35:
+		h.Put(k, &diffValue{id: fmt.Sprintf("p_%d", op), size: pickCallbackPutSize(r, cacheCapacity)})
+	case dice < 50:
+		h.Get(k)
+	case dice < 60:
+		h.Peek(k)
+	case dice < 80:
+		h.Replace(k, &diffValue{id: fmt.Sprintf("r_%d", op), size: pickCallbackReplaceSize(r, cacheCapacity)})
+	case dice < 90:
+		h.Delete(k)
+	case dice < 95:
+		if r.IntN(12) == 0 {
+			h.DeletePrefix("")
+		} else {
+			prefix := fmt.Sprintf("svc/%02d/mod/%02d/", r.IntN(4), r.IntN(4))
+			h.DeletePrefix(prefix)
+		}
+		return true
+	case dice < 97:
+		h.CompactAll()
+	default:
+		h.EvaluateMemoryPressureAll()
+	}
+	return false
+}
+
+func TestDifferential_EvictionCallbacksParity(t *testing.T) {
+	// Arrange: 6 instances (MapCache, RadixCache, ArenaRadixCache x invariants={false,true})
+	// configured with both WithOnEvictValue and WithOnEvictEntry under oscillating memory pressure.
+	r := rand.New(rand.NewPCG(20261002, 0))
+	const (
+		numOps        = 6000
+		cacheCapacity = 300
+	)
+	pressure := 0.10
+	h, instances := setupCallbackParityHarness(t, cacheCapacity, &pressure)
 
 	keys := make([]string, 64)
 	for i := range keys {
@@ -1229,63 +1312,7 @@ func TestDifferential_EvictionCallbacksParity(t *testing.T) {
 			pressure = 0.10
 		}
 
-		k := keys[r.IntN(len(keys))]
-		dice := r.IntN(100)
-		isDeletePrefix := false
-		switch {
-		case dice < 35:
-			var sz uint64
-			switch r.IntN(8) {
-			case 0:
-				sz = 0
-			case 1:
-				sz = cacheCapacity + 20
-			default:
-				sz = uint64(r.IntN(80) + 1)
-			}
-			h.Put(k, &diffValue{id: fmt.Sprintf("p_%d", op), size: sz})
-		case dice < 50:
-			h.Get(k)
-		case dice < 60:
-			h.Peek(k)
-		case dice < 80:
-			var sz uint64
-			switch r.IntN(5) {
-			case 0:
-				sz = 0
-			case 1:
-				sz = uint64(r.IntN(20) + 1)
-			case 2:
-				sz = uint64(r.IntN(120) + 20)
-			default:
-				sz = cacheCapacity + 20
-			}
-			h.Replace(k, &diffValue{id: fmt.Sprintf("r_%d", op), size: sz})
-		case dice < 90:
-			h.Delete(k)
-		case dice < 95:
-			isDeletePrefix = true
-			if r.IntN(12) == 0 {
-				h.DeletePrefix("")
-			} else {
-				prefix := fmt.Sprintf("svc/%02d/mod/%02d/", r.IntN(4), r.IntN(4))
-				h.DeletePrefix(prefix)
-			}
-		case dice < 97:
-			for _, inst := range h.instances {
-				inst.cache.(lru.PressureAwareCache[*diffValue]).Compact()
-			}
-		default:
-			var baseEvicted []*diffValue
-			for i, inst := range h.instances {
-				ev := inst.cache.(lru.PressureAwareCache[*diffValue]).EvaluateMemoryPressure()
-				if i == 0 {
-					baseEvicted = ev
-				} else {
-					h.compareEvicted("EvaluateMemoryPressure()", baseEvicted, ev, inst.name, inst.invariants)
-				}
-			}
-		}
+		isDeletePrefix := execCallbackParityStep(h, r, keys, op, cacheCapacity)
 
 		if (op+1)%250 == 0 {
 			h.VerifyIterators()
@@ -1295,7 +1322,7 @@ func TestDifferential_EvictionCallbacksParity(t *testing.T) {
 				reasonTotals[e.reason]++
 			}
 		}
-		verifyStepCallbacks(fmt.Sprintf("op=%d", op), isDeletePrefix)
+		verifyStepCallbacks(t, instances, fmt.Sprintf("op=%d", op), isDeletePrefix)
 	}
 
 	// Assert: every single EvictionReason (Capacity, Pressure, Deleted, Replaced) was exercised and verified
@@ -1660,253 +1687,230 @@ func TestDifferential_StatsFullLifecycleParity(t *testing.T) {
 	assert.Zero(t, st.PeakEntryLen)
 }
 
+func newEvictRecordingHarness(t *testing.T, maxSize uint64, valEvents, entryEvents *[]diffEvictEvent) *differentialHarness {
+	t.Helper()
+	return newDifferentialHarness(
+		t,
+		maxSize,
+		lru.WithOnEvictValue(func(v *diffValue, reason lru.EvictionReason) {
+			*valEvents = append(*valEvents, newDiffEvictEvent("", v, reason))
+		}),
+		lru.WithOnEvictEntry(func(k string, v *diffValue, reason lru.EvictionReason) {
+			*entryEvents = append(*entryEvents, newDiffEvictEvent(k, v, reason))
+		}),
+	)
+}
+
+func testAll256SingleByteKeys(t *testing.T) {
+	// Arrange
+	var valEvents []diffEvictEvent
+	var entryEvents []diffEvictEvent
+	h := newEvictRecordingHarness(t, 3000, &valEvents, &entryEvents)
+
+	var raw [256]byte
+	for i := range 256 {
+		raw[i] = byte(i)
+	}
+	backing := string(raw[:])
+	keys := make([]string, 256)
+	for i := range 256 {
+		keys[i] = backing[i : i+1]
+	}
+	highByteKeys := []string{"\x80", "\xaf", "\xff"}
+
+	// Act
+	for i, k := range keys {
+		evicted := h.Put(k, &diffValue{id: fmt.Sprintf("init_%02x", i), size: 10})
+		require.Empty(t, evicted)
+	}
+	for _, k := range highByteKeys {
+		evicted := h.Put(k, &diffValue{id: fmt.Sprintf("put_%02x", k[0]), size: 10})
+		require.Empty(t, evicted)
+	}
+	for _, k := range highByteKeys {
+		h.Replace(k, &diffValue{id: fmt.Sprintf("rep_%02x", k[0]), size: 10})
+	}
+
+	var gotGet [256]*diffValue
+	var gotPeek [256]*diffValue
+	for i, k := range keys {
+		gotGet[i] = h.Get(k)
+		gotPeek[i] = h.Peek(k)
+	}
+	h.VerifyIterators()
+
+	del80 := h.Delete("\x80")
+	delAF := h.Delete("\xaf")
+	h.DeletePrefix("\xff")
+	miss80 := h.Get("\x80")
+	missAF := h.Peek("\xaf")
+	missFF := h.Get("\xff")
+
+	// Assert
+	for i := range 256 {
+		require.NotNil(t, gotGet[i], "Get must hit for byte 0x%02x", i)
+		require.NotNil(t, gotPeek[i], "Peek must hit for byte 0x%02x", i)
+		expectedID := fmt.Sprintf("init_%02x", i)
+		if i == 0x80 || i == 0xaf || i == 0xff {
+			expectedID = fmt.Sprintf("rep_%02x", i)
+		}
+		assert.Equal(t, expectedID, gotGet[i].id)
+		assert.Equal(t, expectedID, gotPeek[i].id)
+	}
+	require.NotNil(t, del80)
+	assert.Equal(t, "rep_80", del80.id)
+	require.NotNil(t, delAF)
+	assert.Equal(t, "rep_af", delAF.id)
+	assert.Nil(t, miss80)
+	assert.Nil(t, missAF)
+	assert.Nil(t, missFF)
+
+	h.VerifyIterators()
+	h.VerifyStatsParity("All256SingleByteKeys")
+	st := h.instances[0].cache.Stats()
+	assert.Equal(t, 253, st.Len)
+	assert.Equal(t, uint64(2530), st.CurrentSize)
+	assert.Equal(t, uint64(256), st.PutInserted)
+	assert.Equal(t, uint64(3), st.PutUpdated)
+	assert.Equal(t, uint64(3), st.ReplaceUpdated)
+	assert.Equal(t, uint64(6), st.EvictionsReplaced)
+	assert.Equal(t, uint64(2), st.DeleteDeleted)
+	assert.Equal(t, uint64(1), st.DeletePrefixExecuted)
+	assert.Equal(t, uint64(3), st.EvictionsDeleted)
+
+	numInstances := len(h.instances)
+	require.Len(t, valEvents, 9*numInstances)
+	require.Len(t, entryEvents, 9*numInstances)
+	for idx, ev := range entryEvents {
+		expectedVal := ev
+		expectedVal.key = ""
+		assert.Equal(t, expectedVal, valEvents[idx])
+	}
+}
+
+func testMultiByteUTF8AndHighByteRadixPrefixSplits(t *testing.T) {
+	// Arrange
+	var valEvents []diffEvictEvent
+	var entryEvents []diffEvictEvent
+	h := newEvictRecordingHarness(t, 160, &valEvents, &entryEvents)
+
+	// Keys ordered to exercise all 4 insertNode clonePrefix call sites on 1-byte segments >= 0x80:
+	// 1. "dir\xaf" followed by "dir" -> splits existing child with 1-byte suffix oldPrefix[lcp:] == "\xaf"
+	// 2. "dir\x80", "dir\xff" -> inserts 1-byte child leaves search == "\x80", "\xff" under "dir"
+	// 3. "\x80alpha", "\x80beta" -> splits 1-byte shared prefix oldPrefix[:lcp] == "\x80"
+	// 4. Multi-byte UTF-8 continuation-byte splits: "café", "cafè", "cafê", "cafë", "é", "è", "naïve", "naïf", "🚀", "🛸"
+	initialKeys := []string{
+		"dir\xaf",
+		"dir",
+		"dir\x80",
+		"dir\xff",
+		"\x80alpha",
+		"\x80beta",
+		"café",
+		"cafè",
+		"cafê",
+		"cafë",
+		"é",
+		"è",
+		"naïve",
+		"naïf",
+		"🚀",
+		"🛸",
+	}
+
+	// Act
+	for i, k := range initialKeys {
+		evicted := h.Put(k, &diffValue{id: fmt.Sprintf("v_%d", i), size: 10})
+		require.Empty(t, evicted)
+	}
+
+	for _, k := range initialKeys {
+		require.NotNil(t, h.Peek(k))
+		require.NotNil(t, h.Get(k))
+	}
+	h.Replace("dir\xaf", &diffValue{id: "v_dir_af_rep", size: 10})
+	h.Replace("café", &diffValue{id: "v_cafe_rep", size: 10})
+	h.VerifyIterators()
+
+	// Trigger capacity eviction of the 2 oldest LRU keys ("dir\xaf" and "dir") by inserting a 20-byte entry.
+	valEvents = nil
+	entryEvents = nil
+	evictedCap := h.Put("overflow_trigger", &diffValue{id: "v_overflow", size: 20})
+
+	capEntryEvents := slices.Clone(entryEvents)
+	valEvents = nil
+	entryEvents = nil
+
+	// DeletePrefix("caf") removes "café", "cafè", "cafê", "cafë" and reconstructs their UTF-8 keys for WithOnEvictEntry.
+	h.DeletePrefix("caf")
+	prefixEntryEvents := slices.Clone(entryEvents)
+	valEvents = nil
+	entryEvents = nil
+
+	// Delete individual keys to exercise upward path compression (compressPathUpwards) on 1-byte high-bit segments.
+	delRocket := h.Delete("🚀")
+	delAlpha := h.Delete("\x80alpha")
+	delDir80 := h.Delete("dir\x80")
+	delNaive := h.Delete("naïve")
+	singleDeleteEvents := slices.Clone(entryEvents)
+
+	// Compact all instances (rebuilding ArenaRadixCache nodeMap via hashNodeKey on split/compressed high-bit prefixes).
+	h.CompactAll()
+
+	// Assert
+	require.Len(t, evictedCap, 2)
+	assert.Equal(t, "v_dir_af_rep", evictedCap[0].id)
+	assert.Equal(t, "v_1", evictedCap[1].id)
+
+	numInstances := len(h.instances)
+	require.Len(t, capEntryEvents, 2*numInstances)
+	for i := range numInstances {
+		instEvents := capEntryEvents[i*2 : (i+1)*2]
+		assert.Equal(t, []diffEvictEvent{
+			{key: "dir\xaf", valID: "v_dir_af_rep", valSz: 10, reason: lru.EvictionReasonCapacity},
+			{key: "dir", valID: "v_1", valSz: 10, reason: lru.EvictionReasonCapacity},
+		}, instEvents)
+	}
+
+	require.Len(t, prefixEntryEvents, 4*numInstances)
+	for i := range numInstances {
+		instEvents := prefixEntryEvents[i*4 : (i+1)*4]
+		assert.ElementsMatch(t, []diffEvictEvent{
+			{key: "café", valID: "v_cafe_rep", valSz: 10, reason: lru.EvictionReasonDeleted},
+			{key: "cafè", valID: "v_7", valSz: 10, reason: lru.EvictionReasonDeleted},
+			{key: "cafê", valID: "v_8", valSz: 10, reason: lru.EvictionReasonDeleted},
+			{key: "cafë", valID: "v_9", valSz: 10, reason: lru.EvictionReasonDeleted},
+		}, instEvents)
+	}
+
+	require.NotNil(t, delRocket)
+	require.NotNil(t, delAlpha)
+	require.NotNil(t, delDir80)
+	require.NotNil(t, delNaive)
+	require.Len(t, singleDeleteEvents, 4*numInstances)
+
+	survivingKeys := []string{"dir\xff", "\x80beta", "é", "è", "naïf", "🛸", "overflow_trigger"}
+	for _, k := range survivingKeys {
+		assert.NotNil(t, h.Peek(k), "expected surviving key %q to be present on Peek", k)
+		assert.NotNil(t, h.Get(k), "expected surviving key %q to be present on Get", k)
+	}
+
+	removedKeys := []string{"dir\xaf", "dir", "dir\x80", "\x80alpha", "café", "cafè", "cafê", "cafë", "naïve", "🚀"}
+	for _, k := range removedKeys {
+		assert.Nil(t, h.Peek(k), "expected removed key %q to miss on Peek", k)
+		assert.Nil(t, h.Get(k), "expected removed key %q to miss on Get", k)
+	}
+
+	h.VerifyIterators()
+	h.VerifyFullCompactionStatsParity("MultiByteUTF8AndHighByteRadixPrefixSplits")
+	st := h.instances[0].cache.Stats()
+	assert.Equal(t, len(survivingKeys), st.Len)
+	assert.Equal(t, uint64(80), st.CurrentSize)
+	assert.Equal(t, uint64(1), st.CompactionsExplicit)
+	assert.Zero(t, st.DeletedSinceCompact)
+}
+
 func TestDifferential_NonASCIISingleByteKeysAndUTF8PrefixSplits(t *testing.T) {
-	t.Run("All256SingleByteKeys", func(t *testing.T) {
-		// Arrange
-		var valEvents []diffEvictEvent
-		var entryEvents []diffEvictEvent
-		h := newDifferentialHarness(
-			t,
-			3000,
-			lru.WithOnEvictValue(func(v *diffValue, reason lru.EvictionReason) {
-				ev := diffEvictEvent{reason: reason, isNil: v == nil}
-				if v != nil {
-					ev.valID = v.id
-					ev.valSz = v.size
-				}
-				valEvents = append(valEvents, ev)
-			}),
-			lru.WithOnEvictEntry(func(k string, v *diffValue, reason lru.EvictionReason) {
-				ev := diffEvictEvent{key: k, reason: reason, isNil: v == nil}
-				if v != nil {
-					ev.valID = v.id
-					ev.valSz = v.size
-				}
-				entryEvents = append(entryEvents, ev)
-			}),
-		)
-
-		var raw [256]byte
-		for i := range 256 {
-			raw[i] = byte(i)
-		}
-		backing := string(raw[:])
-		keys := make([]string, 256)
-		for i := range 256 {
-			keys[i] = backing[i : i+1]
-		}
-		highByteKeys := []string{"\x80", "\xaf", "\xff"}
-
-		// Act
-		for i, k := range keys {
-			evicted := h.Put(k, &diffValue{id: fmt.Sprintf("init_%02x", i), size: 10})
-			require.Empty(t, evicted)
-		}
-		for _, k := range highByteKeys {
-			evicted := h.Put(k, &diffValue{id: fmt.Sprintf("put_%02x", k[0]), size: 10})
-			require.Empty(t, evicted)
-		}
-		for _, k := range highByteKeys {
-			h.Replace(k, &diffValue{id: fmt.Sprintf("rep_%02x", k[0]), size: 10})
-		}
-
-		var gotGet [256]*diffValue
-		var gotPeek [256]*diffValue
-		for i, k := range keys {
-			gotGet[i] = h.Get(k)
-			gotPeek[i] = h.Peek(k)
-		}
-		h.VerifyIterators()
-
-		del80 := h.Delete("\x80")
-		delAF := h.Delete("\xaf")
-		h.DeletePrefix("\xff")
-		miss80 := h.Get("\x80")
-		missAF := h.Peek("\xaf")
-		missFF := h.Get("\xff")
-
-		// Assert
-		for i := range 256 {
-			require.NotNil(t, gotGet[i], "Get must hit for byte 0x%02x", i)
-			require.NotNil(t, gotPeek[i], "Peek must hit for byte 0x%02x", i)
-			expectedID := fmt.Sprintf("init_%02x", i)
-			if i == 0x80 || i == 0xaf || i == 0xff {
-				expectedID = fmt.Sprintf("rep_%02x", i)
-			}
-			assert.Equal(t, expectedID, gotGet[i].id)
-			assert.Equal(t, expectedID, gotPeek[i].id)
-		}
-		require.NotNil(t, del80)
-		assert.Equal(t, "rep_80", del80.id)
-		require.NotNil(t, delAF)
-		assert.Equal(t, "rep_af", delAF.id)
-		assert.Nil(t, miss80)
-		assert.Nil(t, missAF)
-		assert.Nil(t, missFF)
-
-		h.VerifyIterators()
-		h.VerifyStatsParity("All256SingleByteKeys")
-		st := h.instances[0].cache.Stats()
-		assert.Equal(t, 253, st.Len)
-		assert.Equal(t, uint64(2530), st.CurrentSize)
-		assert.Equal(t, uint64(256), st.PutInserted)
-		assert.Equal(t, uint64(3), st.PutUpdated)
-		assert.Equal(t, uint64(3), st.ReplaceUpdated)
-		assert.Equal(t, uint64(6), st.EvictionsReplaced)
-		assert.Equal(t, uint64(2), st.DeleteDeleted)
-		assert.Equal(t, uint64(1), st.DeletePrefixExecuted)
-		assert.Equal(t, uint64(3), st.EvictionsDeleted)
-
-		numInstances := len(h.instances)
-		require.Len(t, valEvents, 9*numInstances)
-		require.Len(t, entryEvents, 9*numInstances)
-		for idx, ev := range entryEvents {
-			expectedVal := ev
-			expectedVal.key = ""
-			assert.Equal(t, expectedVal, valEvents[idx])
-		}
-	})
-
-	t.Run("MultiByteUTF8AndHighByteRadixPrefixSplits", func(t *testing.T) {
-		// Arrange
-		var valEvents []diffEvictEvent
-		var entryEvents []diffEvictEvent
-		h := newDifferentialHarness(
-			t,
-			160,
-			lru.WithOnEvictValue(func(v *diffValue, reason lru.EvictionReason) {
-				ev := diffEvictEvent{reason: reason, isNil: v == nil}
-				if v != nil {
-					ev.valID = v.id
-					ev.valSz = v.size
-				}
-				valEvents = append(valEvents, ev)
-			}),
-			lru.WithOnEvictEntry(func(k string, v *diffValue, reason lru.EvictionReason) {
-				ev := diffEvictEvent{key: k, reason: reason, isNil: v == nil}
-				if v != nil {
-					ev.valID = v.id
-					ev.valSz = v.size
-				}
-				entryEvents = append(entryEvents, ev)
-			}),
-		)
-
-		// Keys ordered to exercise all 4 insertNode clonePrefix call sites on 1-byte segments >= 0x80:
-		// 1. "dir\xaf" followed by "dir" -> splits existing child with 1-byte suffix oldPrefix[lcp:] == "\xaf"
-		// 2. "dir\x80", "dir\xff" -> inserts 1-byte child leaves search == "\x80", "\xff" under "dir"
-		// 3. "\x80alpha", "\x80beta" -> splits 1-byte shared prefix oldPrefix[:lcp] == "\x80"
-		// 4. Multi-byte UTF-8 continuation-byte splits: "café", "cafè", "cafê", "cafë", "é", "è", "naïve", "naïf", "🚀", "🛸"
-		initialKeys := []string{
-			"dir\xaf",
-			"dir",
-			"dir\x80",
-			"dir\xff",
-			"\x80alpha",
-			"\x80beta",
-			"café",
-			"cafè",
-			"cafê",
-			"cafë",
-			"é",
-			"è",
-			"naïve",
-			"naïf",
-			"🚀",
-			"🛸",
-		}
-
-		// Act
-		for i, k := range initialKeys {
-			evicted := h.Put(k, &diffValue{id: fmt.Sprintf("v_%d", i), size: 10})
-			require.Empty(t, evicted)
-		}
-
-		for _, k := range initialKeys {
-			require.NotNil(t, h.Peek(k))
-			require.NotNil(t, h.Get(k))
-		}
-		h.Replace("dir\xaf", &diffValue{id: "v_dir_af_rep", size: 10})
-		h.Replace("café", &diffValue{id: "v_cafe_rep", size: 10})
-		h.VerifyIterators()
-
-		// Trigger capacity eviction of the 2 oldest LRU keys ("dir\xaf" and "dir") by inserting a 20-byte entry.
-		valEvents = nil
-		entryEvents = nil
-		evictedCap := h.Put("overflow_trigger", &diffValue{id: "v_overflow", size: 20})
-
-		capEntryEvents := slices.Clone(entryEvents)
-		valEvents = nil
-		entryEvents = nil
-
-		// DeletePrefix("caf") removes "café", "cafè", "cafê", "cafë" and reconstructs their UTF-8 keys for WithOnEvictEntry.
-		h.DeletePrefix("caf")
-		prefixEntryEvents := slices.Clone(entryEvents)
-		valEvents = nil
-		entryEvents = nil
-
-		// Delete individual keys to exercise upward path compression (compressPathUpwards) on 1-byte high-bit segments.
-		delRocket := h.Delete("🚀")
-		delAlpha := h.Delete("\x80alpha")
-		delDir80 := h.Delete("dir\x80")
-		delNaive := h.Delete("naïve")
-		singleDeleteEvents := slices.Clone(entryEvents)
-
-		// Compact all instances (rebuilding ArenaRadixCache nodeMap via hashNodeKey on split/compressed high-bit prefixes).
-		for _, inst := range h.instances {
-			inst.cache.(lru.PressureAwareCache[*diffValue]).Compact()
-		}
-
-		// Assert
-		require.Len(t, evictedCap, 2)
-		assert.Equal(t, "v_dir_af_rep", evictedCap[0].id)
-		assert.Equal(t, "v_1", evictedCap[1].id)
-
-		numInstances := len(h.instances)
-		require.Len(t, capEntryEvents, 2*numInstances)
-		for i := range numInstances {
-			instEvents := capEntryEvents[i*2 : (i+1)*2]
-			assert.Equal(t, []diffEvictEvent{
-				{key: "dir\xaf", valID: "v_dir_af_rep", valSz: 10, reason: lru.EvictionReasonCapacity},
-				{key: "dir", valID: "v_1", valSz: 10, reason: lru.EvictionReasonCapacity},
-			}, instEvents)
-		}
-
-		require.Len(t, prefixEntryEvents, 4*numInstances)
-		for i := range numInstances {
-			instEvents := prefixEntryEvents[i*4 : (i+1)*4]
-			assert.ElementsMatch(t, []diffEvictEvent{
-				{key: "café", valID: "v_cafe_rep", valSz: 10, reason: lru.EvictionReasonDeleted},
-				{key: "cafè", valID: "v_7", valSz: 10, reason: lru.EvictionReasonDeleted},
-				{key: "cafê", valID: "v_8", valSz: 10, reason: lru.EvictionReasonDeleted},
-				{key: "cafë", valID: "v_9", valSz: 10, reason: lru.EvictionReasonDeleted},
-			}, instEvents)
-		}
-
-		require.NotNil(t, delRocket)
-		require.NotNil(t, delAlpha)
-		require.NotNil(t, delDir80)
-		require.NotNil(t, delNaive)
-		require.Len(t, singleDeleteEvents, 4*numInstances)
-
-		survivingKeys := []string{"dir\xff", "\x80beta", "é", "è", "naïf", "🛸", "overflow_trigger"}
-		for _, k := range survivingKeys {
-			assert.NotNil(t, h.Peek(k), "expected surviving key %q to be present on Peek", k)
-			assert.NotNil(t, h.Get(k), "expected surviving key %q to be present on Get", k)
-		}
-
-		removedKeys := []string{"dir\xaf", "dir", "dir\x80", "\x80alpha", "café", "cafè", "cafê", "cafë", "naïve", "🚀"}
-		for _, k := range removedKeys {
-			assert.Nil(t, h.Peek(k), "expected removed key %q to miss on Peek", k)
-			assert.Nil(t, h.Get(k), "expected removed key %q to miss on Get", k)
-		}
-
-		h.VerifyIterators()
-		h.VerifyFullCompactionStatsParity("MultiByteUTF8AndHighByteRadixPrefixSplits")
-		st := h.instances[0].cache.Stats()
-		assert.Equal(t, len(survivingKeys), st.Len)
-		assert.Equal(t, uint64(80), st.CurrentSize)
-		assert.Equal(t, uint64(1), st.CompactionsExplicit)
-		assert.Zero(t, st.DeletedSinceCompact)
-	})
+	t.Run("All256SingleByteKeys", testAll256SingleByteKeys)
+	t.Run("MultiByteUTF8AndHighByteRadixPrefixSplits", testMultiByteUTF8AndHighByteRadixPrefixSplits)
 }

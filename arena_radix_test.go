@@ -100,129 +100,19 @@ func TestArenaRadixCache_GetUnknownKey(t *testing.T) {
 }
 
 func TestArenaRadixCache_FillUpToCapacity(t *testing.T) {
-	// Arrange
-	cache := setupArenaRadixCacheTest(t)
-
-	// Act
-	ev1, err1 := cache.Put("burrito", testData{value: 23, dataSize: 4})
-	ev2, err2 := cache.Put("taco", testData{value: 26, dataSize: 20})
-	ev3, err3 := cache.Put("enchilada", testData{value: 28, dataSize: 26})
-
-	// Assert
-	require.NoError(t, err1)
-	assert.Empty(t, ev1)
-	require.NoError(t, err2)
-	assert.Empty(t, ev2)
-	require.NoError(t, err3)
-	assert.Empty(t, ev3)
-
-	v1, ok := cache.Get("burrito")
-	require.True(t, ok)
-	assert.Equal(t, int64(23), v1.value)
-
-	v2, ok := cache.Get("taco")
-	require.True(t, ok)
-	assert.Equal(t, int64(26), v2.value)
-
-	v3, ok := cache.Get("enchilada")
-	require.True(t, ok)
-	assert.Equal(t, int64(28), v3.value)
+	assertFillUpToCapacity(t, setupArenaRadixCacheTest(t))
 }
 
 func TestArenaRadixCache_ExpiresLeastRecentlyUsed(t *testing.T) {
-	// Arrange
-	cache := setupArenaRadixCacheTest(t)
-	_, err := cache.Put("burrito", testData{value: 23, dataSize: 4})
-	require.NoError(t, err)
-	_, err = cache.Put("taco", testData{value: 26, dataSize: 20})
-	require.NoError(t, err)
-	_, err = cache.Put("enchilada", testData{value: 28, dataSize: 26})
-	require.NoError(t, err)
-
-	// Promote burrito to MRU
-	promoted, ok := cache.Get("burrito")
-	require.True(t, ok)
-	assert.Equal(t, int64(23), promoted.value)
-
-	// Act: Put another item; taco (least recent) should be evicted
-	evicted, err := cache.Put("queso", testData{value: 34, dataSize: 5})
-
-	// Assert
-	require.NoError(t, err)
-	assertEvictedValues(t, evicted, []int64{26})
-	_, ok = cache.Get("taco")
-	assert.False(t, ok)
-
-	vBurrito, ok := cache.Get("burrito")
-	require.True(t, ok)
-	assert.Equal(t, int64(23), vBurrito.value)
-
-	vEnchilada, ok := cache.Get("enchilada")
-	require.True(t, ok)
-	assert.Equal(t, int64(28), vEnchilada.value)
-
-	vQueso, ok := cache.Get("queso")
-	require.True(t, ok)
-	assert.Equal(t, int64(34), vQueso.value)
+	assertExpiresLeastRecentlyUsed(t, setupArenaRadixCacheTest(t))
 }
 
 func TestArenaRadixCache_Overwrite(t *testing.T) {
-	// Arrange
-	cache := setupArenaRadixCacheTest(t)
-	_, err := cache.Put("burrito", testData{value: 23, dataSize: 4})
-	require.NoError(t, err)
-	_, err = cache.Put("taco", testData{value: 26, dataSize: 20})
-	require.NoError(t, err)
-	_, err = cache.Put("enchilada", testData{value: 28, dataSize: 20})
-	require.NoError(t, err)
-	ev1, err := cache.Put("burrito", testData{value: 33, dataSize: 6})
-	require.NoError(t, err)
-	assert.Empty(t, ev1)
-
-	// Act: Increase size during overwrite; taco should be evicted
-	evicted, err := cache.Put("burrito", testData{value: 33, dataSize: 12})
-
-	// Assert
-	require.NoError(t, err)
-	assertEvictedValues(t, evicted, []int64{26})
-	_, ok := cache.Get("taco")
-	assert.False(t, ok)
-
-	vBurrito, ok := cache.Get("burrito")
-	require.True(t, ok)
-	assert.Equal(t, int64(33), vBurrito.value)
-
-	vEnchilada, ok := cache.Get("enchilada")
-	require.True(t, ok)
-	assert.Equal(t, int64(28), vEnchilada.value)
+	assertOverwriteEviction(t, setupArenaRadixCacheTest(t))
 }
 
 func TestArenaRadixCache_MultipleEviction(t *testing.T) {
-	// Arrange
-	cache := setupArenaRadixCacheTest(t)
-	_, err := cache.Put("burrito", testData{value: 23, dataSize: 4})
-	require.NoError(t, err)
-	_, err = cache.Put("taco", testData{value: 26, dataSize: 20})
-	require.NoError(t, err)
-	_, err = cache.Put("enchilada", testData{value: 28, dataSize: 20})
-	require.NoError(t, err)
-
-	// Act: Large insert requiring all previous entries to be evicted
-	evicted, err := cache.Put("large_data", testData{value: 33, dataSize: 45})
-
-	// Assert
-	require.NoError(t, err)
-	assertEvictedValues(t, evicted, []int64{23, 26, 28})
-	_, ok := cache.Get("taco")
-	assert.False(t, ok)
-	_, ok = cache.Get("burrito")
-	assert.False(t, ok)
-	_, ok = cache.Get("enchilada")
-	assert.False(t, ok)
-
-	vLarge, ok := cache.Get("large_data")
-	require.True(t, ok)
-	assert.Equal(t, int64(33), vLarge.value)
+	assertMultipleEviction(t, setupArenaRadixCacheTest(t))
 }
 
 func TestArenaRadixCache_WhenEntrySizeMoreThanCacheMaxSize(t *testing.T) {
@@ -277,35 +167,7 @@ func TestArenaRadixCache_DeleteWhenKeyNotPresent(t *testing.T) {
 }
 
 func TestArenaRadixCache_DeletePrefix(t *testing.T) {
-	// Arrange
-	cache := setupArenaRadixCacheTest(t)
-	_, err := cache.Put("a", testData{value: 23, dataSize: 4})
-	require.NoError(t, err)
-	_, err = cache.Put("a/b", testData{value: 26, dataSize: 5})
-	require.NoError(t, err)
-	_, err = cache.Put("a/b/d", testData{value: 22, dataSize: 6})
-	require.NoError(t, err)
-	_, err = cache.Put("a/c", testData{value: 20, dataSize: 6})
-	require.NoError(t, err)
-	_, err = cache.Put("b", testData{value: 21, dataSize: 2})
-	require.NoError(t, err)
-
-	// Act
-	cache.DeletePrefix("a")
-
-	// Assert
-	_, ok := cache.Get("a")
-	assert.False(t, ok)
-	_, ok = cache.Get("a/b")
-	assert.False(t, ok)
-	_, ok = cache.Get("a/b/d")
-	assert.False(t, ok)
-	_, ok = cache.Get("a/c")
-	assert.False(t, ok)
-
-	vb, ok := cache.Get("b")
-	require.True(t, ok)
-	assert.Equal(t, uint64(2), vb.dataSize)
+	assertDeletePrefixTree(t, setupArenaRadixCacheTest(t))
 }
 
 func TestArenaRadixCache_DeletePrefixWithEmptyPrefix(t *testing.T) {
@@ -331,96 +193,16 @@ func TestArenaRadixCache_DeletePrefixWithEmptyPrefix(t *testing.T) {
 }
 
 func TestArenaRadixCache_DeletePrefixWhereNoEntriesExist(t *testing.T) {
-	// Arrange
-	cache := setupArenaRadixCacheTest(t)
-	_, err := cache.Put("a", testData{value: 23, dataSize: 4})
-	require.NoError(t, err)
-	_, err = cache.Put("a/b", testData{value: 26, dataSize: 5})
-	require.NoError(t, err)
-	_, err = cache.Put("b", testData{value: 21, dataSize: 2})
-	require.NoError(t, err)
-
-	// Act
-	cache.DeletePrefix("c")
-
-	// Assert
-	va, ok := cache.Get("a")
-	require.True(t, ok)
-	assert.Equal(t, uint64(4), va.dataSize)
-
-	vab, ok := cache.Get("a/b")
-	require.True(t, ok)
-	assert.Equal(t, uint64(5), vab.dataSize)
-
-	vb, ok := cache.Get("b")
-	require.True(t, ok)
-	assert.Equal(t, uint64(2), vb.dataSize)
+	assertDeletePrefixNoMatch(t, setupArenaRadixCacheTest(t))
 }
 
 func TestArenaRadixCache_DeletePrefixWithSomeEntriesEvictedDueToCacheSize(t *testing.T) {
-	// Arrange
-	cache := setupArenaRadixCacheTest(t)
-	_, err := cache.Put("a", testData{value: 23, dataSize: 20})
-	require.NoError(t, err)
-	_, err = cache.Put("a/b", testData{value: 26, dataSize: 10})
-	require.NoError(t, err)
-	_, err = cache.Put("a/b/d", testData{value: 22, dataSize: 5})
-	require.NoError(t, err)
-	_, err = cache.Put("a/c", testData{value: 20, dataSize: 10})
-	require.NoError(t, err)
-	evicted, err := cache.Put("b", testData{value: 21, dataSize: 15})
-	require.NoError(t, err)
-	assertEvictedValues(t, evicted, []int64{23})
-
-	// Act: "a" was evicted by "b", remaining "a/b", "a/b/d", "a/c" should be erased
-	cache.DeletePrefix("a")
-
-	// Assert
-	_, ok := cache.Get("a")
-	assert.False(t, ok)
-	_, ok = cache.Get("a/b")
-	assert.False(t, ok)
-	_, ok = cache.Get("a/b/d")
-	assert.False(t, ok)
-	_, ok = cache.Get("a/c")
-	assert.False(t, ok)
-
-	vb, ok := cache.Get("b")
-	require.True(t, ok)
-	assert.Equal(t, uint64(15), vb.dataSize)
+	assertDeletePrefixAfterEviction(t, setupArenaRadixCacheTest(t))
 }
 
 func TestArenaRadixCache_ReplaceGrowSize(t *testing.T) {
-	t.Run("NonExistentKey", func(t *testing.T) {
-		// Arrange
-		cache := NewArenaRadixCache[testData](100, WithInvariantChecking(true), testDataWeigher)
-
-		// Act
-		err := cache.Replace("key1", testData{value: 1, dataSize: 20})
-
-		// Assert
-		require.ErrorIs(t, err, ErrEntryNotExist)
-	})
-
-	t.Run("ImmediateEviction", func(t *testing.T) {
-		// Arrange
-		cache := NewArenaRadixCache[testData](100, WithInvariantChecking(true), testDataWeigher)
-		data1 := testData{value: 1, dataSize: 10}
-		data2 := testData{value: 2, dataSize: 70}
-		_, err := cache.Put("key1", data1)
-		require.NoError(t, err)
-		_, err = cache.Put("key2", data2)
-		require.NoError(t, err)
-
-		// Act: Grow key1 (at LRU tail) from 10 to 40 -> total 110 > 100 -> key1 evicts itself!
-		errUpdate := cache.Replace("key1", testData{value: 11, dataSize: 40})
-
-		// Assert
-		require.NoError(t, errUpdate)
-		_, ok := cache.Get("key1")
-		assert.False(t, ok)
-		_, ok = cache.Get("key2")
-		assert.True(t, ok)
+	assertReplaceGrowNonExistentAndSelfEvict(t, func(maxSize uint64) Cache[testData] {
+		return NewArenaRadixCache[testData](maxSize, WithInvariantChecking(true), testDataWeigher)
 	})
 }
 
@@ -548,6 +330,12 @@ func TestArenaRadixCache_ReplaceNotChangeOrder(t *testing.T) {
 	// Assert: key1 (value 7) is evicted because key1 remained the LRU element
 	require.NoError(t, err)
 	assertEvictedValues(t, evicted, []int64{7})
+}
+
+func TestArenaRadixCache_ReplaceGrowToExactMaxSize(t *testing.T) {
+	assertReplaceGrowToExactMaxSize(t, func(maxSize uint64) Cache[testData] {
+		return NewArenaRadixCache[testData](maxSize, WithInvariantChecking(true), testDataWeigher)
+	})
 }
 
 func TestArenaRadixCache_Peek(t *testing.T) {
@@ -1871,54 +1659,21 @@ func TestArenaRadixCache_Iterators(t *testing.T) {
 	})
 
 	t.Run("EarlyBreakAndNonMutationAndZeroAllocValues", func(t *testing.T) {
-		c := NewArenaRadixCache[testData](50, WithInvariantChecking(true), testDataWeigher)
-		for i := range 5 {
-			_, err := c.Put(fmt.Sprintf("arena/k%d", i), testData{value: int64(i + 1), dataSize: 10})
-			require.NoError(t, err)
-		}
-
-		var gotKeys []string
-		for k, v := range c.All() {
-			gotKeys = append(gotKeys, k)
-			_ = v
-			if len(gotKeys) == 2 {
-				break
-			}
-		}
-		assert.Equal(t, []string{"arena/k4", "arena/k3"}, gotKeys)
-
-		for k := range c.Keys() {
-			assert.Equal(t, "arena/k4", k)
-			break
-		}
-		for v := range c.Values() {
-			assert.Equal(t, int64(5), v.value)
-			break
-		}
-
-		cNoInv := NewArenaRadixCache[testData](50, testDataWeigher)
-		for i := range 5 {
-			_, err := cNoInv.Put(fmt.Sprintf("arena/k%d", i), testData{value: int64(i + 1), dataSize: 10})
-			require.NoError(t, err)
-		}
-		ac := cNoInv.(*arenaRadix[testData])
-		valSeq := cNoInv.Values()
-		allocs := testing.AllocsPerRun(100, func() {
-			valSeq(func(v testData) bool {
-				return v.value >= 0
-			})
-			for v := range ac.Values() {
-				if v.value < 0 {
-					break
+		assertIteratorEarlyBreakAndNonMutation(t, NewArenaRadixCache[testData], "arena/", func(cNoInv Cache[testData]) {
+			ac := cNoInv.(*arenaRadix[testData])
+			valSeq := cNoInv.Values()
+			allocs := testing.AllocsPerRun(100, func() {
+				valSeq(func(v testData) bool {
+					return v.value >= 0
+				})
+				for v := range ac.Values() {
+					if v.value < 0 {
+						break
+					}
 				}
-			}
+			})
+			assert.Zero(t, allocs, "ArenaRadixCache.Values() must allocate 0 heap objects")
 		})
-		assert.Zero(t, allocs, "ArenaRadixCache.Values() must allocate 0 heap objects")
-
-		// Confirm iteration did not mutate LRU eviction order: inserting k5 (10B) evicts oldest entry k0 (value 1).
-		evicted, err := c.Put("arena/k5", testData{value: 6, dataSize: 10})
-		require.NoError(t, err)
-		assertEvictedValues(t, evicted, []int64{1})
 	})
 }
 

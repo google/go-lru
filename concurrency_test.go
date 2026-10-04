@@ -55,6 +55,79 @@ func allEngines() []struct {
 	}
 }
 
+func exerciseConcurrentIterators(t *testing.T, cache lru.Cache[concValue], step, maxItems int) {
+	t.Helper()
+	switch step % 3 {
+	case 0:
+		count := 0
+		for k, v := range cache.All() {
+			assert.NotEmpty(t, k)
+			assert.NotEmpty(t, v.id)
+			count++
+			if step%2 == 0 && count >= maxItems {
+				break
+			}
+		}
+	case 1:
+		count := 0
+		for k := range cache.Keys() {
+			assert.NotEmpty(t, k)
+			count++
+			if step%2 == 0 && count >= maxItems {
+				break
+			}
+		}
+	case 2:
+		count := 0
+		for v := range cache.Values() {
+			assert.NotEmpty(t, v.id)
+			count++
+			if step%2 == 0 && count >= maxItems {
+				break
+			}
+		}
+	}
+}
+
+func runMixedOpStep(t *testing.T, cache lru.Cache[concValue], r *rand.Rand, step, numKeys int) {
+	t.Helper()
+	op := r.IntN(100)
+	kIdx := r.IntN(numKeys * 2)
+	dirIdx := kIdx % 5
+	subIdx := (kIdx / 5) % 10
+	key := fmt.Sprintf("dir_%02d/sub_%02d/file_%03d.txt", dirIdx, subIdx, kIdx)
+
+	switch {
+	case op < 28:
+		_, err := cache.Put(key, concValue{id: key, size: 10})
+		if err != nil {
+			assert.ErrorIs(t, err, lru.ErrInvalidEntrySize) //nolint:testifylint // wg.Go runs in a child goroutine
+		}
+	case op < 50:
+		_, _ = cache.Get(key)
+	case op < 64:
+		_, _ = cache.Peek(key)
+	case op < 74:
+		err := cache.Replace(key, concValue{id: key + "_upd", size: 10})
+		if err != nil {
+			assert.ErrorIs(t, err, lru.ErrEntryNotExist) //nolint:testifylint // wg.Go runs in a child goroutine
+		}
+	case op < 82:
+		sz := uint64(5 + (kIdx%3)*10) // 5, 15, or 25 (shrinks or grows weight)
+		err := cache.Replace(key, concValue{id: key + "_sz", size: sz})
+		if err != nil {
+			assert.ErrorIs(t, err, lru.ErrEntryNotExist) //nolint:testifylint // wg.Go runs in a child goroutine
+		}
+	case op < 88:
+		_, _ = cache.Delete(key)
+	case op < 94:
+		exerciseConcurrentIterators(t, cache, step, 5)
+	default:
+		prefix := fmt.Sprintf("dir_%02d/", dirIdx)
+		cache.DeletePrefix(prefix)
+	}
+}
+
 // TestConcurrency_MixedOperations exercises all Cache methods concurrently across
 // multiple goroutines on all three cache engines.
 func TestConcurrency_MixedOperations(t *testing.T) {
@@ -81,72 +154,8 @@ func TestConcurrency_MixedOperations(t *testing.T) {
 			for g := range numGoroutines {
 				wg.Go(func() {
 					r := rand.New(rand.NewPCG(uint64(g*10007+42), 0))
-
 					for step := range opsPerWorker {
-						op := r.IntN(100)
-						kIdx := r.IntN(numKeys * 2)
-						dirIdx := kIdx % 5
-						subIdx := (kIdx / 5) % 10
-						key := fmt.Sprintf("dir_%02d/sub_%02d/file_%03d.txt", dirIdx, subIdx, kIdx)
-
-						switch {
-						case op < 28:
-							_, err := cache.Put(key, concValue{id: key, size: 10})
-							if err != nil {
-								assert.ErrorIs(t, err, lru.ErrInvalidEntrySize) //nolint:testifylint // wg.Go runs in a child goroutine
-							}
-						case op < 50:
-							_, _ = cache.Get(key)
-						case op < 64:
-							_, _ = cache.Peek(key)
-						case op < 74:
-							err := cache.Replace(key, concValue{id: key + "_upd", size: 10})
-							if err != nil {
-								assert.ErrorIs(t, err, lru.ErrEntryNotExist) //nolint:testifylint // wg.Go runs in a child goroutine
-							}
-						case op < 82:
-							sz := uint64(5 + (kIdx%3)*10) // 5, 15, or 25 (shrinks or grows weight)
-							err := cache.Replace(key, concValue{id: key + "_sz", size: sz})
-							if err != nil {
-								assert.ErrorIs(t, err, lru.ErrEntryNotExist) //nolint:testifylint // wg.Go runs in a child goroutine
-							}
-						case op < 88:
-							_, _ = cache.Delete(key)
-						case op < 94:
-							switch step % 3 {
-							case 0:
-								count := 0
-								for k, v := range cache.All() {
-									assert.NotEmpty(t, k)
-									assert.NotEmpty(t, v.id)
-									count++
-									if step%2 == 0 && count >= 5 {
-										break
-									}
-								}
-							case 1:
-								count := 0
-								for k := range cache.Keys() {
-									assert.NotEmpty(t, k)
-									count++
-									if step%2 == 0 && count >= 5 {
-										break
-									}
-								}
-							case 2:
-								count := 0
-								for v := range cache.Values() {
-									assert.NotEmpty(t, v.id)
-									count++
-									if step%2 == 0 && count >= 5 {
-										break
-									}
-								}
-							}
-						default:
-							prefix := fmt.Sprintf("dir_%02d/", dirIdx)
-							cache.DeletePrefix(prefix)
-						}
+						runMixedOpStep(t, cache, r, step, numKeys)
 					}
 				})
 			}
@@ -285,6 +294,66 @@ func TestConcurrency_ParallelReadersPeek(t *testing.T) {
 	}
 }
 
+func verifyConcurrentAllOrder(t *testing.T, cache lru.Cache[concValue], totalKeys, limit int, earlyBreak bool) {
+	t.Helper()
+	idx := totalKeys - 1
+	count := 0
+	for k, v := range cache.All() {
+		expected := fmt.Sprintf("dir_%02d/key_%04d", idx%5, idx)
+		if !assert.Equal(t, expected, k) || !assert.Equal(t, expected, v.id) {
+			return
+		}
+		idx--
+		count++
+		if earlyBreak && count >= limit {
+			break
+		}
+	}
+	if !earlyBreak {
+		assert.Equal(t, totalKeys, count)
+	}
+}
+
+func verifyConcurrentKeysOrder(t *testing.T, cache lru.Cache[concValue], totalKeys, limit int, earlyBreak bool) {
+	t.Helper()
+	idx := totalKeys - 1
+	count := 0
+	for k := range cache.Keys() {
+		expected := fmt.Sprintf("dir_%02d/key_%04d", idx%5, idx)
+		if !assert.Equal(t, expected, k) {
+			return
+		}
+		idx--
+		count++
+		if earlyBreak && count >= limit {
+			break
+		}
+	}
+	if !earlyBreak {
+		assert.Equal(t, totalKeys, count)
+	}
+}
+
+func verifyConcurrentValuesOrder(t *testing.T, cache lru.Cache[concValue], totalKeys, limit int, earlyBreak bool) {
+	t.Helper()
+	idx := totalKeys - 1
+	count := 0
+	for v := range cache.Values() {
+		expected := fmt.Sprintf("dir_%02d/key_%04d", idx%5, idx)
+		if !assert.Equal(t, expected, v.id) {
+			return
+		}
+		idx--
+		count++
+		if earlyBreak && count >= limit {
+			break
+		}
+	}
+	if !earlyBreak {
+		assert.Equal(t, totalKeys, count)
+	}
+}
+
 // TestConcurrency_ParallelIteratorsPreservesLRUOrder verifies that concurrent
 // All(), Keys(), and Values() iterators (both full traversals and early breaks)
 // observe deterministic MRU-to-LRU order under RLock and never alter LRU eviction order.
@@ -317,56 +386,11 @@ func TestConcurrency_ParallelIteratorsPreservesLRUOrder(t *testing.T) {
 
 						switch (r + i) % 3 {
 						case 0:
-							idx := totalKeys - 1
-							count := 0
-							for k, v := range cache.All() {
-								expected := fmt.Sprintf("dir_%02d/key_%04d", idx%5, idx)
-								if !assert.Equal(t, expected, k) || !assert.Equal(t, expected, v.id) {
-									return
-								}
-								idx--
-								count++
-								if earlyBreak && count >= limit {
-									break
-								}
-							}
-							if !earlyBreak {
-								assert.Equal(t, totalKeys, count)
-							}
+							verifyConcurrentAllOrder(t, cache, totalKeys, limit, earlyBreak)
 						case 1:
-							idx := totalKeys - 1
-							count := 0
-							for k := range cache.Keys() {
-								expected := fmt.Sprintf("dir_%02d/key_%04d", idx%5, idx)
-								if !assert.Equal(t, expected, k) {
-									return
-								}
-								idx--
-								count++
-								if earlyBreak && count >= limit {
-									break
-								}
-							}
-							if !earlyBreak {
-								assert.Equal(t, totalKeys, count)
-							}
+							verifyConcurrentKeysOrder(t, cache, totalKeys, limit, earlyBreak)
 						case 2:
-							idx := totalKeys - 1
-							count := 0
-							for v := range cache.Values() {
-								expected := fmt.Sprintf("dir_%02d/key_%04d", idx%5, idx)
-								if !assert.Equal(t, expected, v.id) {
-									return
-								}
-								idx--
-								count++
-								if earlyBreak && count >= limit {
-									break
-								}
-							}
-							if !earlyBreak {
-								assert.Equal(t, totalKeys, count)
-							}
+							verifyConcurrentValuesOrder(t, cache, totalKeys, limit, earlyBreak)
 						}
 					}
 				})
@@ -421,6 +445,63 @@ func TestConcurrency_EvictionThrashingWithInvariants(t *testing.T) {
 	}
 }
 
+func oscillateTestPressure(setPressure func(float64), idx int, normal float64) {
+	switch idx % 3 {
+	case 0:
+		setPressure(normal)
+	case 1:
+		setPressure(0.80)
+	case 2:
+		setPressure(0.95)
+	}
+}
+
+func runPressureCompactionStep(t *testing.T, cache lru.Cache[concValue], reclaimer lru.PressureAwareCache[concValue], r *rand.Rand, step, numKeys int, capacity uint64) {
+	t.Helper()
+	op := r.IntN(100)
+	kIdx := r.IntN(numKeys)
+	dirIdx := kIdx % 6
+	subIdx := (kIdx / 6) % 5
+	key := fmt.Sprintf("mp_dir_%02d/sub_%02d/file_%03d.dat", dirIdx, subIdx, kIdx)
+
+	switch {
+	case op < 28:
+		_, err := cache.Put(key, concValue{id: key, size: 10})
+		if err != nil {
+			assert.ErrorIs(t, err, lru.ErrInvalidEntrySize) //nolint:testifylint // wg.Go runs in a child goroutine
+		}
+	case op < 48:
+		_, _ = cache.Get(key)
+	case op < 64:
+		_, _ = cache.Peek(key)
+	case op < 72:
+		err := cache.Replace(key, concValue{id: key + "_u", size: 10})
+		if err != nil {
+			assert.ErrorIs(t, err, lru.ErrEntryNotExist) //nolint:testifylint // wg.Go runs in a child goroutine
+		}
+	case op < 80:
+		sz := uint64(5 + (step%2)*10) // 5 or 15
+		err := cache.Replace(key, concValue{id: key + "_sz", size: sz})
+		if err != nil {
+			assert.ErrorIs(t, err, lru.ErrEntryNotExist) //nolint:testifylint // wg.Go runs in a child goroutine
+		}
+	case op < 86:
+		_, _ = cache.Delete(key)
+	case op < 91:
+		exerciseConcurrentIterators(t, cache, step, 4)
+	case op < 95:
+		prefix := fmt.Sprintf("mp_dir_%02d/", dirIdx)
+		cache.DeletePrefix(prefix)
+	case op < 97:
+		st := cache.Stats()
+		assert.Equal(t, capacity, st.MaxSize)
+	case op < 99:
+		reclaimer.Compact()
+	default:
+		_ = reclaimer.EvaluateMemoryPressure()
+	}
+}
+
 // TestConcurrency_MemoryPressureCompactionAndEviction exercises concurrent reads, writes,
 // replacements, size updates, deletions, prefix deletions, and explicit/automatic compactions
 // while memory pressure dynamically oscillates across normal, moderate, and critical tiers
@@ -462,90 +543,9 @@ func TestConcurrency_MemoryPressureCompactionAndEviction(t *testing.T) {
 			for g := range numGoroutines {
 				wg.Go(func() {
 					r := rand.New(rand.NewPCG(uint64(g*13337+99), 0))
-
 					for step := range opsPerWorker {
-						// Dynamically oscillate simulated pressure across Normal (0.20),
-						// Moderate (0.80), and Critical (0.95) tiers.
-						switch (g + step) % 3 {
-						case 0:
-							setPressure(0.20)
-						case 1:
-							setPressure(0.80)
-						case 2:
-							setPressure(0.95)
-						}
-
-						op := r.IntN(100)
-						kIdx := r.IntN(numKeys)
-						dirIdx := kIdx % 6
-						subIdx := (kIdx / 6) % 5
-						key := fmt.Sprintf("mp_dir_%02d/sub_%02d/file_%03d.dat", dirIdx, subIdx, kIdx)
-
-						switch {
-						case op < 28:
-							_, err := cache.Put(key, concValue{id: key, size: 10})
-							if err != nil {
-								assert.ErrorIs(t, err, lru.ErrInvalidEntrySize) //nolint:testifylint // wg.Go runs in a child goroutine
-							}
-						case op < 48:
-							_, _ = cache.Get(key)
-						case op < 64:
-							_, _ = cache.Peek(key)
-						case op < 72:
-							err := cache.Replace(key, concValue{id: key + "_u", size: 10})
-							if err != nil {
-								assert.ErrorIs(t, err, lru.ErrEntryNotExist) //nolint:testifylint // wg.Go runs in a child goroutine
-							}
-						case op < 80:
-							sz := uint64(5 + (step%2)*10) // 5 or 15
-							err := cache.Replace(key, concValue{id: key + "_sz", size: sz})
-							if err != nil {
-								assert.ErrorIs(t, err, lru.ErrEntryNotExist) //nolint:testifylint // wg.Go runs in a child goroutine
-							}
-						case op < 86:
-							_, _ = cache.Delete(key)
-						case op < 91:
-							switch step % 3 {
-							case 0:
-								count := 0
-								for k, v := range cache.All() {
-									assert.NotEmpty(t, k)
-									assert.NotEmpty(t, v.id)
-									count++
-									if step%2 == 0 && count >= 4 {
-										break
-									}
-								}
-							case 1:
-								count := 0
-								for k := range cache.Keys() {
-									assert.NotEmpty(t, k)
-									count++
-									if step%2 == 0 && count >= 4 {
-										break
-									}
-								}
-							case 2:
-								count := 0
-								for v := range cache.Values() {
-									assert.NotEmpty(t, v.id)
-									count++
-									if step%2 == 0 && count >= 4 {
-										break
-									}
-								}
-							}
-						case op < 95:
-							prefix := fmt.Sprintf("mp_dir_%02d/", dirIdx)
-							cache.DeletePrefix(prefix)
-						case op < 97:
-							st := cache.Stats()
-							assert.Equal(t, uint64(capacity), st.MaxSize)
-						case op < 99:
-							reclaimer.Compact()
-						default:
-							_ = reclaimer.EvaluateMemoryPressure()
-						}
+						oscillateTestPressure(setPressure, g+step, 0.20)
+						runPressureCompactionStep(t, cache, reclaimer, r, step, numKeys, capacity)
 					}
 				})
 			}
@@ -557,6 +557,55 @@ func TestConcurrency_MemoryPressureCompactionAndEviction(t *testing.T) {
 			st := cache.Stats()
 			assert.LessOrEqual(t, st.CurrentSize, st.MaxSize)
 		})
+	}
+}
+
+func runEvictionCallbackRaceStep(t *testing.T, cache lru.Cache[concValue], reclaimer lru.PressureAwareCache[concValue], r *rand.Rand, step, numKeys int, capacity uint64) {
+	t.Helper()
+	op := r.IntN(100)
+	kIdx := r.IntN(numKeys)
+	dirIdx := kIdx % 6
+	subIdx := (kIdx / 6) % 5
+	key := fmt.Sprintf("cb_dir_%02d/sub_%02d/file_%03d.dat", dirIdx, subIdx, kIdx)
+	if kIdx == 0 {
+		key = ""
+	}
+
+	switch {
+	case op < 35:
+		_, err := cache.Put(key, concValue{id: key, size: 10})
+		if err != nil {
+			assert.ErrorIs(t, err, lru.ErrInvalidEntrySize) //nolint:testifylint // wg.Go runs in a child goroutine
+		}
+	case op < 52:
+		_, _ = cache.Get(key)
+	case op < 65:
+		_, _ = cache.Peek(key)
+	case op < 78:
+		sz := uint64(5 + (step%3)*10) // 5, 15, or 25
+		err := cache.Replace(key, concValue{id: key + "_r", size: sz})
+		if err != nil {
+			assert.ErrorIs(t, err, lru.ErrEntryNotExist) //nolint:testifylint // wg.Go runs in a child goroutine
+		}
+	case op < 86:
+		// Self-evicting Replace (> capacity or !canFit alongside newer entries)
+		sz := capacity + 10
+		if step%2 == 1 {
+			sz = capacity - 15
+		}
+		err := cache.Replace(key, concValue{id: key + "_r", size: sz})
+		if err != nil {
+			assert.ErrorIs(t, err, lru.ErrEntryNotExist) //nolint:testifylint // wg.Go runs in a child goroutine
+		}
+	case op < 92:
+		_, _ = cache.Delete(key)
+	case op < 96:
+		prefix := fmt.Sprintf("cb_dir_%02d/", dirIdx)
+		cache.DeletePrefix(prefix)
+	case op < 98:
+		reclaimer.Compact()
+	default:
+		_ = reclaimer.EvaluateMemoryPressure()
 	}
 }
 
@@ -624,62 +673,9 @@ func TestConcurrency_EvictionCallbacksUnderRace(t *testing.T) {
 			for g := range numGoroutines {
 				wg.Go(func() {
 					r := rand.New(rand.NewPCG(uint64(g*17777+42), 0))
-
 					for step := range opsPerWorker {
-						switch (g + step) % 3 {
-						case 0:
-							setPressure(0.20)
-						case 1:
-							setPressure(0.80)
-						case 2:
-							setPressure(0.95)
-						}
-
-						op := r.IntN(100)
-						kIdx := r.IntN(numKeys)
-						dirIdx := kIdx % 6
-						subIdx := (kIdx / 6) % 5
-						key := fmt.Sprintf("cb_dir_%02d/sub_%02d/file_%03d.dat", dirIdx, subIdx, kIdx)
-						if kIdx == 0 {
-							key = ""
-						}
-
-						switch {
-						case op < 35:
-							_, err := cache.Put(key, concValue{id: key, size: 10})
-							if err != nil {
-								assert.ErrorIs(t, err, lru.ErrInvalidEntrySize) //nolint:testifylint // wg.Go runs in a child goroutine
-							}
-						case op < 52:
-							_, _ = cache.Get(key)
-						case op < 65:
-							_, _ = cache.Peek(key)
-						case op < 78:
-							sz := uint64(5 + (step%3)*10) // 5, 15, or 25
-							err := cache.Replace(key, concValue{id: key + "_r", size: sz})
-							if err != nil {
-								assert.ErrorIs(t, err, lru.ErrEntryNotExist) //nolint:testifylint // wg.Go runs in a child goroutine
-							}
-						case op < 86:
-							// Self-evicting Replace (> capacity or !canFit alongside newer entries)
-							sz := uint64(capacity + 10)
-							if step%2 == 1 {
-								sz = capacity - 15
-							}
-							err := cache.Replace(key, concValue{id: key + "_r", size: sz})
-							if err != nil {
-								assert.ErrorIs(t, err, lru.ErrEntryNotExist) //nolint:testifylint // wg.Go runs in a child goroutine
-							}
-						case op < 92:
-							_, _ = cache.Delete(key)
-						case op < 96:
-							prefix := fmt.Sprintf("cb_dir_%02d/", dirIdx)
-							cache.DeletePrefix(prefix)
-						case op < 98:
-							reclaimer.Compact()
-						default:
-							_ = reclaimer.EvaluateMemoryPressure()
-						}
+						oscillateTestPressure(setPressure, g+step, 0.20)
+						runEvictionCallbackRaceStep(t, cache, reclaimer, r, step, numKeys, capacity)
 					}
 				})
 			}
@@ -702,6 +698,80 @@ func TestConcurrency_EvictionCallbacksUnderRace(t *testing.T) {
 				assert.Positivef(t, eCount, "expected EvictionReason %s to be exercised under concurrency", r)
 			}
 		})
+	}
+}
+
+func assertMonotonicStats(t *testing.T, cur, prev lru.Stats, capacity uint64) {
+	t.Helper()
+	assert.Equal(t, capacity, cur.MaxSize)
+	assert.LessOrEqual(t, cur.CurrentSize, cur.MaxSize)
+	assert.GreaterOrEqual(t, cur.Len, 0)
+	assert.GreaterOrEqual(t, cur.ZeroSizeCount, 0)
+	assert.LessOrEqual(t, cur.ZeroSizeCount, cur.Len)
+
+	// Monotonic cumulative counters within a single reader timeline:
+	assert.GreaterOrEqual(t, cur.GetHits, prev.GetHits)
+	assert.GreaterOrEqual(t, cur.GetMisses, prev.GetMisses)
+	assert.GreaterOrEqual(t, cur.PeekHits, prev.PeekHits)
+	assert.GreaterOrEqual(t, cur.PeekMisses, prev.PeekMisses)
+	assert.GreaterOrEqual(t, cur.EvictionsCapacity, prev.EvictionsCapacity)
+	assert.GreaterOrEqual(t, cur.EvictionsPressure, prev.EvictionsPressure)
+	assert.GreaterOrEqual(t, cur.EvictionsDeleted, prev.EvictionsDeleted)
+	assert.GreaterOrEqual(t, cur.EvictionsReplaced, prev.EvictionsReplaced)
+	assert.GreaterOrEqual(t, cur.EvictedWeightCapacity, prev.EvictedWeightCapacity)
+	assert.GreaterOrEqual(t, cur.EvictedWeightPressure, prev.EvictedWeightPressure)
+	assert.GreaterOrEqual(t, cur.EvictedWeightDeleted, prev.EvictedWeightDeleted)
+	assert.GreaterOrEqual(t, cur.EvictedWeightReplaced, prev.EvictedWeightReplaced)
+	assert.GreaterOrEqual(t, cur.PutInserted, prev.PutInserted)
+	assert.GreaterOrEqual(t, cur.PutUpdated, prev.PutUpdated)
+	assert.GreaterOrEqual(t, cur.PutRejectedOversized, prev.PutRejectedOversized)
+	assert.GreaterOrEqual(t, cur.ReplaceUpdated, prev.ReplaceUpdated)
+	assert.GreaterOrEqual(t, cur.ReplaceNotFound, prev.ReplaceNotFound)
+	assert.GreaterOrEqual(t, cur.ReplaceSelfEvicted, prev.ReplaceSelfEvicted)
+	assert.GreaterOrEqual(t, cur.DeleteDeleted, prev.DeleteDeleted)
+	assert.GreaterOrEqual(t, cur.DeleteNotFound, prev.DeleteNotFound)
+	assert.GreaterOrEqual(t, cur.DeletePrefixExecuted, prev.DeletePrefixExecuted)
+	assert.GreaterOrEqual(t, cur.CompactionsExplicit, prev.CompactionsExplicit)
+	assert.GreaterOrEqual(t, cur.CompactionsPressureTier1, prev.CompactionsPressureTier1)
+	assert.GreaterOrEqual(t, cur.CompactionsPressureTier2, prev.CompactionsPressureTier2)
+	assert.GreaterOrEqual(t, cur.CompactionsAutoSlack, prev.CompactionsAutoSlack)
+	assert.GreaterOrEqual(t, cur.PressureShedsInline, prev.PressureShedsInline)
+	assert.GreaterOrEqual(t, cur.PressureShedsExplicit, prev.PressureShedsExplicit)
+	assert.GreaterOrEqual(t, cur.ReclaimEpoch, prev.ReclaimEpoch)
+}
+
+func runStatsRaceWriterStep(cache lru.Cache[concValue], reclaimer lru.PressureAwareCache[concValue], r *rand.Rand, step, numKeys int, capacity uint64) {
+	op := r.IntN(100)
+	kIdx := r.IntN(numKeys)
+	key := fmt.Sprintf("st_dir_%02d/item_%03d", kIdx%5, kIdx)
+
+	switch {
+	case op < 30:
+		sz := uint64(10)
+		if step%15 == 0 {
+			sz = 0
+		} else if step%19 == 0 {
+			sz = capacity + 50
+		}
+		_, _ = cache.Put(key, concValue{id: key, size: sz})
+	case op < 50:
+		_, _ = cache.Get(key)
+	case op < 65:
+		_, _ = cache.Peek(key)
+	case op < 80:
+		sz := uint64(15)
+		if step%11 == 0 {
+			sz = capacity + 20
+		}
+		_ = cache.Replace(key, concValue{id: key + "_u", size: sz})
+	case op < 90:
+		_, _ = cache.Delete(key)
+	case op < 95:
+		cache.DeletePrefix(fmt.Sprintf("st_dir_%02d/", kIdx%5))
+	case op < 98:
+		reclaimer.Compact()
+	default:
+		_ = reclaimer.EvaluateMemoryPressure()
 	}
 }
 
@@ -758,41 +828,7 @@ func TestConcurrency_StatsAndPressureUnderRace(t *testing.T) {
 					var prev lru.Stats
 					for !stopReaders.Load() {
 						cur := cache.Stats()
-						assert.Equal(t, uint64(capacity), cur.MaxSize)
-						assert.LessOrEqual(t, cur.CurrentSize, cur.MaxSize)
-						assert.GreaterOrEqual(t, cur.Len, 0)
-						assert.GreaterOrEqual(t, cur.ZeroSizeCount, 0)
-						assert.LessOrEqual(t, cur.ZeroSizeCount, cur.Len)
-
-						// Monotonic cumulative counters within a single reader timeline:
-						assert.GreaterOrEqual(t, cur.GetHits, prev.GetHits)
-						assert.GreaterOrEqual(t, cur.GetMisses, prev.GetMisses)
-						assert.GreaterOrEqual(t, cur.PeekHits, prev.PeekHits)
-						assert.GreaterOrEqual(t, cur.PeekMisses, prev.PeekMisses)
-						assert.GreaterOrEqual(t, cur.EvictionsCapacity, prev.EvictionsCapacity)
-						assert.GreaterOrEqual(t, cur.EvictionsPressure, prev.EvictionsPressure)
-						assert.GreaterOrEqual(t, cur.EvictionsDeleted, prev.EvictionsDeleted)
-						assert.GreaterOrEqual(t, cur.EvictionsReplaced, prev.EvictionsReplaced)
-						assert.GreaterOrEqual(t, cur.EvictedWeightCapacity, prev.EvictedWeightCapacity)
-						assert.GreaterOrEqual(t, cur.EvictedWeightPressure, prev.EvictedWeightPressure)
-						assert.GreaterOrEqual(t, cur.EvictedWeightDeleted, prev.EvictedWeightDeleted)
-						assert.GreaterOrEqual(t, cur.EvictedWeightReplaced, prev.EvictedWeightReplaced)
-						assert.GreaterOrEqual(t, cur.PutInserted, prev.PutInserted)
-						assert.GreaterOrEqual(t, cur.PutUpdated, prev.PutUpdated)
-						assert.GreaterOrEqual(t, cur.PutRejectedOversized, prev.PutRejectedOversized)
-						assert.GreaterOrEqual(t, cur.ReplaceUpdated, prev.ReplaceUpdated)
-						assert.GreaterOrEqual(t, cur.ReplaceNotFound, prev.ReplaceNotFound)
-						assert.GreaterOrEqual(t, cur.ReplaceSelfEvicted, prev.ReplaceSelfEvicted)
-						assert.GreaterOrEqual(t, cur.DeleteDeleted, prev.DeleteDeleted)
-						assert.GreaterOrEqual(t, cur.DeleteNotFound, prev.DeleteNotFound)
-						assert.GreaterOrEqual(t, cur.DeletePrefixExecuted, prev.DeletePrefixExecuted)
-						assert.GreaterOrEqual(t, cur.CompactionsExplicit, prev.CompactionsExplicit)
-						assert.GreaterOrEqual(t, cur.CompactionsPressureTier1, prev.CompactionsPressureTier1)
-						assert.GreaterOrEqual(t, cur.CompactionsPressureTier2, prev.CompactionsPressureTier2)
-						assert.GreaterOrEqual(t, cur.CompactionsAutoSlack, prev.CompactionsAutoSlack)
-						assert.GreaterOrEqual(t, cur.PressureShedsInline, prev.PressureShedsInline)
-						assert.GreaterOrEqual(t, cur.PressureShedsExplicit, prev.PressureShedsExplicit)
-						assert.GreaterOrEqual(t, cur.ReclaimEpoch, prev.ReclaimEpoch)
+						assertMonotonicStats(t, cur, prev, capacity)
 						prev = cur
 					}
 				})
@@ -804,47 +840,8 @@ func TestConcurrency_StatsAndPressureUnderRace(t *testing.T) {
 				writerWg.Go(func() {
 					r := rand.New(rand.NewPCG(uint64(g*31337+7), 0))
 					for step := range opsPerWorker {
-						switch (g + step) % 3 {
-						case 0:
-							setPressure(0.25)
-						case 1:
-							setPressure(0.80)
-						case 2:
-							setPressure(0.95)
-						}
-
-						op := r.IntN(100)
-						kIdx := r.IntN(numKeys)
-						key := fmt.Sprintf("st_dir_%02d/item_%03d", kIdx%5, kIdx)
-
-						switch {
-						case op < 30:
-							sz := uint64(10)
-							if step%15 == 0 {
-								sz = 0
-							} else if step%19 == 0 {
-								sz = capacity + 50
-							}
-							_, _ = cache.Put(key, concValue{id: key, size: sz})
-						case op < 50:
-							_, _ = cache.Get(key)
-						case op < 65:
-							_, _ = cache.Peek(key)
-						case op < 80:
-							sz := uint64(15)
-							if step%11 == 0 {
-								sz = capacity + 20
-							}
-							_ = cache.Replace(key, concValue{id: key + "_u", size: sz})
-						case op < 90:
-							_, _ = cache.Delete(key)
-						case op < 95:
-							cache.DeletePrefix(fmt.Sprintf("st_dir_%02d/", kIdx%5))
-						case op < 98:
-							reclaimer.Compact()
-						default:
-							_ = reclaimer.EvaluateMemoryPressure()
-						}
+						oscillateTestPressure(setPressure, g+step, 0.25)
+						runStatsRaceWriterStep(cache, reclaimer, r, step, numKeys, capacity)
 					}
 				})
 			}

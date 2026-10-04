@@ -84,6 +84,23 @@ func TestMapCache_PutZeroAndNilSliceValue(t *testing.T) {
 	assert.Nil(t, val)
 }
 
+func TestMapCache_PutEmptyKey(t *testing.T) {
+	// Arrange
+	cache := setupCacheTest(t)
+
+	// Act
+	evicted, err := cache.Put("", testData{value: 42, dataSize: 10})
+
+	// Assert
+	require.NoError(t, err)
+	assertEvictedValues(t, evicted, nil)
+	val, ok := cache.Get("")
+	assert.True(t, ok)
+	assert.Equal(t, testData{value: 42, dataSize: 10}, val)
+	_, ok = cache.Get("taco")
+	assert.False(t, ok)
+}
+
 func TestMapCache_GetUnknownKey(t *testing.T) {
 	// Arrange
 	cache := setupCacheTest(t)
@@ -106,16 +123,12 @@ func TestMapCache_GetUnknownKey(t *testing.T) {
 	assert.Equal(t, testData{}, valEnchilada)
 }
 
-func TestMapCache_FillUpToCapacity(t *testing.T) {
-	// Arrange
-	cache := setupCacheTest(t)
-
-	// Act
+func assertFillUpToCapacity(t *testing.T, cache Cache[testData]) {
+	t.Helper()
 	evicted1, err1 := cache.Put("burrito", testData{value: 23, dataSize: 4})
 	evicted2, err2 := cache.Put("taco", testData{value: 26, dataSize: 20})
 	evicted3, err3 := cache.Put("enchilada", testData{value: 28, dataSize: 26})
 
-	// Assert
 	require.NoError(t, err1)
 	assertEvictedValues(t, evicted1, nil)
 	require.NoError(t, err2)
@@ -134,32 +147,25 @@ func TestMapCache_FillUpToCapacity(t *testing.T) {
 	assert.Equal(t, testData{value: 28, dataSize: 26}, val)
 }
 
-func TestMapCache_ExpiresLeastRecentlyUsed(t *testing.T) {
-	// Arrange
-	cache := setupCacheTest(t)
+func assertExpiresLeastRecentlyUsed(t *testing.T, cache Cache[testData]) {
+	t.Helper()
 	evicted, err := cache.Put("burrito", testData{value: 23, dataSize: 4})
 	require.NoError(t, err)
 	assertEvictedValues(t, evicted, nil)
 
-	// Least recent.
 	evicted, err = cache.Put("taco", testData{value: 26, dataSize: 20})
 	require.NoError(t, err)
 	assertEvictedValues(t, evicted, nil)
 
-	// Second most recent.
 	evicted, err = cache.Put("enchilada", testData{value: 28, dataSize: 26})
 	require.NoError(t, err)
 	assertEvictedValues(t, evicted, nil)
 
-	// Promote burrito to MRU.
 	val, ok := cache.Get("burrito")
 	assert.True(t, ok)
 	assert.Equal(t, testData{value: 23, dataSize: 4}, val)
 
-	// Act: Put another, requiring eviction of taco (size 20) to fit queso (size 5).
 	evicted, err = cache.Put("queso", testData{value: 34, dataSize: 5})
-
-	// Assert
 	require.NoError(t, err)
 	assertEvictedValues(t, evicted, []int64{26})
 	_, ok = cache.Get("taco")
@@ -175,9 +181,8 @@ func TestMapCache_ExpiresLeastRecentlyUsed(t *testing.T) {
 	assert.Equal(t, testData{value: 34, dataSize: 5}, val)
 }
 
-func TestMapCache_Overwrite(t *testing.T) {
-	// Arrange
-	cache := setupCacheTest(t)
+func assertOverwriteEviction(t *testing.T, cache Cache[testData]) {
+	t.Helper()
 	evicted, err := cache.Put("burrito", testData{value: 23, dataSize: 4})
 	require.NoError(t, err)
 	assertEvictedValues(t, evicted, nil)
@@ -194,10 +199,7 @@ func TestMapCache_Overwrite(t *testing.T) {
 	require.NoError(t, err)
 	assertEvictedValues(t, evicted, nil)
 
-	// Act: Increase the DataSize while modifying, so eviction of taco should happen.
 	evicted, err = cache.Put("burrito", testData{value: 33, dataSize: 12})
-
-	// Assert
 	require.NoError(t, err)
 	assertEvictedValues(t, evicted, []int64{26})
 	_, ok := cache.Get("taco")
@@ -210,9 +212,8 @@ func TestMapCache_Overwrite(t *testing.T) {
 	assert.Equal(t, testData{value: 28, dataSize: 20}, val)
 }
 
-func TestMapCache_MultipleEviction(t *testing.T) {
-	// Arrange
-	cache := setupCacheTest(t)
+func assertMultipleEviction(t *testing.T, cache Cache[testData]) {
+	t.Helper()
 	evicted, err := cache.Put("burrito", testData{value: 23, dataSize: 4})
 	require.NoError(t, err)
 	assertEvictedValues(t, evicted, nil)
@@ -225,10 +226,7 @@ func TestMapCache_MultipleEviction(t *testing.T) {
 	require.NoError(t, err)
 	assertEvictedValues(t, evicted, nil)
 
-	// Act: Putting large entry requires evicting burrito, taco, and enchilada in oldest-first order.
 	evicted, err = cache.Put("large_data", testData{value: 33, dataSize: 45})
-
-	// Assert
 	require.NoError(t, err)
 	assertEvictedValues(t, evicted, []int64{23, 26, 28})
 	_, ok := cache.Get("taco")
@@ -240,6 +238,22 @@ func TestMapCache_MultipleEviction(t *testing.T) {
 	val, ok := cache.Get("large_data")
 	assert.True(t, ok)
 	assert.Equal(t, testData{value: 33, dataSize: 45}, val)
+}
+
+func TestMapCache_FillUpToCapacity(t *testing.T) {
+	assertFillUpToCapacity(t, setupCacheTest(t))
+}
+
+func TestMapCache_ExpiresLeastRecentlyUsed(t *testing.T) {
+	assertExpiresLeastRecentlyUsed(t, setupCacheTest(t))
+}
+
+func TestMapCache_Overwrite(t *testing.T) {
+	assertOverwriteEviction(t, setupCacheTest(t))
+}
+
+func TestMapCache_MultipleEviction(t *testing.T) {
+	assertMultipleEviction(t, setupCacheTest(t))
 }
 
 func TestMapCache_WhenEntrySizeMoreThanCacheMaxSize(t *testing.T) {
@@ -277,9 +291,8 @@ func TestMapCache_DeleteWhenKeyPresent(t *testing.T) {
 	assert.False(t, ok)
 }
 
-func TestMapCache_DeletePrefix(t *testing.T) {
-	// Arrange
-	cache := setupCacheTest(t)
+func assertDeletePrefixTree(t *testing.T, cache Cache[testData]) {
+	t.Helper()
 	_, err := cache.Put("a", testData{value: 23, dataSize: 4})
 	require.NoError(t, err)
 	_, err = cache.Put("a/b", testData{value: 26, dataSize: 5})
@@ -291,10 +304,8 @@ func TestMapCache_DeletePrefix(t *testing.T) {
 	_, err = cache.Put("b", testData{value: 21, dataSize: 2})
 	require.NoError(t, err)
 
-	// Act
 	cache.DeletePrefix("a")
 
-	// Assert
 	_, ok := cache.Get("a")
 	assert.False(t, ok)
 	_, ok = cache.Get("a/b")
@@ -308,9 +319,8 @@ func TestMapCache_DeletePrefix(t *testing.T) {
 	assert.Equal(t, uint64(2), valB.dataSize)
 }
 
-func TestMapCache_DeletePrefixWhereNoEntriesExist(t *testing.T) {
-	// Arrange
-	cache := setupCacheTest(t)
+func assertDeletePrefixNoMatch(t *testing.T, cache Cache[testData]) {
+	t.Helper()
 	_, err := cache.Put("a", testData{value: 23, dataSize: 4})
 	require.NoError(t, err)
 	_, err = cache.Put("a/b", testData{value: 26, dataSize: 5})
@@ -318,10 +328,8 @@ func TestMapCache_DeletePrefixWhereNoEntriesExist(t *testing.T) {
 	_, err = cache.Put("b", testData{value: 21, dataSize: 2})
 	require.NoError(t, err)
 
-	// Act
 	cache.DeletePrefix("c")
 
-	// Assert
 	valA, ok := cache.Get("a")
 	require.True(t, ok)
 	assert.Equal(t, uint64(4), valA.dataSize)
@@ -335,9 +343,8 @@ func TestMapCache_DeletePrefixWhereNoEntriesExist(t *testing.T) {
 	assert.Equal(t, uint64(2), valB.dataSize)
 }
 
-func TestMapCache_DeletePrefixWithSomeEntriesEvictedDueToCacheSize(t *testing.T) {
-	// Arrange
-	cache := setupCacheTest(t)
+func assertDeletePrefixAfterEviction(t *testing.T, cache Cache[testData]) {
+	t.Helper()
 	_, err := cache.Put("a", testData{value: 23, dataSize: 20})
 	require.NoError(t, err)
 	_, err = cache.Put("a/b", testData{value: 26, dataSize: 10})
@@ -350,10 +357,9 @@ func TestMapCache_DeletePrefixWithSomeEntriesEvictedDueToCacheSize(t *testing.T)
 	require.NoError(t, err)
 	assertEvictedValues(t, evicted, []int64{23})
 
-	// Act: As entry "a" was already evicted by the insertion of "b", only three entries will be removed.
+	// Entry "a" was already evicted by the insertion of "b"; deleting prefix "a" removes the remaining descendants.
 	cache.DeletePrefix("a")
 
-	// Assert
 	_, ok := cache.Get("a")
 	assert.False(t, ok)
 	_, ok = cache.Get("a/b")
@@ -365,6 +371,90 @@ func TestMapCache_DeletePrefixWithSomeEntriesEvictedDueToCacheSize(t *testing.T)
 	valB, ok := cache.Get("b")
 	require.True(t, ok)
 	assert.Equal(t, uint64(15), valB.dataSize)
+}
+
+func assertReplaceGrowNonExistentAndSelfEvict(t *testing.T, newCache func(uint64) Cache[testData]) {
+	t.Helper()
+	t.Run("NonExistentKey", func(t *testing.T) {
+		cache := newCache(100)
+		err := cache.Replace("key1", testData{value: 1, dataSize: 20})
+		require.ErrorIs(t, err, ErrEntryNotExist)
+	})
+
+	t.Run("ImmediateEviction", func(t *testing.T) {
+		cache := newCache(100)
+		_, err := cache.Put("key1", testData{value: 1, dataSize: 10})
+		require.NoError(t, err)
+		_, err = cache.Put("key2", testData{value: 2, dataSize: 70})
+		require.NoError(t, err)
+
+		// Grow key1 (at LRU tail) from 10 to 40 -> total 110 > 100 -> key1 evicts itself!
+		errUpdate := cache.Replace("key1", testData{value: 11, dataSize: 40})
+		require.NoError(t, errUpdate)
+		_, ok := cache.Get("key1")
+		assert.False(t, ok)
+		_, ok = cache.Get("key2")
+		assert.True(t, ok)
+	})
+}
+
+func assertIteratorEarlyBreakAndNonMutation(
+	t *testing.T,
+	newCache func(uint64, ...Option) Cache[testData],
+	keyPrefix string,
+	concreteCheck func(Cache[testData]),
+) {
+	t.Helper()
+	c := newCache(50, WithInvariantChecking(true), testDataWeigher)
+	for i := range 5 {
+		_, err := c.Put(fmt.Sprintf("%sk%d", keyPrefix, i), testData{value: int64(i + 1), dataSize: 10})
+		require.NoError(t, err)
+	}
+
+	var gotKeys []string
+	for k, v := range c.All() {
+		gotKeys = append(gotKeys, k)
+		_ = v
+		if len(gotKeys) == 2 {
+			break
+		}
+	}
+	assert.Equal(t, []string{keyPrefix + "k4", keyPrefix + "k3"}, gotKeys)
+
+	for k := range c.Keys() {
+		assert.Equal(t, keyPrefix+"k4", k)
+		break
+	}
+	for v := range c.Values() {
+		assert.Equal(t, int64(5), v.value)
+		break
+	}
+
+	if concreteCheck != nil {
+		cNoInv := newCache(50, testDataWeigher)
+		for i := range 5 {
+			_, err := cNoInv.Put(fmt.Sprintf("%sk%d", keyPrefix, i), testData{value: int64(i + 1), dataSize: 10})
+			require.NoError(t, err)
+		}
+		concreteCheck(cNoInv)
+	}
+
+	// Confirm iteration did not mutate LRU eviction order: inserting k5 (10B) evicts oldest entry k0 (value 1).
+	evicted, err := c.Put(keyPrefix+"k5", testData{value: 6, dataSize: 10})
+	require.NoError(t, err)
+	assertEvictedValues(t, evicted, []int64{1})
+}
+
+func TestMapCache_DeletePrefix(t *testing.T) {
+	assertDeletePrefixTree(t, setupCacheTest(t))
+}
+
+func TestMapCache_DeletePrefixWhereNoEntriesExist(t *testing.T) {
+	assertDeletePrefixNoMatch(t, setupCacheTest(t))
+}
+
+func TestMapCache_DeletePrefixWithSomeEntriesEvictedDueToCacheSize(t *testing.T) {
+	assertDeletePrefixAfterEviction(t, setupCacheTest(t))
 }
 
 func TestMapCache_DeletePrefixWithEmptyPrefix(t *testing.T) {
@@ -487,6 +577,30 @@ func TestMapCache_ReplaceNotChangeOrder(t *testing.T) {
 	// Assert
 	require.NoError(t, err)
 	assertEvictedValues(t, evicted, []int64{7})
+}
+
+func assertReplaceGrowToExactMaxSize(t *testing.T, newCache func(uint64) Cache[testData]) {
+	t.Helper()
+	const maxSize = 100
+	const initialSize = 50
+	const sizeDelta = 50
+
+	cache := newCache(maxSize)
+	_, err := cache.Put("file.txt", testData{value: 1, dataSize: initialSize})
+	require.NoError(t, err)
+
+	err = cache.Replace("file.txt", testData{value: 2, dataSize: initialSize + sizeDelta})
+	require.NoError(t, err)
+
+	val, ok := cache.Get("file.txt")
+	assert.True(t, ok)
+	assert.Equal(t, testData{value: 2, dataSize: initialSize + sizeDelta}, val)
+}
+
+func TestMapCache_ReplaceGrowToExactMaxSize(t *testing.T) {
+	assertReplaceGrowToExactMaxSize(t, func(maxSize uint64) Cache[testData] {
+		return NewMapCache[testData](maxSize, WithInvariantChecking(true), testDataWeigher)
+	})
 }
 
 func TestMapCache_Peek_WhenKeyPresent(t *testing.T) {
@@ -1073,42 +1187,10 @@ func TestMapCache_Iterators(t *testing.T) {
 	})
 
 	t.Run("EarlyBreakTerminatesCleanlyAndRepeatedIterationDoesNotMutateLRUOrder", func(t *testing.T) {
-		c := NewMapCache[testData](50, WithInvariantChecking(true), testDataWeigher)
-		for i := range 5 {
-			_, err := c.Put(fmt.Sprintf("k%d", i), testData{value: int64(i + 1), dataSize: 10})
-			require.NoError(t, err)
-		}
-
-		var firstTwoKeys []string
-		for k, v := range c.All() {
-			firstTwoKeys = append(firstTwoKeys, k)
-			_ = v
-			if len(firstTwoKeys) == 2 {
-				break
-			}
-		}
-		assert.Equal(t, []string{"k4", "k3"}, firstTwoKeys)
-
-		var firstKey string
-		for k := range c.Keys() {
-			firstKey = k
-			break
-		}
-		assert.Equal(t, "k4", firstKey)
-
-		var firstVal testData
-		for v := range c.Values() {
-			firstVal = v
-			break
-		}
-		assert.Equal(t, int64(5), firstVal.value)
-
-		// Repeated full iteration must not alter LRU eviction order: inserting k5 (10B) must evict oldest entry k0 (value 1).
-		_ = slices.Collect(c.Keys())
-		_ = slices.Collect(c.Values())
-		evicted, err := c.Put("k5", testData{value: 6, dataSize: 10})
-		require.NoError(t, err)
-		assertEvictedValues(t, evicted, []int64{1})
+		assertIteratorEarlyBreakAndNonMutation(t, NewMapCache[testData], "", func(c Cache[testData]) {
+			_ = slices.Collect(c.Keys())
+			_ = slices.Collect(c.Values())
+		})
 	})
 }
 

@@ -1198,105 +1198,115 @@ func TestPressure_EpochInvalidationAndResamplingSynchronization(t *testing.T) {
 			})
 
 			t.Run("ChildGoroutineReclaimingInsidePressureFuncTerminatesInBoundedRetries", func(t *testing.T) {
-				// Arrange
-				var cacheRef Cache[testData]
-				var inChild atomic.Bool
-				var parentSampleCalls atomic.Int32
-
-				cache := b.fn(
-					500,
-					WithInvariantChecking(true),
-					WithPressureFunc(func() float64 {
-						if cacheRef != nil && inChild.CompareAndSwap(false, true) {
-							parentSampleCalls.Add(1)
-							done := make(chan struct{})
-							go func() {
-								defer func() {
-									inChild.Store(false)
-									close(done)
-								}()
-								_, _ = cacheRef.Put("tmp_item", testData{value: 1, dataSize: 1})
-								cacheRef.DeletePrefix("tmp_")
-							}()
-							<-done
-						}
-						return 0.95
-					}),
-					WithEvictionRetentionRatio(0.50),
-				)
-				cacheRef = cache
-
-				// Act
-				parentSampleCalls.Store(0)
-				_, err := cache.Put("target_key", testData{value: 1, dataSize: 10})
-				_ = cache.(PressureAwareCache[testData]).EvaluateMemoryPressure()
-
-				// Assert: Both Put and EvaluateMemoryPressure terminate in bounded retries (3 parent samples each = 6 total).
-				require.NoError(t, err)
-				assert.True(t, hasKey(cache, "target_key"))
-				assert.Equal(t, int32(6), parentSampleCalls.Load())
+				testChildGoroutineReclaimingInsidePressureFunc(t, b)
 			})
 
 			t.Run("ExhaustedEpochRetriesUseLatestEpochPressure", func(t *testing.T) {
-				// Arrange
-				var cache PressureAwareCache[testData]
-				var currentPressure atomic.Uint64
-				currentPressure.Store(math.Float64bits(0.10))
-
-				var interceptCaller atomic.Bool
-				sampleEntered := make(chan struct{}, 4)
-				sampleProceed := make(chan struct{}, 4)
-
-				cache = b.fn(
-					1000,
-					WithInvariantChecking(true),
-					WithEvictionRetentionRatio(0.50),
-					WithPressureFunc(func() float64 {
-						if interceptCaller.Load() {
-							sampleEntered <- struct{}{}
-							<-sampleProceed
-							return 0.95
-						}
-						return math.Float64frombits(currentPressure.Load())
-					}),
-				).(PressureAwareCache[testData])
-
-				_, err := cache.Put("survivor", testData{value: 1, dataSize: 600})
-				require.NoError(t, err)
-
-				interceptCaller.Store(true)
-				done := make(chan []testData, 1)
-				go func() {
-					done <- cache.EvaluateMemoryPressure()
-				}()
-
-				for attempt := range 3 {
-					<-sampleEntered
-					interceptCaller.Store(false)
-					if attempt == 2 {
-						currentPressure.Store(math.Float64bits(0.10))
-					}
-					_, _ = cache.Put("tmp", testData{value: 1, dataSize: 10})
-					_, _ = cache.Delete("tmp")
-					cache.Compact()
-					if attempt == 2 {
-						_ = cache.EvaluateMemoryPressure()
-					}
-					if attempt < 2 {
-						interceptCaller.Store(true)
-					}
-					sampleProceed <- struct{}{}
-				}
-
-				// Act
-				evicted := <-done
-
-				// Assert
-				assert.Empty(t, evicted)
-				assert.True(t, hasKey(cache, "survivor"))
+				testExhaustedEpochRetriesUseLatestEpochPressure(t, b)
 			})
 		})
 	}
+}
+
+func testChildGoroutineReclaimingInsidePressureFunc(t *testing.T, b backendDef) {
+	t.Helper()
+	// Arrange
+	var cacheRef Cache[testData]
+	var inChild atomic.Bool
+	var parentSampleCalls atomic.Int32
+
+	cache := b.fn(
+		500,
+		WithInvariantChecking(true),
+		WithPressureFunc(func() float64 {
+			if cacheRef != nil && inChild.CompareAndSwap(false, true) {
+				parentSampleCalls.Add(1)
+				done := make(chan struct{})
+				go func() {
+					defer func() {
+						inChild.Store(false)
+						close(done)
+					}()
+					_, _ = cacheRef.Put("tmp_item", testData{value: 1, dataSize: 1})
+					cacheRef.DeletePrefix("tmp_")
+				}()
+				<-done
+			}
+			return 0.95
+		}),
+		WithEvictionRetentionRatio(0.50),
+	)
+	cacheRef = cache
+
+	// Act
+	parentSampleCalls.Store(0)
+	_, err := cache.Put("target_key", testData{value: 1, dataSize: 10})
+	_ = cache.(PressureAwareCache[testData]).EvaluateMemoryPressure()
+
+	// Assert: Both Put and EvaluateMemoryPressure terminate in bounded retries (3 parent samples each = 6 total).
+	require.NoError(t, err)
+	assert.True(t, hasKey(cache, "target_key"))
+	assert.Equal(t, int32(6), parentSampleCalls.Load())
+}
+
+func testExhaustedEpochRetriesUseLatestEpochPressure(t *testing.T, b backendDef) {
+	t.Helper()
+	// Arrange
+	var cache PressureAwareCache[testData]
+	var currentPressure atomic.Uint64
+	currentPressure.Store(math.Float64bits(0.10))
+
+	var interceptCaller atomic.Bool
+	sampleEntered := make(chan struct{}, 4)
+	sampleProceed := make(chan struct{}, 4)
+
+	cache = b.fn(
+		1000,
+		WithInvariantChecking(true),
+		WithEvictionRetentionRatio(0.50),
+		WithPressureFunc(func() float64 {
+			if interceptCaller.Load() {
+				sampleEntered <- struct{}{}
+				<-sampleProceed
+				return 0.95
+			}
+			return math.Float64frombits(currentPressure.Load())
+		}),
+	).(PressureAwareCache[testData])
+
+	_, err := cache.Put("survivor", testData{value: 1, dataSize: 600})
+	require.NoError(t, err)
+
+	interceptCaller.Store(true)
+	done := make(chan []testData, 1)
+	go func() {
+		done <- cache.EvaluateMemoryPressure()
+	}()
+
+	for attempt := range 3 {
+		<-sampleEntered
+		interceptCaller.Store(false)
+		if attempt == 2 {
+			currentPressure.Store(math.Float64bits(0.10))
+		}
+		_, _ = cache.Put("tmp", testData{value: 1, dataSize: 10})
+		_, _ = cache.Delete("tmp")
+		cache.Compact()
+		if attempt == 2 {
+			_ = cache.EvaluateMemoryPressure()
+		}
+		if attempt < 2 {
+			interceptCaller.Store(true)
+		}
+		sampleProceed <- struct{}{}
+	}
+
+	// Act
+	evicted := <-done
+
+	// Assert
+	assert.Empty(t, evicted)
+	assert.True(t, hasKey(cache, "survivor"))
 }
 
 func TestPressure_ReentrancyAndOverflowSamplerCoordination(t *testing.T) {
@@ -1361,286 +1371,296 @@ func TestPressure_ReentrancyAndOverflowSamplerCoordination(t *testing.T) {
 			})
 
 			t.Run("ThreePlusConcurrentCallersReentrantPressureFuncNoStackOverflow", func(t *testing.T) {
-				// Arrange: 4 concurrent callers enter fresh pressure sampling during cold start in deterministic order
-				// so G1 holds the primary sampler slot (order == 1), G2 holds the fallback sampler slot (order == 2), and G3 + G4
-				// execute the 3rd+ overflow path (order == 3, 4).
-				const numCallers = 4
-				var pac PressureAwareCache[testData]
-				var cache Cache[testData]
-				var activeDepth sync.Map
-				var maxDepth atomic.Int32
-				var enteredCount atomic.Int32
-				var overflowDone atomic.Int32
-				firstEntered := make(chan struct{})
-				secondEntered := make(chan struct{})
-				allEntered := make(chan struct{})
-				releaseHolders := make(chan struct{})
-
-				cache = b.fn(
-					100,
-					WithInvariantChecking(true),
-					WithPressureFunc(func() float64 {
-						gid := testGoroutineID()
-						val, _ := activeDepth.LoadOrStore(gid, new(atomic.Int32))
-						depthPtr := val.(*atomic.Int32)
-						d := depthPtr.Add(1)
-						defer depthPtr.Add(-1)
-
-						for {
-							prev := maxDepth.Load()
-							if d <= prev || maxDepth.CompareAndSwap(prev, d) {
-								break
-							}
-						}
-						if d > 1 {
-							return 0.10
-						}
-
-						order := enteredCount.Add(1)
-						switch order {
-						case 1:
-							close(firstEntered)
-						case 2:
-							close(secondEntered)
-						case numCallers:
-							close(allEntered)
-						}
-						<-allEntered
-
-						// G3 and G4 (3rd+ overflow callers) make re-entrant cache calls while G1 and G2 are still inside PressureFunc.
-						if (order == 3 || order == 4) && pac != nil {
-							pac.Compact()
-							_ = pac.EvaluateMemoryPressure()
-							_, _ = cache.Put(fmt.Sprintf("reentrant_%d", order), testData{value: 1, dataSize: 10})
-							_, _ = cache.Delete(fmt.Sprintf("reentrant_%d", order))
-							if overflowDone.Add(1) == numCallers-2 {
-								close(releaseHolders)
-							}
-						}
-						if order <= 2 {
-							<-releaseHolders
-						}
-						return 0.10
-					}),
-				)
-				pac = cache.(PressureAwareCache[testData])
-
-				// Act: Launch G1 first (primary), then G2 (fallback), then G3 and G4 (overflow).
-				var wg sync.WaitGroup
-				wg.Go(func() {
-					_ = pac.EvaluateMemoryPressure()
-				})
-				<-firstEntered
-
-				wg.Go(func() {
-					_ = pac.EvaluateMemoryPressure()
-				})
-				<-secondEntered
-
-				for range numCallers - 2 {
-					wg.Go(func() {
-						_ = pac.EvaluateMemoryPressure()
-					})
-				}
-				wg.Wait()
-
-				// Assert: Every goroutine's PressureFunc recursion depth stayed strictly 1 (no stack overflow)
-				// and none of the re-entrant calls inside G3/G4 bumped the reclamation epoch (enteredCount == 4 with zero retries).
-				assert.Equal(t, int32(1), maxDepth.Load())
-				assert.Equal(t, int32(numCallers), enteredCount.Load())
-				assert.False(t, hasKey(cache, "reentrant_3"))
-				assert.False(t, hasKey(cache, "reentrant_4"))
+				testThreePlusConcurrentCallersReentrant(t, b)
 			})
 
-			t.Run("ReentrantReclamationInsidePressureFuncNotOverwrittenByStoreSampledPressure", func(t *testing.T) {
-				// Arrange: PressureFunc performs a re-entrant Compact() (which marks the cache reclaimed)
-				// and returns the pre-reclamation reading 0.95 on that call while subsequent calls return 0.10.
-				var pac PressureAwareCache[testData]
-				var reentrantCompact atomic.Bool
-				var currentPressure atomic.Uint64
-				currentPressure.Store(math.Float64bits(0.10))
-
-				cache := b.fn(
-					200,
-					WithInvariantChecking(true),
-					WithEvictionRetentionRatio(0.50),
-					WithPressureFunc(func() float64 {
-						if reentrantCompact.CompareAndSwap(true, false) && pac != nil {
-							pac.Compact()
-							return 0.95
-						}
-						return math.Float64frombits(currentPressure.Load())
-					}),
-				)
-				pac = cache.(PressureAwareCache[testData])
-
-				for i := range 5 {
-					_, err := cache.Put(fmt.Sprintf("k-%d", i), testData{value: int64(i), dataSize: 10})
-					require.NoError(t, err)
-				}
-				_, _ = cache.Delete("k-0")
-
-				// Act: Trigger fresh pressure sampling with reentrantCompact enabled, then insert 80B at 0.10 pressure
-				// (bringing total occupancy to 130B > targetSize 100B).
-				reentrantCompact.Store(true)
-				_, err := cache.Put("k-after", testData{value: 10, dataSize: 10})
-				require.NoError(t, err)
-				evicted, err := cache.Put("k-large", testData{value: 11, dataSize: 80})
-				require.NoError(t, err)
-
-				// Assert: Because Compact() reclaimed memory during PressureFunc, the pre-reclamation 0.95 reading
-				// did not overwrite the post-reclamation pressure state, so k-large and all surviving keys remain intact.
-				assert.Empty(t, evicted)
-				assert.True(t, hasKey(cache, "k-1"))
-				assert.True(t, hasKey(cache, "k-after"))
-				assert.True(t, hasKey(cache, "k-large"))
-			})
-
-			t.Run("SamplePressureFreshRetainsPostReclamationDirectReturnValue", func(t *testing.T) {
-				// Arrange: Populate cache with 2 entries of 40B (80B > targetSize 50B) at healthy pressure (0.10)
-				// and create slack via a temporary entry so Compact() reclaims memory across all backends.
-				var pac PressureAwareCache[testData]
-				reentrantCompact := false
-				pressure := 0.10
-
-				cache := b.fn(
-					100,
-					WithInvariantChecking(true),
-					WithEvictionThreshold(0.90),
-					WithEvictionRetentionRatio(0.50),
-					WithPressureFunc(func() float64 {
-						if reentrantCompact && pac != nil {
-							reentrantCompact = false
-							pac.Compact()
-						}
-						return pressure
-					}),
-				)
-				pac = cache.(PressureAwareCache[testData])
-
-				_, err := cache.Put("k1", testData{value: 1, dataSize: 40})
-				require.NoError(t, err)
-				_, err = cache.Put("k2", testData{value: 2, dataSize: 40})
-				require.NoError(t, err)
-				_, err = cache.Put("tmp", testData{value: 3, dataSize: 10})
-				require.NoError(t, err)
-				_, ok := cache.Delete("tmp")
-				require.True(t, ok)
-
-				// Act: Evaluate memory pressure when PressureFunc performs re-entrant Compact() before returning critical pressure (0.95).
-				pressure = 0.95
-				reentrantCompact = true
-				evicted := pac.EvaluateMemoryPressure()
-
-				// Assert: Because lossless Compact() does not reduce live byte occupancy (80B > 50B targetSize),
-				// the 0.95 return value from PressureFunc must not be discarded as 0.0 and must shed LRU tail "k1".
-				assert.Len(t, evicted, 1)
-				assert.False(t, hasKey(cache, "k1"))
-				assert.True(t, hasKey(cache, "k2"))
-			})
-
-			t.Run("ForegroundReclaimDuringOverflowSamplingAdvancesReclaimEpoch", func(t *testing.T) {
-				// Arrange: Prepare a cache with two 40B live entries and dirty/fragmented state so Compact() reclaims.
-				var pressureBits atomic.Uint64
-				pressureBits.Store(math.Float64bits(0.10))
-				var trapActive atomic.Bool
-				enteredCh := make(chan struct{}, 3)
-				releaseCh := make(chan struct{})
-
-				cache := b.fn(100,
-					WithInvariantChecking(true),
-					WithEvictionThreshold(0.90),
-					WithEvictionRetentionRatio(0.50),
-					WithPressureFunc(func() float64 {
-						p := math.Float64frombits(pressureBits.Load())
-						if trapActive.Load() {
-							enteredCh <- struct{}{}
-							<-releaseCh
-						}
-						return p
-					}),
-				)
-				pac, ok := cache.(PressureAwareCache[testData])
-				require.True(t, ok)
-
-				_, err := cache.Put("k1", testData{value: 1, dataSize: 40})
-				require.NoError(t, err)
-				_, err = cache.Put("k2", testData{value: 2, dataSize: 40})
-				require.NoError(t, err)
-				_, err = cache.Put("scratch", testData{value: 3, dataSize: 1})
-				require.NoError(t, err)
-				_, ok = cache.Delete("scratch")
-				require.True(t, ok)
-
-				pressureBits.Store(math.Float64bits(0.95))
-				trapActive.Store(true)
-
-				// Act: 3 concurrent samplers enter PressureFunc (primary + fallback + 1 overflow sampler).
-				var wg sync.WaitGroup
-				for range 3 {
-					wg.Go(func() {
-						pac.EvaluateMemoryPressure()
-					})
-				}
-				for range 3 {
-					<-enteredCh
-				}
-				trapActive.Store(false)
-				pressureBits.Store(math.Float64bits(0.10))
-				pac.Compact() // Foreground reclamation while an overflow sampler is in flight
-				close(releaseCh)
-				wg.Wait()
-
-				// Assert: Stale 0.95 pre-Compact samples must be invalidated by Compact(), preserving both k1 and k2.
-				assert.True(t, hasKey(cache, "k1"))
-				assert.True(t, hasKey(cache, "k2"))
-			})
-
-			t.Run("ReentrantPutPreservesLastSampledPressureAndZeroWatermark", func(t *testing.T) {
-				// Arrange: Populate 4 zero-size entries at 0.0 pressure, then shed 2 of them at 0.95 pressure
-				// so 2 zero-size entries ("z-2", "z-3") remain with a zero-size watermark of 2.
-				var cache Cache[testData]
-				var reentrantPut atomic.Bool
-				var pressure atomic.Uint64
-				pressure.Store(math.Float64bits(0.0))
-
-				cache = b.fn(
-					1000,
-					WithInvariantChecking(true),
-					WithEvictionRetentionRatio(0.50),
-					WithPressureFunc(func() float64 {
-						if reentrantPut.CompareAndSwap(true, false) && cache != nil {
-							_, _ = cache.Put("reentrant_key", testData{value: 1, dataSize: 10})
-						}
-						return math.Float64frombits(pressure.Load())
-					}),
-				)
-				pac := cache.(PressureAwareCache[testData])
-
-				for i := range 4 {
-					_, err := cache.Put(fmt.Sprintf("z-%d", i), testData{value: int64(i), dataSize: 0})
-					require.NoError(t, err)
-				}
-				pressure.Store(math.Float64bits(0.95))
-				evicted := pac.EvaluateMemoryPressure()
-				require.Len(t, evicted, 2)
-				require.True(t, hasKey(cache, "z-2"))
-				require.True(t, hasKey(cache, "z-3"))
-
-				// Act: Put "trigger" under 0.95 while PressureFunc performs a re-entrant 10B Put.
-				reentrantPut.Store(true)
-				_, err := cache.Put("trigger", testData{value: 99, dataSize: 10})
-				require.NoError(t, err)
-
-				// Assert: Re-entrant Put at synthetic 0.0 pressure did not reset the zero-size watermark to 0,
-				// so the retained zero-size entries ("z-2", "z-3") were not re-shed.
-				assert.True(t, hasKey(cache, "z-2"))
-				assert.True(t, hasKey(cache, "z-3"))
-				assert.True(t, hasKey(cache, "reentrant_key"))
-				assert.True(t, hasKey(cache, "trigger"))
-			})
+			testOverflowAndWatermarkReentrancy(t, b)
 		})
 	}
+}
+
+func testThreePlusConcurrentCallersReentrant(t *testing.T, b backendDef) {
+	t.Helper()
+	// Arrange: 4 concurrent callers enter fresh pressure sampling during cold start in deterministic order
+	// so G1 holds the primary sampler slot (order == 1), G2 holds the fallback sampler slot (order == 2), and G3 + G4
+	// execute the 3rd+ overflow path (order == 3, 4).
+	const numCallers = 4
+	var pac PressureAwareCache[testData]
+	var cache Cache[testData]
+	var activeDepth sync.Map
+	var maxDepth atomic.Int32
+	var enteredCount atomic.Int32
+	var overflowDone atomic.Int32
+	firstEntered := make(chan struct{})
+	secondEntered := make(chan struct{})
+	allEntered := make(chan struct{})
+	releaseHolders := make(chan struct{})
+
+	cache = b.fn(
+		100,
+		WithInvariantChecking(true),
+		WithPressureFunc(func() float64 {
+			gid := testGoroutineID()
+			val, _ := activeDepth.LoadOrStore(gid, new(atomic.Int32))
+			depthPtr := val.(*atomic.Int32)
+			d := depthPtr.Add(1)
+			defer depthPtr.Add(-1)
+
+			for {
+				prev := maxDepth.Load()
+				if d <= prev || maxDepth.CompareAndSwap(prev, d) {
+					break
+				}
+			}
+			if d > 1 {
+				return 0.10
+			}
+
+			order := enteredCount.Add(1)
+			switch order {
+			case 1:
+				close(firstEntered)
+			case 2:
+				close(secondEntered)
+			case numCallers:
+				close(allEntered)
+			}
+			<-allEntered
+
+			// G3 and G4 (3rd+ overflow callers) make re-entrant cache calls while G1 and G2 are still inside PressureFunc.
+			if (order == 3 || order == 4) && pac != nil {
+				pac.Compact()
+				_ = pac.EvaluateMemoryPressure()
+				_, _ = cache.Put(fmt.Sprintf("reentrant_%d", order), testData{value: 1, dataSize: 10})
+				_, _ = cache.Delete(fmt.Sprintf("reentrant_%d", order))
+				if overflowDone.Add(1) == numCallers-2 {
+					close(releaseHolders)
+				}
+			}
+			if order <= 2 {
+				<-releaseHolders
+			}
+			return 0.10
+		}),
+	)
+	pac = cache.(PressureAwareCache[testData])
+
+	// Act: Launch G1 first (primary), then G2 (fallback), then G3 and G4 (overflow).
+	var wg sync.WaitGroup
+	wg.Go(func() {
+		_ = pac.EvaluateMemoryPressure()
+	})
+	<-firstEntered
+
+	wg.Go(func() {
+		_ = pac.EvaluateMemoryPressure()
+	})
+	<-secondEntered
+
+	for range numCallers - 2 {
+		wg.Go(func() {
+			_ = pac.EvaluateMemoryPressure()
+		})
+	}
+	wg.Wait()
+
+	// Assert: Every goroutine's PressureFunc recursion depth stayed strictly 1 (no stack overflow)
+	// and none of the re-entrant calls inside G3/G4 bumped the reclamation epoch (enteredCount == 4 with zero retries).
+	assert.Equal(t, int32(1), maxDepth.Load())
+	assert.Equal(t, int32(numCallers), enteredCount.Load())
+	assert.False(t, hasKey(cache, "reentrant_3"))
+	assert.False(t, hasKey(cache, "reentrant_4"))
+}
+
+func testOverflowAndWatermarkReentrancy(t *testing.T, b backendDef) {
+	t.Helper()
+	t.Run("ReentrantReclamationInsidePressureFuncNotOverwrittenByStoreSampledPressure", func(t *testing.T) {
+		// Arrange: PressureFunc performs a re-entrant Compact() (which marks the cache reclaimed)
+		// and returns the pre-reclamation reading 0.95 on that call while subsequent calls return 0.10.
+		var pac PressureAwareCache[testData]
+		var reentrantCompact atomic.Bool
+		var currentPressure atomic.Uint64
+		currentPressure.Store(math.Float64bits(0.10))
+
+		cache := b.fn(
+			200,
+			WithInvariantChecking(true),
+			WithEvictionRetentionRatio(0.50),
+			WithPressureFunc(func() float64 {
+				if reentrantCompact.CompareAndSwap(true, false) && pac != nil {
+					pac.Compact()
+					return 0.95
+				}
+				return math.Float64frombits(currentPressure.Load())
+			}),
+		)
+		pac = cache.(PressureAwareCache[testData])
+
+		for i := range 5 {
+			_, err := cache.Put(fmt.Sprintf("k-%d", i), testData{value: int64(i), dataSize: 10})
+			require.NoError(t, err)
+		}
+		_, _ = cache.Delete("k-0")
+
+		// Act: Trigger fresh pressure sampling with reentrantCompact enabled, then insert 80B at 0.10 pressure
+		// (bringing total occupancy to 130B > targetSize 100B).
+		reentrantCompact.Store(true)
+		_, err := cache.Put("k-after", testData{value: 10, dataSize: 10})
+		require.NoError(t, err)
+		evicted, err := cache.Put("k-large", testData{value: 11, dataSize: 80})
+		require.NoError(t, err)
+
+		// Assert: Because Compact() reclaimed memory during PressureFunc, the pre-reclamation 0.95 reading
+		// did not overwrite the post-reclamation pressure state, so k-large and all surviving keys remain intact.
+		assert.Empty(t, evicted)
+		assert.True(t, hasKey(cache, "k-1"))
+		assert.True(t, hasKey(cache, "k-after"))
+		assert.True(t, hasKey(cache, "k-large"))
+	})
+
+	t.Run("SamplePressureFreshRetainsPostReclamationDirectReturnValue", func(t *testing.T) {
+		// Arrange: Populate cache with 2 entries of 40B (80B > targetSize 50B) at healthy pressure (0.10)
+		// and create slack via a temporary entry so Compact() reclaims memory across all backends.
+		var pac PressureAwareCache[testData]
+		reentrantCompact := false
+		pressure := 0.10
+
+		cache := b.fn(
+			100,
+			WithInvariantChecking(true),
+			WithEvictionThreshold(0.90),
+			WithEvictionRetentionRatio(0.50),
+			WithPressureFunc(func() float64 {
+				if reentrantCompact && pac != nil {
+					reentrantCompact = false
+					pac.Compact()
+				}
+				return pressure
+			}),
+		)
+		pac = cache.(PressureAwareCache[testData])
+
+		_, err := cache.Put("k1", testData{value: 1, dataSize: 40})
+		require.NoError(t, err)
+		_, err = cache.Put("k2", testData{value: 2, dataSize: 40})
+		require.NoError(t, err)
+		_, err = cache.Put("tmp", testData{value: 3, dataSize: 10})
+		require.NoError(t, err)
+		_, ok := cache.Delete("tmp")
+		require.True(t, ok)
+
+		// Act: Evaluate memory pressure when PressureFunc performs re-entrant Compact() before returning critical pressure (0.95).
+		pressure = 0.95
+		reentrantCompact = true
+		evicted := pac.EvaluateMemoryPressure()
+
+		// Assert: Because lossless Compact() does not reduce live byte occupancy (80B > 50B targetSize),
+		// the 0.95 return value from PressureFunc must not be discarded as 0.0 and must shed LRU tail "k1".
+		assert.Len(t, evicted, 1)
+		assert.False(t, hasKey(cache, "k1"))
+		assert.True(t, hasKey(cache, "k2"))
+	})
+
+	t.Run("ForegroundReclaimDuringOverflowSamplingAdvancesReclaimEpoch", func(t *testing.T) {
+		// Arrange: Prepare a cache with two 40B live entries and dirty/fragmented state so Compact() reclaims.
+		var pressureBits atomic.Uint64
+		pressureBits.Store(math.Float64bits(0.10))
+		var trapActive atomic.Bool
+		enteredCh := make(chan struct{}, 3)
+		releaseCh := make(chan struct{})
+
+		cache := b.fn(100,
+			WithInvariantChecking(true),
+			WithEvictionThreshold(0.90),
+			WithEvictionRetentionRatio(0.50),
+			WithPressureFunc(func() float64 {
+				p := math.Float64frombits(pressureBits.Load())
+				if trapActive.Load() {
+					enteredCh <- struct{}{}
+					<-releaseCh
+				}
+				return p
+			}),
+		)
+		pac, ok := cache.(PressureAwareCache[testData])
+		require.True(t, ok)
+
+		_, err := cache.Put("k1", testData{value: 1, dataSize: 40})
+		require.NoError(t, err)
+		_, err = cache.Put("k2", testData{value: 2, dataSize: 40})
+		require.NoError(t, err)
+		_, err = cache.Put("scratch", testData{value: 3, dataSize: 1})
+		require.NoError(t, err)
+		_, ok = cache.Delete("scratch")
+		require.True(t, ok)
+
+		pressureBits.Store(math.Float64bits(0.95))
+		trapActive.Store(true)
+
+		// Act: 3 concurrent samplers enter PressureFunc (primary + fallback + 1 overflow sampler).
+		var wg sync.WaitGroup
+		for range 3 {
+			wg.Go(func() {
+				pac.EvaluateMemoryPressure()
+			})
+		}
+		for range 3 {
+			<-enteredCh
+		}
+		trapActive.Store(false)
+		pressureBits.Store(math.Float64bits(0.10))
+		pac.Compact() // Foreground reclamation while an overflow sampler is in flight
+		close(releaseCh)
+		wg.Wait()
+
+		// Assert: Stale 0.95 pre-Compact samples must be invalidated by Compact(), preserving both k1 and k2.
+		assert.True(t, hasKey(cache, "k1"))
+		assert.True(t, hasKey(cache, "k2"))
+	})
+
+	t.Run("ReentrantPutPreservesLastSampledPressureAndZeroWatermark", func(t *testing.T) {
+		// Arrange: Populate 4 zero-size entries at 0.0 pressure, then shed 2 of them at 0.95 pressure
+		// so 2 zero-size entries ("z-2", "z-3") remain with a zero-size watermark of 2.
+		var cache Cache[testData]
+		var reentrantPut atomic.Bool
+		var pressure atomic.Uint64
+		pressure.Store(math.Float64bits(0.0))
+
+		cache = b.fn(
+			1000,
+			WithInvariantChecking(true),
+			WithEvictionRetentionRatio(0.50),
+			WithPressureFunc(func() float64 {
+				if reentrantPut.CompareAndSwap(true, false) && cache != nil {
+					_, _ = cache.Put("reentrant_key", testData{value: 1, dataSize: 10})
+				}
+				return math.Float64frombits(pressure.Load())
+			}),
+		)
+		pac := cache.(PressureAwareCache[testData])
+
+		for i := range 4 {
+			_, err := cache.Put(fmt.Sprintf("z-%d", i), testData{value: int64(i), dataSize: 0})
+			require.NoError(t, err)
+		}
+		pressure.Store(math.Float64bits(0.95))
+		evicted := pac.EvaluateMemoryPressure()
+		require.Len(t, evicted, 2)
+		require.True(t, hasKey(cache, "z-2"))
+		require.True(t, hasKey(cache, "z-3"))
+
+		// Act: Put "trigger" under 0.95 while PressureFunc performs a re-entrant 10B Put.
+		reentrantPut.Store(true)
+		_, err := cache.Put("trigger", testData{value: 99, dataSize: 10})
+		require.NoError(t, err)
+
+		// Assert: Re-entrant Put at synthetic 0.0 pressure did not reset the zero-size watermark to 0,
+		// so the retained zero-size entries ("z-2", "z-3") were not re-shed.
+		assert.True(t, hasKey(cache, "z-2"))
+		assert.True(t, hasKey(cache, "z-3"))
+		assert.True(t, hasKey(cache, "reentrant_key"))
+		assert.True(t, hasKey(cache, "trigger"))
+	})
 }
 
 func TestPressure_ConcurrentReentrantSamplersAndOverflowEpochInvalidation(t *testing.T) {
@@ -1952,347 +1972,362 @@ func TestPressure_PreSampleEpochLoadAndConcurrentSamplerOrdering(t *testing.T) {
 			})
 
 			t.Run("OlderInFlightSamplerDoesNotOverwriteNewerCompletedSample", func(t *testing.T) {
-				// Arrange
-				var mode atomic.Int32
-				g1Entered := make(chan struct{})
-				releaseG1 := make(chan struct{})
-
-				cache := b.fn(1000,
-					WithInvariantChecking(true),
-					WithEvictionRetentionRatio(0.50),
-					WithPressureFunc(func() float64 {
-						m := mode.Load()
-						if m == 0 {
-							return 0.10
-						}
-						if m == 1 && mode.CompareAndSwap(1, 2) {
-							close(g1Entered)
-							<-releaseG1
-							return 0.10
-						}
-						return 0.95
-					}),
-				)
-
-				for i := range 80 {
-					_, err := cache.Put(fmt.Sprintf("k/%02d", i), testData{value: int64(i), dataSize: 10})
-					require.NoError(t, err)
-				}
-
-				// Act
-				mode.Store(1)
-
-				var wg sync.WaitGroup
-				wg.Go(func() {
-					_, _ = cache.Delete("nonexistent-1")
-				})
-				<-g1Entered
-
-				_, _ = cache.Delete("nonexistent-2")
-				close(releaseG1)
-				wg.Wait()
-
-				_, err := cache.Put("post-spike", testData{value: 99, dataSize: 10})
-				require.NoError(t, err)
-
-				// Assert: Compute surviving byte total solely via the public Peek API.
-				var survivingBytes uint64
-				for i := range 80 {
-					if v, ok := cache.Peek(fmt.Sprintf("k/%02d", i)); ok {
-						survivingBytes += v.dataSize
-					}
-				}
-				if v, ok := cache.Peek("post-spike"); ok {
-					survivingBytes += v.dataSize
-				}
-				assert.LessOrEqual(t, survivingBytes, uint64(500))
-				assert.False(t, hasKey(cache, "k/00"))
-				assert.True(t, hasKey(cache, "post-spike"))
+				testOlderInFlightSamplerDoesNotOverwrite(t, b)
 			})
 
 			t.Run("ReentrantReclamationInsidePressureFuncInvalidatesConcurrentCallerEpoch", func(t *testing.T) {
-				// Arrange
-				var phase atomic.Int32
-				g2Sampled := make(chan struct{})
-				g1Reclaimed := make(chan struct{})
-
-				var pac PressureAwareCache[testData]
-				cache := b.fn(1000,
-					WithInvariantChecking(true),
-					WithEvictionRetentionRatio(0.50),
-					WithPressureFunc(func() float64 {
-						switch phase.Load() {
-						case 1:
-							if phase.CompareAndSwap(1, 2) {
-								close(g2Sampled)
-								<-g1Reclaimed
-								return 0.95
-							}
-							phase.Store(3)
-							pac.Compact()
-							return 0.10
-						case 2:
-							phase.Store(3)
-							pac.Compact()
-							return 0.10
-						default:
-							return 0.10
-						}
-					}),
-				)
-				pac = cache.(PressureAwareCache[testData])
-
-				for i := range 85 {
-					_, err := cache.Put(fmt.Sprintf("k/%02d", i), testData{value: int64(i), dataSize: 10})
-					require.NoError(t, err)
-				}
-				_, err := cache.Put("scratch", testData{value: 1, dataSize: 10})
-				require.NoError(t, err)
-				_, ok := cache.Delete("scratch")
-				require.True(t, ok)
-
-				// Act
-				phase.Store(1)
-
-				var wg sync.WaitGroup
-				wg.Go(func() {
-					_, err := cache.Put("g2-key", testData{value: 1, dataSize: 10})
-					assert.NoError(t, err) //nolint:testifylint // wg.Go runs in a child goroutine where require.* (t.FailNow) is invalid
-				})
-
-				<-g2Sampled
-				pac.EvaluateMemoryPressure()
-				close(g1Reclaimed)
-				wg.Wait()
-
-				// Assert: Verify all 85 original entries plus "g2-key" (860B total) survived via public API.
-				var survivingBytes uint64
-				for i := range 85 {
-					v, ok := cache.Peek(fmt.Sprintf("k/%02d", i))
-					if assert.True(t, ok) {
-						survivingBytes += v.dataSize
-					}
-				}
-				vG2, ok := cache.Peek("g2-key")
-				if assert.True(t, ok) {
-					survivingBytes += vG2.dataSize
-				}
-				assert.Equal(t, uint64(860), survivingBytes)
+				testReentrantReclamationInvalidatesConcurrentCaller(t, b)
 			})
 
-			t.Run("OverflowSamplerReentrantCompactAdvancesEpochAndInvalidatesPrimaryAndFallback", func(t *testing.T) {
-				// Arrange: Primary sampler G1, fallback sampler G2, and overflow sampler G3 all enter PressureFunc.
-				// When the 3rd (overflow) sampler G3 calls pac.Compact() re-entrantly on dirty slack,
-				// markReclaimedLocked() must unconditionally advance reclaimEpoch so G1 and G2's stale 0.95
-				// readings are invalidated and resampled as 0.10.
-				var pac PressureAwareCache[testData]
-				var cache Cache[testData]
-				var armed atomic.Bool
-				var orderCounter atomic.Int32
-				g1Ready := make(chan struct{})
-				g2Ready := make(chan struct{})
-				g3Ready := make(chan struct{})
-				releaseG3 := make(chan struct{})
-				g3Compacted := make(chan struct{})
-				releaseG1AndG2 := make(chan struct{})
-
-				cache = b.fn(
-					200,
-					WithInvariantChecking(true),
-					WithEvictionThreshold(0.90),
-					WithEvictionRetentionRatio(0.50),
-					WithPressureFunc(func() float64 {
-						if !armed.Load() {
-							return 0.10
-						}
-						switch orderCounter.Add(1) {
-						case 1:
-							// Primary sampler G1
-							close(g1Ready)
-							<-releaseG1AndG2
-							return 0.95
-						case 2:
-							// Fallback sampler G2
-							close(g2Ready)
-							<-releaseG1AndG2
-							return 0.95
-						case 3:
-							// Overflow sampler G3 performs re-entrant Compact()
-							close(g3Ready)
-							<-releaseG3
-							pac.Compact()
-							close(g3Compacted)
-							return 0.10
-						default:
-							return 0.10
-						}
-					}),
-				)
-				pac = cache.(PressureAwareCache[testData])
-
-				_, err := cache.Put("k1", testData{value: 1, dataSize: 60})
-				require.NoError(t, err)
-				_, err = cache.Put("k2", testData{value: 2, dataSize: 60})
-				require.NoError(t, err)
-				_, err = cache.Put("tmp", testData{value: 3, dataSize: 10})
-				require.NoError(t, err)
-				_, ok := cache.Delete("tmp")
-				require.True(t, ok)
-				armed.Store(true)
-
-				var wg sync.WaitGroup
-				wg.Go(func() {
-					_ = pac.EvaluateMemoryPressure()
-				})
-				<-g1Ready
-
-				wg.Go(func() {
-					_ = pac.EvaluateMemoryPressure()
-				})
-				<-g2Ready
-
-				wg.Go(func() {
-					_ = pac.EvaluateMemoryPressure()
-				})
-				<-g3Ready
-
-				// Act: Release overflow sampler G3 to run re-entrant Compact(), then release G1 and G2.
-				close(releaseG3)
-				<-g3Compacted
-				close(releaseG1AndG2)
-				wg.Wait()
-
-				// Assert: Neither k1 nor k2 was shed because G3's overflow re-entrant Compact() invalidated G1 and G2's epochs.
-				assert.True(t, hasKey(cache, "k1"))
-				assert.True(t, hasKey(cache, "k2"))
-			})
-
-			t.Run("ExternalReclamationAfterSamplerReentrantCompactClearsExemptionAndForcesResample", func(t *testing.T) {
-				// Arrange: Primary sampler G1 performs a re-entrant Compact() inside PressureFunc, and before G1 returns 0.95,
-				// an external caller creates and compacts new dirty slack. The external reclamation must clear G1's
-				// re-entrant exemption so G1 is forced to resample (0.10) in lockWithPressure.
-				var pac PressureAwareCache[testData]
-				var cache Cache[testData]
-				var armed atomic.Bool
-				var calls atomic.Int32
-				g1AfterReentrantCompact := make(chan struct{})
-				releaseG1 := make(chan struct{})
-
-				cache = b.fn(
-					200,
-					WithInvariantChecking(true),
-					WithEvictionThreshold(0.90),
-					WithEvictionRetentionRatio(0.50),
-					WithPressureFunc(func() float64 {
-						if !armed.Load() {
-							return 0.10
-						}
-						if calls.Add(1) == 1 {
-							pac.Compact() // G1's own re-entrant Compact()
-							close(g1AfterReentrantCompact)
-							<-releaseG1
-							return 0.95
-						}
-						return 0.10
-					}),
-				)
-				pac = cache.(PressureAwareCache[testData])
-
-				_, err := cache.Put("k1", testData{value: 1, dataSize: 60})
-				require.NoError(t, err)
-				_, err = cache.Put("k2", testData{value: 2, dataSize: 60})
-				require.NoError(t, err)
-				_, err = cache.Put("tmp1", testData{value: 3, dataSize: 10})
-				require.NoError(t, err)
-				_, ok := cache.Delete("tmp1")
-				require.True(t, ok)
-				armed.Store(true)
-
-				g1Done := make(chan struct{})
-				go func() {
-					defer close(g1Done)
-					_ = pac.EvaluateMemoryPressure()
-				}()
-				<-g1AfterReentrantCompact
-
-				// External caller creates dirty slack and compacts while G1 is still inside PressureFunc.
-				armed.Store(false)
-				_, err = cache.Put("tmp2", testData{value: 4, dataSize: 10})
-				require.NoError(t, err)
-				_, ok = cache.Delete("tmp2")
-				require.True(t, ok)
-				armed.Store(true)
-				pac.Compact()
-
-				// Act: Release G1 to return stale 0.95; lockWithPressure must reject the cleared exemption and resample 0.10.
-				close(releaseG1)
-				<-g1Done
-
-				// Assert: G1 resampled (calls >= 2) and both k1 and k2 survived.
-				assert.GreaterOrEqual(t, calls.Load(), int32(2))
-				assert.True(t, hasKey(cache, "k1"))
-				assert.True(t, hasKey(cache, "k2"))
-			})
-
-			t.Run("ContendedEvaluateMemoryPressureDoesNotHijackOlderPreSpikeSample", func(t *testing.T) {
-				// Arrange: G1 holds the primary sampler slot prepared to return a pre-spike 0.10 reading,
-				// while G2 completes a fallback 0.95 sample. When G3 subsequently calls EvaluateMemoryPressure()
-				// while G1 is still holding the primary slot, G3 must invoke PressureFunc itself (0.95) and shed k1
-				// rather than hijacking G1's stale 0.10 sample.
-				var armed atomic.Bool
-				var calls atomic.Int32
-				g1Entered := make(chan struct{})
-				releaseG1 := make(chan struct{})
-
-				cache := b.fn(
-					100,
-					WithInvariantChecking(true),
-					WithEvictionThreshold(0.90),
-					WithEvictionRetentionRatio(0.50),
-					WithPressureFunc(func() float64 {
-						if !armed.Load() {
-							return 0.10
-						}
-						if calls.Add(1) == 1 {
-							close(g1Entered)
-							<-releaseG1
-							return 0.10
-						}
-						return 0.95
-					}),
-				)
-				pac := cache.(PressureAwareCache[testData])
-
-				_, err := cache.Put("k1", testData{value: 1, dataSize: 40})
-				require.NoError(t, err)
-				_, err = cache.Put("k2", testData{value: 2, dataSize: 40})
-				require.NoError(t, err)
-				armed.Store(true)
-
-				g1Done := make(chan struct{})
-				go func() {
-					defer close(g1Done)
-					_, _ = cache.Delete("miss-1")
-				}()
-				<-g1Entered
-
-				// G2 completes a 0.95 sample via the fallback slot while G1 is blocked in the primary slot.
-				_, _ = cache.Delete("miss-2")
-
-				// Act: G3 calls EvaluateMemoryPressure() while G1 is still in the primary slot.
-				evicted := pac.EvaluateMemoryPressure()
-				callsWhileG1Blocked := calls.Load()
-				close(releaseG1)
-				<-g1Done
-
-				// Assert: G3 sampled 0.95 while G1 was still blocked (3 calls before releasing G1) and shed k1.
-				assert.Equal(t, int32(3), callsWhileG1Blocked)
-				assert.Len(t, evicted, 1)
-				assert.False(t, hasKey(cache, "k1"))
-				assert.True(t, hasKey(cache, "k2"))
-			})
+			testOverflowAndExternalReclamationResampling(t, b)
 		})
 	}
+}
+
+func testOlderInFlightSamplerDoesNotOverwrite(t *testing.T, b backendDef) {
+	t.Helper()
+	// Arrange
+	var mode atomic.Int32
+	g1Entered := make(chan struct{})
+	releaseG1 := make(chan struct{})
+
+	cache := b.fn(1000,
+		WithInvariantChecking(true),
+		WithEvictionRetentionRatio(0.50),
+		WithPressureFunc(func() float64 {
+			m := mode.Load()
+			if m == 0 {
+				return 0.10
+			}
+			if m == 1 && mode.CompareAndSwap(1, 2) {
+				close(g1Entered)
+				<-releaseG1
+				return 0.10
+			}
+			return 0.95
+		}),
+	)
+
+	for i := range 80 {
+		_, err := cache.Put(fmt.Sprintf("k/%02d", i), testData{value: int64(i), dataSize: 10})
+		require.NoError(t, err)
+	}
+
+	// Act
+	mode.Store(1)
+
+	var wg sync.WaitGroup
+	wg.Go(func() {
+		_, _ = cache.Delete("nonexistent-1")
+	})
+	<-g1Entered
+
+	_, _ = cache.Delete("nonexistent-2")
+	close(releaseG1)
+	wg.Wait()
+
+	_, err := cache.Put("post-spike", testData{value: 99, dataSize: 10})
+	require.NoError(t, err)
+
+	// Assert: Compute surviving byte total solely via the public Peek API.
+	var survivingBytes uint64
+	for i := range 80 {
+		if v, ok := cache.Peek(fmt.Sprintf("k/%02d", i)); ok {
+			survivingBytes += v.dataSize
+		}
+	}
+	if v, ok := cache.Peek("post-spike"); ok {
+		survivingBytes += v.dataSize
+	}
+	assert.LessOrEqual(t, survivingBytes, uint64(500))
+	assert.False(t, hasKey(cache, "k/00"))
+	assert.True(t, hasKey(cache, "post-spike"))
+}
+
+func testReentrantReclamationInvalidatesConcurrentCaller(t *testing.T, b backendDef) {
+	t.Helper()
+	// Arrange
+	var phase atomic.Int32
+	g2Sampled := make(chan struct{})
+	g1Reclaimed := make(chan struct{})
+
+	var pac PressureAwareCache[testData]
+	cache := b.fn(1000,
+		WithInvariantChecking(true),
+		WithEvictionRetentionRatio(0.50),
+		WithPressureFunc(func() float64 {
+			switch phase.Load() {
+			case 1:
+				if phase.CompareAndSwap(1, 2) {
+					close(g2Sampled)
+					<-g1Reclaimed
+					return 0.95
+				}
+				phase.Store(3)
+				pac.Compact()
+				return 0.10
+			case 2:
+				phase.Store(3)
+				pac.Compact()
+				return 0.10
+			default:
+				return 0.10
+			}
+		}),
+	)
+	pac = cache.(PressureAwareCache[testData])
+
+	for i := range 85 {
+		_, err := cache.Put(fmt.Sprintf("k/%02d", i), testData{value: int64(i), dataSize: 10})
+		require.NoError(t, err)
+	}
+	_, err := cache.Put("scratch", testData{value: 1, dataSize: 10})
+	require.NoError(t, err)
+	_, ok := cache.Delete("scratch")
+	require.True(t, ok)
+
+	// Act
+	phase.Store(1)
+
+	var wg sync.WaitGroup
+	wg.Go(func() {
+		_, err := cache.Put("g2-key", testData{value: 1, dataSize: 10})
+		assert.NoError(t, err) //nolint:testifylint // wg.Go runs in a child goroutine where require.* (t.FailNow) is invalid
+	})
+
+	<-g2Sampled
+	pac.EvaluateMemoryPressure()
+	close(g1Reclaimed)
+	wg.Wait()
+
+	// Assert: Verify all 85 original entries plus "g2-key" (860B total) survived via public API.
+	var survivingBytes uint64
+	for i := range 85 {
+		v, ok := cache.Peek(fmt.Sprintf("k/%02d", i))
+		if assert.True(t, ok) {
+			survivingBytes += v.dataSize
+		}
+	}
+	vG2, ok := cache.Peek("g2-key")
+	if assert.True(t, ok) {
+		survivingBytes += vG2.dataSize
+	}
+	assert.Equal(t, uint64(860), survivingBytes)
+}
+
+func testOverflowAndExternalReclamationResampling(t *testing.T, b backendDef) {
+	t.Helper()
+	t.Run("OverflowSamplerReentrantCompactAdvancesEpochAndInvalidatesPrimaryAndFallback", func(t *testing.T) {
+		// Arrange: Primary sampler G1, fallback sampler G2, and overflow sampler G3 all enter PressureFunc.
+		// When the 3rd (overflow) sampler G3 calls pac.Compact() re-entrantly on dirty slack,
+		// markReclaimedLocked() must unconditionally advance reclaimEpoch so G1 and G2's stale 0.95
+		// readings are invalidated and resampled as 0.10.
+		var pac PressureAwareCache[testData]
+		var cache Cache[testData]
+		var armed atomic.Bool
+		var orderCounter atomic.Int32
+		g1Ready := make(chan struct{})
+		g2Ready := make(chan struct{})
+		g3Ready := make(chan struct{})
+		releaseG3 := make(chan struct{})
+		g3Compacted := make(chan struct{})
+		releaseG1AndG2 := make(chan struct{})
+
+		cache = b.fn(
+			200,
+			WithInvariantChecking(true),
+			WithEvictionThreshold(0.90),
+			WithEvictionRetentionRatio(0.50),
+			WithPressureFunc(func() float64 {
+				if !armed.Load() {
+					return 0.10
+				}
+				switch orderCounter.Add(1) {
+				case 1:
+					// Primary sampler G1
+					close(g1Ready)
+					<-releaseG1AndG2
+					return 0.95
+				case 2:
+					// Fallback sampler G2
+					close(g2Ready)
+					<-releaseG1AndG2
+					return 0.95
+				case 3:
+					// Overflow sampler G3 performs re-entrant Compact()
+					close(g3Ready)
+					<-releaseG3
+					pac.Compact()
+					close(g3Compacted)
+					return 0.10
+				default:
+					return 0.10
+				}
+			}),
+		)
+		pac = cache.(PressureAwareCache[testData])
+
+		_, err := cache.Put("k1", testData{value: 1, dataSize: 60})
+		require.NoError(t, err)
+		_, err = cache.Put("k2", testData{value: 2, dataSize: 60})
+		require.NoError(t, err)
+		_, err = cache.Put("tmp", testData{value: 3, dataSize: 10})
+		require.NoError(t, err)
+		_, ok := cache.Delete("tmp")
+		require.True(t, ok)
+		armed.Store(true)
+
+		var wg sync.WaitGroup
+		wg.Go(func() {
+			_ = pac.EvaluateMemoryPressure()
+		})
+		<-g1Ready
+
+		wg.Go(func() {
+			_ = pac.EvaluateMemoryPressure()
+		})
+		<-g2Ready
+
+		wg.Go(func() {
+			_ = pac.EvaluateMemoryPressure()
+		})
+		<-g3Ready
+
+		// Act: Release overflow sampler G3 to run re-entrant Compact(), then release G1 and G2.
+		close(releaseG3)
+		<-g3Compacted
+		close(releaseG1AndG2)
+		wg.Wait()
+
+		// Assert: Neither k1 nor k2 was shed because G3's overflow re-entrant Compact() invalidated G1 and G2's epochs.
+		assert.True(t, hasKey(cache, "k1"))
+		assert.True(t, hasKey(cache, "k2"))
+	})
+
+	t.Run("ExternalReclamationAfterSamplerReentrantCompactClearsExemptionAndForcesResample", func(t *testing.T) {
+		// Arrange: Primary sampler G1 performs a re-entrant Compact() inside PressureFunc, and before G1 returns 0.95,
+		// an external caller creates and compacts new dirty slack. The external reclamation must clear G1's
+		// re-entrant exemption so G1 is forced to resample (0.10) in lockWithPressure.
+		var pac PressureAwareCache[testData]
+		var cache Cache[testData]
+		var armed atomic.Bool
+		var calls atomic.Int32
+		g1AfterReentrantCompact := make(chan struct{})
+		releaseG1 := make(chan struct{})
+
+		cache = b.fn(
+			200,
+			WithInvariantChecking(true),
+			WithEvictionThreshold(0.90),
+			WithEvictionRetentionRatio(0.50),
+			WithPressureFunc(func() float64 {
+				if !armed.Load() {
+					return 0.10
+				}
+				if calls.Add(1) == 1 {
+					pac.Compact() // G1's own re-entrant Compact()
+					close(g1AfterReentrantCompact)
+					<-releaseG1
+					return 0.95
+				}
+				return 0.10
+			}),
+		)
+		pac = cache.(PressureAwareCache[testData])
+
+		_, err := cache.Put("k1", testData{value: 1, dataSize: 60})
+		require.NoError(t, err)
+		_, err = cache.Put("k2", testData{value: 2, dataSize: 60})
+		require.NoError(t, err)
+		_, err = cache.Put("tmp1", testData{value: 3, dataSize: 10})
+		require.NoError(t, err)
+		_, ok := cache.Delete("tmp1")
+		require.True(t, ok)
+		armed.Store(true)
+
+		g1Done := make(chan struct{})
+		go func() {
+			defer close(g1Done)
+			_ = pac.EvaluateMemoryPressure()
+		}()
+		<-g1AfterReentrantCompact
+
+		// External caller creates dirty slack and compacts while G1 is still inside PressureFunc.
+		armed.Store(false)
+		_, err = cache.Put("tmp2", testData{value: 4, dataSize: 10})
+		require.NoError(t, err)
+		_, ok = cache.Delete("tmp2")
+		require.True(t, ok)
+		armed.Store(true)
+		pac.Compact()
+
+		// Act: Release G1 to return stale 0.95; lockWithPressure must reject the cleared exemption and resample 0.10.
+		close(releaseG1)
+		<-g1Done
+
+		// Assert: G1 resampled (calls >= 2) and both k1 and k2 survived.
+		assert.GreaterOrEqual(t, calls.Load(), int32(2))
+		assert.True(t, hasKey(cache, "k1"))
+		assert.True(t, hasKey(cache, "k2"))
+	})
+
+	t.Run("ContendedEvaluateMemoryPressureDoesNotHijackOlderPreSpikeSample", func(t *testing.T) {
+		// Arrange: G1 holds the primary sampler slot prepared to return a pre-spike 0.10 reading,
+		// while G2 completes a fallback 0.95 sample. When G3 subsequently calls EvaluateMemoryPressure()
+		// while G1 is still holding the primary slot, G3 must invoke PressureFunc itself (0.95) and shed k1
+		// rather than hijacking G1's stale 0.10 sample.
+		var armed atomic.Bool
+		var calls atomic.Int32
+		g1Entered := make(chan struct{})
+		releaseG1 := make(chan struct{})
+
+		cache := b.fn(
+			100,
+			WithInvariantChecking(true),
+			WithEvictionThreshold(0.90),
+			WithEvictionRetentionRatio(0.50),
+			WithPressureFunc(func() float64 {
+				if !armed.Load() {
+					return 0.10
+				}
+				if calls.Add(1) == 1 {
+					close(g1Entered)
+					<-releaseG1
+					return 0.10
+				}
+				return 0.95
+			}),
+		)
+		pac := cache.(PressureAwareCache[testData])
+
+		_, err := cache.Put("k1", testData{value: 1, dataSize: 40})
+		require.NoError(t, err)
+		_, err = cache.Put("k2", testData{value: 2, dataSize: 40})
+		require.NoError(t, err)
+		armed.Store(true)
+
+		g1Done := make(chan struct{})
+		go func() {
+			defer close(g1Done)
+			_, _ = cache.Delete("miss-1")
+		}()
+		<-g1Entered
+
+		// G2 completes a 0.95 sample via the fallback slot while G1 is blocked in the primary slot.
+		_, _ = cache.Delete("miss-2")
+
+		// Act: G3 calls EvaluateMemoryPressure() while G1 is still in the primary slot.
+		evicted := pac.EvaluateMemoryPressure()
+		callsWhileG1Blocked := calls.Load()
+		close(releaseG1)
+		<-g1Done
+
+		// Assert: G3 sampled 0.95 while G1 was still blocked (3 calls before releasing G1) and shed k1.
+		assert.Equal(t, int32(3), callsWhileG1Blocked)
+		assert.Len(t, evicted, 1)
+		assert.False(t, hasKey(cache, "k1"))
+		assert.True(t, hasKey(cache, "k2"))
+	})
 }
 
 func TestPressure_ZeroSizeWatermarksAndIdempotency(t *testing.T) {
@@ -3106,78 +3141,81 @@ func TestClonePrefix_AllByteValuesAndZeroAllocations(t *testing.T) {
 		assert.Zero(t, allocsHighBytes, "clonePrefix across high-bit 1-byte strings (0x80..0xFF) must allocate 0 objects")
 	})
 
-	t.Run("ZeroAllocationsOnHotPathsWithNonASCIIAndUTF8Keys", func(t *testing.T) {
-		backends := []struct {
-			name string
-			newC func() Cache[int]
-		}{
-			{name: "MapCache", newC: func() Cache[int] { return NewMapCache[int](64) }},
-			{name: "RadixCache", newC: func() Cache[int] { return NewRadixCache[int](64) }},
-			{name: "ArenaRadixCache", newC: func() Cache[int] { return NewArenaRadixCache[int](64) }},
-		}
+	t.Run("ZeroAllocationsOnHotPathsWithNonASCIIAndUTF8Keys", testZeroAllocationsOnHotPathsWithNonASCII)
+}
 
-		for _, b := range backends {
-			t.Run(b.name, func(t *testing.T) {
-				// Arrange
-				cache := b.newC()
-				keys := []string{"\x80", "\xaf", "\xff", "café", "cafè"}
-				for idx, k := range keys {
-					_, err := cache.Put(k, idx+1)
-					require.NoError(t, err)
-				}
-				valSeq := cache.Values()
+func testZeroAllocationsOnHotPathsWithNonASCII(t *testing.T) {
+	backends := []struct {
+		name string
+		newC func() Cache[int]
+	}{
+		{name: "MapCache", newC: func() Cache[int] { return NewMapCache[int](64) }},
+		{name: "RadixCache", newC: func() Cache[int] { return NewRadixCache[int](64) }},
+		{name: "ArenaRadixCache", newC: func() Cache[int] { return NewArenaRadixCache[int](64) }},
+	}
 
-				// Act
-				getAllocs := testing.AllocsPerRun(100, func() {
-					for _, k := range keys {
-						v, ok := cache.Get(k)
-						if !ok || v == 0 {
-							panic("unexpected Get miss")
-						}
-					}
-				})
-				peekAllocs := testing.AllocsPerRun(100, func() {
-					for _, k := range keys {
-						v, ok := cache.Peek(k)
-						if !ok || v == 0 {
-							panic("unexpected Peek miss")
-						}
-					}
-				})
-				putInPlaceAllocs := testing.AllocsPerRun(100, func() {
-					for _, k := range keys {
-						if _, err := cache.Put(k, 42); err != nil {
-							panic(err)
-						}
-					}
-				})
-				replaceAllocs := testing.AllocsPerRun(100, func() {
-					for _, k := range keys {
-						if err := cache.Replace(k, 99); err != nil {
-							panic(err)
-						}
-					}
-				})
-				valuesAllocs := testing.AllocsPerRun(100, func() {
-					valSeq(func(v int) bool {
-						return v > 0
-					})
-				})
-				statsAllocs := testing.AllocsPerRun(100, func() {
-					st := cache.Stats()
-					if st.Len != len(keys) {
-						panic("unexpected Stats().Len")
-					}
-				})
+	for _, b := range backends {
+		t.Run(b.name, func(t *testing.T) {
+			verifyBackendZeroAllocHotPaths(t, b.name, b.newC())
+		})
+	}
+}
 
-				// Assert
-				assert.Zero(t, getAllocs, "%s Get must be 0 allocs/op", b.name)
-				assert.Zero(t, peekAllocs, "%s Peek must be 0 allocs/op", b.name)
-				assert.Zero(t, putInPlaceAllocs, "%s in-place Put must be 0 allocs/op", b.name)
-				assert.Zero(t, replaceAllocs, "%s Replace must be 0 allocs/op", b.name)
-				assert.Zero(t, valuesAllocs, "%s Values() must be 0 allocs/op", b.name)
-				assert.Zero(t, statsAllocs, "%s Stats() must be 0 allocs/op", b.name)
-			})
+func verifyBackendZeroAllocHotPaths(t *testing.T, name string, cache Cache[int]) {
+	t.Helper()
+	keys := []string{"\x80", "\xaf", "\xff", "café", "cafè"}
+	for idx, k := range keys {
+		_, err := cache.Put(k, idx+1)
+		require.NoError(t, err)
+	}
+	valSeq := cache.Values()
+
+	getAllocs := testing.AllocsPerRun(100, func() {
+		for _, k := range keys {
+			v, ok := cache.Get(k)
+			if !ok || v == 0 {
+				panic("unexpected Get miss")
+			}
 		}
 	})
+	peekAllocs := testing.AllocsPerRun(100, func() {
+		for _, k := range keys {
+			v, ok := cache.Peek(k)
+			if !ok || v == 0 {
+				panic("unexpected Peek miss")
+			}
+		}
+	})
+	putInPlaceAllocs := testing.AllocsPerRun(100, func() {
+		for _, k := range keys {
+			if _, err := cache.Put(k, 42); err != nil {
+				panic(err)
+			}
+		}
+	})
+	replaceAllocs := testing.AllocsPerRun(100, func() {
+		for _, k := range keys {
+			if err := cache.Replace(k, 99); err != nil {
+				panic(err)
+			}
+		}
+	})
+	valuesAllocs := testing.AllocsPerRun(100, func() {
+		valSeq(func(v int) bool {
+			return v > 0
+		})
+	})
+	statsAllocs := testing.AllocsPerRun(100, func() {
+		st := cache.Stats()
+		if st.Len != len(keys) {
+			panic("unexpected Stats().Len")
+		}
+	})
+
+	assert.Zero(t, getAllocs, "%s Get must be 0 allocs/op", name)
+	assert.Zero(t, peekAllocs, "%s Peek must be 0 allocs/op", name)
+	assert.Zero(t, putInPlaceAllocs, "%s in-place Put must be 0 allocs/op", name)
+	assert.Zero(t, replaceAllocs, "%s Replace must be 0 allocs/op", name)
+	assert.Zero(t, valuesAllocs, "%s Values() must be 0 allocs/op", name)
+	assert.Zero(t, statsAllocs, "%s Stats() must be 0 allocs/op", name)
 }

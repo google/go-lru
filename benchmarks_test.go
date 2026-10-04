@@ -18,6 +18,7 @@ import (
 	"fmt"
 	"math/rand/v2"
 	"runtime"
+	"strings"
 	"sync/atomic"
 	"testing"
 
@@ -41,8 +42,7 @@ var benchWeigher = lru.WithWeigher(func(_ string, v benchValue) uint64 {
 })
 
 // generateBenchmarkKeys creates test keys partitioned by prefix with configurable directory depth.
-func generateBenchmarkKeys(prefixCount, itemsPerPrefix, depth int) (keys []string, prefixMap map[string][]string, prefixes []string) {
-	prefixMap = make(map[string][]string, prefixCount)
+func generateBenchmarkKeys(prefixCount, itemsPerPrefix, depth int) (keys, prefixes []string) {
 	prefixes = make([]string, 0, prefixCount)
 	totalKeys := prefixCount * itemsPerPrefix
 	keys = make([]string, 0, totalKeys)
@@ -52,19 +52,18 @@ func generateBenchmarkKeys(prefixCount, itemsPerPrefix, depth int) (keys []strin
 		if depth == 0 {
 			prefix = fmt.Sprintf("prefix%d-", p)
 		} else {
+			var sb strings.Builder
 			for d := range depth {
-				prefix += fmt.Sprintf("dir%d/", p*depth+d)
+				fmt.Fprintf(&sb, "dir%d/", p*depth+d)
 			}
+			prefix = sb.String()
 		}
 		prefixes = append(prefixes, prefix)
 
-		keysForPrefix := make([]string, 0, itemsPerPrefix)
 		for i := range itemsPerPrefix {
 			key := fmt.Sprintf("%sfile%d.dat", prefix, i)
-			keysForPrefix = append(keysForPrefix, key)
 			keys = append(keys, key)
 		}
-		prefixMap[prefix] = keysForPrefix
 	}
 
 	// Shuffle keys to simulate realistic, unpredictable access patterns
@@ -73,7 +72,7 @@ func generateBenchmarkKeys(prefixCount, itemsPerPrefix, depth int) (keys []strin
 		keys[i], keys[j] = keys[j], keys[i]
 	})
 
-	return keys, prefixMap, prefixes
+	return keys, prefixes
 }
 
 // ============================================================================
@@ -89,7 +88,7 @@ func runBenchmarkPutWithOptions(b *testing.B, constructor func(uint64, ...lru.Op
 	b.Helper()
 	const prefixCount = 100
 	const itemsPerPrefix = 100
-	keys, _, _ := generateBenchmarkKeys(prefixCount, itemsPerPrefix, depth)
+	keys, _ := generateBenchmarkKeys(prefixCount, itemsPerPrefix, depth)
 	data := benchValue{val: 1, dataSize: 10}
 	capacity := uint64(len(keys)) * capMultiplier
 
@@ -146,7 +145,7 @@ func runBenchmarkGet(b *testing.B, constructor func(uint64, ...lru.Option) lru.C
 	b.Helper()
 	const prefixCount = 100
 	const itemsPerPrefix = 100
-	keys, _, _ := generateBenchmarkKeys(prefixCount, itemsPerPrefix, depth)
+	keys, _ := generateBenchmarkKeys(prefixCount, itemsPerPrefix, depth)
 	data := benchValue{val: 1, dataSize: 10}
 	capacity := uint64(len(keys) * 100)
 
@@ -196,7 +195,7 @@ func runBenchmarkPeek(b *testing.B, constructor func(uint64, ...lru.Option) lru.
 	b.Helper()
 	const prefixCount = 100
 	const itemsPerPrefix = 100
-	keys, _, _ := generateBenchmarkKeys(prefixCount, itemsPerPrefix, depth)
+	keys, _ := generateBenchmarkKeys(prefixCount, itemsPerPrefix, depth)
 	data := benchValue{val: 1, dataSize: 10}
 	capacity := uint64(len(keys) * 100)
 
@@ -337,7 +336,7 @@ func runBenchmarkDeletePrefix(b *testing.B, constructor func(uint64, ...lru.Opti
 	b.Helper()
 	const prefixCount = 100
 	const itemsPerPrefix = 100
-	keys, _, prefixes := generateBenchmarkKeys(prefixCount, itemsPerPrefix, depth)
+	keys, prefixes := generateBenchmarkKeys(prefixCount, itemsPerPrefix, depth)
 	data := benchValue{val: 1, dataSize: 10}
 	capacity := uint64(len(keys) * 100)
 
@@ -442,7 +441,7 @@ func runParallelPeekOnly(b *testing.B, constructor func(uint64, ...lru.Option) l
 	b.Helper()
 	const prefixCount = 100
 	const itemsPerPrefix = 100
-	keys, _, _ := generateBenchmarkKeys(prefixCount, itemsPerPrefix, 2)
+	keys, _ := generateBenchmarkKeys(prefixCount, itemsPerPrefix, 2)
 	data := benchValue{val: 1, dataSize: 10}
 	capacity := uint64(len(keys) * 100)
 
@@ -703,16 +702,21 @@ func Benchmark_Replace_WithOnEvictEntry(b *testing.B) {
 // 11. Range-Over-Function Iterator Benchmarks (All, Keys, Values)
 // ============================================================================
 
-func runBenchmarkAll(b *testing.B, constructor func(uint64, ...lru.Option) lru.Cache[benchValue]) {
+func setupPopulatedIteratorBenchCache(b *testing.B, constructor func(uint64, ...lru.Option) lru.Cache[benchValue]) lru.Cache[benchValue] {
 	b.Helper()
 	const numKeys = 1000
-	keys, _, _ := generateBenchmarkKeys(20, 50, 2)
+	keys, _ := generateBenchmarkKeys(20, 50, 2)
 	data := benchValue{val: 1, dataSize: 10}
 	cache := constructor(uint64(numKeys*100), benchWeigher)
 	for _, key := range keys[:numKeys] {
 		_, _ = cache.Put(key, data)
 	}
+	return cache
+}
 
+func runBenchmarkAll(b *testing.B, constructor func(uint64, ...lru.Option) lru.Cache[benchValue]) {
+	b.Helper()
+	cache := setupPopulatedIteratorBenchCache(b, constructor)
 	seq := cache.All()
 	b.ReportAllocs()
 	b.ResetTimer()
@@ -728,14 +732,7 @@ func runBenchmarkAll(b *testing.B, constructor func(uint64, ...lru.Option) lru.C
 
 func runBenchmarkKeys(b *testing.B, constructor func(uint64, ...lru.Option) lru.Cache[benchValue]) {
 	b.Helper()
-	const numKeys = 1000
-	keys, _, _ := generateBenchmarkKeys(20, 50, 2)
-	data := benchValue{val: 1, dataSize: 10}
-	cache := constructor(uint64(numKeys*100), benchWeigher)
-	for _, key := range keys[:numKeys] {
-		_, _ = cache.Put(key, data)
-	}
-
+	cache := setupPopulatedIteratorBenchCache(b, constructor)
 	seq := cache.Keys()
 	b.ReportAllocs()
 	b.ResetTimer()
@@ -750,14 +747,7 @@ func runBenchmarkKeys(b *testing.B, constructor func(uint64, ...lru.Option) lru.
 
 func runBenchmarkValues(b *testing.B, constructor func(uint64, ...lru.Option) lru.Cache[benchValue]) {
 	b.Helper()
-	const numKeys = 1000
-	keys, _, _ := generateBenchmarkKeys(20, 50, 2)
-	data := benchValue{val: 1, dataSize: 10}
-	cache := constructor(uint64(numKeys*100), benchWeigher)
-	for _, key := range keys[:numKeys] {
-		_, _ = cache.Put(key, data)
-	}
-
+	cache := setupPopulatedIteratorBenchCache(b, constructor)
 	seq := cache.Values()
 	b.ReportAllocs()
 	b.ResetTimer()
@@ -796,13 +786,7 @@ var benchSinkStats lru.Stats
 
 func runBenchmarkStats(b *testing.B, constructor func(uint64, ...lru.Option) lru.Cache[benchValue]) {
 	b.Helper()
-	const numKeys = 1000
-	keys, _, _ := generateBenchmarkKeys(20, 50, 2)
-	data := benchValue{val: 1, dataSize: 10}
-	cache := constructor(uint64(numKeys*100), benchWeigher)
-	for _, key := range keys[:numKeys] {
-		_, _ = cache.Put(key, data)
-	}
+	cache := setupPopulatedIteratorBenchCache(b, constructor)
 
 	b.Run("Sequential", func(b *testing.B) {
 		b.ReportAllocs()

@@ -5,6 +5,7 @@ linters:
   enable:
     - errcheck
     - gocritic
+    - gocyclo
     - govet
     - ineffassign
     - revive
@@ -12,6 +13,9 @@ linters:
     - testifylint
     - thelper
     - unused
+  settings:
+    gocyclo:
+      min-complexity: 15
 
 formatters:
   enable:
