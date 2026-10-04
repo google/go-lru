@@ -3163,6 +3163,7 @@ func testZeroAllocationsOnHotPathsWithNonASCII(t *testing.T) {
 
 func verifyBackendZeroAllocHotPaths(t *testing.T, name string, cache Cache[int]) {
 	t.Helper()
+	// Arrange
 	keys := []string{"\x80", "\xaf", "\xff", "café", "cafè"}
 	for idx, k := range keys {
 		_, err := cache.Put(k, idx+1)
@@ -3170,6 +3171,7 @@ func verifyBackendZeroAllocHotPaths(t *testing.T, name string, cache Cache[int])
 	}
 	valSeq := cache.Values()
 
+	// Act
 	getAllocs := testing.AllocsPerRun(100, func() {
 		for _, k := range keys {
 			v, ok := cache.Get(k)
@@ -3212,6 +3214,7 @@ func verifyBackendZeroAllocHotPaths(t *testing.T, name string, cache Cache[int])
 		}
 	})
 
+	// Assert
 	assert.Zero(t, getAllocs, "%s Get must be 0 allocs/op", name)
 	assert.Zero(t, peekAllocs, "%s Peek must be 0 allocs/op", name)
 	assert.Zero(t, putInPlaceAllocs, "%s in-place Put must be 0 allocs/op", name)

@@ -15,6 +15,7 @@
 package lru
 
 import (
+	"fmt"
 	"slices"
 	"strings"
 	"testing"
@@ -101,19 +102,138 @@ func TestRadixCache_GetUnknownKey(t *testing.T) {
 }
 
 func TestRadixCache_FillUpToCapacity(t *testing.T) {
-	assertFillUpToCapacity(t, setupRadixCacheTest(t))
+	// Arrange
+	cache := setupRadixCacheTest(t)
+
+	// Act
+	evicted1, err1 := cache.Put("burrito", testData{value: 23, dataSize: 4})
+	evicted2, err2 := cache.Put("taco", testData{value: 26, dataSize: 20})
+	evicted3, err3 := cache.Put("enchilada", testData{value: 28, dataSize: 26})
+
+	// Assert
+	require.NoError(t, err1)
+	assertEvictedValues(t, evicted1, nil)
+	require.NoError(t, err2)
+	assertEvictedValues(t, evicted2, nil)
+	require.NoError(t, err3)
+	assertEvictedValues(t, evicted3, nil)
+
+	val, ok := cache.Get("burrito")
+	assert.True(t, ok)
+	assert.Equal(t, testData{value: 23, dataSize: 4}, val)
+	val, ok = cache.Get("taco")
+	assert.True(t, ok)
+	assert.Equal(t, testData{value: 26, dataSize: 20}, val)
+	val, ok = cache.Get("enchilada")
+	assert.True(t, ok)
+	assert.Equal(t, testData{value: 28, dataSize: 26}, val)
 }
 
 func TestRadixCache_ExpiresLeastRecentlyUsed(t *testing.T) {
-	assertExpiresLeastRecentlyUsed(t, setupRadixCacheTest(t))
+	// Arrange
+	cache := setupRadixCacheTest(t)
+	evicted, err := cache.Put("burrito", testData{value: 23, dataSize: 4})
+	require.NoError(t, err)
+	assertEvictedValues(t, evicted, nil)
+
+	// Least recent.
+	evicted, err = cache.Put("taco", testData{value: 26, dataSize: 20})
+	require.NoError(t, err)
+	assertEvictedValues(t, evicted, nil)
+
+	// Second most recent.
+	evicted, err = cache.Put("enchilada", testData{value: 28, dataSize: 26})
+	require.NoError(t, err)
+	assertEvictedValues(t, evicted, nil)
+
+	val, ok := cache.Get("burrito")
+	assert.True(t, ok)
+	assert.Equal(t, testData{value: 23, dataSize: 4}, val)
+
+	// Act: Put another, should evict taco (value 26).
+	evicted, err = cache.Put("queso", testData{value: 34, dataSize: 5})
+
+	// Assert
+	require.NoError(t, err)
+	assertEvictedValues(t, evicted, []int64{26})
+	_, ok = cache.Get("taco")
+	assert.False(t, ok)
+	val, ok = cache.Get("burrito")
+	assert.True(t, ok)
+	assert.Equal(t, testData{value: 23, dataSize: 4}, val)
+	val, ok = cache.Get("enchilada")
+	assert.True(t, ok)
+	assert.Equal(t, testData{value: 28, dataSize: 26}, val)
+	val, ok = cache.Get("queso")
+	assert.True(t, ok)
+	assert.Equal(t, testData{value: 34, dataSize: 5}, val)
 }
 
 func TestRadixCache_Overwrite(t *testing.T) {
-	assertOverwriteEviction(t, setupRadixCacheTest(t))
+	// Arrange
+	cache := setupRadixCacheTest(t)
+	evicted, err := cache.Put("burrito", testData{value: 23, dataSize: 4})
+	require.NoError(t, err)
+	assertEvictedValues(t, evicted, nil)
+
+	evicted, err = cache.Put("taco", testData{value: 26, dataSize: 20})
+	require.NoError(t, err)
+	assertEvictedValues(t, evicted, nil)
+
+	evicted, err = cache.Put("enchilada", testData{value: 28, dataSize: 20})
+	require.NoError(t, err)
+	assertEvictedValues(t, evicted, nil)
+
+	evicted, err = cache.Put("burrito", testData{value: 33, dataSize: 6})
+	require.NoError(t, err)
+	assertEvictedValues(t, evicted, nil)
+
+	// Act: Increase dataSize while modifying, so eviction should happen (taco evicted)
+	evicted, err = cache.Put("burrito", testData{value: 33, dataSize: 12})
+
+	// Assert
+	require.NoError(t, err)
+	assertEvictedValues(t, evicted, []int64{26})
+	_, ok := cache.Get("taco")
+	assert.False(t, ok)
+	val, ok := cache.Get("burrito")
+	assert.True(t, ok)
+	assert.Equal(t, testData{value: 33, dataSize: 12}, val)
+	val, ok = cache.Get("enchilada")
+	assert.True(t, ok)
+	assert.Equal(t, testData{value: 28, dataSize: 20}, val)
 }
 
 func TestRadixCache_MultipleEviction(t *testing.T) {
-	assertMultipleEviction(t, setupRadixCacheTest(t))
+	// Arrange
+	cache := setupRadixCacheTest(t)
+	evicted, err := cache.Put("burrito", testData{value: 23, dataSize: 4})
+	require.NoError(t, err)
+	assertEvictedValues(t, evicted, nil)
+
+	evicted, err = cache.Put("taco", testData{value: 26, dataSize: 20})
+	require.NoError(t, err)
+	assertEvictedValues(t, evicted, nil)
+
+	evicted, err = cache.Put("enchilada", testData{value: 28, dataSize: 20})
+	require.NoError(t, err)
+	assertEvictedValues(t, evicted, nil)
+
+	// Act: Putting large data evicts all three existing items
+	evicted, err = cache.Put("large_data", testData{value: 33, dataSize: 45})
+
+	// Assert
+	require.NoError(t, err)
+	assertEvictedValues(t, evicted, []int64{23, 26, 28})
+	_, ok := cache.Get("taco")
+	assert.False(t, ok)
+	_, ok = cache.Get("burrito")
+	assert.False(t, ok)
+	_, ok = cache.Get("enchilada")
+	assert.False(t, ok)
+	val, ok := cache.Get("large_data")
+	assert.True(t, ok)
+	assert.Equal(t, testData{value: 33, dataSize: 45}, val)
 }
 
 func TestRadixCache_WhenEntrySizeMoreThanCacheMaxSize(t *testing.T) {
@@ -152,7 +272,34 @@ func TestRadixCache_DeleteWhenKeyPresent(t *testing.T) {
 }
 
 func TestRadixCache_DeletePrefix(t *testing.T) {
-	assertDeletePrefixTree(t, setupRadixCacheTest(t))
+	// Arrange
+	cache := setupRadixCacheTest(t)
+	_, err := cache.Put("a", testData{value: 23, dataSize: 4})
+	require.NoError(t, err)
+	_, err = cache.Put("a/b", testData{value: 26, dataSize: 5})
+	require.NoError(t, err)
+	_, err = cache.Put("a/b/d", testData{value: 22, dataSize: 6})
+	require.NoError(t, err)
+	_, err = cache.Put("a/c", testData{value: 20, dataSize: 6})
+	require.NoError(t, err)
+	_, err = cache.Put("b", testData{value: 21, dataSize: 2})
+	require.NoError(t, err)
+
+	// Act
+	cache.DeletePrefix("a")
+
+	// Assert
+	_, ok := cache.Get("a")
+	assert.False(t, ok)
+	_, ok = cache.Get("a/b")
+	assert.False(t, ok)
+	_, ok = cache.Get("a/b/d")
+	assert.False(t, ok)
+	_, ok = cache.Get("a/c")
+	assert.False(t, ok)
+	valB, ok := cache.Get("b")
+	require.True(t, ok)
+	assert.Equal(t, uint64(2), valB.dataSize)
 }
 
 func TestRadixCache_DeletePrefixWithEmptyPrefix(t *testing.T) {
@@ -178,11 +325,62 @@ func TestRadixCache_DeletePrefixWithEmptyPrefix(t *testing.T) {
 }
 
 func TestRadixCache_DeletePrefixWhereNoEntriesExist(t *testing.T) {
-	assertDeletePrefixNoMatch(t, setupRadixCacheTest(t))
+	// Arrange
+	cache := setupRadixCacheTest(t)
+	_, err := cache.Put("a", testData{value: 23, dataSize: 4})
+	require.NoError(t, err)
+	_, err = cache.Put("a/b", testData{value: 26, dataSize: 5})
+	require.NoError(t, err)
+	_, err = cache.Put("b", testData{value: 21, dataSize: 2})
+	require.NoError(t, err)
+
+	// Act
+	cache.DeletePrefix("c")
+
+	// Assert
+	valA, ok := cache.Get("a")
+	require.True(t, ok)
+	assert.Equal(t, uint64(4), valA.dataSize)
+
+	valAB, ok := cache.Get("a/b")
+	require.True(t, ok)
+	assert.Equal(t, uint64(5), valAB.dataSize)
+
+	valB, ok := cache.Get("b")
+	require.True(t, ok)
+	assert.Equal(t, uint64(2), valB.dataSize)
 }
 
 func TestRadixCache_DeletePrefixWithSomeEntriesEvictedDueToCacheSize(t *testing.T) {
-	assertDeletePrefixAfterEviction(t, setupRadixCacheTest(t))
+	// Arrange
+	cache := setupRadixCacheTest(t)
+	_, err := cache.Put("a", testData{value: 23, dataSize: 20})
+	require.NoError(t, err)
+	_, err = cache.Put("a/b", testData{value: 26, dataSize: 10})
+	require.NoError(t, err)
+	_, err = cache.Put("a/b/d", testData{value: 22, dataSize: 5})
+	require.NoError(t, err)
+	_, err = cache.Put("a/c", testData{value: 20, dataSize: 10})
+	require.NoError(t, err)
+	evicted, err := cache.Put("b", testData{value: 21, dataSize: 15})
+	require.NoError(t, err)
+	assertEvictedValues(t, evicted, []int64{23})
+
+	// Act: Entry "a" was already evicted by insertion of "b". Deleting prefix "a" cleans remaining descendants.
+	cache.DeletePrefix("a")
+
+	// Assert
+	_, ok := cache.Get("a")
+	assert.False(t, ok)
+	_, ok = cache.Get("a/b")
+	assert.False(t, ok)
+	_, ok = cache.Get("a/b/d")
+	assert.False(t, ok)
+	_, ok = cache.Get("a/c")
+	assert.False(t, ok)
+	valB, ok := cache.Get("b")
+	require.True(t, ok)
+	assert.Equal(t, uint64(15), valB.dataSize)
 }
 
 func TestRadixCache_DeleteWhenKeyNotPresent(t *testing.T) {
@@ -203,8 +401,36 @@ func TestRadixCache_DeleteWhenKeyNotPresent(t *testing.T) {
 }
 
 func TestRadixCache_ReplaceGrowSize(t *testing.T) {
-	assertReplaceGrowNonExistentAndSelfEvict(t, func(maxSize uint64) Cache[testData] {
-		return NewRadixCache[testData](maxSize, WithInvariantChecking(true), testDataWeigher)
+	t.Run("NonExistentKey", func(t *testing.T) {
+		// Arrange
+		cache := NewRadixCache[testData](100, WithInvariantChecking(true), testDataWeigher)
+
+		// Act
+		err := cache.Replace("key1", testData{value: 1, dataSize: 20})
+
+		// Assert
+		require.ErrorIs(t, err, ErrEntryNotExist)
+	})
+
+	t.Run("ImmediateEviction", func(t *testing.T) {
+		// Arrange
+		cache := NewRadixCache[testData](100, WithInvariantChecking(true), testDataWeigher)
+		data1 := testData{value: 1, dataSize: 10}
+		data2 := testData{value: 2, dataSize: 70}
+		_, err := cache.Put("key1", data1)
+		require.NoError(t, err)
+		_, err = cache.Put("key2", data2)
+		require.NoError(t, err)
+
+		// Act: Grow key1 (at LRU tail) from 10 to 40 -> total 110 > 100 -> key1 evicts itself!
+		errUpdate := cache.Replace("key1", testData{value: 11, dataSize: 40})
+
+		// Assert
+		require.NoError(t, errUpdate)
+		_, ok := cache.Get("key1")
+		assert.False(t, ok)
+		_, ok = cache.Get("key2")
+		assert.True(t, ok)
 	})
 }
 
@@ -310,9 +536,23 @@ func TestRadixCache_ReplaceNotChangeOrder(t *testing.T) {
 }
 
 func TestRadixCache_ReplaceGrowToExactMaxSize(t *testing.T) {
-	assertReplaceGrowToExactMaxSize(t, func(maxSize uint64) Cache[testData] {
-		return NewRadixCache[testData](maxSize, WithInvariantChecking(true), testDataWeigher)
-	})
+	// Arrange
+	const maxSize = 100
+	const initialSize = 50
+	const sizeDelta = 50 // New total size will be 50 + 50 = 100 (exactly at maxSize)
+
+	radixCache := NewRadixCache[testData](maxSize, WithInvariantChecking(true), testDataWeigher)
+	_, err := radixCache.Put("file.txt", testData{value: 1, dataSize: initialSize})
+	require.NoError(t, err)
+
+	// Act: Grow entry via Replace to exact maxSize
+	err = radixCache.Replace("file.txt", testData{value: 2, dataSize: initialSize + sizeDelta})
+
+	// Assert
+	require.NoError(t, err)
+	val, ok := radixCache.Get("file.txt")
+	assert.True(t, ok)
+	assert.Equal(t, testData{value: 2, dataSize: initialSize + sizeDelta}, val)
 }
 
 func TestRadixCache_Peek_WhenKeyPresent(t *testing.T) {
@@ -798,20 +1038,53 @@ func TestRadixCache_Iterators(t *testing.T) {
 	})
 
 	t.Run("EarlyBreakAndNonMutationAndZeroAllocValues", func(t *testing.T) {
-		assertIteratorEarlyBreakAndNonMutation(t, NewRadixCache[testData], "prefix/", func(cNoInv Cache[testData]) {
-			rc := cNoInv.(*radixCache[testData])
-			valSeq := cNoInv.Values()
-			allocs := testing.AllocsPerRun(100, func() {
-				valSeq(func(v testData) bool {
-					return v.value >= 0
-				})
-				for v := range rc.Values() {
-					if v.value < 0 {
-						break
-					}
-				}
+		c := NewRadixCache[testData](50, WithInvariantChecking(true), testDataWeigher)
+		for i := range 5 {
+			_, err := c.Put(fmt.Sprintf("prefix/k%d", i), testData{value: int64(i + 1), dataSize: 10})
+			require.NoError(t, err)
+		}
+
+		var gotKeys []string
+		for k, v := range c.All() {
+			gotKeys = append(gotKeys, k)
+			_ = v
+			if len(gotKeys) == 2 {
+				break
+			}
+		}
+		assert.Equal(t, []string{"prefix/k4", "prefix/k3"}, gotKeys)
+
+		for k := range c.Keys() {
+			assert.Equal(t, "prefix/k4", k)
+			break
+		}
+		for v := range c.Values() {
+			assert.Equal(t, int64(5), v.value)
+			break
+		}
+
+		cNoInv := NewRadixCache[testData](50, testDataWeigher)
+		for i := range 5 {
+			_, err := cNoInv.Put(fmt.Sprintf("prefix/k%d", i), testData{value: int64(i + 1), dataSize: 10})
+			require.NoError(t, err)
+		}
+		rc := cNoInv.(*radixCache[testData])
+		valSeq := cNoInv.Values()
+		allocs := testing.AllocsPerRun(100, func() {
+			valSeq(func(v testData) bool {
+				return v.value >= 0
 			})
-			assert.Zero(t, allocs, "RadixCache.Values() must allocate 0 heap objects")
+			for v := range rc.Values() {
+				if v.value < 0 {
+					break
+				}
+			}
 		})
+		assert.Zero(t, allocs, "RadixCache.Values() must allocate 0 heap objects")
+
+		// Confirm iteration did not mutate LRU eviction order: inserting k5 (10B) evicts oldest entry k0 (value 1).
+		evicted, err := c.Put("prefix/k5", testData{value: 6, dataSize: 10})
+		require.NoError(t, err)
+		assertEvictedValues(t, evicted, []int64{1})
 	})
 }
