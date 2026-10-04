@@ -45,7 +45,6 @@ jobs:
 
       - name: Run Base Branch Benchmarks for Regression Comparison (PR only)
         if: github.event_name == 'pull_request'
-        continue-on-error: true
         run: |
           HEAD_SHA=$(git rev-parse HEAD)
           trap 'git checkout "$HEAD_SHA"' EXIT
@@ -57,6 +56,7 @@ jobs:
           benchstat benchmark-base.txt benchmark-head.txt | tee benchstat-comparison.txt
 
       - name: Publish Benchmark & Resource Footprint Summary
+        if: always()
         run: |
           {
             echo "## 📊 Performance & Resource Usage Summary"
@@ -66,11 +66,12 @@ jobs:
             awk '/^Benchmark_/ && !seen[$1]++ {
               bench=$1; iters=$2; ns=$3 " " $4;
               b_op="-"; allocs="-"; extra="";
-              for (i=5; i<=NF; i++) {
-                if ($(i+1) == "B/op") { b_op = $i " B/op"; i++; }
-                else if ($(i+1) == "allocs/op") { allocs = $i " allocs/op"; i++; }
-                else if (i < NF) { extra = extra $i " " $(i+1) " "; i++; }
+              for (i=5; i<NF; i+=2) {
+                if ($(i+1) == "B/op") { b_op = $i " B/op"; }
+                else if ($(i+1) == "allocs/op") { allocs = $i " allocs/op"; }
+                else { extra = extra $i " " $(i+1) " "; }
               }
+              if (extra == "") { extra = "-"; }
               printf "| \`%s\` | %s | %s | %s | %s | %s |\n", bench, iters, ns, b_op, allocs, extra
             }' benchmark-head.txt
             echo ""
@@ -80,10 +81,20 @@ jobs:
               echo '```text'
               cat benchstat-comparison.txt
               echo '```'
+              echo ""
             fi
           } >> "$GITHUB_STEP_SUMMARY"
 
+      - name: Enforce Performance Targets & Regression Thresholds
+        run: |
+          if [ -f benchmark-base.txt ]; then
+            go run ./cmd/benchcheck -base benchmark-base.txt -head benchmark-head.txt -format markdown -summary "$GITHUB_STEP_SUMMARY" | tee benchcheck-report.md
+          else
+            go run ./cmd/benchcheck -head benchmark-head.txt -format markdown -summary "$GITHUB_STEP_SUMMARY" | tee benchcheck-report.md
+          fi
+
       - name: Upload Benchmark Artifacts
+        if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: benchmark-results
@@ -91,5 +102,6 @@ jobs:
             benchmark-head.txt
             benchmark-base.txt
             benchstat-comparison.txt
+            benchcheck-report.md
           if-no-files-found: ignore
           retention-days: 30
