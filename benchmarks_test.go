@@ -438,6 +438,40 @@ func Benchmark_ParallelThroughput_WriteHeavy(b *testing.B) {
 	b.Run("ArenaRadixCache", func(b *testing.B) { runParallelWorkload(b, lru.NewArenaRadixCache[benchValue], 80, 15) })
 }
 
+func runParallelPeekOnly(b *testing.B, constructor func(uint64, ...lru.Option) lru.Cache[benchValue]) {
+	b.Helper()
+	const prefixCount = 100
+	const itemsPerPrefix = 100
+	keys, _, _ := generateBenchmarkKeys(prefixCount, itemsPerPrefix, 2)
+	data := benchValue{val: 1, dataSize: 10}
+	capacity := uint64(len(keys) * 100)
+
+	cache := constructor(capacity, benchWeigher)
+	for _, key := range keys {
+		_, _ = cache.Put(key, data)
+	}
+
+	var workerSeq atomic.Uint64
+	b.ReportAllocs()
+	b.ResetTimer()
+
+	b.RunParallel(func(pb *testing.PB) {
+		workerID := workerSeq.Add(1)
+		var pcg rand.PCG
+		pcg.Seed(42+workerID*10007, 0)
+		n := uint64(len(keys))
+		for pb.Next() {
+			_, _ = cache.Peek(keys[pcg.Uint64()%n])
+		}
+	})
+}
+
+func Benchmark_ParallelThroughput_PeekOnly(b *testing.B) {
+	b.Run("MapCache", func(b *testing.B) { runParallelPeekOnly(b, lru.NewMapCache[benchValue]) })
+	b.Run("RadixCache", func(b *testing.B) { runParallelPeekOnly(b, lru.NewRadixCache[benchValue]) })
+	b.Run("ArenaRadixCache", func(b *testing.B) { runParallelPeekOnly(b, lru.NewArenaRadixCache[benchValue]) })
+}
+
 // ============================================================================
 // 8. High-Volume 100K Operations Scale Benchmarks
 // ============================================================================

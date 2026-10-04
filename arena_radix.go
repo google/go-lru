@@ -45,7 +45,6 @@ type arenaRadixNode[V any] struct {
 type arenaRadix[V any] struct {
 	maxSize     uint64
 	currentSize uint64
-	mu          sync.RWMutex
 
 	nodes     []arenaRadixNode[V]
 	freeHead  uint32
@@ -64,6 +63,11 @@ type arenaRadix[V any] struct {
 	weigher      func(key string, value V) uint64
 	onEvictValue func(value V, reason EvictionReason)
 	onEvictEntry func(key string, value V, reason EvictionReason)
+
+	// mu is placed after the fields read on every lookup (nodes, nodeMap, root):
+	// RLock/RUnlock atomically update its reader count, and sharing a cache line
+	// with those fields would make every concurrent lookup miss (false sharing).
+	mu sync.RWMutex
 
 	pressureState
 }
