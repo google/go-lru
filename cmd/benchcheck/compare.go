@@ -354,50 +354,83 @@ func effectiveMinDelta(
 	// When both baseline and candidate report 0 allocs/op on warmup/batch-amortized
 	// benchmarks (such as ParallelThroughput_*, Put_UnitWeight_*, DeletePrefix_*, Delete_*),
 	// non-zero B/op values are one-time setup bytes divided by b.N.
-	if unit == UnitBytesPerOp && isWarmupAmortizedZeroAllocBenchmark(benchName) {
-		baseAllocs, ok1 := baseRes.Metrics[UnitAllocsPerOp]
-		candAllocs, ok2 := candRes.Metrics[UnitAllocsPerOp]
-		if ok1 && ok2 && baseAllocs == 0 && candAllocs == 0 && candRes.Metrics[UnitBytesPerOp] <= 256 {
-			if minDelta < 160.0 {
-				minDelta = 160.0
-			}
-		}
+	if isZeroAllocWarmupBytesJitter(benchName, unit, baseRes, candRes) {
+		minDelta = max(minDelta, 160.0)
 	}
 
 	// Parallel multi-core contention benchmarks (b.RunParallel across GOMAXPROCS cores)
 	// and cold-to-warm loop benchmarks exhibit natural scheduler/lock contention jitter
 	// (~100-250 ns/op) on short -benchtime=10ms runs.
-	if unit == UnitNsPerOp && (strings.HasPrefix(benchName, "Benchmark_ParallelThroughput_") ||
-		strings.HasPrefix(benchName, "Benchmark_Put_UnitWeight_") ||
-		strings.HasSuffix(benchName, "/Parallel")) {
-		if minDelta < 300.0 {
-			minDelta = 300.0
-		}
+	if isParallelOrUnitWeightNsJitter(benchName, unit) {
+		minDelta = max(minDelta, 300.0)
 	}
 
 	// Benchmark_ArenaRadixCache_Compact allocates a 10,000-key slice (20,001 allocs)
 	// before the b.N loop without b.ResetTimer(), so at -benchtime=10ms (b.N ~ 12..18)
 	// allocs/op = 20 + 20001/b.N varies when b.N changes by 1-3 iterations.
-	if benchName == "Benchmark_ArenaRadixCache_Compact" && unit == UnitAllocsPerOp {
-		if baseRes.Iterations != candRes.Iterations && (baseRes.Iterations < 100 || candRes.Iterations < 100) {
-			if minDelta < 800.0 {
-				minDelta = 800.0
-			}
-		}
+	if isCompactLowIterAllocsJitter(benchName, unit, baseRes, candRes) {
+		minDelta = max(minDelta, 800.0)
 	}
 
 	// Benchmark_LargeScale_DeletePrefix_100K/MapCache runs b.N=1..2 at -benchtime=10ms
 	// immediately after runtime.GC(), which can record 192 B/op, 2 allocs/op when b.N=1.
-	if benchName == "Benchmark_LargeScale_DeletePrefix_100K/MapCache" && (baseRes.Iterations <= 2 || candRes.Iterations <= 2) {
-		if unit == UnitBytesPerOp && minDelta < 256.0 {
-			minDelta = 256.0
-		}
-		if unit == UnitAllocsPerOp && minDelta < 4.0 {
-			minDelta = 4.0
-		}
+	if floor := largeScaleDeletePrefixMinDelta(benchName, unit, baseRes, candRes); floor > 0 {
+		minDelta = max(minDelta, floor)
 	}
 
 	return minDelta
+}
+
+func isZeroAllocWarmupBytesJitter(
+	benchName, unit string,
+	baseRes, candRes *BenchmarkResult,
+) bool {
+	if unit != UnitBytesPerOp || !isWarmupAmortizedZeroAllocBenchmark(benchName) {
+		return false
+	}
+	baseAllocs, ok1 := baseRes.Metrics[UnitAllocsPerOp]
+	candAllocs, ok2 := candRes.Metrics[UnitAllocsPerOp]
+	return ok1 && ok2 && baseAllocs == 0 && candAllocs == 0 && candRes.Metrics[UnitBytesPerOp] <= 256
+}
+
+func isParallelOrUnitWeightNsJitter(benchName, unit string) bool {
+	if unit != UnitNsPerOp {
+		return false
+	}
+	return strings.HasPrefix(benchName, "Benchmark_ParallelThroughput_") ||
+		strings.HasPrefix(benchName, "Benchmark_Put_UnitWeight_") ||
+		strings.HasSuffix(benchName, "/Parallel")
+}
+
+func isCompactLowIterAllocsJitter(
+	benchName, unit string,
+	baseRes, candRes *BenchmarkResult,
+) bool {
+	if benchName != "Benchmark_ArenaRadixCache_Compact" || unit != UnitAllocsPerOp {
+		return false
+	}
+	return baseRes.Iterations != candRes.Iterations &&
+		(baseRes.Iterations < 100 || candRes.Iterations < 100)
+}
+
+func largeScaleDeletePrefixMinDelta(
+	benchName, unit string,
+	baseRes, candRes *BenchmarkResult,
+) float64 {
+	if benchName != "Benchmark_LargeScale_DeletePrefix_100K/MapCache" {
+		return 0
+	}
+	if baseRes.Iterations > 2 && candRes.Iterations > 2 {
+		return 0
+	}
+	switch unit {
+	case UnitBytesPerOp:
+		return 256.0
+	case UnitAllocsPerOp:
+		return 4.0
+	default:
+		return 0
+	}
 }
 
 func isWarmupAmortizedZeroAllocBenchmark(name string) bool {

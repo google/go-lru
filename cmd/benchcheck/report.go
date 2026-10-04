@@ -53,23 +53,43 @@ func FormatMarkdown(
 	var b strings.Builder
 	passed := overallPassed(targetRep, cmpRep)
 
+	writeMarkdownSummary(&b, passed, cand, agg, targetRep, cmpRep)
+	if !passed {
+		writeMarkdownFailures(&b, targetRep, cmpRep)
+	}
+	writeMarkdownCandidateTable(&b, cand, targetRep)
+	if cmpRep != nil {
+		writeMarkdownComparisonTable(&b, cmpRep)
+	}
+
+	return b.String()
+}
+
+func writeMarkdownSummary(
+	b *strings.Builder,
+	passed bool,
+	cand *Suite,
+	agg AggregationMode,
+	targetRep *TargetReport,
+	cmpRep *ComparisonReport,
+) {
 	if passed {
 		b.WriteString("## ✅ Performance Benchmark & Target Check: PASSED\n\n")
 	} else {
 		b.WriteString("## ❌ Performance Benchmark & Target Check: FAILED\n\n")
 	}
 
-	_, _ = fmt.Fprintf(&b, "- **Candidate Benchmarks Evaluated**: `%d` (aggregation: `%s`)\n", len(cand.Order), agg)
+	_, _ = fmt.Fprintf(b, "- **Candidate Benchmarks Evaluated**: `%d` (aggregation: `%s`)\n", len(cand.Order), agg)
 	if targetRep != nil {
 		_, _ = fmt.Fprintf(
-			&b,
+			b,
 			"- **Absolute Target Enforcement**: `%d/%d` matched, `%d` violation(s)\n",
 			targetRep.Matched, targetRep.Evaluated, len(targetRep.Violations),
 		)
 	}
 	if cmpRep != nil {
 		_, _ = fmt.Fprintf(
-			&b,
+			b,
 			"- **Relative Regression Check**: `%d` matched, `%d` regression(s), `%d` new, `%d` missing\n",
 			len(cmpRep.MatchedBenchmarks),
 			len(cmpRep.Regressions),
@@ -78,113 +98,121 @@ func FormatMarkdown(
 		)
 	}
 	b.WriteString("\n")
+}
 
-	if !passed {
-		b.WriteString("### ❌ Detected Failures\n\n")
-		b.WriteString("| Check Type | Benchmark | Metric | Baseline / Target | Candidate | Details |\n")
-		b.WriteString("|---|---|---|---:|---:|---|\n")
+func writeMarkdownFailures(b *strings.Builder, targetRep *TargetReport, cmpRep *ComparisonReport) {
+	b.WriteString("### ❌ Detected Failures\n\n")
+	b.WriteString("| Check Type | Benchmark | Metric | Baseline / Target | Candidate | Details |\n")
+	b.WriteString("|---|---|---|---:|---:|---|\n")
 
-		if targetRep != nil {
-			for _, v := range targetRep.Violations {
-				targetStr := fmt.Sprintf("%s %s", v.Operator, formatMetricValue(v.Metric, v.Limit))
-				candStr := formatMetricValue(v.Metric, v.Actual)
+	if targetRep != nil {
+		for _, v := range targetRep.Violations {
+			targetStr := fmt.Sprintf("%s %s", v.Operator, formatMetricValue(v.Metric, v.Limit))
+			candStr := formatMetricValue(v.Metric, v.Actual)
+			_, _ = fmt.Fprintf(
+				b,
+				"| Target Violation | `%s` | `%s` | `%s` | `%s` | %s |\n",
+				v.Benchmark, v.Metric, targetStr, candStr, v.Message,
+			)
+		}
+		if targetRep.StrictUnmatched {
+			for _, name := range targetRep.Unmatched {
 				_, _ = fmt.Fprintf(
-					&b,
-					"| Target Violation | `%s` | `%s` | `%s` | `%s` | %s |\n",
-					v.Benchmark, v.Metric, targetStr, candStr, v.Message,
+					b,
+					"| Unmatched Target | `%s` | `-` | `matched rule` | `none` | benchmark did not match any target rule |\n",
+					name,
 				)
 			}
-			if targetRep.StrictUnmatched {
-				for _, name := range targetRep.Unmatched {
-					_, _ = fmt.Fprintf(
-						&b,
-						"| Unmatched Target | `%s` | `-` | `matched rule` | `none` | benchmark did not match any target rule |\n",
-						name,
-					)
-				}
-			}
 		}
-
-		if cmpRep != nil {
-			for _, reg := range cmpRep.Regressions {
-				baseStr := formatMetricValue(reg.Unit, reg.BaseValue)
-				candStr := formatMetricValue(reg.Unit, reg.CandValue)
-				_, _ = fmt.Fprintf(
-					&b,
-					"| Relative Regression | `%s` | `%s` | `%s` | `%s` | %s |\n",
-					reg.Benchmark, reg.Unit, baseStr, candStr, reg.Message,
-				)
-			}
-			if cmpRep.Config.StrictMissing {
-				for _, name := range cmpRep.MissingInCandidate {
-					_, _ = fmt.Fprintf(
-						&b,
-						"| Missing Benchmark | `%s` | `-` | `present` | `missing` | baseline benchmark missing from candidate |\n",
-						name,
-					)
-				}
-			}
-		}
-		b.WriteString("\n")
 	}
 
+	if cmpRep != nil {
+		for _, reg := range cmpRep.Regressions {
+			baseStr := formatMetricValue(reg.Unit, reg.BaseValue)
+			candStr := formatMetricValue(reg.Unit, reg.CandValue)
+			_, _ = fmt.Fprintf(
+				b,
+				"| Relative Regression | `%s` | `%s` | `%s` | `%s` | %s |\n",
+				reg.Benchmark, reg.Unit, baseStr, candStr, reg.Message,
+			)
+		}
+		if cmpRep.Config.StrictMissing {
+			for _, name := range cmpRep.MissingInCandidate {
+				_, _ = fmt.Fprintf(
+					b,
+					"| Missing Benchmark | `%s` | `-` | `present` | `missing` | baseline benchmark missing from candidate |\n",
+					name,
+				)
+			}
+		}
+	}
+	b.WriteString("\n")
+}
+
+func writeMarkdownCandidateTable(b *strings.Builder, cand *Suite, targetRep *TargetReport) {
 	b.WriteString("### 🎯 Candidate Benchmark & Target Summary\n\n")
 	b.WriteString("| Status | Benchmark | Samples | Throughput (`ns/op`) | Memory (`B/op`) | Allocations (`allocs/op`) | Custom Metrics | Target Budget |\n")
 	b.WriteString("|---|---|---:|---:|---:|---:|---|---|\n")
 
 	for _, name := range cand.Order {
 		res := cand.Results[name]
-		status := "✅ PASS"
-		budget := "-"
-		if targetRep != nil {
-			if eval, ok := targetRep.Evaluations[name]; ok {
-				if eval.BudgetSummary != "" {
-					budget = eval.BudgetSummary
-				}
-				if len(eval.Violations) > 0 || (targetRep.StrictUnmatched && len(eval.MatchedRules) == 0) {
-					status = "❌ FAIL"
-				}
-			}
-		}
+		status, budget := candidateRowStatusAndBudget(name, targetRep)
 		nsStr := formatOptionalMetric(res.Metrics, UnitNsPerOp)
 		bytesStr := formatOptionalMetric(res.Metrics, UnitBytesPerOp)
 		allocsStr := formatOptionalMetric(res.Metrics, UnitAllocsPerOp)
 		customStr := formatCustomMetrics(res.Metrics)
 
 		_, _ = fmt.Fprintf(
-			&b,
+			b,
 			"| %s | `%s` | %d | %s | %s | %s | %s | %s |\n",
 			status, name, len(res.Samples), nsStr, bytesStr, allocsStr, customStr, budget,
 		)
 	}
 	b.WriteString("\n")
+}
 
-	if cmpRep != nil {
-		b.WriteString("### 🔍 Baseline vs. Candidate Regression Comparison\n\n")
-		b.WriteString("| Status | Benchmark | `ns/op` (Base → Head) | `B/op` (Base → Head) | `allocs/op` (Base → Head) | Custom Metrics (Base → Head) |\n")
-		b.WriteString("|---|---|---|---|---|---|\n")
-
-		for _, name := range cmpRep.MatchedBenchmarks {
-			cmp := cmpRep.Comparisons[name]
-			status := "✅ PASS"
-			if cmp.Regressed {
-				status = "❌ REGRESSED"
-			}
-			nsCell := formatDeltaCell(cmp.Deltas, UnitNsPerOp)
-			bytesCell := formatDeltaCell(cmp.Deltas, UnitBytesPerOp)
-			allocsCell := formatDeltaCell(cmp.Deltas, UnitAllocsPerOp)
-			customCell := formatCustomDeltaCells(cmp)
-
-			_, _ = fmt.Fprintf(
-				&b,
-				"| %s | `%s` | %s | %s | %s | %s |\n",
-				status, name, nsCell, bytesCell, allocsCell, customCell,
-			)
-		}
-		b.WriteString("\n")
+func candidateRowStatusAndBudget(name string, targetRep *TargetReport) (status, budget string) {
+	status = "✅ PASS"
+	budget = "-"
+	if targetRep == nil {
+		return status, budget
 	}
+	eval, ok := targetRep.Evaluations[name]
+	if !ok {
+		return status, budget
+	}
+	if eval.BudgetSummary != "" {
+		budget = eval.BudgetSummary
+	}
+	if len(eval.Violations) > 0 || (targetRep.StrictUnmatched && len(eval.MatchedRules) == 0) {
+		status = "❌ FAIL"
+	}
+	return status, budget
+}
 
-	return b.String()
+func writeMarkdownComparisonTable(b *strings.Builder, cmpRep *ComparisonReport) {
+	b.WriteString("### 🔍 Baseline vs. Candidate Regression Comparison\n\n")
+	b.WriteString("| Status | Benchmark | `ns/op` (Base → Head) | `B/op` (Base → Head) | `allocs/op` (Base → Head) | Custom Metrics (Base → Head) |\n")
+	b.WriteString("|---|---|---|---|---|---|\n")
+
+	for _, name := range cmpRep.MatchedBenchmarks {
+		cmp := cmpRep.Comparisons[name]
+		status := "✅ PASS"
+		if cmp.Regressed {
+			status = "❌ REGRESSED"
+		}
+		nsCell := formatDeltaCell(cmp.Deltas, UnitNsPerOp)
+		bytesCell := formatDeltaCell(cmp.Deltas, UnitBytesPerOp)
+		allocsCell := formatDeltaCell(cmp.Deltas, UnitAllocsPerOp)
+		customCell := formatCustomDeltaCells(cmp)
+
+		_, _ = fmt.Fprintf(
+			b,
+			"| %s | `%s` | %s | %s | %s | %s |\n",
+			status, name, nsCell, bytesCell, allocsCell, customCell,
+		)
+	}
+	b.WriteString("\n")
 }
 
 // FormatText renders the target and regression evaluation results as plain text.

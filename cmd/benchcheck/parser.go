@@ -118,8 +118,7 @@ func Parse(r io.Reader, agg AggregationMode) (*Suite, error) {
 	lineNum := 0
 	for scanner.Scan() {
 		lineNum++
-		line := scanner.Text()
-		trimmed := strings.TrimSpace(line)
+		trimmed := strings.TrimSpace(scanner.Text())
 		if trimmed == "" {
 			continue
 		}
@@ -141,21 +140,7 @@ func Parse(r io.Reader, agg AggregationMode) (*Suite, error) {
 		if err != nil {
 			return nil, err
 		}
-
-		res, exists := suite.Results[sample.Name]
-		if !exists {
-			res = &BenchmarkResult{
-				Name:       sample.Name,
-				Metrics:    make(map[string]float64),
-				RawMetrics: make(map[string][]float64),
-			}
-			suite.Results[sample.Name] = res
-			suite.Order = append(suite.Order, sample.Name)
-		}
-		res.Samples = append(res.Samples, sample)
-		for unit, val := range sample.Metrics {
-			res.RawMetrics[unit] = append(res.RawMetrics[unit], val)
-		}
+		recordBenchmarkSample(suite, sample)
 	}
 
 	if err := scanner.Err(); err != nil {
@@ -166,6 +151,28 @@ func Parse(r io.Reader, agg AggregationMode) (*Suite, error) {
 		return nil, ErrNoBenchmarksFound
 	}
 
+	finalizeSuiteAggregates(suite, agg)
+	return suite, nil
+}
+
+func recordBenchmarkSample(suite *Suite, sample Sample) {
+	res, exists := suite.Results[sample.Name]
+	if !exists {
+		res = &BenchmarkResult{
+			Name:       sample.Name,
+			Metrics:    make(map[string]float64),
+			RawMetrics: make(map[string][]float64),
+		}
+		suite.Results[sample.Name] = res
+		suite.Order = append(suite.Order, sample.Name)
+	}
+	res.Samples = append(res.Samples, sample)
+	for unit, val := range sample.Metrics {
+		res.RawMetrics[unit] = append(res.RawMetrics[unit], val)
+	}
+}
+
+func finalizeSuiteAggregates(suite *Suite, agg AggregationMode) {
 	for _, name := range suite.Order {
 		res := suite.Results[name]
 		iters := make([]float64, len(res.Samples))
@@ -177,8 +184,6 @@ func Parse(r io.Reader, agg AggregationMode) (*Suite, error) {
 			res.Metrics[unit] = aggregateValues(vals, agg)
 		}
 	}
-
-	return suite, nil
 }
 
 func isTestFailureLine(trimmed string) bool {
