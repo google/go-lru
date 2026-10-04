@@ -174,10 +174,11 @@ const (
 	samplerSlotFallback
 	samplerSlotOverflow
 
-	pressureSampleWindowMask = 255
-	minPeakSlackEntries      = 8
-	minChurnCompactDeletes   = 64
-	slackQuarterMultiplier   = 4
+	pressureSampleWindowMask   = 255
+	minPeakSlackEntries        = 8
+	minChurnCompactDeletes     = 64
+	minSingleSurvivorFreeNodes = 63
+	slackQuarterMultiplier     = 4
 )
 
 func (p *pressureState) hasOverflowSamplingGID(gid uint64) bool {
@@ -599,6 +600,58 @@ func (p *pressureState) updateZeroWatermarkAfterShed(retention float64, currentL
 		p.lastReclaimedZeroCount = 0
 		p.lastReclaimedLen = 0
 	}
+}
+
+func (p *pressureState) shouldContinueShedding(currentSize, effectiveTarget uint64, needFullFlush bool, targetZeroCount, currentLen, targetLen int) (needByteShed, needZeroShed bool) {
+	needByteShed = currentSize > effectiveTarget || needFullFlush
+	needZeroShed = !needFullFlush && p.zeroSizeCount > targetZeroCount && currentLen > targetLen
+	return needByteShed, needZeroShed
+}
+
+func (p *pressureState) shouldEvictShedVictim(isProtected bool, size uint64, needFullFlush, needByteShed bool, targetZeroCount int) bool {
+	if isProtected {
+		return false
+	}
+	if needFullFlush || (needByteShed && p.zeroSizeCount > targetZeroCount) {
+		return true
+	}
+	if needByteShed {
+		return size > 0
+	}
+	return size == 0
+}
+
+func (p *pressureState) recordPressureShed(isBackground bool) {
+	if isBackground {
+		p.pressureShedsExplicit++
+	} else {
+		p.pressureShedsInline++
+	}
+}
+
+func (p *pressureState) maybeMarkReclaimed(reclaimedOrReduced bool, sampledEpoch uint64, pressure float64) {
+	if reclaimedOrReduced && p.reclaimEpoch.Load() == sampledEpoch && p.hasElevatedPressureToInvalidate(pressure) {
+		p.markReclaimedLocked()
+	}
+}
+
+func (p *pressureState) finishClearAllLocked(hadCompactionSlack, hadReclaimable bool) {
+	if hadCompactionSlack {
+		p.compactionsAutoSlack++
+	}
+	if hadReclaimable && p.hasElevatedPressureToInvalidate(0.0) {
+		p.markReclaimedLocked()
+	}
+}
+
+func appendEvicted[V any](base, extra []V) []V {
+	if len(base) == 0 {
+		return extra
+	}
+	if len(extra) > 0 {
+		return append(base, extra...)
+	}
+	return base
 }
 
 func (p *pressureState) resetZeroWatermarkBelowTier2(pressure float64) {

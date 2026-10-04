@@ -9,7 +9,7 @@ This document details the internal data structures, concurrency models, and memo
 | Dimension | `MapCache` (`NewMapCache`) | `RadixCache` (`NewRadixCache`) | `ArenaRadixCache` (`NewArenaRadixCache`) |
 | :--- | :--- | :--- | :--- |
 | **Primary Data Structure** | `map[string]*entry[V]` + Intrusive Generic Doubly-Linked List (`entryList[V]`) | Compressed Radix Tree (LCRS) + Intrusive Pointer LRU List | Contiguous Slice Arena `[]arenaRadixNode` + Freelist + Hash Index |
-| **Node Representation** | Intrusive `entry[V]` struct (40 B + `sizeof(V)`) + Map Buckets | `radixNode` struct (80 B heap object) | `arenaRadixNode` struct (64 B contiguous array entry) |
+| **Node Representation** | Intrusive `entry[V]` struct (40 B + `sizeof(V)`) + Map Buckets | `radixNode` struct (80 B heap object) | `arenaRadixNode` struct (48 B + `sizeof(V)` contiguous array entry) |
 | **Per-Node Heap Allocations** | 1 allocation per new entry (0 on update) | 1 allocation per node | **0 allocations** (recycled via intrusive free-list) |
 | **Node Pointer Width** | 64-bit pointers | 64-bit pointers (5 pointers / node) | **32-bit indices** (`uint32`, sentinel `nilNode = math.MaxUint32`) |
 | **Max Entry Capacity** | Memory / Heap limited | Memory / Heap limited | **`2^32 - 2` total arena nodes** (`0..math.MaxUint32-2`; `nilNode = MaxUint32`, `foregroundNoProtect = MaxUint32-1`) |
@@ -67,7 +67,7 @@ When normalized memory pressure reaches `CompactionThreshold`:
 ### 3.3 Tier 2 — Critical Pressure (`pressure >= EvictionThreshold`, default `0.90`)
 When normalized memory pressure reaches `EvictionThreshold`:
 - `shedAndCompactLocked()` proactively evicts least-recently-used (`tail`) entries until `currentSize <= maxSize * EvictionRetentionRatio` (default `50%` of `maxSize`), and also proportionally sheds zero-size entries (`size == 0`) down to `EvictionRetentionRatio` (bounded by `targetLen` and `lastReclaimedZeroCount` / `lastReclaimedLen` watermarks so repeated evaluations at sustained critical pressure remain idempotent).
-- Foreground `Put` operations pass the MRU head entry as a protected reference so the entry currently being stored or overwritten is never self-evicted during inline pressure shedding, while foreground order-preserving replacements (`Replace`) pass an unprotected sentinel (`nil` / `foregroundNoProtect`) and protect the MRU head entry when `tail == head`.
+- Foreground `Put` operations pass the MRU head entry as a protected reference so the entry currently being stored or overwritten is never self-evicted during inline pressure shedding, while foreground order-preserving replacements (`Replace`) protect the replaced entry only when it already resides at the MRU head (`head`).
 - After shedding LRU entries, `compactDataStructuresLocked()` executes immediately to return both the evicted entries' backing structures and any prior map/tree/arena slack to the Go runtime heap.
 
 ---
