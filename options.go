@@ -432,11 +432,15 @@ func WithMemoryBudget(bytes uint64) Option {
 	}
 }
 
+func isValidPositiveThreshold(v float64) bool {
+	return !math.IsNaN(v) && !math.IsInf(v, 0) && v > 0
+}
+
 // WithCompactionThreshold configures the Moderate Pressure threshold for lossless arena/map compaction.
 // Passing a non-positive, NaN, or infinite value resets CompactionThreshold to DefaultCompactionThreshold.
 func WithCompactionThreshold(threshold float64) Option {
 	return func(o *Options) {
-		if math.IsNaN(threshold) || math.IsInf(threshold, 0) || threshold <= 0 {
+		if !isValidPositiveThreshold(threshold) {
 			o.CompactionThreshold = DefaultCompactionThreshold
 			o.hasCustomCompactionThreshold = false
 			o.customCompactionBits = 0
@@ -452,7 +456,7 @@ func WithCompactionThreshold(threshold float64) Option {
 // Passing a non-positive, NaN, or infinite value resets EvictionThreshold to DefaultEvictionThreshold.
 func WithEvictionThreshold(threshold float64) Option {
 	return func(o *Options) {
-		if math.IsNaN(threshold) || math.IsInf(threshold, 0) || threshold <= 0 {
+		if !isValidPositiveThreshold(threshold) {
 			o.EvictionThreshold = DefaultEvictionThreshold
 			o.hasCustomEvictionThreshold = false
 			o.customEvictionBits = 0
@@ -510,6 +514,96 @@ func DefaultRuntimePressureFunc(memoryBudget uint64) PressureFunc {
 	}
 }
 
+func sanitizeThresholds(options *Options) {
+	if options.hasCustomCompactionThreshold && math.Float64bits(options.CompactionThreshold) != options.customCompactionBits {
+		options.hasCustomCompactionThreshold = false
+	}
+	if options.hasCustomEvictionThreshold && math.Float64bits(options.EvictionThreshold) != options.customEvictionBits {
+		options.hasCustomEvictionThreshold = false
+	}
+	if !isValidPositiveThreshold(options.CompactionThreshold) {
+		options.CompactionThreshold = DefaultCompactionThreshold
+		options.hasCustomCompactionThreshold = false
+	}
+	if !isValidPositiveThreshold(options.EvictionThreshold) {
+		options.EvictionThreshold = DefaultEvictionThreshold
+		options.hasCustomEvictionThreshold = false
+	}
+}
+
+func advanceEvictionThreshold(compaction float64) float64 {
+	eviction := compaction + (DefaultEvictionThreshold - DefaultCompactionThreshold)
+	if math.IsInf(eviction, 1) {
+		eviction = math.MaxFloat64
+	}
+	if eviction <= compaction {
+		if compaction < math.MaxFloat64 {
+			return math.Nextafter(compaction, math.MaxFloat64)
+		}
+		return compaction
+	}
+	return eviction
+}
+
+func scaleCompactionThreshold(eviction float64) float64 {
+	compaction := eviction * (DefaultCompactionThreshold / DefaultEvictionThreshold)
+	if compaction == 0 {
+		compaction = math.SmallestNonzeroFloat64
+	}
+	if compaction >= eviction && eviction > math.SmallestNonzeroFloat64 {
+		compaction = math.Nextafter(eviction, 0)
+	}
+	return compaction
+}
+
+func reconcileThresholdWindow(options *Options) {
+	if options.CompactionThreshold < options.EvictionThreshold {
+		return
+	}
+	if options.CompactionThreshold == options.EvictionThreshold && options.hasCustomCompactionThreshold == options.hasCustomEvictionThreshold {
+		return
+	}
+	if options.hasCustomCompactionThreshold && !options.hasCustomEvictionThreshold && options.EvictionThreshold == DefaultEvictionThreshold {
+		// Caller raised CompactionThreshold at or above default EvictionThreshold; advance EvictionThreshold
+		// to preserve the Tier 1 compaction window.
+		options.EvictionThreshold = advanceEvictionThreshold(options.CompactionThreshold)
+		return
+	}
+	// Scale CompactionThreshold proportionally below EvictionThreshold to preserve a non-empty Tier 1 window.
+	options.CompactionThreshold = scaleCompactionThreshold(options.EvictionThreshold)
+}
+
+func normalizeRetentionRatio(ratio float64) float64 {
+	switch {
+	case math.IsNaN(ratio) || math.IsInf(ratio, -1) || ratio < 0:
+		return DefaultEvictionRetentionRatio
+	case math.IsInf(ratio, 1) || ratio > 1.0:
+		return 1.0
+	case ratio == 0:
+		return 0.0
+	default:
+		return ratio
+	}
+}
+
+func normalizeCallbacks(options *Options) {
+	if isNilFunc(options.Weigher) {
+		options.Weigher = nil
+	}
+	if isNilFunc(options.OnEvictValue) {
+		options.OnEvictValue = nil
+	}
+	if isNilFunc(options.OnEvictEntry) {
+		options.OnEvictEntry = nil
+	}
+	if options.PressureFunc == nil {
+		options.PressureFunc = DefaultRuntimePressureFunc(options.MemoryBudget)
+		options.hasCustomPressureFunc = false
+	} else {
+		options.hasCustomPressureFunc = true
+	}
+}
+
 // ApplyOptions parses and applies the provided slice of Option functions onto a default Options configuration.
 func ApplyOptions(opts ...Option) Options {
 	options := Options{
@@ -527,69 +621,9 @@ func ApplyOptions(opts ...Option) Options {
 	if options.Backend != BackendMap && options.Backend != BackendRadix && options.Backend != BackendArenaRadix {
 		options.Backend = BackendMap
 	}
-	if options.hasCustomCompactionThreshold && math.Float64bits(options.CompactionThreshold) != options.customCompactionBits {
-		options.hasCustomCompactionThreshold = false
-	}
-	if options.hasCustomEvictionThreshold && math.Float64bits(options.EvictionThreshold) != options.customEvictionBits {
-		options.hasCustomEvictionThreshold = false
-	}
-	if math.IsNaN(options.CompactionThreshold) || math.IsInf(options.CompactionThreshold, 0) || options.CompactionThreshold <= 0 {
-		options.CompactionThreshold = DefaultCompactionThreshold
-		options.hasCustomCompactionThreshold = false
-	}
-	if math.IsNaN(options.EvictionThreshold) || math.IsInf(options.EvictionThreshold, 0) || options.EvictionThreshold <= 0 {
-		options.EvictionThreshold = DefaultEvictionThreshold
-		options.hasCustomEvictionThreshold = false
-	}
-	if options.CompactionThreshold > options.EvictionThreshold ||
-		(options.CompactionThreshold == options.EvictionThreshold && options.hasCustomCompactionThreshold != options.hasCustomEvictionThreshold) {
-		if options.hasCustomCompactionThreshold && !options.hasCustomEvictionThreshold && options.EvictionThreshold == DefaultEvictionThreshold {
-			// Caller raised CompactionThreshold at or above default EvictionThreshold; advance EvictionThreshold
-			// to preserve the Tier 1 compaction window.
-			options.EvictionThreshold = options.CompactionThreshold + (DefaultEvictionThreshold - DefaultCompactionThreshold)
-			if math.IsInf(options.EvictionThreshold, 1) {
-				options.EvictionThreshold = math.MaxFloat64
-			}
-			if options.EvictionThreshold <= options.CompactionThreshold {
-				if options.CompactionThreshold < math.MaxFloat64 {
-					options.EvictionThreshold = math.Nextafter(options.CompactionThreshold, math.MaxFloat64)
-				} else {
-					options.EvictionThreshold = options.CompactionThreshold
-				}
-			}
-		} else {
-			// Scale CompactionThreshold proportionally below EvictionThreshold to preserve a non-empty Tier 1 window.
-			options.CompactionThreshold = options.EvictionThreshold * (DefaultCompactionThreshold / DefaultEvictionThreshold)
-			if options.CompactionThreshold == 0 {
-				options.CompactionThreshold = math.SmallestNonzeroFloat64
-			}
-			if options.CompactionThreshold >= options.EvictionThreshold && options.EvictionThreshold > math.SmallestNonzeroFloat64 {
-				options.CompactionThreshold = math.Nextafter(options.EvictionThreshold, 0)
-			}
-		}
-	}
-	switch {
-	case math.IsNaN(options.EvictionRetentionRatio) || math.IsInf(options.EvictionRetentionRatio, -1) || options.EvictionRetentionRatio < 0:
-		options.EvictionRetentionRatio = DefaultEvictionRetentionRatio
-	case math.IsInf(options.EvictionRetentionRatio, 1) || options.EvictionRetentionRatio > 1.0:
-		options.EvictionRetentionRatio = 1.0
-	case options.EvictionRetentionRatio == 0:
-		options.EvictionRetentionRatio = 0.0
-	}
-	if isNilFunc(options.Weigher) {
-		options.Weigher = nil
-	}
-	if isNilFunc(options.OnEvictValue) {
-		options.OnEvictValue = nil
-	}
-	if isNilFunc(options.OnEvictEntry) {
-		options.OnEvictEntry = nil
-	}
-	if options.PressureFunc == nil {
-		options.PressureFunc = DefaultRuntimePressureFunc(options.MemoryBudget)
-		options.hasCustomPressureFunc = false
-	} else {
-		options.hasCustomPressureFunc = true
-	}
+	sanitizeThresholds(&options)
+	reconcileThresholdWindow(&options)
+	options.EvictionRetentionRatio = normalizeRetentionRatio(options.EvictionRetentionRatio)
+	normalizeCallbacks(&options)
 	return options
 }
