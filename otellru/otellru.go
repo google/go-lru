@@ -179,6 +179,270 @@ func makeObserveOpts(base []attribute.KeyValue, extra ...attribute.KeyValue) []m
 	return []metric.ObserveOption{metric.WithAttributeSet(set)}
 }
 
+func resolveMeter(cfg *config) metric.Meter {
+	if cfg.meter != nil {
+		return cfg.meter
+	}
+	mp := cfg.meterProvider
+	if mp == nil {
+		mp = otel.GetMeterProvider()
+	}
+	return mp.Meter(ScopeName)
+}
+
+func buildBaseAttrs(cfg *config, backend lru.Backend) []attribute.KeyValue {
+	baseAttrs := make([]attribute.KeyValue, 0, len(cfg.attrs)+2)
+	for _, kv := range cfg.attrs {
+		if !isReservedAttributeKey(kv.Key) {
+			baseAttrs = append(baseAttrs, kv)
+		}
+	}
+	if cfg.name != "" {
+		baseAttrs = append(baseAttrs, attrKeyCacheName.String(cfg.name))
+	}
+	return append(baseAttrs, attrKeyCacheBackend.String(backendAttributeValue(backend)))
+}
+
+type observeSets struct {
+	base                    []metric.ObserveOption
+	reqGetHit               []metric.ObserveOption
+	reqGetMiss              []metric.ObserveOption
+	reqPeekHit              []metric.ObserveOption
+	reqPeekMiss             []metric.ObserveOption
+	reasonCapacity          []metric.ObserveOption
+	reasonPressure          []metric.ObserveOption
+	reasonDeleted           []metric.ObserveOption
+	reasonReplaced          []metric.ObserveOption
+	mutPutInserted          []metric.ObserveOption
+	mutPutUpdated           []metric.ObserveOption
+	mutPutRejectedOversized []metric.ObserveOption
+	mutReplaceUpdated       []metric.ObserveOption
+	mutReplaceNotFound      []metric.ObserveOption
+	mutReplaceSelfEvicted   []metric.ObserveOption
+	mutDeleteDeleted        []metric.ObserveOption
+	mutDeleteNotFound       []metric.ObserveOption
+	mutDeletePrefixExecuted []metric.ObserveOption
+	compactExplicit         []metric.ObserveOption
+	compactTier1            []metric.ObserveOption
+	compactTier2            []metric.ObserveOption
+	compactAutoSlack        []metric.ObserveOption
+	shedInline              []metric.ObserveOption
+	shedExplicit            []metric.ObserveOption
+	arenaLive               []metric.ObserveOption
+	arenaFree               []metric.ObserveOption
+	arenaUnallocatedCap     []metric.ObserveOption
+}
+
+func newObserveSets(baseAttrs []attribute.KeyValue, isArena bool) observeSets {
+	sets := observeSets{
+		base:                    makeObserveOpts(baseAttrs),
+		reqGetHit:               makeObserveOpts(baseAttrs, attrKeyOperation.String("get"), attrKeyResult.String("hit")),
+		reqGetMiss:              makeObserveOpts(baseAttrs, attrKeyOperation.String("get"), attrKeyResult.String("miss")),
+		reqPeekHit:              makeObserveOpts(baseAttrs, attrKeyOperation.String("peek"), attrKeyResult.String("hit")),
+		reqPeekMiss:             makeObserveOpts(baseAttrs, attrKeyOperation.String("peek"), attrKeyResult.String("miss")),
+		reasonCapacity:          makeObserveOpts(baseAttrs, attrKeyReason.String("capacity")),
+		reasonPressure:          makeObserveOpts(baseAttrs, attrKeyReason.String("pressure")),
+		reasonDeleted:           makeObserveOpts(baseAttrs, attrKeyReason.String("deleted")),
+		reasonReplaced:          makeObserveOpts(baseAttrs, attrKeyReason.String("replaced")),
+		mutPutInserted:          makeObserveOpts(baseAttrs, attrKeyOperation.String("put"), attrKeyOutcome.String("inserted")),
+		mutPutUpdated:           makeObserveOpts(baseAttrs, attrKeyOperation.String("put"), attrKeyOutcome.String("updated")),
+		mutPutRejectedOversized: makeObserveOpts(baseAttrs, attrKeyOperation.String("put"), attrKeyOutcome.String("rejected_oversized")),
+		mutReplaceUpdated:       makeObserveOpts(baseAttrs, attrKeyOperation.String("replace"), attrKeyOutcome.String("updated")),
+		mutReplaceNotFound:      makeObserveOpts(baseAttrs, attrKeyOperation.String("replace"), attrKeyOutcome.String("not_found")),
+		mutReplaceSelfEvicted:   makeObserveOpts(baseAttrs, attrKeyOperation.String("replace"), attrKeyOutcome.String("self_evicted")),
+		mutDeleteDeleted:        makeObserveOpts(baseAttrs, attrKeyOperation.String("delete"), attrKeyOutcome.String("deleted")),
+		mutDeleteNotFound:       makeObserveOpts(baseAttrs, attrKeyOperation.String("delete"), attrKeyOutcome.String("not_found")),
+		mutDeletePrefixExecuted: makeObserveOpts(baseAttrs, attrKeyOperation.String("delete_prefix"), attrKeyOutcome.String("executed")),
+		compactExplicit:         makeObserveOpts(baseAttrs, attrKeyTrigger.String("explicit")),
+		compactTier1:            makeObserveOpts(baseAttrs, attrKeyTrigger.String("pressure_tier1")),
+		compactTier2:            makeObserveOpts(baseAttrs, attrKeyTrigger.String("pressure_tier2")),
+		compactAutoSlack:        makeObserveOpts(baseAttrs, attrKeyTrigger.String("auto_slack")),
+		shedInline:              makeObserveOpts(baseAttrs, attrKeyTrigger.String("inline")),
+		shedExplicit:            makeObserveOpts(baseAttrs, attrKeyTrigger.String("explicit")),
+	}
+	if isArena {
+		sets.arenaLive = makeObserveOpts(baseAttrs, attrKeyState.String("live"))
+		sets.arenaFree = makeObserveOpts(baseAttrs, attrKeyState.String("free"))
+		sets.arenaUnallocatedCap = makeObserveOpts(baseAttrs, attrKeyState.String("unallocated_cap"))
+	}
+	return sets
+}
+
+type cacheInstruments struct {
+	requestsCounter           metric.Int64ObservableCounter
+	evictionsCounter          metric.Int64ObservableCounter
+	evictedWeightCounter      metric.Int64ObservableCounter
+	sizeGauge                 metric.Int64ObservableGauge
+	maxSizeGauge              metric.Int64ObservableGauge
+	entriesGauge              metric.Int64ObservableGauge
+	zeroWeightEntriesGauge    metric.Int64ObservableGauge
+	mutationsCounter          metric.Int64ObservableCounter
+	memoryPressureGauge       metric.Float64ObservableGauge
+	compactionsCounter        metric.Int64ObservableCounter
+	pressureShedsCounter      metric.Int64ObservableCounter
+	reclaimEpochsCounter      metric.Int64ObservableCounter
+	deletedSinceCompactGauge  metric.Int64ObservableGauge
+	peakEntriesGauge          metric.Int64ObservableGauge
+	arenaNodesGauge           metric.Int64ObservableGauge
+	arenaHashFallbacksCounter metric.Int64ObservableCounter
+	observables               []metric.Observable
+}
+
+func newInt64Counter(meter metric.Meter, name, unit, desc string) (metric.Int64ObservableCounter, error) {
+	return meter.Int64ObservableCounter(name, metric.WithUnit(unit), metric.WithDescription(desc))
+}
+
+func newInt64Gauge(meter metric.Meter, name, unit, desc string) (metric.Int64ObservableGauge, error) {
+	return meter.Int64ObservableGauge(name, metric.WithUnit(unit), metric.WithDescription(desc))
+}
+
+func (inst *cacheInstruments) initLookupAndCapacityInstruments(meter metric.Meter) error {
+	var err error
+	if inst.requestsCounter, err = newInt64Counter(meter, "lru.cache.requests", "{request}", "Total number of cache lookup requests."); err != nil {
+		return err
+	}
+	if inst.evictionsCounter, err = newInt64Counter(meter, "lru.cache.evictions", "{entry}", "Total number of cache entries evicted, deleted, or displaced."); err != nil {
+		return err
+	}
+	if inst.evictedWeightCounter, err = newInt64Counter(meter, "lru.cache.evicted_weight", "{weight}", "Total weight of cache entries evicted, deleted, or displaced."); err != nil {
+		return err
+	}
+	if inst.sizeGauge, err = newInt64Gauge(meter, "lru.cache.size", "{weight}", "Current total weight of live entries in the cache."); err != nil {
+		return err
+	}
+	if inst.maxSizeGauge, err = newInt64Gauge(meter, "lru.cache.max_size", "{weight}", "Maximum configured capacity weight of the cache."); err != nil {
+		return err
+	}
+	if inst.entriesGauge, err = newInt64Gauge(meter, "lru.cache.entries", "{entry}", "Current number of live entries in the cache."); err != nil {
+		return err
+	}
+	inst.zeroWeightEntriesGauge, err = newInt64Gauge(meter, "lru.cache.zero_weight_entries", "{entry}", "Current number of live zero-weight entries in the cache.")
+	return err
+}
+
+func (inst *cacheInstruments) initMutationAndPressureInstruments(meter metric.Meter) error {
+	var err error
+	if inst.mutationsCounter, err = newInt64Counter(meter, "lru.cache.mutations", "{operation}", "Total number of cache mutation operations by outcome."); err != nil {
+		return err
+	}
+	if inst.memoryPressureGauge, err = meter.Float64ObservableGauge(
+		"lru.cache.memory_pressure",
+		metric.WithUnit("1"),
+		metric.WithDescription("Latest sampled normalized memory pressure reading."),
+	); err != nil {
+		return err
+	}
+	if inst.compactionsCounter, err = newInt64Counter(meter, "lru.cache.compactions", "{compaction}", "Total number of internal index or arena compactions performed."); err != nil {
+		return err
+	}
+	if inst.pressureShedsCounter, err = newInt64Counter(meter, "lru.cache.pressure_sheds", "{event}", "Total number of Tier 2 critical memory-pressure shedding events."); err != nil {
+		return err
+	}
+	if inst.reclaimEpochsCounter, err = newInt64Counter(meter, "lru.cache.reclaim_epochs", "{epoch}", "Total number of memory reclamation epochs completed."); err != nil {
+		return err
+	}
+	if inst.deletedSinceCompactGauge, err = newInt64Gauge(meter, "lru.cache.deleted_since_compact", "{entry}", "Number of entries deleted or evicted since the last compaction or reset."); err != nil {
+		return err
+	}
+	inst.peakEntriesGauge, err = newInt64Gauge(meter, "lru.cache.peak_entries", "{entry}", "Peak number of live entries since the last compaction or reset.")
+	return err
+}
+
+func (inst *cacheInstruments) initArenaInstruments(meter metric.Meter, isArena bool) error {
+	inst.observables = make([]metric.Observable, 0, 16)
+	inst.observables = append(inst.observables,
+		inst.requestsCounter,
+		inst.evictionsCounter,
+		inst.evictedWeightCounter,
+		inst.sizeGauge,
+		inst.maxSizeGauge,
+		inst.entriesGauge,
+		inst.zeroWeightEntriesGauge,
+		inst.mutationsCounter,
+		inst.memoryPressureGauge,
+		inst.compactionsCounter,
+		inst.pressureShedsCounter,
+		inst.reclaimEpochsCounter,
+		inst.deletedSinceCompactGauge,
+		inst.peakEntriesGauge,
+	)
+	if !isArena {
+		return nil
+	}
+	var err error
+	if inst.arenaNodesGauge, err = newInt64Gauge(meter, "lru.cache.arena.nodes", "{node}", "Current number of arena radix tree nodes by allocation state."); err != nil {
+		return err
+	}
+	if inst.arenaHashFallbacksCounter, err = newInt64Counter(meter, "lru.cache.arena.hash_fallbacks", "{lookup}", "Total number of FNV-1a hash-index lookups that fell back to radix trie traversal."); err != nil {
+		return err
+	}
+	inst.observables = append(inst.observables, inst.arenaNodesGauge, inst.arenaHashFallbacksCounter)
+	return nil
+}
+
+func (inst *cacheInstruments) observe(o metric.Observer, st lru.Stats, opts *observeSets, isArena bool) {
+	// 1. lru.cache.requests
+	o.ObserveInt64(inst.requestsCounter, uint64ToInt64(st.GetHits), opts.reqGetHit...)
+	o.ObserveInt64(inst.requestsCounter, uint64ToInt64(st.GetMisses), opts.reqGetMiss...)
+	o.ObserveInt64(inst.requestsCounter, uint64ToInt64(st.PeekHits), opts.reqPeekHit...)
+	o.ObserveInt64(inst.requestsCounter, uint64ToInt64(st.PeekMisses), opts.reqPeekMiss...)
+
+	// 2. lru.cache.evictions
+	o.ObserveInt64(inst.evictionsCounter, uint64ToInt64(st.EvictionsCapacity), opts.reasonCapacity...)
+	o.ObserveInt64(inst.evictionsCounter, uint64ToInt64(st.EvictionsPressure), opts.reasonPressure...)
+	o.ObserveInt64(inst.evictionsCounter, uint64ToInt64(st.EvictionsDeleted), opts.reasonDeleted...)
+	o.ObserveInt64(inst.evictionsCounter, uint64ToInt64(st.EvictionsReplaced), opts.reasonReplaced...)
+
+	// 3. lru.cache.evicted_weight
+	o.ObserveInt64(inst.evictedWeightCounter, uint64ToInt64(st.EvictedWeightCapacity), opts.reasonCapacity...)
+	o.ObserveInt64(inst.evictedWeightCounter, uint64ToInt64(st.EvictedWeightPressure), opts.reasonPressure...)
+	o.ObserveInt64(inst.evictedWeightCounter, uint64ToInt64(st.EvictedWeightDeleted), opts.reasonDeleted...)
+	o.ObserveInt64(inst.evictedWeightCounter, uint64ToInt64(st.EvictedWeightReplaced), opts.reasonReplaced...)
+
+	// 4–7. Capacity & entry gauges
+	o.ObserveInt64(inst.sizeGauge, uint64ToInt64(st.CurrentSize), opts.base...)
+	o.ObserveInt64(inst.maxSizeGauge, uint64ToInt64(st.MaxSize), opts.base...)
+	o.ObserveInt64(inst.entriesGauge, int64(st.Len), opts.base...)
+	o.ObserveInt64(inst.zeroWeightEntriesGauge, int64(st.ZeroSizeCount), opts.base...)
+
+	// 8. lru.cache.mutations
+	o.ObserveInt64(inst.mutationsCounter, uint64ToInt64(st.PutInserted), opts.mutPutInserted...)
+	o.ObserveInt64(inst.mutationsCounter, uint64ToInt64(st.PutUpdated), opts.mutPutUpdated...)
+	o.ObserveInt64(inst.mutationsCounter, uint64ToInt64(st.PutRejectedOversized), opts.mutPutRejectedOversized...)
+	o.ObserveInt64(inst.mutationsCounter, uint64ToInt64(st.ReplaceUpdated), opts.mutReplaceUpdated...)
+	o.ObserveInt64(inst.mutationsCounter, uint64ToInt64(st.ReplaceNotFound), opts.mutReplaceNotFound...)
+	o.ObserveInt64(inst.mutationsCounter, uint64ToInt64(st.ReplaceSelfEvicted), opts.mutReplaceSelfEvicted...)
+	o.ObserveInt64(inst.mutationsCounter, uint64ToInt64(st.DeleteDeleted), opts.mutDeleteDeleted...)
+	o.ObserveInt64(inst.mutationsCounter, uint64ToInt64(st.DeleteNotFound), opts.mutDeleteNotFound...)
+	o.ObserveInt64(inst.mutationsCounter, uint64ToInt64(st.DeletePrefixExecuted), opts.mutDeletePrefixExecuted...)
+
+	// 9. lru.cache.memory_pressure
+	o.ObserveFloat64(inst.memoryPressureGauge, st.MemoryPressure, opts.base...)
+
+	// 10. lru.cache.compactions
+	o.ObserveInt64(inst.compactionsCounter, uint64ToInt64(st.CompactionsExplicit), opts.compactExplicit...)
+	o.ObserveInt64(inst.compactionsCounter, uint64ToInt64(st.CompactionsPressureTier1), opts.compactTier1...)
+	o.ObserveInt64(inst.compactionsCounter, uint64ToInt64(st.CompactionsPressureTier2), opts.compactTier2...)
+	o.ObserveInt64(inst.compactionsCounter, uint64ToInt64(st.CompactionsAutoSlack), opts.compactAutoSlack...)
+
+	// 11. lru.cache.pressure_sheds
+	o.ObserveInt64(inst.pressureShedsCounter, uint64ToInt64(st.PressureShedsInline), opts.shedInline...)
+	o.ObserveInt64(inst.pressureShedsCounter, uint64ToInt64(st.PressureShedsExplicit), opts.shedExplicit...)
+
+	// 12–14. Reclamation epoch & structural watermark gauges
+	o.ObserveInt64(inst.reclaimEpochsCounter, uint64ToInt64(st.ReclaimEpoch), opts.base...)
+	o.ObserveInt64(inst.deletedSinceCompactGauge, int64(st.DeletedSinceCompact), opts.base...)
+	o.ObserveInt64(inst.peakEntriesGauge, int64(st.PeakEntryLen), opts.base...)
+
+	// 15–16. ArenaRadixCache-only instruments
+	if isArena {
+		o.ObserveInt64(inst.arenaNodesGauge, int64(st.ArenaLiveNodes), opts.arenaLive...)
+		o.ObserveInt64(inst.arenaNodesGauge, int64(st.ArenaFreeNodes), opts.arenaFree...)
+		o.ObserveInt64(inst.arenaNodesGauge, int64(st.ArenaUnallocatedCap), opts.arenaUnallocatedCap...)
+		o.ObserveInt64(inst.arenaHashFallbacksCounter, uint64ToInt64(st.ArenaHashFallbacks), opts.base...)
+	}
+}
+
 // Register instruments cache using purely asynchronous OpenTelemetry observable counters
 // and gauges backed by a single batch Meter.RegisterCallback that reads cache.Stats() once
 // per collection cycle.
@@ -194,306 +458,27 @@ func Register(cache StatsProvider, opts ...Option) (*Registration, error) {
 		}
 	}
 
-	meter := cfg.meter
-	if meter == nil {
-		mp := cfg.meterProvider
-		if mp == nil {
-			mp = otel.GetMeterProvider()
-		}
-		meter = mp.Meter(ScopeName)
-	}
-
+	meter := resolveMeter(&cfg)
 	initialStats := cache.Stats()
 	isArena := initialStats.Backend == lru.BackendArenaRadix
+	baseAttrs := buildBaseAttrs(&cfg, initialStats.Backend)
+	optSets := newObserveSets(baseAttrs, isArena)
 
-	// Build base attributes: custom non-reserved attributes first, then authoritative cache.name and cache.backend.
-	baseAttrs := make([]attribute.KeyValue, 0, len(cfg.attrs)+2)
-	for _, kv := range cfg.attrs {
-		if !isReservedAttributeKey(kv.Key) {
-			baseAttrs = append(baseAttrs, kv)
-		}
-	}
-	if cfg.name != "" {
-		baseAttrs = append(baseAttrs, attrKeyCacheName.String(cfg.name))
-	}
-	baseAttrs = append(baseAttrs, attrKeyCacheBackend.String(backendAttributeValue(initialStats.Backend)))
-
-	// Pre-allocate all attribute.Set / []metric.ObserveOption slices once at registration time.
-	baseOpts := makeObserveOpts(baseAttrs)
-
-	reqGetHitOpts := makeObserveOpts(baseAttrs, attrKeyOperation.String("get"), attrKeyResult.String("hit"))
-	reqGetMissOpts := makeObserveOpts(baseAttrs, attrKeyOperation.String("get"), attrKeyResult.String("miss"))
-	reqPeekHitOpts := makeObserveOpts(baseAttrs, attrKeyOperation.String("peek"), attrKeyResult.String("hit"))
-	reqPeekMissOpts := makeObserveOpts(baseAttrs, attrKeyOperation.String("peek"), attrKeyResult.String("miss"))
-
-	reasonCapacityOpts := makeObserveOpts(baseAttrs, attrKeyReason.String("capacity"))
-	reasonPressureOpts := makeObserveOpts(baseAttrs, attrKeyReason.String("pressure"))
-	reasonDeletedOpts := makeObserveOpts(baseAttrs, attrKeyReason.String("deleted"))
-	reasonReplacedOpts := makeObserveOpts(baseAttrs, attrKeyReason.String("replaced"))
-
-	mutPutInsertedOpts := makeObserveOpts(baseAttrs, attrKeyOperation.String("put"), attrKeyOutcome.String("inserted"))
-	mutPutUpdatedOpts := makeObserveOpts(baseAttrs, attrKeyOperation.String("put"), attrKeyOutcome.String("updated"))
-	mutPutRejectedOversizedOpts := makeObserveOpts(baseAttrs, attrKeyOperation.String("put"), attrKeyOutcome.String("rejected_oversized"))
-	mutReplaceUpdatedOpts := makeObserveOpts(baseAttrs, attrKeyOperation.String("replace"), attrKeyOutcome.String("updated"))
-	mutReplaceNotFoundOpts := makeObserveOpts(baseAttrs, attrKeyOperation.String("replace"), attrKeyOutcome.String("not_found"))
-	mutReplaceSelfEvictedOpts := makeObserveOpts(baseAttrs, attrKeyOperation.String("replace"), attrKeyOutcome.String("self_evicted"))
-	mutDeleteDeletedOpts := makeObserveOpts(baseAttrs, attrKeyOperation.String("delete"), attrKeyOutcome.String("deleted"))
-	mutDeleteNotFoundOpts := makeObserveOpts(baseAttrs, attrKeyOperation.String("delete"), attrKeyOutcome.String("not_found"))
-	mutDeletePrefixExecutedOpts := makeObserveOpts(baseAttrs, attrKeyOperation.String("delete_prefix"), attrKeyOutcome.String("executed"))
-
-	compactExplicitOpts := makeObserveOpts(baseAttrs, attrKeyTrigger.String("explicit"))
-	compactTier1Opts := makeObserveOpts(baseAttrs, attrKeyTrigger.String("pressure_tier1"))
-	compactTier2Opts := makeObserveOpts(baseAttrs, attrKeyTrigger.String("pressure_tier2"))
-	compactAutoSlackOpts := makeObserveOpts(baseAttrs, attrKeyTrigger.String("auto_slack"))
-
-	shedInlineOpts := makeObserveOpts(baseAttrs, attrKeyTrigger.String("inline"))
-	shedExplicitOpts := makeObserveOpts(baseAttrs, attrKeyTrigger.String("explicit"))
-
-	// Create the 14 general cache observable instruments.
-	requestsCounter, err := meter.Int64ObservableCounter(
-		"lru.cache.requests",
-		metric.WithUnit("{request}"),
-		metric.WithDescription("Total number of cache lookup requests."),
-	)
-	if err != nil {
+	var inst cacheInstruments
+	if err := inst.initLookupAndCapacityInstruments(meter); err != nil {
 		return nil, err
 	}
-
-	evictionsCounter, err := meter.Int64ObservableCounter(
-		"lru.cache.evictions",
-		metric.WithUnit("{entry}"),
-		metric.WithDescription("Total number of cache entries evicted, deleted, or displaced."),
-	)
-	if err != nil {
+	if err := inst.initMutationAndPressureInstruments(meter); err != nil {
 		return nil, err
 	}
-
-	evictedWeightCounter, err := meter.Int64ObservableCounter(
-		"lru.cache.evicted_weight",
-		metric.WithUnit("{weight}"),
-		metric.WithDescription("Total weight of cache entries evicted, deleted, or displaced."),
-	)
-	if err != nil {
+	if err := inst.initArenaInstruments(meter, isArena); err != nil {
 		return nil, err
-	}
-
-	sizeGauge, err := meter.Int64ObservableGauge(
-		"lru.cache.size",
-		metric.WithUnit("{weight}"),
-		metric.WithDescription("Current total weight of live entries in the cache."),
-	)
-	if err != nil {
-		return nil, err
-	}
-
-	maxSizeGauge, err := meter.Int64ObservableGauge(
-		"lru.cache.max_size",
-		metric.WithUnit("{weight}"),
-		metric.WithDescription("Maximum configured capacity weight of the cache."),
-	)
-	if err != nil {
-		return nil, err
-	}
-
-	entriesGauge, err := meter.Int64ObservableGauge(
-		"lru.cache.entries",
-		metric.WithUnit("{entry}"),
-		metric.WithDescription("Current number of live entries in the cache."),
-	)
-	if err != nil {
-		return nil, err
-	}
-
-	zeroWeightEntriesGauge, err := meter.Int64ObservableGauge(
-		"lru.cache.zero_weight_entries",
-		metric.WithUnit("{entry}"),
-		metric.WithDescription("Current number of live zero-weight entries in the cache."),
-	)
-	if err != nil {
-		return nil, err
-	}
-
-	mutationsCounter, err := meter.Int64ObservableCounter(
-		"lru.cache.mutations",
-		metric.WithUnit("{operation}"),
-		metric.WithDescription("Total number of cache mutation operations by outcome."),
-	)
-	if err != nil {
-		return nil, err
-	}
-
-	memoryPressureGauge, err := meter.Float64ObservableGauge(
-		"lru.cache.memory_pressure",
-		metric.WithUnit("1"),
-		metric.WithDescription("Latest sampled normalized memory pressure reading."),
-	)
-	if err != nil {
-		return nil, err
-	}
-
-	compactionsCounter, err := meter.Int64ObservableCounter(
-		"lru.cache.compactions",
-		metric.WithUnit("{compaction}"),
-		metric.WithDescription("Total number of internal index or arena compactions performed."),
-	)
-	if err != nil {
-		return nil, err
-	}
-
-	pressureShedsCounter, err := meter.Int64ObservableCounter(
-		"lru.cache.pressure_sheds",
-		metric.WithUnit("{event}"),
-		metric.WithDescription("Total number of Tier 2 critical memory-pressure shedding events."),
-	)
-	if err != nil {
-		return nil, err
-	}
-
-	reclaimEpochsCounter, err := meter.Int64ObservableCounter(
-		"lru.cache.reclaim_epochs",
-		metric.WithUnit("{epoch}"),
-		metric.WithDescription("Total number of memory reclamation epochs completed."),
-	)
-	if err != nil {
-		return nil, err
-	}
-
-	deletedSinceCompactGauge, err := meter.Int64ObservableGauge(
-		"lru.cache.deleted_since_compact",
-		metric.WithUnit("{entry}"),
-		metric.WithDescription("Number of entries deleted or evicted since the last compaction or reset."),
-	)
-	if err != nil {
-		return nil, err
-	}
-
-	peakEntriesGauge, err := meter.Int64ObservableGauge(
-		"lru.cache.peak_entries",
-		metric.WithUnit("{entry}"),
-		metric.WithDescription("Peak number of live entries since the last compaction or reset."),
-	)
-	if err != nil {
-		return nil, err
-	}
-
-	observables := make([]metric.Observable, 0, 16)
-	observables = append(observables,
-		requestsCounter,
-		evictionsCounter,
-		evictedWeightCounter,
-		sizeGauge,
-		maxSizeGauge,
-		entriesGauge,
-		zeroWeightEntriesGauge,
-		mutationsCounter,
-		memoryPressureGauge,
-		compactionsCounter,
-		pressureShedsCounter,
-		reclaimEpochsCounter,
-		deletedSinceCompactGauge,
-		peakEntriesGauge,
-	)
-
-	var (
-		arenaNodesGauge           metric.Int64ObservableGauge
-		arenaHashFallbacksCounter metric.Int64ObservableCounter
-		arenaLiveOpts             []metric.ObserveOption
-		arenaFreeOpts             []metric.ObserveOption
-		arenaUnallocatedCapOpts   []metric.ObserveOption
-	)
-
-	if isArena {
-		arenaNodesGauge, err = meter.Int64ObservableGauge(
-			"lru.cache.arena.nodes",
-			metric.WithUnit("{node}"),
-			metric.WithDescription("Current number of arena radix tree nodes by allocation state."),
-		)
-		if err != nil {
-			return nil, err
-		}
-
-		arenaHashFallbacksCounter, err = meter.Int64ObservableCounter(
-			"lru.cache.arena.hash_fallbacks",
-			metric.WithUnit("{lookup}"),
-			metric.WithDescription("Total number of FNV-1a hash-index lookups that fell back to radix trie traversal."),
-		)
-		if err != nil {
-			return nil, err
-		}
-
-		arenaLiveOpts = makeObserveOpts(baseAttrs, attrKeyState.String("live"))
-		arenaFreeOpts = makeObserveOpts(baseAttrs, attrKeyState.String("free"))
-		arenaUnallocatedCapOpts = makeObserveOpts(baseAttrs, attrKeyState.String("unallocated_cap"))
-
-		observables = append(observables, arenaNodesGauge, arenaHashFallbacksCounter)
 	}
 
 	reg, err := meter.RegisterCallback(func(_ context.Context, o metric.Observer) error {
-		st := cache.Stats()
-
-		// 1. lru.cache.requests
-		o.ObserveInt64(requestsCounter, uint64ToInt64(st.GetHits), reqGetHitOpts...)
-		o.ObserveInt64(requestsCounter, uint64ToInt64(st.GetMisses), reqGetMissOpts...)
-		o.ObserveInt64(requestsCounter, uint64ToInt64(st.PeekHits), reqPeekHitOpts...)
-		o.ObserveInt64(requestsCounter, uint64ToInt64(st.PeekMisses), reqPeekMissOpts...)
-
-		// 2. lru.cache.evictions
-		o.ObserveInt64(evictionsCounter, uint64ToInt64(st.EvictionsCapacity), reasonCapacityOpts...)
-		o.ObserveInt64(evictionsCounter, uint64ToInt64(st.EvictionsPressure), reasonPressureOpts...)
-		o.ObserveInt64(evictionsCounter, uint64ToInt64(st.EvictionsDeleted), reasonDeletedOpts...)
-		o.ObserveInt64(evictionsCounter, uint64ToInt64(st.EvictionsReplaced), reasonReplacedOpts...)
-
-		// 3. lru.cache.evicted_weight
-		o.ObserveInt64(evictedWeightCounter, uint64ToInt64(st.EvictedWeightCapacity), reasonCapacityOpts...)
-		o.ObserveInt64(evictedWeightCounter, uint64ToInt64(st.EvictedWeightPressure), reasonPressureOpts...)
-		o.ObserveInt64(evictedWeightCounter, uint64ToInt64(st.EvictedWeightDeleted), reasonDeletedOpts...)
-		o.ObserveInt64(evictedWeightCounter, uint64ToInt64(st.EvictedWeightReplaced), reasonReplacedOpts...)
-
-		// 4–7. Capacity & entry gauges
-		o.ObserveInt64(sizeGauge, uint64ToInt64(st.CurrentSize), baseOpts...)
-		o.ObserveInt64(maxSizeGauge, uint64ToInt64(st.MaxSize), baseOpts...)
-		o.ObserveInt64(entriesGauge, int64(st.Len), baseOpts...)
-		o.ObserveInt64(zeroWeightEntriesGauge, int64(st.ZeroSizeCount), baseOpts...)
-
-		// 8. lru.cache.mutations
-		o.ObserveInt64(mutationsCounter, uint64ToInt64(st.PutInserted), mutPutInsertedOpts...)
-		o.ObserveInt64(mutationsCounter, uint64ToInt64(st.PutUpdated), mutPutUpdatedOpts...)
-		o.ObserveInt64(mutationsCounter, uint64ToInt64(st.PutRejectedOversized), mutPutRejectedOversizedOpts...)
-		o.ObserveInt64(mutationsCounter, uint64ToInt64(st.ReplaceUpdated), mutReplaceUpdatedOpts...)
-		o.ObserveInt64(mutationsCounter, uint64ToInt64(st.ReplaceNotFound), mutReplaceNotFoundOpts...)
-		o.ObserveInt64(mutationsCounter, uint64ToInt64(st.ReplaceSelfEvicted), mutReplaceSelfEvictedOpts...)
-		o.ObserveInt64(mutationsCounter, uint64ToInt64(st.DeleteDeleted), mutDeleteDeletedOpts...)
-		o.ObserveInt64(mutationsCounter, uint64ToInt64(st.DeleteNotFound), mutDeleteNotFoundOpts...)
-		o.ObserveInt64(mutationsCounter, uint64ToInt64(st.DeletePrefixExecuted), mutDeletePrefixExecutedOpts...)
-
-		// 9. lru.cache.memory_pressure
-		o.ObserveFloat64(memoryPressureGauge, st.MemoryPressure, baseOpts...)
-
-		// 10. lru.cache.compactions
-		o.ObserveInt64(compactionsCounter, uint64ToInt64(st.CompactionsExplicit), compactExplicitOpts...)
-		o.ObserveInt64(compactionsCounter, uint64ToInt64(st.CompactionsPressureTier1), compactTier1Opts...)
-		o.ObserveInt64(compactionsCounter, uint64ToInt64(st.CompactionsPressureTier2), compactTier2Opts...)
-		o.ObserveInt64(compactionsCounter, uint64ToInt64(st.CompactionsAutoSlack), compactAutoSlackOpts...)
-
-		// 11. lru.cache.pressure_sheds
-		o.ObserveInt64(pressureShedsCounter, uint64ToInt64(st.PressureShedsInline), shedInlineOpts...)
-		o.ObserveInt64(pressureShedsCounter, uint64ToInt64(st.PressureShedsExplicit), shedExplicitOpts...)
-
-		// 12–14. Reclamation epoch & structural watermark gauges
-		o.ObserveInt64(reclaimEpochsCounter, uint64ToInt64(st.ReclaimEpoch), baseOpts...)
-		o.ObserveInt64(deletedSinceCompactGauge, int64(st.DeletedSinceCompact), baseOpts...)
-		o.ObserveInt64(peakEntriesGauge, int64(st.PeakEntryLen), baseOpts...)
-
-		// 15–16. ArenaRadixCache-only instruments
-		if isArena {
-			o.ObserveInt64(arenaNodesGauge, int64(st.ArenaLiveNodes), arenaLiveOpts...)
-			o.ObserveInt64(arenaNodesGauge, int64(st.ArenaFreeNodes), arenaFreeOpts...)
-			o.ObserveInt64(arenaNodesGauge, int64(st.ArenaUnallocatedCap), arenaUnallocatedCapOpts...)
-			o.ObserveInt64(arenaHashFallbacksCounter, uint64ToInt64(st.ArenaHashFallbacks), baseOpts...)
-		}
-
+		inst.observe(o, cache.Stats(), &optSets, isArena)
 		return nil
-	}, observables...)
+	}, inst.observables...)
 	if err != nil {
 		return nil, err
 	}

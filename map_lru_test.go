@@ -84,6 +84,23 @@ func TestMapCache_PutZeroAndNilSliceValue(t *testing.T) {
 	assert.Nil(t, val)
 }
 
+func TestMapCache_PutEmptyKey(t *testing.T) {
+	// Arrange
+	cache := setupCacheTest(t)
+
+	// Act
+	evicted, err := cache.Put("", testData{value: 42, dataSize: 10})
+
+	// Assert
+	require.NoError(t, err)
+	assertEvictedValues(t, evicted, nil)
+	val, ok := cache.Get("")
+	assert.True(t, ok)
+	assert.Equal(t, testData{value: 42, dataSize: 10}, val)
+	_, ok = cache.Get("taco")
+	assert.False(t, ok)
+}
+
 func TestMapCache_GetUnknownKey(t *testing.T) {
 	// Arrange
 	cache := setupCacheTest(t)
@@ -487,6 +504,26 @@ func TestMapCache_ReplaceNotChangeOrder(t *testing.T) {
 	// Assert
 	require.NoError(t, err)
 	assertEvictedValues(t, evicted, []int64{7})
+}
+
+func TestMapCache_ReplaceGrowToExactMaxSize(t *testing.T) {
+	// Arrange
+	const maxSize = 100
+	const initialSize = 50
+	const sizeDelta = 50 // New total size will be 50 + 50 = 100 (exactly at maxSize)
+
+	cache := NewMapCache[testData](maxSize, WithInvariantChecking(true), testDataWeigher)
+	_, err := cache.Put("file.txt", testData{value: 1, dataSize: initialSize})
+	require.NoError(t, err)
+
+	// Act: Grow entry via Replace to exact maxSize
+	err = cache.Replace("file.txt", testData{value: 2, dataSize: initialSize + sizeDelta})
+
+	// Assert
+	require.NoError(t, err)
+	val, ok := cache.Get("file.txt")
+	assert.True(t, ok)
+	assert.Equal(t, testData{value: 2, dataSize: initialSize + sizeDelta}, val)
 }
 
 func TestMapCache_Peek_WhenKeyPresent(t *testing.T) {

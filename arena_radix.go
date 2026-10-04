@@ -362,45 +362,38 @@ func (c *arenaRadix[V]) getNodeKey(key string) (uint32, bool) {
 	return c.lookupNodeKeyWithHash(key, hashString(key))
 }
 
-// lookupNodeKeyWithHash finds a value-bearing node index for key using a precomputed FNV-1a hash
-// without mutating c.nodeMap.
-func (c *arenaRadix[V]) lookupNodeKeyWithHash(key string, keyHash uint64) (uint32, bool) {
-	nodeID, ok := c.nodeMap[keyHash]
+func (c *arenaRadix[V]) lookupOrWalkNodeKey(key string, keyHash uint64) (nodeID uint32, walked, found bool) {
+	id, ok := c.nodeMap[keyHash]
 	if ok {
-		if nodeID < uint32(len(c.nodes)) && c.nodes[nodeID].hasValue && c.verifyKey(nodeID, key) {
-			return nodeID, true
+		if id < uint32(len(c.nodes)) && c.nodes[id].hasValue && c.verifyKey(id, key) {
+			return id, false, true
 		}
 	} else if len(c.nodeMap) == c.len {
 		// By Invariant 6 and the Pigeonhole Principle, when len(c.nodeMap) == c.len,
 		// there is an exact 1:1 bijection between c.nodeMap and all live value-bearing nodes,
 		// so a map miss is a guaranteed cache miss.
-		return nilNode, false
+		return nilNode, false, false
 	}
 	c.arenaHashFallbacks.Add(1)
-	return c.findNodeByTrieWalk(key)
+	curr, ok := c.findNodeByTrieWalk(key)
+	return curr, true, ok
+}
+
+// lookupNodeKeyWithHash finds a value-bearing node index for key using a precomputed FNV-1a hash
+// without mutating c.nodeMap.
+func (c *arenaRadix[V]) lookupNodeKeyWithHash(key string, keyHash uint64) (uint32, bool) {
+	nodeID, _, found := c.lookupOrWalkNodeKey(key, keyHash)
+	return nodeID, found
 }
 
 // getNodeKeyWithHash finds a value-bearing node index for key under exclusive write lock,
 // healing c.nodeMap[keyHash] if resolved via the slow-path trie walk.
 func (c *arenaRadix[V]) getNodeKeyWithHash(key string, keyHash uint64) (uint32, bool) {
-	nodeID, ok := c.nodeMap[keyHash]
-	if ok {
-		if nodeID < uint32(len(c.nodes)) && c.nodes[nodeID].hasValue && c.verifyKey(nodeID, key) {
-			return nodeID, true
-		}
-	} else if len(c.nodeMap) == c.len {
-		// By Invariant 6 and the Pigeonhole Principle, when len(c.nodeMap) == c.len,
-		// there is an exact 1:1 bijection between c.nodeMap and all live value-bearing nodes,
-		// so a map miss is a guaranteed cache miss.
-		return nilNode, false
+	nodeID, walked, found := c.lookupOrWalkNodeKey(key, keyHash)
+	if walked && found {
+		c.nodeMap[keyHash] = nodeID
 	}
-
-	c.arenaHashFallbacks.Add(1)
-	curr, found := c.findNodeByTrieWalk(key)
-	if found {
-		c.nodeMap[keyHash] = curr
-	}
-	return curr, found
+	return nodeID, found
 }
 
 // deleteNode clears the value at nodeID and compresses the parent path if needed.
@@ -580,7 +573,7 @@ func (c *arenaRadix[V]) clearEmptyArenaStateLocked() {
 	c.tail = nilNode
 	c.currentSize = 0
 	c.len = 0
-	if c.nodeMap != nil && c.peakEntryLen <= 8 && c.deletedSinceCompact < 64 {
+	if c.nodeMap != nil && c.peakEntryLen <= minPeakSlackEntries && c.deletedSinceCompact < minChurnCompactDeletes {
 		clear(c.nodeMap)
 	} else {
 		c.nodeMap = make(map[uint64]uint32)
@@ -605,10 +598,33 @@ func (c *arenaRadix[V]) shouldAutoCompactLocked(protectedNodeID uint32) bool {
 	if protectedNodeID == nilNode {
 		return c.isDirtyLocked()
 	}
-	if c.freeHead != nilNode && c.peakEntryLen > 8 && len(c.nodes) > 8 && c.freeCount >= 2 && uint64(c.freeCount)*4 >= uint64(len(c.nodes)) {
+	if c.freeHead != nilNode && c.peakEntryLen > minPeakSlackEntries && len(c.nodes) > minPeakSlackEntries && c.freeCount >= 2 && uint64(c.freeCount)*slackQuarterMultiplier >= uint64(len(c.nodes)) {
 		return true
 	}
 	return c.shouldAutoCompactEntryCounts(c.nodeMapDirty, false, c.len)
+}
+
+func (c *arenaRadix[V]) compactContiguousLocked() bool {
+	if len(c.nodes) == cap(c.nodes) && !c.nodeMapDirty {
+		return false
+	}
+	if len(c.nodes) < cap(c.nodes) {
+		newNodes := make([]arenaRadixNode[V], len(c.nodes))
+		copy(newNodes, c.nodes)
+		c.nodes = newNodes
+	}
+	if c.nodeMapDirty {
+		newNodeMap := make(map[uint64]uint32, c.len)
+		for id := range uint32(len(c.nodes)) {
+			if c.nodes[id].hasValue {
+				newNodeMap[c.hashNodeKey(id)] = id
+			}
+		}
+		c.nodeMap = newNodeMap
+		c.nodeMapDirty = false
+	}
+	c.onCompacted(c.len)
+	return true
 }
 
 // compactDataStructuresLocked performs the physical slice and map compaction without updating
@@ -617,26 +633,7 @@ func (c *arenaRadix[V]) shouldAutoCompactLocked(protectedNodeID uint32) bool {
 func (c *arenaRadix[V]) compactDataStructuresLocked() bool {
 	// Fast-path: when no nodes are on the free-list, node indices are already contiguous [0..len-1].
 	if c.freeHead == nilNode {
-		if len(c.nodes) == cap(c.nodes) && !c.nodeMapDirty {
-			return false
-		}
-		if len(c.nodes) < cap(c.nodes) {
-			newNodes := make([]arenaRadixNode[V], len(c.nodes))
-			copy(newNodes, c.nodes)
-			c.nodes = newNodes
-		}
-		if c.nodeMapDirty {
-			newNodeMap := make(map[uint64]uint32, c.len)
-			for id := range uint32(len(c.nodes)) {
-				if c.nodes[id].hasValue {
-					newNodeMap[c.hashNodeKey(id)] = id
-				}
-			}
-			c.nodeMap = newNodeMap
-			c.nodeMapDirty = false
-		}
-		c.onCompacted(c.len)
-		return true
+		return c.compactContiguousLocked()
 	}
 
 	oldLen := uint32(len(c.nodes))
@@ -710,6 +707,31 @@ func (c *arenaRadix[V]) compactLocked() {
 	}
 }
 
+func (c *arenaRadix[V]) completeShedAndCompactLocked(evictedCount int, retention float64, unadjusted bool, unprotectedZeroTarget, targetLen int, autoCompactID uint32) {
+	isBackground := autoCompactID == nilNode
+	if evictedCount > 0 {
+		c.recordPressureShed(isBackground)
+		if c.len == 0 {
+			if c.shouldAutoCompactEntryCounts(true, isBackground, 0) || c.freeCount >= minChurnCompactDeletes {
+				c.compactionsPressureTier2++
+			}
+			c.resetEmptyArenaLocked()
+			return
+		}
+		c.updateZeroWatermarkAfterShed(retention, c.len, unadjusted, unprotectedZeroTarget, targetLen)
+	}
+	compacted := false
+	if c.shouldAutoCompactLocked(autoCompactID) {
+		compacted = c.compactDataStructuresLocked()
+		if compacted {
+			c.compactionsPressureTier2++
+		}
+	}
+	if evictedCount > 0 || compacted {
+		c.markReclaimedLocked()
+	}
+}
+
 // shedAndCompactLocked evicts least-recently-used entries strictly from c.tail in a single O(N) pass
 // until c.currentSize <= targetSize (and proportionally sheds zero-size entries down to targetZeroCount),
 // protecting protectedNodeID only when it resides at the MRU head (c.head),
@@ -730,66 +752,21 @@ func (c *arenaRadix[V]) shedAndCompactLocked(targetSize uint64, retention float6
 
 	needFullFlush := retention == 0.0
 	var evicted []V
-	victimID := c.tail
-	for victimID != nilNode {
-		needByteShed := c.currentSize > effectiveTarget || needFullFlush
-		needZeroShed := !needFullFlush && c.zeroSizeCount > targetZeroCount && c.len > targetLen
+	for victimID := c.tail; victimID != nilNode; {
+		needByteShed, needZeroShed := c.shouldContinueShedding(c.currentSize, effectiveTarget, needFullFlush, targetZeroCount, c.len, targetLen)
 		if !needByteShed && !needZeroShed {
 			break
 		}
-		switch {
-		case needFullFlush || (needByteShed && c.zeroSizeCount > targetZeroCount):
-			for victimID != nilNode && victimID == protectedNodeID {
-				victimID = c.nodes[victimID].prev
-			}
-		case needByteShed:
-			for victimID != nilNode && (victimID == protectedNodeID || c.nodes[victimID].size == 0) {
-				victimID = c.nodes[victimID].prev
-			}
-		default:
-			for victimID != nilNode && (victimID == protectedNodeID || c.nodes[victimID].size > 0) {
-				victimID = c.nodes[victimID].prev
-			}
-		}
-		if victimID == nilNode {
-			break
-		}
 		nextVictimID := c.nodes[victimID].prev
-		if val, ok := c.eraseInternal(victimID, EvictionReasonPressure); ok {
-			evicted = append(evicted, val)
+		if c.shouldEvictShedVictim(victimID == protectedNodeID, c.nodes[victimID].size, needFullFlush, needByteShed, targetZeroCount) {
+			if val, ok := c.eraseInternal(victimID, EvictionReasonPressure); ok {
+				evicted = append(evicted, val)
+			}
 		}
 		victimID = nextVictimID
 	}
 
-	if len(evicted) > 0 {
-		if autoCompactID == nilNode {
-			c.pressureShedsExplicit++
-		} else {
-			c.pressureShedsInline++
-		}
-	}
-
-	if len(evicted) > 0 && c.len == 0 {
-		if c.shouldAutoCompactEntryCounts(true, autoCompactID == nilNode, 0) || c.freeCount >= 64 {
-			c.compactionsPressureTier2++
-		}
-		c.resetEmptyArenaLocked()
-		return evicted
-	}
-
-	if len(evicted) > 0 {
-		c.updateZeroWatermarkAfterShed(retention, c.len, !hasProtected || effectiveTarget <= targetSize, unprotectedZeroTarget, targetLen)
-	}
-	compacted := false
-	if c.shouldAutoCompactLocked(autoCompactID) {
-		compacted = c.compactDataStructuresLocked()
-		if compacted {
-			c.compactionsPressureTier2++
-		}
-	}
-	if len(evicted) > 0 || compacted {
-		c.markReclaimedLocked()
-	}
+	c.completeShedAndCompactLocked(len(evicted), retention, !hasProtected || effectiveTarget <= targetSize, unprotectedZeroTarget, targetLen, autoCompactID)
 	return evicted
 }
 
@@ -803,21 +780,15 @@ func (c *arenaRadix[V]) maybeReclaimUnderPressureLocked(pressure float64, protec
 	if c.isSamplingGoroutine() {
 		return nil
 	}
-	var evicted []V
 	if pressure >= c.options.EvictionThreshold {
 		retention := c.options.EvictionRetentionRatio
 		targetSize := computeTargetSize(c.maxSize, retention)
-		evicted = c.shedAndCompactLocked(targetSize, retention, protectedNodeID)
-	} else {
-		c.resetZeroWatermarkBelowTier2(pressure)
-		if pressure >= c.options.CompactionThreshold {
-			if c.shouldAutoCompactLocked(protectedNodeID) {
-				if c.compactDataStructuresLocked() {
-					c.compactionsPressureTier1++
-					c.markReclaimedLocked()
-				}
-			}
-		}
+		return c.shedAndCompactLocked(targetSize, retention, protectedNodeID)
 	}
-	return evicted
+	c.resetZeroWatermarkBelowTier2(pressure)
+	if pressure >= c.options.CompactionThreshold && c.shouldAutoCompactLocked(protectedNodeID) && c.compactDataStructuresLocked() {
+		c.compactionsPressureTier1++
+		c.markReclaimedLocked()
+	}
+	return nil
 }

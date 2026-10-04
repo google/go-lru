@@ -142,18 +142,36 @@ func (c *radixCache[V]) reconstructKey(node *radixNode[V]) string {
 	return b.String()
 }
 
-func (c *radixCache[V]) checkInvariants() {
-	// INVARIANT 1: maxSize > 0
-	if c.maxSize == 0 {
-		panic("radixCache invariant violation: maxSize must be greater than 0")
+func (c *radixCache[V]) checkLRUNodeLinkInvariants(curr, prevNode *radixNode[V]) {
+	if !curr.hasValue {
+		panic(fmt.Sprintf("radixCache invariant violation: unexpected hasValue=false in LRU list for prefix '%s'", curr.prefix))
 	}
-
-	// INVARIANT 2: currentSize <= maxSize
-	if c.currentSize > c.maxSize {
-		panic(fmt.Sprintf("radixCache invariant violation: currentSize %d exceeds maxSize %d", c.currentSize, c.maxSize))
+	if curr.prev != prevNode {
+		panic(fmt.Sprintf("radixCache invariant violation: corrupt prev pointer in LRU list for prefix '%s'", curr.prefix))
 	}
+	if prevNode == nil {
+		if c.head != curr {
+			panic("radixCache invariant violation: head mismatch in LRU list")
+		}
+	} else if prevNode.next != curr {
+		panic(fmt.Sprintf("radixCache invariant violation: corrupt next pointer in LRU list for prefix '%s'", prevNode.prefix))
+	}
+	if curr.next == nil && c.tail != curr {
+		panic("radixCache invariant violation: tail mismatch in LRU list")
+	}
+}
 
-	// INVARIANT 3: LRU list validation
+func (c *radixCache[V]) checkLRUEndpointsInvariants() {
+	if c.len == 0 {
+		if c.head != nil || c.tail != nil {
+			panic("radixCache invariant violation: head or tail is non-nil when len is 0")
+		}
+	} else if c.head == nil || c.tail == nil {
+		panic("radixCache invariant violation: head or tail is nil when len > 0")
+	}
+}
+
+func (c *radixCache[V]) checkLRUListInvariants() {
 	lruCount := 0
 	zeroCount := 0
 	var sumSize uint64
@@ -168,30 +186,7 @@ func (c *radixCache[V]) checkInvariants() {
 		if curr.size == 0 {
 			zeroCount++
 		}
-		if !curr.hasValue {
-			panic(fmt.Sprintf("radixCache invariant violation: unexpected hasValue=false in LRU list for prefix '%s'", curr.prefix))
-		}
-
-		// Bidirectional link validation
-		if curr.prev != prevNode {
-			panic(fmt.Sprintf("radixCache invariant violation: corrupt prev pointer in LRU list for prefix '%s'", curr.prefix))
-		}
-		if prevNode == nil {
-			if c.head != curr {
-				panic("radixCache invariant violation: head mismatch in LRU list")
-			}
-		} else {
-			if prevNode.next != curr {
-				panic(fmt.Sprintf("radixCache invariant violation: corrupt next pointer in LRU list for prefix '%s'", prevNode.prefix))
-			}
-		}
-
-		if curr.next == nil {
-			if c.tail != curr {
-				panic("radixCache invariant violation: tail mismatch in LRU list")
-			}
-		}
-
+		c.checkLRUNodeLinkInvariants(curr, prevNode)
 		prevNode = curr
 	}
 
@@ -207,17 +202,10 @@ func (c *radixCache[V]) checkInvariants() {
 		panic(fmt.Sprintf("radixCache: currentSize drift: currentSize=%d sumSize=%d", c.currentSize, sumSize))
 	}
 
-	if c.len == 0 {
-		if c.head != nil || c.tail != nil {
-			panic("radixCache invariant violation: head or tail is non-nil when len is 0")
-		}
-	} else {
-		if c.head == nil || c.tail == nil {
-			panic("radixCache invariant violation: head or tail is nil when len > 0")
-		}
-	}
+	c.checkLRUEndpointsInvariants()
+}
 
-	// INVARIANT 4: Root structure checks
+func (c *radixCache[V]) checkRootInvariants() {
 	if c.root == nil {
 		panic("radixCache invariant violation: root node is nil")
 	}
@@ -230,8 +218,52 @@ func (c *radixCache[V]) checkInvariants() {
 	if c.root.sibling != nil {
 		panic("radixCache invariant violation: root node must not have siblings")
 	}
+}
 
-	// INVARIANT 5: Iterative pre-order traversal using parent/sibling pointers (O(1) space).
+func (c *radixCache[V]) checkTreeNodeInvariants(curr *radixNode[V]) {
+	if curr.hasValue {
+		// A node is verifiably in the LRU list iff it is the head (with nil prev) or its prev's next points back to it.
+		inLRU := (c.head == curr && curr.prev == nil) || (curr.prev != nil && curr.prev.next == curr)
+		if !inLRU {
+			panic(fmt.Sprintf("radixCache invariant violation: node with prefix '%s' has value but is missing from LRU list", curr.prefix))
+		}
+		return
+	}
+	if curr.size != 0 {
+		panic(fmt.Sprintf("radixCache invariant violation: routing node with prefix '%s' has non-zero size %d", curr.prefix, curr.size))
+	}
+	if curr.prev != nil || curr.next != nil || c.head == curr || c.tail == curr {
+		panic(fmt.Sprintf("radixCache invariant violation: routing node with prefix '%s' has non-nil LRU pointers", curr.prefix))
+	}
+	if !isZeroValue(&curr.value) {
+		panic(fmt.Sprintf("radixCache invariant violation: routing node with prefix '%s' retains non-zero value", curr.prefix))
+	}
+}
+
+func (c *radixCache[V]) checkChildrenAndCompactness(curr *radixNode[V]) {
+	// Validate child pointers and sibling ordering
+	var prevSibling *radixNode[V]
+	for ch := curr.child; ch != nil; ch = ch.sibling {
+		if ch.parent != curr {
+			panic(fmt.Sprintf("radixCache invariant violation: child with prefix '%s' has incorrect parent pointer", ch.prefix))
+		}
+		if len(ch.prefix) == 0 {
+			panic("radixCache invariant violation: non-root child node has empty prefix")
+		}
+		if prevSibling != nil && prevSibling.prefix[0] >= ch.prefix[0] {
+			panic(fmt.Sprintf("radixCache invariant violation: siblings not sorted lexicographically ('%s' >= '%s')", prevSibling.prefix, ch.prefix))
+		}
+		prevSibling = ch
+	}
+
+	// Validate tree compactness: non-root routing nodes without a value must have >= 2 children.
+	if curr != c.root && !curr.hasValue && (curr.child == nil || curr.child.sibling == nil) {
+		panic(fmt.Sprintf("radixCache invariant violation: intermediate routing node with prefix '%s' has fewer than 2 children", curr.prefix))
+	}
+}
+
+func (c *radixCache[V]) checkTreeInvariants() {
+	// Iterative pre-order traversal using parent/sibling pointers (O(1) space).
 	// Validates tree integrity, sibling sorted order, parent pointers, compactness,
 	// and 1:1 bijection between value-bearing nodes and LRU list elements.
 	treeCount := 0
@@ -244,44 +276,9 @@ func (c *radixCache[V]) checkInvariants() {
 				panic("radixCache invariant violation: treeSumSize uint64 overflow")
 			}
 			treeSumSize += curr.size
-			// A node is verifiably in the LRU list iff it is the head (with nil prev) or its prev's next points back to it.
-			inLRU := (c.head == curr && curr.prev == nil) || (curr.prev != nil && curr.prev.next == curr)
-			if !inLRU {
-				panic(fmt.Sprintf("radixCache invariant violation: node with prefix '%s' has value but is missing from LRU list", curr.prefix))
-			}
-		} else {
-			if curr.size != 0 {
-				panic(fmt.Sprintf("radixCache invariant violation: routing node with prefix '%s' has non-zero size %d", curr.prefix, curr.size))
-			}
-			if curr.prev != nil || curr.next != nil || c.head == curr || c.tail == curr {
-				panic(fmt.Sprintf("radixCache invariant violation: routing node with prefix '%s' has non-nil LRU pointers", curr.prefix))
-			}
-			if !isZeroValue(&curr.value) {
-				panic(fmt.Sprintf("radixCache invariant violation: routing node with prefix '%s' retains non-zero value", curr.prefix))
-			}
 		}
-
-		// Validate child pointers and sibling ordering
-		var prevSibling *radixNode[V]
-		for ch := curr.child; ch != nil; ch = ch.sibling {
-			if ch.parent != curr {
-				panic(fmt.Sprintf("radixCache invariant violation: child with prefix '%s' has incorrect parent pointer", ch.prefix))
-			}
-			if len(ch.prefix) == 0 {
-				panic("radixCache invariant violation: non-root child node has empty prefix")
-			}
-			if prevSibling != nil && prevSibling.prefix[0] >= ch.prefix[0] {
-				panic(fmt.Sprintf("radixCache invariant violation: siblings not sorted lexicographically ('%s' >= '%s')", prevSibling.prefix, ch.prefix))
-			}
-			prevSibling = ch
-		}
-
-		// Validate tree compactness: non-root routing nodes without a value must have >= 2 children.
-		if curr != c.root && !curr.hasValue {
-			if curr.child == nil || curr.child.sibling == nil {
-				panic(fmt.Sprintf("radixCache invariant violation: intermediate routing node with prefix '%s' has fewer than 2 children", curr.prefix))
-			}
-		}
+		c.checkTreeNodeInvariants(curr)
+		c.checkChildrenAndCompactness(curr)
 
 		// Advance to child if present
 		if curr.child != nil {
@@ -306,6 +303,27 @@ func (c *radixCache[V]) checkInvariants() {
 	if treeSumSize != c.currentSize {
 		panic(fmt.Sprintf("radixCache: currentSize drift in tree: currentSize=%d treeSumSize=%d", c.currentSize, treeSumSize))
 	}
+}
+
+func (c *radixCache[V]) checkInvariants() {
+	// INVARIANT 1: maxSize > 0
+	if c.maxSize == 0 {
+		panic("radixCache invariant violation: maxSize must be greater than 0")
+	}
+
+	// INVARIANT 2: currentSize <= maxSize
+	if c.currentSize > c.maxSize {
+		panic(fmt.Sprintf("radixCache invariant violation: currentSize %d exceeds maxSize %d", c.currentSize, c.maxSize))
+	}
+
+	// INVARIANT 3: LRU list validation
+	c.checkLRUListInvariants()
+
+	// INVARIANT 4: Root structure checks
+	c.checkRootInvariants()
+
+	// INVARIANT 5: Tree traversal & bijection checks
+	c.checkTreeInvariants()
 
 	c.checkTelemetryInvariants(c.len)
 }
@@ -683,9 +701,7 @@ func (c *radixCache[V]) finishDeleteReclaimLocked(sizeBefore, sampledEpoch uint6
 			c.recordCompactionByPressure(pressure)
 		}
 		c.clearEmptyTreeStateLocked()
-		if (hadSlack || sizeBefore > 0) && c.reclaimEpoch.Load() == sampledEpoch && c.hasElevatedPressureToInvalidate(pressure) {
-			c.markReclaimedLocked()
-		}
+		c.maybeMarkReclaimed(hadSlack || sizeBefore > 0, sampledEpoch, pressure)
 		return
 	}
 	reclaimedSingleSurvivor := false
@@ -696,18 +712,12 @@ func (c *radixCache[V]) finishDeleteReclaimLocked(sizeBefore, sampledEpoch uint6
 		reclaimedSingleSurvivor = true
 	}
 	c.maybeReclaimUnderPressureLocked(pressure, nil, false)
-	if (reclaimedSingleSurvivor || c.currentSize < sizeBefore) && c.reclaimEpoch.Load() == sampledEpoch && c.hasElevatedPressureToInvalidate(pressure) {
-		c.markReclaimedLocked()
-	}
+	c.maybeMarkReclaimed(reclaimedSingleSurvivor || c.currentSize < sizeBefore, sampledEpoch, pressure)
 }
 
 func (c *radixCache[V]) finishMutationReclaimLocked(evictedValues []V, protectedNode *radixNode[V], reclaimedPre, compactedPre bool, sizeBefore, sampledEpoch uint64, pressure float64) []V {
 	evictedByPressure := c.maybeReclaimUnderPressureLocked(pressure, protectedNode, false)
-	if len(evictedValues) == 0 {
-		evictedValues = evictedByPressure
-	} else if len(evictedByPressure) > 0 {
-		evictedValues = append(evictedValues, evictedByPressure...)
-	}
+	evictedValues = appendEvicted(evictedValues, evictedByPressure)
 	netByteReduced := c.currentSize < sizeBefore
 	if c.shouldCompactAfterMutation(reclaimedPre, netByteReduced, c.deletedSinceCompact > 0, pressure) {
 		if c.compactDataStructuresLocked() && !compactedPre {
@@ -844,6 +854,36 @@ func (c *radixCache[V]) Peek(key string) (value V, ok bool) {
 	return node.value, true
 }
 
+func (c *radixCache[V]) canFitGrowthLocked(node *radixNode[V], newSize, sizeDelta, avail uint64) bool {
+	if sizeDelta <= avail {
+		return true
+	}
+	maxNewer := c.maxSize - newSize
+	var newerSize uint64
+	headCurr := c.head
+	tailCurr := c.tail
+	for {
+		if headCurr == node {
+			return newerSize <= maxNewer
+		}
+		if headCurr != nil {
+			newerSize += headCurr.size
+			if newerSize > maxNewer {
+				return false
+			}
+			headCurr = headCurr.next
+		}
+		if tailCurr == nil || tailCurr == node {
+			return sizeDelta <= avail
+		}
+		avail += tailCurr.size
+		if sizeDelta <= avail {
+			return true
+		}
+		tailCurr = tailCurr.prev
+	}
+}
+
 // Replace updates the value of an existing key and recomputes its weight
 // without modifying its LRU order.
 // If the entry's new weight exceeds maxSize (or cannot fit alongside entries more recent than node),
@@ -875,79 +915,36 @@ func (c *radixCache[V]) Replace(key string, value V) error {
 
 	sizeBefore := c.currentSize
 	evictedAny := false
-	reclaimedPreUpdate := false
 
 	switch {
 	case newSize > oldSize:
 		sizeDelta := newSize - oldSize
-		avail := c.maxSize - c.currentSize
-		if sizeDelta > avail {
-			maxNewer := c.maxSize - newSize
-			var newerSize uint64
-			headCurr := c.head
-			tailCurr := c.tail
-			canFit := false
-			for {
-				if headCurr == node {
-					canFit = newerSize <= maxNewer
-					break
-				}
-				if headCurr != nil {
-					newerSize += headCurr.size
-					if newerSize > maxNewer {
-						canFit = false
-						break
-					}
-					headCurr = headCurr.next
-				}
-				if tailCurr == nil || tailCurr == node {
-					canFit = sizeDelta <= avail
-					break
-				}
-				avail += tailCurr.size
-				if sizeDelta <= avail {
-					canFit = true
-					break
-				}
-				tailCurr = tailCurr.prev
-			}
-			if !canFit {
-				c.replaceSelfEvicted++
-				c.eraseInternalWithKey(node, key, EvictionReasonCapacity)
-				c.finishDeleteReclaimLocked(sizeBefore, sampledEpoch, pressure)
-				return nil
-			}
+		if !c.canFitGrowthLocked(node, newSize, sizeDelta, c.maxSize-c.currentSize) {
+			c.replaceSelfEvicted++
+			c.eraseInternalWithKey(node, key, EvictionReasonCapacity)
+			c.finishDeleteReclaimLocked(sizeBefore, sampledEpoch, pressure)
+			return nil
 		}
 
-		for sizeDelta > c.maxSize-c.currentSize && c.tail != nil {
-			if c.tail == node {
-				break
-			}
+		for sizeDelta > c.maxSize-c.currentSize && c.tail != nil && c.tail != node {
 			c.evictOne()
 			evictedAny = true
 		}
 
 		c.onEntrySizeUpdated(oldSize, newSize)
-		node.value = value
-		node.hasValue = true
-		node.size = newSize
 		c.currentSize += sizeDelta
 	case newSize < oldSize:
-		sizeDiff := oldSize - newSize
 		c.onEntrySizeUpdated(oldSize, newSize)
-		node.value = value
-		node.hasValue = true
-		node.size = newSize
-		c.currentSize -= sizeDiff
-	default:
-		node.value = value
-		node.hasValue = true
+		c.currentSize -= oldSize - newSize
 	}
+	node.value = value
+	node.hasValue = true
+	node.size = newSize
 
 	c.replaceUpdated++
 	c.notifyEvict(key, oldValue, oldSize, EvictionReasonReplaced)
 
-	reclaimedPreUpdate = c.shouldReclaimSingleSurvivorOnMutation(c.len, c.deletedSinceCompact > 0, false, evictedAny, c.currentSize, sizeBefore, pressure)
+	reclaimedPreUpdate := c.shouldReclaimSingleSurvivorOnMutation(c.len, c.deletedSinceCompact > 0, false, evictedAny, c.currentSize, sizeBefore, pressure)
 
 	var protectedNode *radixNode[V]
 	if node == c.head && node.hasValue {
@@ -958,37 +955,35 @@ func (c *radixCache[V]) Replace(key string, value V) error {
 	return nil
 }
 
+func (c *radixCache[V]) deleteAllPrefixLocked() {
+	c.deletePrefixExecuted++
+	hadEntries := c.len > 0 || (c.root != nil && (c.root.hasValue || c.root.child != nil))
+	hadDirtySlack := c.deletedSinceCompact > 0 || c.peakEntryLen > minPeakSlackEntries
+	if !hadEntries && !hadDirtySlack && c.peakEntryLen == 0 {
+		return
+	}
+	hadReclaimable := c.currentSize > 0 || hadDirtySlack
+	if c.root != nil {
+		c.sweepAndUnlink(c.root)
+	} else {
+		c.root = &radixNode[V]{}
+	}
+	c.head = nil
+	c.tail = nil
+	c.currentSize = 0
+	c.len = 0
+	hadCompactionSlack := c.hasEmptyDeleteSlack(false)
+	c.clearEmptyTreeStateLocked()
+	c.finishClearAllLocked(hadCompactionSlack, hadReclaimable)
+}
+
 // DeletePrefix deletes all entries whose keys start with prefix.
 // Prunes subtrees in O(prefix_length + subtree_size) time and sweeps detached nodes.
 func (c *radixCache[V]) DeletePrefix(prefix string) {
 	if prefix == "" {
 		c.mu.Lock()
 		defer c.unlock()
-
-		c.deletePrefixExecuted++
-		hadEntries := c.len > 0 || (c.root != nil && (c.root.hasValue || c.root.child != nil))
-		hadDirtySlack := c.deletedSinceCompact > 0 || c.peakEntryLen > 8
-		if !hadEntries && !hadDirtySlack && c.peakEntryLen == 0 {
-			return
-		}
-		hadReclaimable := c.currentSize > 0 || hadDirtySlack
-		if c.root != nil {
-			c.sweepAndUnlink(c.root)
-		} else {
-			c.root = &radixNode[V]{}
-		}
-		c.head = nil
-		c.tail = nil
-		c.currentSize = 0
-		c.len = 0
-		hadCompactionSlack := c.hasEmptyDeleteSlack(false)
-		c.clearEmptyTreeStateLocked()
-		if hadCompactionSlack {
-			c.compactionsAutoSlack++
-		}
-		if hadReclaimable && c.hasElevatedPressureToInvalidate(0.0) {
-			c.markReclaimedLocked()
-		}
+		c.deleteAllPrefixLocked()
 		return
 	}
 
@@ -1109,6 +1104,30 @@ func (c *radixCache[V]) shouldAutoCompactLocked(isBackground bool) bool {
 	return c.shouldAutoCompactEntryCounts(c.deletedSinceCompact > 0, isBackground, c.len)
 }
 
+func (c *radixCache[V]) completeShedAndCompactLocked(evictedCount int, retention float64, unadjusted bool, unprotectedZeroTarget, targetLen int, isBackground bool) {
+	if evictedCount > 0 {
+		c.recordPressureShed(isBackground)
+		if c.len == 0 {
+			if c.shouldAutoCompactEntryCounts(true, isBackground, 0) {
+				c.compactionsPressureTier2++
+			}
+			c.resetEmptyTreeLocked()
+			return
+		}
+		c.updateZeroWatermarkAfterShed(retention, c.len, unadjusted, unprotectedZeroTarget, targetLen)
+	}
+	compacted := false
+	if c.shouldAutoCompactLocked(isBackground) {
+		compacted = c.compactDataStructuresLocked()
+		if compacted {
+			c.compactionsPressureTier2++
+		}
+	}
+	if evictedCount > 0 || compacted {
+		c.markReclaimedLocked()
+	}
+}
+
 func (c *radixCache[V]) shedAndCompactLocked(targetSize uint64, retention float64, protectedNode *radixNode[V], isBackground bool) []V {
 	if protectedNode != nil && (protectedNode != c.head || protectedNode.prev != nil || !protectedNode.hasValue) {
 		protectedNode = nil
@@ -1123,66 +1142,21 @@ func (c *radixCache[V]) shedAndCompactLocked(targetSize uint64, retention float6
 
 	needFullFlush := retention == 0.0
 	var evicted []V
-	victim := c.tail
-	for victim != nil {
-		needByteShed := c.currentSize > effectiveTarget || needFullFlush
-		needZeroShed := !needFullFlush && c.zeroSizeCount > targetZeroCount && c.len > targetLen
+	for victim := c.tail; victim != nil; {
+		needByteShed, needZeroShed := c.shouldContinueShedding(c.currentSize, effectiveTarget, needFullFlush, targetZeroCount, c.len, targetLen)
 		if !needByteShed && !needZeroShed {
 			break
 		}
-		switch {
-		case needFullFlush || (needByteShed && c.zeroSizeCount > targetZeroCount):
-			for victim != nil && victim == protectedNode {
-				victim = victim.prev
-			}
-		case needByteShed:
-			for victim != nil && (victim == protectedNode || victim.size == 0) {
-				victim = victim.prev
-			}
-		default:
-			for victim != nil && (victim == protectedNode || victim.size > 0) {
-				victim = victim.prev
-			}
-		}
-		if victim == nil {
-			break
-		}
 		nextVictim := victim.prev
-		if val, ok := c.eraseInternal(victim, EvictionReasonPressure); ok {
-			evicted = append(evicted, val)
+		if c.shouldEvictShedVictim(victim == protectedNode, victim.size, needFullFlush, needByteShed, targetZeroCount) {
+			if val, ok := c.eraseInternal(victim, EvictionReasonPressure); ok {
+				evicted = append(evicted, val)
+			}
 		}
 		victim = nextVictim
 	}
 
-	if len(evicted) > 0 {
-		if isBackground {
-			c.pressureShedsExplicit++
-		} else {
-			c.pressureShedsInline++
-		}
-	}
-
-	if len(evicted) > 0 && c.len == 0 {
-		if c.shouldAutoCompactEntryCounts(true, isBackground, 0) {
-			c.compactionsPressureTier2++
-		}
-		c.resetEmptyTreeLocked()
-		return evicted
-	}
-
-	if len(evicted) > 0 {
-		c.updateZeroWatermarkAfterShed(retention, c.len, !hasProtected || effectiveTarget <= targetSize, unprotectedZeroTarget, targetLen)
-	}
-	compacted := false
-	if c.shouldAutoCompactLocked(isBackground) {
-		compacted = c.compactDataStructuresLocked()
-		if compacted {
-			c.compactionsPressureTier2++
-		}
-	}
-	if len(evicted) > 0 || compacted {
-		c.markReclaimedLocked()
-	}
+	c.completeShedAndCompactLocked(len(evicted), retention, !hasProtected || effectiveTarget <= targetSize, unprotectedZeroTarget, targetLen, isBackground)
 	return evicted
 }
 
@@ -1190,23 +1164,17 @@ func (c *radixCache[V]) maybeReclaimUnderPressureLocked(pressure float64, protec
 	if c.isSamplingGoroutine() {
 		return nil
 	}
-	var evicted []V
 	if pressure >= c.options.EvictionThreshold {
 		retention := c.options.EvictionRetentionRatio
 		targetSize := computeTargetSize(c.maxSize, retention)
-		evicted = c.shedAndCompactLocked(targetSize, retention, protectedNode, isBackground)
-	} else {
-		c.resetZeroWatermarkBelowTier2(pressure)
-		if pressure >= c.options.CompactionThreshold {
-			if c.shouldAutoCompactLocked(isBackground) {
-				if c.compactDataStructuresLocked() {
-					c.compactionsPressureTier1++
-					c.markReclaimedLocked()
-				}
-			}
-		}
+		return c.shedAndCompactLocked(targetSize, retention, protectedNode, isBackground)
 	}
-	return evicted
+	c.resetZeroWatermarkBelowTier2(pressure)
+	if pressure >= c.options.CompactionThreshold && c.shouldAutoCompactLocked(isBackground) && c.compactDataStructuresLocked() {
+		c.compactionsPressureTier1++
+		c.markReclaimedLocked()
+	}
+	return nil
 }
 
 // EvaluateMemoryPressure samples the configured memory-pressure probe and sheds LRU tail entries

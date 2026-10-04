@@ -653,6 +653,31 @@ func TestRegister_ZeroAllocScrapeCallback(t *testing.T) {
 	assert.Equal(t, 1, obs.float64Calls)
 }
 
+func verifyConcurrentScrape(t *testing.T, reader *sdkmetric.ManualReader, hitSet attribute.Set, prevGetHits int64) int64 {
+	t.Helper()
+	var rm metricdata.ResourceMetrics
+	err := reader.Collect(context.Background(), &rm)
+	assert.NoError(t, err) //nolint:testifylint // wg.Go runs in a child goroutine
+	for _, sm := range rm.ScopeMetrics {
+		for _, m := range sm.Metrics {
+			if m.Name != "lru.cache.requests" {
+				continue
+			}
+			sum, ok := m.Data.(metricdata.Sum[int64])
+			if !ok {
+				continue
+			}
+			for _, dp := range sum.DataPoints {
+				if dp.Attributes.Equals(&hitSet) {
+					assert.GreaterOrEqual(t, dp.Value, prevGetHits)
+					prevGetHits = dp.Value
+				}
+			}
+		}
+	}
+	return prevGetHits
+}
+
 func TestRegister_ConcurrentOperationsAndScrapesUnderRace(t *testing.T) {
 	// Arrange
 	reader := sdkmetric.NewManualReader()
@@ -714,23 +739,7 @@ func TestRegister_ConcurrentOperationsAndScrapesUnderRace(t *testing.T) {
 				attribute.String("result", "hit"),
 			)
 			for range 25 {
-				var rm metricdata.ResourceMetrics
-				err := reader.Collect(context.Background(), &rm)
-				assert.NoError(t, err) //nolint:testifylint // wg.Go runs in a child goroutine
-				for _, sm := range rm.ScopeMetrics {
-					for _, m := range sm.Metrics {
-						if m.Name == "lru.cache.requests" {
-							if sum, ok := m.Data.(metricdata.Sum[int64]); ok {
-								for _, dp := range sum.DataPoints {
-									if dp.Attributes.Equals(&hitSet) {
-										assert.GreaterOrEqual(t, dp.Value, prevGetHits)
-										prevGetHits = dp.Value
-									}
-								}
-							}
-						}
-					}
-				}
+				prevGetHits = verifyConcurrentScrape(t, reader, hitSet, prevGetHits)
 			}
 		})
 	}

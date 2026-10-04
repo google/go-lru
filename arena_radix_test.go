@@ -550,6 +550,26 @@ func TestArenaRadixCache_ReplaceNotChangeOrder(t *testing.T) {
 	assertEvictedValues(t, evicted, []int64{7})
 }
 
+func TestArenaRadixCache_ReplaceGrowToExactMaxSize(t *testing.T) {
+	// Arrange
+	const maxSize = 100
+	const initialSize = 50
+	const sizeDelta = 50 // New total size will be 50 + 50 = 100 (exactly at maxSize)
+
+	cache := NewArenaRadixCache[testData](maxSize, WithInvariantChecking(true), testDataWeigher)
+	_, err := cache.Put("file.txt", testData{value: 1, dataSize: initialSize})
+	require.NoError(t, err)
+
+	// Act: Grow entry via Replace to exact maxSize
+	err = cache.Replace("file.txt", testData{value: 2, dataSize: initialSize + sizeDelta})
+
+	// Assert
+	require.NoError(t, err)
+	val, ok := cache.Get("file.txt")
+	require.True(t, ok)
+	assert.Equal(t, testData{value: 2, dataSize: initialSize + sizeDelta}, val)
+}
+
 func TestArenaRadixCache_Peek(t *testing.T) {
 	// Arrange
 	cache := setupArenaRadixCacheTest(t)

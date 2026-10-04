@@ -35,7 +35,62 @@ func main() {
 	os.Exit(run(os.Args[1:], os.Stdin, os.Stdout, os.Stderr))
 }
 
+type cliOptions struct {
+	candidatePath string
+	baselinePath  string
+	checkTargets  bool
+	targetsPath   string
+	agg           AggregationMode
+	format        string
+	summaryPath   string
+	cfg           ComparisonConfig
+}
+
 func run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
+	opts, ok := parseCLIOptions(args, stderr)
+	if !ok {
+		return exitUsageErr
+	}
+
+	candSuite, err := parseBenchmarkSource(opts.candidatePath, stdin, opts.agg)
+	if err != nil {
+		_, _ = fmt.Fprintf(stderr, "benchcheck: failed to parse candidate %q: %v\n", opts.candidatePath, err)
+		return exitUsageErr
+	}
+
+	targetRep, err := evaluateTargetsIfEnabled(candSuite, opts)
+	if err != nil {
+		_, _ = fmt.Fprintf(stderr, "benchcheck: %v\n", err)
+		return exitUsageErr
+	}
+
+	cmpRep, err := evaluateComparisonIfEnabled(candSuite, stdin, opts)
+	if err != nil {
+		_, _ = fmt.Fprintf(stderr, "benchcheck: %v\n", err)
+		return exitUsageErr
+	}
+
+	markdownReport := FormatMarkdown(candSuite, opts.agg, targetRep, cmpRep)
+	if opts.format == "text" {
+		_, _ = fmt.Fprint(stdout, FormatText(candSuite, opts.agg, targetRep, cmpRep))
+	} else {
+		_, _ = fmt.Fprint(stdout, markdownReport)
+	}
+
+	if opts.summaryPath != "" {
+		if err := appendSummaryFile(opts.summaryPath, markdownReport); err != nil {
+			_, _ = fmt.Fprintf(stderr, "benchcheck: failed to write summary %q: %v\n", opts.summaryPath, err)
+			return exitUsageErr
+		}
+	}
+
+	if !overallPassed(targetRep, cmpRep) {
+		return exitViolation
+	}
+	return exitOK
+}
+
+func parseCLIOptions(args []string, stderr io.Writer) (cliOptions, bool) {
 	fs := flag.NewFlagSet("benchcheck", flag.ContinueOnError)
 	fs.SetOutput(stderr)
 
@@ -73,112 +128,117 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 	fs.StringVar(&summaryPath, "summary", "", "Optional file path (e.g. $GITHUB_STEP_SUMMARY) to append Markdown report to")
 
 	if err := fs.Parse(args); err != nil {
-		return exitUsageErr
+		return cliOptions{}, false
 	}
 
-	candidatePath := firstNonEmpty(candidateFlag, headFlag)
-	baselinePath := firstNonEmpty(baselineFlag, baseFlag)
+	candidatePath, baselinePath, ok := resolveBenchmarkPaths(
+		firstNonEmpty(candidateFlag, headFlag),
+		firstNonEmpty(baselineFlag, baseFlag),
+		fs.Args(),
+		stderr,
+	)
+	if !ok {
+		return cliOptions{}, false
+	}
 
-	posArgs := fs.Args()
-	if candidatePath == "" {
-		switch len(posArgs) {
-		case 1:
-			candidatePath = posArgs[0]
-		case 2:
-			if baselinePath == "" {
-				baselinePath = posArgs[0]
-				candidatePath = posArgs[1]
-			} else {
-				_, _ = fmt.Fprintf(stderr, "benchcheck: unexpected positional arguments %v\n", posArgs)
-				return exitUsageErr
-			}
-		default:
-			if len(posArgs) > 2 {
-				_, _ = fmt.Fprintf(stderr, "benchcheck: too many positional arguments %v\n", posArgs)
-				return exitUsageErr
-			}
+	opts := cliOptions{
+		candidatePath: candidatePath,
+		baselinePath:  baselinePath,
+		checkTargets:  checkTargets,
+		targetsPath:   targetsPath,
+		agg:           AggregationMode(strings.ToLower(strings.TrimSpace(aggStr))),
+		format:        strings.ToLower(strings.TrimSpace(formatStr)),
+		summaryPath:   summaryPath,
+		cfg:           cfg,
+	}
+	if !validateCLIOptions(opts, formatStr, stderr) {
+		return cliOptions{}, false
+	}
+	return opts, true
+}
+
+func resolveBenchmarkPaths(
+	candidatePath, baselinePath string,
+	posArgs []string,
+	stderr io.Writer,
+) (cand, base string, ok bool) {
+	if candidatePath != "" {
+		if len(posArgs) > 0 {
+			_, _ = fmt.Fprintf(stderr, "benchcheck: unexpected positional arguments %v when -head/-candidate is set\n", posArgs)
+			return "", "", false
 		}
-	} else if len(posArgs) > 0 {
-		_, _ = fmt.Fprintf(stderr, "benchcheck: unexpected positional arguments %v when -head/-candidate is set\n", posArgs)
-		return exitUsageErr
+		return candidatePath, baselinePath, true
 	}
 
-	if candidatePath == "" {
+	switch len(posArgs) {
+	case 0:
+		return "", baselinePath, true
+	case 1:
+		return posArgs[0], baselinePath, true
+	case 2:
+		if baselinePath != "" {
+			_, _ = fmt.Fprintf(stderr, "benchcheck: unexpected positional arguments %v\n", posArgs)
+			return "", "", false
+		}
+		return posArgs[1], posArgs[0], true
+	default:
+		_, _ = fmt.Fprintf(stderr, "benchcheck: too many positional arguments %v\n", posArgs)
+		return "", "", false
+	}
+}
+
+func validateCLIOptions(opts cliOptions, rawFormat string, stderr io.Writer) bool {
+	if opts.candidatePath == "" {
 		_, _ = fmt.Fprintln(stderr, "benchcheck: missing required -head/-candidate benchmark file path")
-		return exitUsageErr
+		return false
 	}
-	if !checkTargets && baselinePath == "" {
+	if !opts.checkTargets && opts.baselinePath == "" {
 		_, _ = fmt.Fprintln(stderr, "benchcheck: nothing to verify (-check-targets=false and no -base/-baseline provided)")
-		return exitUsageErr
+		return false
 	}
-
-	format := strings.ToLower(strings.TrimSpace(formatStr))
-	if format != "markdown" && format != "text" {
-		_, _ = fmt.Fprintf(stderr, "benchcheck: unsupported -format %q (expected 'markdown' or 'text')\n", formatStr)
-		return exitUsageErr
+	if opts.format != "markdown" && opts.format != "text" {
+		_, _ = fmt.Fprintf(stderr, "benchcheck: unsupported -format %q (expected 'markdown' or 'text')\n", rawFormat)
+		return false
 	}
-
-	if err := cfg.Validate(); err != nil {
+	if err := opts.cfg.Validate(); err != nil {
 		_, _ = fmt.Fprintf(stderr, "benchcheck: %v\n", err)
-		return exitUsageErr
+		return false
 	}
+	return true
+}
 
-	agg := AggregationMode(strings.ToLower(strings.TrimSpace(aggStr)))
-	candSuite, err := parseBenchmarkSource(candidatePath, stdin, agg)
+func evaluateTargetsIfEnabled(candSuite *Suite, opts cliOptions) (*TargetReport, error) {
+	if !opts.checkTargets {
+		return nil, nil
+	}
+	rules := DefaultTargets()
+	if opts.targetsPath != "" {
+		var err error
+		rules, err = LoadTargets(opts.targetsPath)
+		if err != nil {
+			return nil, err
+		}
+	}
+	targetRep, err := CheckTargets(candSuite, rules, opts.cfg.StrictMissing)
 	if err != nil {
-		_, _ = fmt.Fprintf(stderr, "benchcheck: failed to parse candidate %q: %v\n", candidatePath, err)
-		return exitUsageErr
+		return nil, fmt.Errorf("target check error: %w", err)
 	}
+	return targetRep, nil
+}
 
-	var targetRep *TargetReport
-	if checkTargets {
-		rules := DefaultTargets()
-		if targetsPath != "" {
-			rules, err = LoadTargets(targetsPath)
-			if err != nil {
-				_, _ = fmt.Fprintf(stderr, "benchcheck: %v\n", err)
-				return exitUsageErr
-			}
-		}
-		targetRep, err = CheckTargets(candSuite, rules, cfg.StrictMissing)
-		if err != nil {
-			_, _ = fmt.Fprintf(stderr, "benchcheck: target check error: %v\n", err)
-			return exitUsageErr
-		}
+func evaluateComparisonIfEnabled(candSuite *Suite, stdin io.Reader, opts cliOptions) (*ComparisonReport, error) {
+	if opts.baselinePath == "" {
+		return nil, nil
 	}
-
-	var cmpRep *ComparisonReport
-	if baselinePath != "" {
-		baseSuite, err := parseBenchmarkSource(baselinePath, stdin, agg)
-		if err != nil {
-			_, _ = fmt.Fprintf(stderr, "benchcheck: failed to parse baseline %q: %v\n", baselinePath, err)
-			return exitUsageErr
-		}
-		cmpRep, err = CompareSuites(baseSuite, candSuite, cfg)
-		if err != nil {
-			_, _ = fmt.Fprintf(stderr, "benchcheck: comparison error: %v\n", err)
-			return exitUsageErr
-		}
+	baseSuite, err := parseBenchmarkSource(opts.baselinePath, stdin, opts.agg)
+	if err != nil {
+		return nil, fmt.Errorf("failed to parse baseline %q: %w", opts.baselinePath, err)
 	}
-
-	markdownReport := FormatMarkdown(candSuite, agg, targetRep, cmpRep)
-	if format == "text" {
-		_, _ = fmt.Fprint(stdout, FormatText(candSuite, agg, targetRep, cmpRep))
-	} else {
-		_, _ = fmt.Fprint(stdout, markdownReport)
+	cmpRep, err := CompareSuites(baseSuite, candSuite, opts.cfg)
+	if err != nil {
+		return nil, fmt.Errorf("comparison error: %w", err)
 	}
-
-	if summaryPath != "" {
-		if err := appendSummaryFile(summaryPath, markdownReport); err != nil {
-			_, _ = fmt.Fprintf(stderr, "benchcheck: failed to write summary %q: %v\n", summaryPath, err)
-			return exitUsageErr
-		}
-	}
-
-	if !overallPassed(targetRep, cmpRep) {
-		return exitViolation
-	}
-	return exitOK
+	return cmpRep, nil
 }
 
 func firstNonEmpty(a, b string) string {
