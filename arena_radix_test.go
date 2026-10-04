@@ -2065,3 +2065,39 @@ func TestArenaRadixCache_StatsArenaNodesAndHashFallbacks(t *testing.T) {
 		assert.Equal(t, uint64(5), cCollide.Stats().ArenaHashFallbacks)
 	})
 }
+
+func TestArenaRadixCache_MuCacheLineSeparation(t *testing.T) {
+	// Arrange
+	const cacheLineSize = uintptr(64)
+	c := NewArenaRadixCache[testData](testMaxSize).(*arenaRadix[testData])
+
+	// Act
+	nodesOffset := unsafe.Offsetof(c.nodes)
+	nodesEnd := nodesOffset + unsafe.Sizeof(c.nodes)
+	nodeMapOffset := unsafe.Offsetof(c.nodeMap)
+	rootOffset := unsafe.Offsetof(c.root)
+	headOffset := unsafe.Offsetof(c.head)
+	tailOffset := unsafe.Offsetof(c.tail)
+	lenOffset := unsafe.Offsetof(c.len)
+	onEvictEntryOffset := unsafe.Offsetof(c.onEvictEntry)
+	muOffset := unsafe.Offsetof(c.mu)
+	pressureStateOffset := unsafe.Offsetof(c.pressureState)
+
+	nodesLastCacheLine := (nodesEnd - 1) / cacheLineSize
+	muFirstCacheLine := muOffset / cacheLineSize
+	nodesHeapLastLine := (uintptr(unsafe.Pointer(&c.nodes)) + unsafe.Sizeof(c.nodes) - 1) / cacheLineSize
+	muHeapFirstLine := uintptr(unsafe.Pointer(&c.mu)) / cacheLineSize
+
+	// Assert
+	assert.Greater(t, muOffset, nodesOffset, "mu must be positioned after nodes")
+	assert.Greater(t, muOffset, nodeMapOffset, "mu must be positioned after nodeMap")
+	assert.Greater(t, muOffset, rootOffset, "mu must be positioned after root")
+	assert.Greater(t, muOffset, headOffset, "mu must be positioned after head")
+	assert.Greater(t, muOffset, tailOffset, "mu must be positioned after tail")
+	assert.Greater(t, muOffset, lenOffset, "mu must be positioned after len")
+	assert.Greater(t, muOffset, onEvictEntryOffset, "mu must be positioned after callbacks")
+	assert.Greater(t, pressureStateOffset, muOffset, "mu must be positioned before pressureState")
+	assert.Greater(t, muFirstCacheLine, nodesLastCacheLine, "mu must be on a different 64-byte cache line from nodes slice header")
+	assert.GreaterOrEqual(t, muOffset-nodesEnd, cacheLineSize, "mu must be separated from the end of nodes slice header by at least 64 bytes")
+	assert.NotEqual(t, nodesHeapLastLine, muHeapFirstLine, "heap-allocated nodes slice header and mu must not share a 64-byte cache line")
+}
