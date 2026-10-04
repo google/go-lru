@@ -77,3 +77,51 @@ go test -run=^$ -bench="Benchmark_(LargeScale|ArenaRadixCache)" -benchmem ./...
 # Run live heap footprint (heap-B/entry) and compaction reclamation (reclaimed-B/op) benchmarks
 go test -run=^$ -bench="Benchmark_(LargeScale_Put_100K|ArenaRadixCache_Compact)" -benchmem ./...
 ```
+
+---
+
+## 5. Enforcing Performance Targets & Regression Thresholds (`./cmd/benchcheck`)
+
+`./cmd/benchcheck` is a zero-dependency Go command that parses `go test -bench=. -benchmem` output (including multi-sample `-count=N` runs and custom metrics `heap-B/entry` and `reclaimed-B/op`), enforces calibrated absolute performance and zero-allocation targets across all 89 repository benchmarks, and detects relative regressions between a baseline and candidate run.
+
+### Local Target & Regression Verification
+
+```bash
+# 1. Run benchmarks and enforce absolute performance & zero-allocation targets directly via stdin
+go test -run=^$ -bench=. -benchmem -benchtime=10ms ./... | go run ./cmd/benchcheck -head -
+
+# 2. Save a baseline benchmark run (e.g., on main) and compare a candidate branch against it
+go test -run=^$ -bench=. -benchmem -benchtime=10ms -count=6 ./... | tee benchmark-base.txt
+# ... apply code changes ...
+go test -run=^$ -bench=. -benchmem -benchtime=10ms -count=6 ./... | tee benchmark-head.txt
+go run ./cmd/benchcheck -base benchmark-base.txt -head benchmark-head.txt -format text
+```
+
+### CLI Flags & Threshold Configuration
+
+| Flag | Default | Description |
+| :--- | :--- | :--- |
+| `-head`, `-candidate` | *(required)* | Path to candidate benchmark output file (`-` for `stdin`, or pass as positional arg) |
+| `-base`, `-baseline` | `""` | Optional path to baseline benchmark output file for relative regression comparison |
+| `-check-targets` | `true` | Enforce calibrated absolute latency, memory, zero-allocation, and custom metric targets |
+| `-targets` | `""` | Optional path to a custom JSON target rules file overriding `DefaultTargets()` |
+| `-agg` | `"median"` | Multi-sample (`-count=N`) aggregation mode (`"median"` or `"mean"`) |
+| `-max-ns-regression` | `0.35` (`+35%`) | Maximum allowed relative increase in `ns/op` |
+| `-max-bytes-regression` | `0.25` (`+25%`) | Maximum allowed relative increase in `B/op` |
+| `-max-allocs-regression` | `0.10` (`+10%`) | Maximum allowed relative increase in `allocs/op` (`0 -> >=1` always fails) |
+| `-max-custom-regression` | `0.15` (`15%`) | Maximum allowed relative regression in custom metrics (`+15%` for `heap-B/entry`, `-15%` for `reclaimed-B/op`) |
+| `-min-ns-delta` | `15.0` | Minimum absolute `ns/op` increase required to flag a regression |
+| `-min-bytes-delta` | `16.0` | Minimum absolute `B/op` increase required to flag a regression |
+| `-min-allocs-delta` | `1.0` | Minimum absolute `allocs/op` increase required to flag a regression |
+| `-min-custom-delta` | `1.0` | Minimum absolute custom metric delta required to flag a regression |
+| `-strict-missing` | `false` | Fail if any baseline benchmark is missing from candidate or unmatched by target rules |
+| `-format` | `"markdown"` | Output report format (`"markdown"` or `"text"`) |
+| `-summary` | `""` | Optional path (e.g., `$GITHUB_STEP_SUMMARY`) to append the Markdown report to |
+
+### Exit Codes & CI Integration (`.github/workflows/benchmarks.yml`)
+
+- **`0`**: All enabled target budgets and relative regression checks passed.
+- **`1`**: One or more absolute performance/allocation targets were violated or a relative regression exceeded the configured threshold.
+- **`2`**: Invalid CLI arguments, unreadable/malformed benchmark output, or test failure (`FAIL`) detected in the benchmark log.
+
+In GitHub Actions (`.github/workflows/benchmarks.yml`), every `push`, `pull_request`, and `workflow_dispatch` build runs `./cmd/benchcheck`, appends the structured pass/fail Markdown report to `$GITHUB_STEP_SUMMARY`, uploads `benchcheck-report.md` as a build artifact, and fails the workflow job whenever any target or regression threshold is violated.

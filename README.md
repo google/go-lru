@@ -152,7 +152,7 @@ defer func() { _ = reg.Unregister() }()
 ## Documentation & Verification
 
 - **[Architecture & Memory-Pressure Reclamation (`docs/architecture.md`)](docs/architecture.md)**: Deep dive into `MapCache`, `RadixCache`, and `ArenaRadixCache` node layouts, 32-bit slice arena indexing, FNV-1a lookup acceleration, Two-Tier Memory-Pressure Reclamation, and `Stats()` / `otellru` observability.
-- **[Benchmarks & Heap Footprint (`docs/performance.md`)](docs/performance.md)**: Empirical latency, prefix deletion speedups, 1M-key true heap footprint tables, and CLI reproduction commands.
+- **[Benchmarks & Heap Footprint (`docs/performance.md`)](docs/performance.md)**: Empirical latency, prefix deletion speedups, 1M-key true heap footprint tables, and `./cmd/benchcheck` target/regression enforcement commands.
 - **[Changelog & Versioning (`CHANGELOG.md`)](CHANGELOG.md)**: Release history and semantic versioning guide.
 
 ```bash
@@ -160,6 +160,9 @@ defer func() { _ = reg.Unregister() }()
 go test -race ./...
 go test -v -run=^Example ./...
 cd otellru && go test -race ./... && go test -v -run=^Example ./...
+
+# Run benchmarks and verify absolute performance targets & regression thresholds
+go test -run=^$ -bench=. -benchmem -benchtime=10ms ./... | go run ./cmd/benchcheck -head -
 ```
 
 ---
