@@ -474,10 +474,7 @@ func (c *arenaRadix[V]) insertNewOnPutLocked(evictQ *evictCallbackQueue[V], key 
 	c.putInserted++
 	c.onEntryPut(c.len, valueSize)
 	c.currentSize += valueSize
-	if prevID, exists := c.nodeMap[keyHash]; exists && prevID != nodeID {
-		c.collisionCount++
-	}
-	c.nodeMap[keyHash] = nodeID
+	c.recordNodeMapInsertLocked(keyHash, nodeID)
 	return nodeID, evictedValues, reclaimedPrePut, compactedPrePut
 }
 
@@ -609,7 +606,7 @@ func (c *arenaRadix[V]) canFitGrowthLocked(nodeID uint32, newSize, sizeDelta, av
 func (c *arenaRadix[V]) restoreDisplacedNodeMapLocked(keyHash uint64, nodeID, prevMappedID uint32, hadPrevMapped bool) {
 	if c.nodeMapDirty && (nodeID >= uint32(len(c.nodes)) || !c.nodes[nodeID].hasValue) &&
 		hadPrevMapped && prevMappedID != nodeID && prevMappedID < uint32(len(c.nodes)) && c.nodes[prevMappedID].hasValue {
-		c.nodeMap[keyHash] = prevMappedID
+		c.promoteCollisionPeerLocked(keyHash, prevMappedID)
 	}
 }
 
@@ -677,7 +674,7 @@ func (c *arenaRadix[V]) Replace(key string, value V) error {
 
 	prevMappedID, hadPrevMapped := c.nodeMap[keyHash]
 	if !hadPrevMapped || prevMappedID != nodeID {
-		c.nodeMap[keyHash] = nodeID
+		c.promoteCollisionPeerLocked(keyHash, nodeID)
 	}
 	c.replaceUpdated++
 	c.notifyEvict(&evictQ, key, oldValue, oldSize, EvictionReasonReplaced)
@@ -811,16 +808,7 @@ func (c *arenaRadix[V]) evictSubtreeValueNodeLocked(evictQ *evictCallbackQueue[V
 	c.currentSize -= evictedSize
 	c.remove(currID)
 	c.nodeMapDirty = true
-	if mappedID, ok := c.nodeMap[currHash]; ok {
-		if mappedID == currID {
-			delete(c.nodeMap, currHash)
-			if c.collisionCount > 0 {
-				c.collisionCount = 0
-			}
-		} else if c.collisionCount > 0 {
-			c.collisionCount--
-		}
-	}
+	c.removeOrPromoteNodeMapLocked(currHash, currID)
 	c.nodes[currID].value = zero
 	c.nodes[currID].hasValue = false
 	c.nodes[currID].size = 0

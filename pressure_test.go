@@ -17,6 +17,7 @@ package lru
 import (
 	"fmt"
 	"math"
+	"runtime"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -3230,4 +3231,179 @@ func verifyBackendZeroAllocHotPaths(t *testing.T, name string, cache Cache[int])
 	assert.Zero(t, replaceAllocs, "%s Replace must be 0 allocs/op", name)
 	assert.Zero(t, valuesAllocs, "%s Values() must be 0 allocs/op", name)
 	assert.Zero(t, statsAllocs, "%s Stats() must be 0 allocs/op", name)
+}
+
+func TestPressure_MultiCacheAndCircularReentrancy(t *testing.T) {
+	t.Run("CrossCacheOnEvictReentrancyUnderContention", func(t *testing.T) {
+		// Arrange
+		var cacheA, cacheB Cache[int]
+		var activeInA, totalACallbacks atomic.Int32
+		var concurrentOverlap atomic.Bool
+		enteredFirstA := make(chan struct{})
+		enteredB := make(chan struct{})
+		releaseFirstA := make(chan struct{})
+		var firstOnce, bOnce sync.Once
+
+		cacheA = NewArenaRadixCache[int](1,
+			WithInvariantChecking(true),
+			WithOnEvictValue(func(_ int, _ EvictionReason) {
+				if activeInA.Add(1) > 1 {
+					concurrentOverlap.Store(true)
+				}
+				firstOnce.Do(func() {
+					close(enteredFirstA)
+					<-releaseFirstA
+				})
+				totalACallbacks.Add(1)
+				activeInA.Add(-1)
+			}),
+		)
+		cacheB = NewArenaRadixCache[int](1,
+			WithInvariantChecking(true),
+			WithOnEvictValue(func(_ int, _ EvictionReason) {
+				bOnce.Do(func() {
+					close(enteredB)
+				})
+				_, putErr := cacheA.Put("from_b", 20)
+				assert.NoError(t, putErr)
+			}),
+		)
+
+		_, err := cacheA.Put("a1", 1)
+		require.NoError(t, err)
+		_, err = cacheB.Put("b1", 1)
+		require.NoError(t, err)
+
+		// Act
+		var wg sync.WaitGroup
+		wg.Go(func() {
+			_, putErr := cacheA.Put("a2", 2)
+			assert.NoError(t, putErr)
+		})
+
+		<-enteredFirstA
+
+		wg.Go(func() {
+			_, putErr := cacheB.Put("b2", 2)
+			assert.NoError(t, putErr)
+		})
+
+		<-enteredB
+		for !hasKey(cacheA, "from_b") {
+			runtime.Gosched()
+		}
+		close(releaseFirstA)
+		wg.Wait()
+
+		// Assert
+		assert.False(t, concurrentOverlap.Load(), "Cache A OnEvict callback must never execute concurrently across goroutines")
+		assert.Equal(t, int32(2), totalACallbacks.Load())
+	})
+
+	t.Run("MultiCacheConcurrentPressureFuncSamplingIsolation", func(t *testing.T) {
+		// Arrange
+		var cacheA, cacheB PressureAwareCache[int]
+		var callsA, callsB, nonPrimaryCallsA atomic.Int32
+		inSamplerA := make(chan struct{})
+		inSamplerB := make(chan struct{})
+		contendDoneA := make(chan struct{})
+		releaseSamplerB := make(chan struct{})
+
+		cacheA = NewArenaRadixCache[int](10, WithPressureFunc(func() float64 {
+			if callsA.Add(1) == 1 {
+				close(inSamplerA)
+				<-inSamplerB
+				<-contendDoneA
+				_, _ = cacheA.Delete("missing_key")
+			} else {
+				nonPrimaryCallsA.Add(1)
+			}
+			return 0.10
+		})).(PressureAwareCache[int])
+
+		cacheB = NewArenaRadixCache[int](10, WithPressureFunc(func() float64 {
+			if callsB.Add(1) == 1 {
+				close(inSamplerB)
+				<-releaseSamplerB
+			}
+			return 0.10
+		})).(PressureAwareCache[int])
+
+		// Act
+		var wg sync.WaitGroup
+		wg.Go(func() {
+			_, putErr := cacheA.Put("ka1", 1)
+			assert.NoError(t, putErr)
+		})
+
+		<-inSamplerA
+
+		wg.Go(func() {
+			_, putErr := cacheB.Put("kb1", 1)
+			assert.NoError(t, putErr)
+		})
+
+		<-inSamplerB
+
+		// Contend on Cache A via public EvaluateMemoryPressure() while both Cache A and Cache B are sampling.
+		_ = cacheA.EvaluateMemoryPressure()
+		close(contendDoneA)
+		close(releaseSamplerB)
+		wg.Wait()
+
+		// Assert: Only the contending EvaluateMemoryPressure() call invoked PressureFunc a second time;
+		// the re-entrant Delete("missing_key") inside Cache A's primary sampler did not re-invoke PressureFunc.
+		assert.Equal(t, int32(1), nonPrimaryCallsA.Load())
+	})
+
+	t.Run("CircularCrossCacheReentrancy_A_To_B_To_A", func(t *testing.T) {
+		// Arrange
+		var cacheA, cacheB Cache[int]
+		var callsA, callsB atomic.Int32
+		var pCallsA, pCallsB atomic.Int32
+
+		cacheA = NewArenaRadixCache[int](1,
+			WithInvariantChecking(true),
+			WithPressureFunc(func() float64 {
+				if pCallsA.Add(1) == 1 {
+					_, _ = cacheB.Delete("missing_in_b")
+				}
+				return 0.10
+			}),
+			WithOnEvictValue(func(_ int, _ EvictionReason) {
+				if callsA.Add(1) == 1 {
+					_, putErr := cacheB.Put("b2", 2)
+					assert.NoError(t, putErr)
+				}
+			}),
+		)
+		cacheB = NewArenaRadixCache[int](1,
+			WithInvariantChecking(true),
+			WithPressureFunc(func() float64 {
+				if pCallsB.Add(1) == 1 {
+					_, _ = cacheA.Delete("missing_in_a")
+				}
+				return 0.10
+			}),
+			WithOnEvictValue(func(_ int, _ EvictionReason) {
+				if callsB.Add(1) == 1 {
+					_, putErr := cacheA.Put("a3", 3)
+					assert.NoError(t, putErr)
+				}
+			}),
+		)
+
+		_, err := cacheB.Put("b1", 1)
+		require.NoError(t, err)
+		_, err = cacheA.Put("a1", 1)
+		require.NoError(t, err)
+
+		// Act
+		_, err = cacheA.Put("a2", 2)
+		require.NoError(t, err)
+
+		// Assert
+		assert.Equal(t, int32(2), callsA.Load(), "Cache A OnEvict should execute for both initial eviction and circular A->B->A eviction")
+		assert.Equal(t, int32(1), callsB.Load(), "Cache B OnEvict should execute once")
+	})
 }

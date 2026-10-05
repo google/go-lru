@@ -2094,6 +2094,73 @@ func TestArenaRadixCache_StatsArenaNodesAndHashFallbacks(t *testing.T) {
 		assert.Equal(t, int64(102), v.value)
 		assert.Equal(t, uint64(5), cCollide.Stats().ArenaHashFallbacks)
 	})
+
+	t.Run("RealFNV1aCollisionPeerPromotionAndMissFastPathRestoration", func(t *testing.T) {
+		const (
+			missProbes    = 1000
+			collisionKeyA = "!!!!!!!!!!!!"
+			collisionKeyB = "&+!o9)1!=\x1c\xd2\x10"
+		)
+
+		// Case A: Deleting the primary colliding key (KeyB) after Get/Replace peer swaps promotes KeyA and restores O(1) misses.
+		// Arrange
+		c := NewArenaRadixCache[int](1000, WithInvariantChecking(true))
+		_, err := c.Put(collisionKeyA, 1)
+		require.NoError(t, err)
+		_, err = c.Put(collisionKeyB, 2)
+		require.NoError(t, err)
+
+		valA, okA := c.Get(collisionKeyA)
+		require.True(t, okA)
+		require.Equal(t, 1, valA)
+		require.NoError(t, c.Replace(collisionKeyB, 20))
+
+		// Act
+		_, deleted := c.Delete(collisionKeyB)
+		require.True(t, deleted)
+
+		beforeFallbacks := c.Stats().ArenaHashFallbacks
+		for i := range missProbes {
+			_, ok := c.Peek(fmt.Sprintf("unrelated_missing_key_%d", i))
+			require.False(t, ok)
+		}
+		afterFallbacks := c.Stats().ArenaHashFallbacks
+
+		// Assert
+		assert.Equal(t, 1, c.Stats().Len)
+		assert.Equal(t, uint64(0), afterFallbacks-beforeFallbacks)
+
+		// Case B: Deleting an unrelated key while two colliding keys remain active preserves both colliding keys and O(1) misses for non-colliding probes.
+		// Arrange
+		c2 := NewArenaRadixCache[int](1000, WithInvariantChecking(true))
+		_, err = c2.Put("unrelated_key", 3)
+		require.NoError(t, err)
+		_, err = c2.Put(collisionKeyA, 1)
+		require.NoError(t, err)
+		_, err = c2.Put(collisionKeyB, 2)
+		require.NoError(t, err)
+
+		// Act
+		_, deleted = c2.Delete("unrelated_key")
+		require.True(t, deleted)
+
+		beforeFallbacks = c2.Stats().ArenaHashFallbacks
+		for i := range missProbes {
+			_, ok := c2.Peek(fmt.Sprintf("unrelated_missing_key_%d", i))
+			require.False(t, ok)
+		}
+		afterFallbacks = c2.Stats().ArenaHashFallbacks
+
+		// Assert
+		assert.Equal(t, 2, c2.Stats().Len)
+		assert.Equal(t, uint64(0), afterFallbacks-beforeFallbacks)
+		valA, okA = c2.Peek(collisionKeyA)
+		require.True(t, okA)
+		assert.Equal(t, 1, valA)
+		valB, okB := c2.Peek(collisionKeyB)
+		require.True(t, okB)
+		assert.Equal(t, 2, valB)
+	})
 }
 
 func TestArenaRadixCache_MuCacheLineSeparation(t *testing.T) {
