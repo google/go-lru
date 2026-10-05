@@ -380,7 +380,7 @@ func (c *mapCache[V]) Put(key string, value V) ([]V, error) {
 		}
 	} else {
 		// Evict prior to adding new entry if valueSize would exceed remaining capacity (prevents uint64 overflow).
-		for (valueSize > c.maxSize-c.currentSize || c.shouldEvictZeroWeightOnInsert(valueSize, c.maxSize, c.currentSize, c.entries.Len())) && c.entries.Len() > 0 {
+		for (valueSize > c.maxSize-c.currentSize || (!evictedPrePut && c.shouldEvictZeroWeightOnInsert(valueSize, c.maxSize, c.currentSize, c.entries.Len()))) && c.entries.Len() > 0 {
 			if evicted, evictedOK := c.evictOne(&evictQ); evictedOK {
 				evictedValues = append(evictedValues, evicted)
 				evictedPrePut = true

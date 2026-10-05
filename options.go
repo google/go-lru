@@ -199,7 +199,7 @@ type Options struct {
 
 	// CompactionThreshold specifies the normalized pressure threshold for Tier 1 lossless compaction.
 	// Defaults to DefaultCompactionThreshold (0.75) if <= 0, NaN, or Inf.
-	// If CompactionThreshold > EvictionThreshold, thresholds are reconciled to preserve ordering.
+	// If CompactionThreshold >= EvictionThreshold, thresholds are reconciled when only one threshold is explicitly set.
 	CompactionThreshold          float64
 	hasCustomCompactionThreshold bool
 	customCompactionBits         uint64

@@ -63,7 +63,36 @@ func currentGoroutineID() uint64 {
 	return id
 }
 
+func captureCurrentGoroutineStack() ([]byte, *[4096]byte) {
+	bufPtr := goroutineStackBufPool.Get().(*[4096]byte)
+	n := runtime.Stack(bufPtr[:], false)
+	if n < len(bufPtr) {
+		return bufPtr[:n], bufPtr
+	}
+	goroutineStackBufPool.Put(bufPtr)
+	const maxSingleStackSize = 1 << 20
+	for size := 8192; size <= maxSingleStackSize; size *= 2 {
+		buf := make([]byte, size)
+		n = runtime.Stack(buf, false)
+		if n < len(buf) || size == maxSingleStackSize {
+			return buf[:n], nil
+		}
+	}
+	return nil, nil
+}
+
+func releaseCurrentGoroutineStack(bufPtr *[4096]byte) {
+	if bufPtr != nil {
+		goroutineStackBufPool.Put(bufPtr)
+	}
+}
+
 func parseStackGoroutineAndParentID(stack []byte) (gid, parentGID uint64) {
+	gid, parentGID, _ = parseStackGoroutineParentAndCreator(stack)
+	return gid, parentGID
+}
+
+func parseStackGoroutineParentAndCreator(stack []byte) (gid, parentGID uint64, creatorFunc []byte) {
 	const prefix = "goroutine "
 	if len(stack) > len(prefix) {
 		gid, _ = parseDecimalUint64(stack[len(prefix):])
@@ -71,8 +100,59 @@ func parseStackGoroutineAndParentID(stack []byte) (gid, parentGID uint64) {
 	const createdIn = " in goroutine "
 	if idx := bytes.LastIndex(stack, []byte(createdIn)); idx >= 0 {
 		parentGID, _ = parseDecimalUint64(stack[idx+len(createdIn):])
+		const createdBy = "\ncreated by "
+		if cIdx := bytes.LastIndex(stack[:idx], []byte(createdBy)); cIdx >= 0 {
+			creatorFunc = stack[cIdx+len(createdBy) : idx]
+		}
 	}
-	return gid, parentGID
+	return gid, parentGID, creatorFunc
+}
+
+func captureAllGoroutineStacks() []byte {
+	const maxAllStacksSize = 16 << 20
+	for size := 16384; size <= maxAllStacksSize; size *= 2 {
+		buf := make([]byte, size)
+		n := runtime.Stack(buf, true)
+		if n < len(buf) || size == maxAllStacksSize {
+			return buf[:n]
+		}
+	}
+	return nil
+}
+
+func containsCreatorCallFrame(stackPrefix, creatorFunc []byte) bool {
+	search := stackPrefix
+	for len(search) > len(creatorFunc) {
+		idx := bytes.Index(search, creatorFunc)
+		if idx < 0 {
+			return false
+		}
+		afterIdx := idx + len(creatorFunc)
+		if idx > 0 && search[idx-1] == '\n' && afterIdx < len(search) && search[afterIdx] == '(' {
+			return true
+		}
+		search = search[idx+1:]
+	}
+	return false
+}
+
+func isParentCreatorAboveHook(parentGID uint64, creatorFunc, hookName []byte) bool {
+	if parentGID == 0 || len(creatorFunc) == 0 {
+		return false
+	}
+	allStacks := captureAllGoroutineStacks()
+	for _, blk := range bytes.Split(allStacks, []byte("\n\n")) {
+		gid, _ := parseStackGoroutineAndParentID(blk)
+		if gid != parentGID {
+			continue
+		}
+		hookIdx := bytes.Index(blk, hookName)
+		if hookIdx < 0 {
+			return false
+		}
+		return containsCreatorCallFrame(blk[:hookIdx], creatorFunc)
+	}
+	return false
 }
 
 var (
@@ -219,6 +299,7 @@ type pressureState struct {
 
 	pressureWriteMu          sync.Mutex
 	samplingPressure         atomic.Bool
+	samplingActive           atomic.Bool
 	fallbackSampling         atomic.Bool
 	pressureInitialized      atomic.Bool
 	pressureNeedsRefresh     atomic.Bool
@@ -274,7 +355,7 @@ func (p *pressureState) isCurrentGoroutineSampling(gid uint64) bool {
 }
 
 func isCandidatePrimarySamplerStack(blk []byte) bool {
-	if bytes.Contains(blk, []byte("invokeAndStorePressure")) {
+	if bytes.Contains(blk, []byte("invokeFastPrimaryPressure")) || bytes.Contains(blk, []byte("invokeAndStorePressure")) {
 		return true
 	}
 	return bytes.Contains(blk, []byte("sampleWithSlot")) &&
@@ -282,53 +363,65 @@ func isCandidatePrimarySamplerStack(blk []byte) bool {
 		!bytes.Contains(blk, []byte("releasePrimarySamplerSlot"))
 }
 
+func (p *pressureState) matchCandidatePrimarySamplerGID(blocks [][]byte, requireFastFrame bool) uint64 {
+	for _, blk := range blocks {
+		if requireFastFrame {
+			if !bytes.Contains(blk, []byte("invokeFastPrimaryPressure")) {
+				continue
+			}
+		} else if !isCandidatePrimarySamplerStack(blk) {
+			continue
+		}
+		gid, _ := parseStackGoroutineAndParentID(blk)
+		if gid == 0 || gid == p.fallbackGID.Load() || p.hasOverflowSamplingGID(gid) {
+			continue
+		}
+		if owners := multiCacheSamplerOwners[gid]; len(owners) > 0 && !slices.Contains(owners, p) {
+			continue
+		}
+		if p.samplingActive.Load() {
+			p.samplingGID.Store(gid)
+			return gid
+		}
+	}
+	return 0
+}
+
 func (p *pressureState) resolvePrimaryFromAllStacksLocked() uint64 {
 	p.samplingResolveMu.Lock()
 	defer p.samplingResolveMu.Unlock()
-	if !p.samplingPressure.Load() {
+	if !p.samplingActive.Load() {
 		return 0
 	}
 	if sGID := p.samplingGID.Load(); sGID != 0 {
 		return sGID
 	}
-	for size := 16384; size <= 1<<20; size *= 2 {
-		buf := make([]byte, size)
-		n := runtime.Stack(buf, true)
-		if n >= len(buf) {
-			continue
-		}
-		for _, blk := range bytes.Split(buf[:n], []byte("\n\n")) {
-			if !isCandidatePrimarySamplerStack(blk) {
-				continue
-			}
-			gid, _ := parseStackGoroutineAndParentID(blk)
-			if gid == 0 || gid == p.fallbackGID.Load() || p.hasOverflowSamplingGID(gid) {
-				continue
-			}
-			if owners := multiCacheSamplerOwners[gid]; len(owners) > 0 && !slices.Contains(owners, p) {
-				continue
-			}
-			if p.samplingPressure.Load() {
-				p.samplingGID.Store(gid)
-				return gid
-			}
-		}
-		break
+	allStacks := captureAllGoroutineStacks()
+	blocks := bytes.Split(allStacks, []byte("\n\n"))
+	if gid := p.matchCandidatePrimarySamplerGID(blocks, true); gid != 0 {
+		return gid
+	}
+	if gid := p.matchCandidatePrimarySamplerGID(blocks, false); gid != 0 {
+		return gid
 	}
 	return p.samplingGID.Load()
 }
 
-func promoteFastPrimarySamplerLocked(firstP *pressureState, callerGID uint64, isNestedSampler bool) {
+func promoteFastPrimarySamplerLocked(firstP *pressureState, callerGID uint64, isFastPrimaryCaller bool) {
 	if firstP == nil || firstP == multiPrimarySamplerSentinel {
 		return
 	}
-	if isNestedSampler && len(multiCacheSamplerOwners) == 0 && firstP.samplingGID.Load() == 0 {
+	if isFastPrimaryCaller && callerGID != 0 && len(multiCacheSamplerOwners) == 0 && firstP.samplingGID.Load() == 0 {
+		stored := false
 		firstP.samplingResolveMu.Lock()
-		if firstP.samplingPressure.Load() && firstP.samplingGID.Load() == 0 {
+		if firstP.samplingActive.Load() && firstP.samplingGID.Load() == 0 {
 			firstP.samplingGID.Store(callerGID)
+			stored = true
 		}
 		firstP.samplingResolveMu.Unlock()
-		addMultiCacheOwner(multiCacheSamplerOwners, callerGID, firstP)
+		if stored {
+			addMultiCacheOwner(multiCacheSamplerOwners, callerGID, firstP)
+		}
 		return
 	}
 	if firstGID := firstP.resolvePrimaryFromAllStacksLocked(); firstGID != 0 {
@@ -336,30 +429,32 @@ func promoteFastPrimarySamplerLocked(firstP *pressureState, callerGID uint64, is
 	}
 }
 
-func (p *pressureState) resolvePrimaryFromAllStacks(callerGID uint64, isNestedSampler bool) {
+func (p *pressureState) resolvePrimaryFromAllStacks(callerGID uint64, isFastPrimaryCaller bool) {
 	multiCacheSamplerMu.Lock()
 	defer multiCacheSamplerMu.Unlock()
 	firstP := fastPrimarySamplerOwner.Swap(multiPrimarySamplerSentinel)
-	promoteFastPrimarySamplerLocked(firstP, callerGID, isNestedSampler)
-	if p.samplingPressure.Load() && p.samplingGID.Load() == 0 {
+	promoteFastPrimarySamplerLocked(firstP, callerGID, isFastPrimaryCaller)
+	if p.samplingActive.Load() && p.samplingGID.Load() == 0 {
 		if candGID := p.resolvePrimaryFromAllStacksLocked(); candGID != 0 {
 			addMultiCacheOwner(multiCacheSamplerOwners, candGID, p)
 		}
 	}
 }
 
-func (p *pressureState) inspectCurrentAndResolvePrimary() (gid, parentGID uint64) {
-	bufPtr := goroutineStackBufPool.Get().(*[4096]byte)
-	n := runtime.Stack(bufPtr[:], false)
-	gid, parentGID = parseStackGoroutineAndParentID(bufPtr[:n])
-	isNestedSampler := bytes.Contains(bufPtr[:n], []byte("invokeAndStorePressure")) &&
+func (p *pressureState) inspectCurrentAndResolvePrimary() (gid, parentGID uint64, creatorFunc []byte) {
+	stack, bufPtr := captureCurrentGoroutineStack()
+	gid, parentGID, creatorFunc = parseStackGoroutineParentAndCreator(stack)
+	isFastPrimaryCaller := bytes.Contains(stack, []byte("invokeFastPrimaryPressure")) &&
 		gid != p.fallbackGID.Load() && !p.hasOverflowSamplingGID(gid)
-	goroutineStackBufPool.Put(bufPtr)
-
-	if p.samplingPressure.Load() && p.samplingGID.Load() == 0 {
-		p.resolvePrimaryFromAllStacks(gid, isNestedSampler)
+	if len(creatorFunc) > 0 && bufPtr != nil {
+		creatorFunc = bytes.Clone(creatorFunc)
 	}
-	return gid, parentGID
+	releaseCurrentGoroutineStack(bufPtr)
+
+	if p.samplingActive.Load() && p.samplingGID.Load() == 0 {
+		p.resolvePrimaryFromAllStacks(gid, isFastPrimaryCaller)
+	}
+	return gid, parentGID, creatorFunc
 }
 
 func (p *pressureState) hasActiveSampler() bool {
@@ -372,7 +467,7 @@ func (p *pressureState) checkSamplingGoroutine() (bool, uint64) {
 	if !p.options.hasCustomPressureFunc || !p.hasActiveSampler() {
 		return false, 0
 	}
-	gid, _ := p.inspectCurrentAndResolvePrimary()
+	gid, _, _ := p.inspectCurrentAndResolvePrimary()
 	return p.isCurrentGoroutineSampling(gid), gid
 }
 
@@ -380,8 +475,11 @@ func (p *pressureState) checkSamplingGoroutineOrChild() (bool, uint64) {
 	if !p.options.hasCustomPressureFunc || !p.hasActiveSampler() {
 		return false, 0
 	}
-	gid, parentGID := p.inspectCurrentAndResolvePrimary()
-	if p.isCurrentGoroutineSampling(gid) || p.isCurrentGoroutineSampling(parentGID) {
+	gid, parentGID, creatorFunc := p.inspectCurrentAndResolvePrimary()
+	if p.isCurrentGoroutineSampling(gid) {
+		return true, gid
+	}
+	if p.isCurrentGoroutineSampling(parentGID) && isParentCreatorAboveHook(parentGID, creatorFunc, []byte("invokeAndStorePressure")) {
 		return true, gid
 	}
 	return false, gid
@@ -567,6 +665,11 @@ func (p *pressureState) invokeAndStorePressure(gid uint64, slot int) (uint64, fl
 	return epoch, val, true
 }
 
+//go:noinline
+func (p *pressureState) invokeFastPrimaryPressure(gid uint64) (uint64, float64, bool) {
+	return p.invokeAndStorePressure(gid, samplerSlotPrimary)
+}
+
 func (p *pressureState) ensureSamplingGID(gid uint64) uint64 {
 	if p.options.hasCustomPressureFunc && gid == 0 {
 		return currentGoroutineID()
@@ -576,42 +679,48 @@ func (p *pressureState) ensureSamplingGID(gid uint64) uint64 {
 
 //go:noinline
 func (p *pressureState) registerMultiCachePrimarySampler(gid uint64) uint64 {
-	bufPtr := goroutineStackBufPool.Get().(*[4096]byte)
-	n := runtime.Stack(bufPtr[:], false)
+	stack, bufPtr := captureCurrentGoroutineStack()
 	if gid == 0 {
-		gid, _ = parseStackGoroutineAndParentID(bufPtr[:n])
+		gid, _, _ = parseStackGoroutineParentAndCreator(stack)
 	}
-	isNestedSampler := bytes.Contains(bufPtr[:n], []byte("invokeAndStorePressure"))
-	goroutineStackBufPool.Put(bufPtr)
+	isFastPrimaryCaller := bytes.Contains(stack, []byte("invokeFastPrimaryPressure")) &&
+		gid != p.fallbackGID.Load() && !p.hasOverflowSamplingGID(gid)
+	releaseCurrentGoroutineStack(bufPtr)
 
 	multiCacheSamplerMu.Lock()
 	firstP := fastPrimarySamplerOwner.Swap(multiPrimarySamplerSentinel)
-	promoteFastPrimarySamplerLocked(firstP, gid, isNestedSampler)
+	promoteFastPrimarySamplerLocked(firstP, gid, isFastPrimaryCaller)
+	var stored bool
 	p.samplingResolveMu.Lock()
-	if p.samplingPressure.Load() {
+	if p.samplingActive.Load() {
 		p.samplingGID.Store(gid)
+		stored = true
 	}
 	p.samplingResolveMu.Unlock()
-	addMultiCacheOwner(multiCacheSamplerOwners, gid, p)
+	if stored {
+		addMultiCacheOwner(multiCacheSamplerOwners, gid, p)
+	}
 	multiCacheSamplerMu.Unlock()
 	return gid
 }
 
 //go:noinline
 func (p *pressureState) releasePrimarySamplerSlot(gid uint64, registeredMulti bool) {
-	p.samplingPressure.Store(false)
+	p.samplingActive.Store(false)
 	if registeredMulti || p.samplingGID.Load() != 0 || !fastPrimarySamplerOwner.CompareAndSwap(p, nil) {
 		multiCacheSamplerMu.Lock()
-		if g := p.samplingGID.Load(); g != 0 {
+		p.samplingResolveMu.Lock()
+		g := p.samplingGID.Swap(0)
+		p.samplingResolveMu.Unlock()
+		if g != 0 {
 			removeMultiCacheOwner(multiCacheSamplerOwners, g, p)
-		} else if gid != 0 {
+		}
+		if gid != 0 && gid != g {
 			removeMultiCacheOwner(multiCacheSamplerOwners, gid, p)
 		}
-		p.samplingResolveMu.Lock()
-		p.samplingGID.Store(0)
-		p.samplingResolveMu.Unlock()
 		multiCacheSamplerMu.Unlock()
 	}
+	p.samplingPressure.Store(false)
 	if globalActivePrimarySamplers.Add(-1) == 0 {
 		multiCacheSamplerMu.Lock()
 		if globalActivePrimarySamplers.Load() == 0 {
@@ -623,10 +732,14 @@ func (p *pressureState) releasePrimarySamplerSlot(gid uint64, registeredMulti bo
 
 //go:noinline
 func (p *pressureState) sampleWithSlot(gid uint64, slot int, slotGID *atomic.Uint64, slotFlag *atomic.Bool) (uint64, float64, bool) {
+	var fastPrimary bool
 	if p.options.hasCustomPressureFunc {
 		var registeredMulti bool
 		if slot == samplerSlotPrimary {
-			if globalActivePrimarySamplers.Add(1) != 1 || gid != 0 || !fastPrimarySamplerOwner.CompareAndSwap(nil, p) {
+			p.samplingActive.Store(true)
+			if globalActivePrimarySamplers.Add(1) == 1 && gid == 0 && fastPrimarySamplerOwner.CompareAndSwap(nil, p) {
+				fastPrimary = true
+			} else {
 				gid = p.registerMultiCachePrimarySampler(gid)
 				registeredMulti = true
 			}
@@ -644,6 +757,9 @@ func (p *pressureState) sampleWithSlot(gid uint64, slot int, slotGID *atomic.Uin
 		}()
 	} else {
 		defer slotFlag.Store(false)
+	}
+	if fastPrimary {
+		return p.invokeFastPrimaryPressure(gid)
 	}
 	return p.invokeAndStorePressure(gid, slot)
 }
@@ -915,13 +1031,37 @@ func (q *evictCallbackQueue[V]) enqueue(key string, value V, reason EvictionReas
 }
 
 func isCandidateEvictCallbackStack(blk []byte) bool {
-	if bytes.Contains(blk, []byte("deliverCallbacks")) {
+	if bytes.Contains(blk, []byte("deliverFastCallbacks")) || bytes.Contains(blk, []byte("deliverCallbacks")) {
 		return true
 	}
 	return bytes.Contains(blk, []byte("evictCallbackQueue")) &&
 		!bytes.Contains(blk, []byte("lockEvictCallbackSlow")) &&
 		!bytes.Contains(blk, []byte("registerMultiCacheEvictHolder")) &&
 		!bytes.Contains(blk, []byte("unlockEvictCallback"))
+}
+
+func (p *pressureState) matchCandidateEvictCallbackGID(blocks [][]byte, requireFastFrame bool) uint64 {
+	for _, blk := range blocks {
+		if requireFastFrame {
+			if !bytes.Contains(blk, []byte("deliverFastCallbacks")) {
+				continue
+			}
+		} else if !isCandidateEvictCallbackStack(blk) {
+			continue
+		}
+		gid, _ := parseStackGoroutineAndParentID(blk)
+		if gid == 0 {
+			continue
+		}
+		if owners := multiCacheEvictOwners[gid]; len(owners) > 0 && !slices.Contains(owners, p) {
+			continue
+		}
+		if p.evictCallbackActive.Load() {
+			p.evictCallbackGID.Store(gid)
+			return gid
+		}
+	}
+	return 0
 }
 
 func (p *pressureState) resolveEvictCallbackHolderFromAllStacksLocked() uint64 {
@@ -933,44 +1073,32 @@ func (p *pressureState) resolveEvictCallbackHolderFromAllStacksLocked() uint64 {
 	if gid := p.evictCallbackGID.Load(); gid != 0 {
 		return gid
 	}
-	for size := 16384; size <= 1<<20; size *= 2 {
-		buf := make([]byte, size)
-		n := runtime.Stack(buf, true)
-		if n >= len(buf) {
-			continue
-		}
-		for _, blk := range bytes.Split(buf[:n], []byte("\n\n")) {
-			if !isCandidateEvictCallbackStack(blk) {
-				continue
-			}
-			gid, _ := parseStackGoroutineAndParentID(blk)
-			if gid == 0 {
-				continue
-			}
-			if owners := multiCacheEvictOwners[gid]; len(owners) > 0 && !slices.Contains(owners, p) {
-				continue
-			}
-			if p.evictCallbackActive.Load() {
-				p.evictCallbackGID.Store(gid)
-				return gid
-			}
-		}
-		break
+	allStacks := captureAllGoroutineStacks()
+	blocks := bytes.Split(allStacks, []byte("\n\n"))
+	if gid := p.matchCandidateEvictCallbackGID(blocks, true); gid != 0 {
+		return gid
+	}
+	if gid := p.matchCandidateEvictCallbackGID(blocks, false); gid != 0 {
+		return gid
 	}
 	return p.evictCallbackGID.Load()
 }
 
-func promoteFastEvictCallbackLocked(firstP *pressureState, callerGID uint64, isNestedCallback bool) {
+func promoteFastEvictCallbackLocked(firstP *pressureState, callerGID uint64, isFastCallbackCaller bool) {
 	if firstP == nil || firstP == multiEvictCallbackSentinel {
 		return
 	}
-	if isNestedCallback && len(multiCacheEvictOwners) == 0 && firstP.evictCallbackGID.Load() == 0 {
+	if isFastCallbackCaller && callerGID != 0 && len(multiCacheEvictOwners) == 0 && firstP.evictCallbackGID.Load() == 0 {
+		stored := false
 		firstP.evictCallbackResolveMu.Lock()
 		if firstP.evictCallbackActive.Load() && firstP.evictCallbackGID.Load() == 0 {
 			firstP.evictCallbackGID.Store(callerGID)
+			stored = true
 		}
 		firstP.evictCallbackResolveMu.Unlock()
-		addMultiCacheOwner(multiCacheEvictOwners, callerGID, firstP)
+		if stored {
+			addMultiCacheOwner(multiCacheEvictOwners, callerGID, firstP)
+		}
 		return
 	}
 	if firstGID := firstP.resolveEvictCallbackHolderFromAllStacksLocked(); firstGID != 0 {
@@ -980,61 +1108,76 @@ func promoteFastEvictCallbackLocked(firstP *pressureState, callerGID uint64, isN
 
 //go:noinline
 func (p *pressureState) registerMultiCacheEvictHolder(gid uint64) {
-	bufPtr := goroutineStackBufPool.Get().(*[4096]byte)
-	n := runtime.Stack(bufPtr[:], false)
+	stack, bufPtr := captureCurrentGoroutineStack()
 	if gid == 0 {
-		gid, _ = parseStackGoroutineAndParentID(bufPtr[:n])
+		gid, _, _ = parseStackGoroutineParentAndCreator(stack)
 	}
-	isNestedCallback := bytes.Contains(bufPtr[:n], []byte("deliverCallbacks"))
-	goroutineStackBufPool.Put(bufPtr)
+	isFastCallbackCaller := bytes.Contains(stack, []byte("deliverFastCallbacks"))
+	releaseCurrentGoroutineStack(bufPtr)
 
 	multiCacheEvictMu.Lock()
 	firstP := fastEvictCallbackOwner.Swap(multiEvictCallbackSentinel)
-	promoteFastEvictCallbackLocked(firstP, gid, isNestedCallback)
+	promoteFastEvictCallbackLocked(firstP, gid, isFastCallbackCaller)
+	var stored bool
 	p.evictCallbackResolveMu.Lock()
 	if p.evictCallbackActive.Load() {
 		p.evictCallbackGID.Store(gid)
+		stored = true
 	}
 	p.evictCallbackResolveMu.Unlock()
-	addMultiCacheOwner(multiCacheEvictOwners, gid, p)
+	if stored {
+		addMultiCacheOwner(multiCacheEvictOwners, gid, p)
+	}
 	multiCacheEvictMu.Unlock()
 }
 
-func (p *pressureState) lockEvictCallback() bool {
+func (p *pressureState) lockEvictCallback() (locked, fastOwner bool) {
 	if p.evictCallbackMu.TryLock() {
 		p.evictCallbackActive.Store(true)
 		if globalActiveEvictCallbacks.Add(1) == 1 && fastEvictCallbackOwner.CompareAndSwap(nil, p) {
-			return true
+			return true, true
 		}
 		p.registerMultiCacheEvictHolder(0)
-		return true
+		return true, false
 	}
-	return p.lockEvictCallbackSlow()
+	return p.lockEvictCallbackSlow(), false
 }
 
 //go:noinline
 func (p *pressureState) lockEvictCallbackSlow() bool {
-	bufPtr := goroutineStackBufPool.Get().(*[4096]byte)
-	n := runtime.Stack(bufPtr[:], false)
-	gid, parentGID := parseStackGoroutineAndParentID(bufPtr[:n])
-	isNestedCallback := bytes.Contains(bufPtr[:n], []byte("deliverCallbacks"))
-	goroutineStackBufPool.Put(bufPtr)
+	stack, bufPtr := captureCurrentGoroutineStack()
+	gid, parentGID, creatorFunc := parseStackGoroutineParentAndCreator(stack)
+	isFastCallbackCaller := bytes.Contains(stack, []byte("deliverFastCallbacks"))
+	if len(creatorFunc) > 0 && bufPtr != nil {
+		creatorFunc = bytes.Clone(creatorFunc)
+	}
+	releaseCurrentGoroutineStack(bufPtr)
+
+	isHolderOrChild := func(holder uint64) bool {
+		if holder == 0 {
+			return false
+		}
+		if holder == gid {
+			return true
+		}
+		return holder == parentGID && isParentCreatorAboveHook(parentGID, creatorFunc, []byte("deliverCallbacks"))
+	}
 
 	if holder := p.evictCallbackGID.Load(); holder != 0 {
-		if holder == gid || holder == parentGID {
+		if isHolderOrChild(holder) {
 			return false
 		}
 	} else {
 		multiCacheEvictMu.Lock()
 		firstP := fastEvictCallbackOwner.Swap(multiEvictCallbackSentinel)
-		promoteFastEvictCallbackLocked(firstP, gid, isNestedCallback)
-		if p.evictCallbackGID.Load() == 0 {
+		promoteFastEvictCallbackLocked(firstP, gid, isFastCallbackCaller)
+		if p.evictCallbackActive.Load() && p.evictCallbackGID.Load() == 0 {
 			if candGID := p.resolveEvictCallbackHolderFromAllStacksLocked(); candGID != 0 {
 				addMultiCacheOwner(multiCacheEvictOwners, candGID, p)
 			}
 		}
 		multiCacheEvictMu.Unlock()
-		if holder := p.evictCallbackGID.Load(); holder != 0 && (holder == gid || holder == parentGID) {
+		if isHolderOrChild(p.evictCallbackGID.Load()) {
 			return false
 		}
 	}
@@ -1050,12 +1193,12 @@ func (p *pressureState) unlockEvictCallback() {
 	p.evictCallbackActive.Store(false)
 	if p.evictCallbackGID.Load() != 0 || !fastEvictCallbackOwner.CompareAndSwap(p, nil) {
 		multiCacheEvictMu.Lock()
-		if g := p.evictCallbackGID.Load(); g != 0 {
+		p.evictCallbackResolveMu.Lock()
+		g := p.evictCallbackGID.Swap(0)
+		p.evictCallbackResolveMu.Unlock()
+		if g != 0 {
 			removeMultiCacheOwner(multiCacheEvictOwners, g, p)
 		}
-		p.evictCallbackResolveMu.Lock()
-		p.evictCallbackGID.Store(0)
-		p.evictCallbackResolveMu.Unlock()
 		multiCacheEvictMu.Unlock()
 	}
 	if globalActiveEvictCallbacks.Add(-1) == 0 {
@@ -1068,11 +1211,20 @@ func (p *pressureState) unlockEvictCallback() {
 	p.evictCallbackMu.Unlock()
 }
 
+func (q *evictCallbackQueue[V]) reset() {
+	q.buf = [2]evictEvent[V]{}
+	clear(q.overflow)
+	q.overflow = nil
+	q.n = 0
+}
+
 //go:noinline
 func (q *evictCallbackQueue[V]) deliverCallbacks(onVal func(V, EvictionReason), onEntry func(string, V, EvictionReason)) {
+	defer q.reset()
 	inlineCount := min(q.n, len(q.buf))
 	for i := range inlineCount {
 		ev := q.buf[i]
+		q.buf[i] = evictEvent[V]{}
 		if onVal != nil {
 			onVal(ev.value, ev.reason)
 		}
@@ -1080,7 +1232,9 @@ func (q *evictCallbackQueue[V]) deliverCallbacks(onVal func(V, EvictionReason), 
 			onEntry(ev.key, ev.value, ev.reason)
 		}
 	}
-	for _, ev := range q.overflow {
+	for i := range q.overflow {
+		ev := q.overflow[i]
+		q.overflow[i] = evictEvent[V]{}
 		if onVal != nil {
 			onVal(ev.value, ev.reason)
 		}
@@ -1091,12 +1245,26 @@ func (q *evictCallbackQueue[V]) deliverCallbacks(onVal func(V, EvictionReason), 
 }
 
 //go:noinline
+func (q *evictCallbackQueue[V]) deliverFastCallbacks(onVal func(V, EvictionReason), onEntry func(string, V, EvictionReason)) {
+	q.deliverCallbacks(onVal, onEntry)
+}
+
+//go:noinline
 func (q *evictCallbackQueue[V]) invoke(p *pressureState, onVal func(V, EvictionReason), onEntry func(string, V, EvictionReason)) {
-	if q.n == 0 || (onVal == nil && onEntry == nil) {
+	if q.n == 0 {
 		return
 	}
-	if p.lockEvictCallback() {
+	if onVal == nil && onEntry == nil {
+		q.reset()
+		return
+	}
+	locked, fastOwner := p.lockEvictCallback()
+	if locked {
 		defer p.unlockEvictCallback()
+	}
+	if fastOwner {
+		q.deliverFastCallbacks(onVal, onEntry)
+		return
 	}
 	q.deliverCallbacks(onVal, onEntry)
 }

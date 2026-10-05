@@ -773,7 +773,7 @@ func (c *radixCache[V]) Put(key string, value V) ([]V, error) {
 		reclaimedPrePut = c.shouldReclaimSingleSurvivorOnMutation(c.len, c.deletedSinceCompact > 0, false, evictedPrePut, c.currentSize, sizeBefore, pressure)
 	} else {
 		// Evict from the LRU tail before inserting into the trie to avoid redundant node splits and merges.
-		for (valueSize > c.maxSize-c.currentSize || c.shouldEvictZeroWeightOnInsert(valueSize, c.maxSize, c.currentSize, c.len)) && c.tail != nil {
+		for (valueSize > c.maxSize-c.currentSize || (!evictedPrePut && c.shouldEvictZeroWeightOnInsert(valueSize, c.maxSize, c.currentSize, c.len))) && c.tail != nil {
 			if evicted, ok := c.evictOne(&evictQ); ok {
 				evictedValues = append(evictedValues, evicted)
 				evictedPrePut = true

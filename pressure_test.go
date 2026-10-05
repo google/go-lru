@@ -3289,7 +3289,8 @@ func TestPressure_MultiCacheAndCircularReentrancy(t *testing.T) {
 		})
 
 		<-enteredB
-		for !hasKey(cacheA, "from_b") {
+		arenaA := cacheA.(*arenaRadix[int])
+		for !hasKey(cacheA, "from_b") || arenaA.evictCallbackGID.Load() == 0 {
 			runtime.Gosched()
 		}
 		close(releaseFirstA)

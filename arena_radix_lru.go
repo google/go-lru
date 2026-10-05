@@ -262,6 +262,27 @@ func (c *arenaRadix[V]) checkNodeMapInvariants() {
 			panic(fmt.Sprintf("arenaRadix invariant violation: nodeMap hash mismatch for node %d", id))
 		}
 	}
+	totalPeers := 0
+	for h, peers := range c.collisionPeers {
+		if len(peers) == 0 {
+			panic(fmt.Sprintf("arenaRadix invariant violation: collisionPeers[%d] is empty", h))
+		}
+		for _, peerID := range peers {
+			if peerID >= uint32(len(c.nodes)) || !c.nodes[peerID].hasValue || c.hashNodeKey(peerID) != h {
+				panic(fmt.Sprintf("arenaRadix invariant violation: invalid collision peer %d for hash %d", peerID, h))
+			}
+			if mappedID, ok := c.nodeMap[h]; ok && mappedID == peerID {
+				panic(fmt.Sprintf("arenaRadix invariant violation: collision peer %d duplicates nodeMap[%d]", peerID, h))
+			}
+			totalPeers++
+		}
+	}
+	if c.collisionCount != totalPeers {
+		panic(fmt.Sprintf("arenaRadix invariant violation: collisionCount %d != totalPeers %d", c.collisionCount, totalPeers))
+	}
+	if len(c.nodeMap)+c.collisionCount > c.len {
+		panic(fmt.Sprintf("arenaRadix invariant violation: len(nodeMap) (%d) + collisionCount (%d) > len (%d)", len(c.nodeMap), c.collisionCount, c.len))
+	}
 }
 
 func (c *arenaRadix[V]) checkFreeNodeInvariants(freeID uint32) {
@@ -428,7 +449,7 @@ func (c *arenaRadix[V]) updateExistingOnPutLocked(evictQ *evictCallbackQueue[V],
 	c.nodes[nodeID].size = valueSize
 	c.currentSize += valueSize
 	if evictedPrePut {
-		c.nodeMap[keyHash] = nodeID
+		c.promoteCollisionPeerLocked(keyHash, nodeID)
 	}
 	c.putUpdated++
 	c.notifyEvict(evictQ, key, oldValue, oldSize, EvictionReasonReplaced)
@@ -453,7 +474,7 @@ func (c *arenaRadix[V]) insertNewOnPutLocked(evictQ *evictCallbackQueue[V], key 
 
 	// Evict from the LRU tail before allocating new arena nodes when valueSize would exceed remaining capacity
 	// (using subtraction to avoid uint64 addition overflow when maxSize is near math.MaxUint64).
-	for (valueSize > c.maxSize-c.currentSize || c.shouldEvictZeroWeightOnInsert(valueSize, c.maxSize, c.currentSize, c.len)) && c.tail != nilNode {
+	for (valueSize > c.maxSize-c.currentSize || (!evictedPrePut && c.shouldEvictZeroWeightOnInsert(valueSize, c.maxSize, c.currentSize, c.len))) && c.tail != nilNode {
 		if evicted, ok := c.evictOne(evictQ); ok {
 			evictedValues = append(evictedValues, evicted)
 			evictedPrePut = true
