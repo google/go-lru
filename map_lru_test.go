@@ -927,13 +927,14 @@ func TestPressureClampingPositiveInfinity(t *testing.T) {
 	})
 
 	t.Run("DerivedEvictionThresholdAboveOne", func(t *testing.T) {
-		// Arrange: WithCompactionThreshold(0.95) derives EvictionThreshold = 1.10.
+		// Arrange: Explicit WithEvictionThreshold(1.10) configures EvictionThreshold = 1.10 > 1.0.
 		pressure := 0.0
 		c := NewMapCache[testData](
 			100,
 			WithInvariantChecking(true),
 			testDataWeigher,
 			WithCompactionThreshold(0.95),
+			WithEvictionThreshold(1.10),
 			WithPressureFunc(func() float64 { return pressure }),
 		).(PressureAwareCache[testData])
 

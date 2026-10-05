@@ -66,14 +66,14 @@ func (r EvictionReason) String() string {
 
 // OnEvictValue is a callback invoked with the value and EvictionReason whenever a cache entry
 // is evicted, deleted, or has its value replaced.
-// The callback runs synchronously under the cache's exclusive write lock and must not re-enter
-// the same Cache instance.
+// The callback runs synchronously after the cache's internal state has been updated and its
+// exclusive write lock has been released.
 type OnEvictValue[V any] func(value V, reason EvictionReason)
 
 // OnEvictEntry is a callback invoked with the key, value, and EvictionReason whenever a cache entry
 // is evicted, deleted, or has its value replaced.
-// The callback runs synchronously under the cache's exclusive write lock and must not re-enter
-// the same Cache instance.
+// The callback runs synchronously after the cache's internal state has been updated and its
+// exclusive write lock has been released.
 type OnEvictEntry[V any] func(key string, value V, reason EvictionReason)
 
 // Backend identifies the underlying cache data structure engine constructed by New.
@@ -299,12 +299,12 @@ func resolveWeigher[V any](options Options) func(string, V) uint64 {
 // displaced in place (via Put or Replace).
 // Passing nil clears any previously configured OnEvictValue callback.
 //
-// The callback executes synchronously under the cache's exclusive write lock and must not invoke
-// methods on the same Cache instance (doing so will deadlock). When both WithOnEvictValue and
-// WithOnEvictEntry are configured, OnEvictValue is invoked before OnEvictEntry. Capacity and
-// pressure evictions invoke callbacks in LRU-to-MRU order; DeletePrefix invokes callbacks once
-// per removed entry in an unspecified order. Prefer WithOnEvictValue when the key is not needed,
-// as it avoids key reconstruction overhead on RadixCache and ArenaRadixCache.
+// The callback executes synchronously after the cache's internal state has been updated and its
+// exclusive write lock has been released. When both WithOnEvictValue and WithOnEvictEntry are
+// configured, OnEvictValue is invoked before OnEvictEntry. Capacity and pressure evictions invoke
+// callbacks in LRU-to-MRU order; DeletePrefix invokes callbacks once per removed entry in an
+// unspecified order. Prefer WithOnEvictValue when the key is not needed, as it avoids key
+// reconstruction overhead on RadixCache and ArenaRadixCache.
 //
 // For zero heap allocations on hot paths, pass a function whose value parameter type V matches
 // the target Cache[V]. A type-erased WithOnEvictValue[any] is also supported for shared Options
@@ -357,11 +357,11 @@ func resolveOnEvictValue[V any](options Options) func(V, EvictionReason) {
 // (via Delete or DeletePrefix), or displaced in place (via Put or Replace).
 // Passing nil clears any previously configured OnEvictEntry callback.
 //
-// The callback executes synchronously under the cache's exclusive write lock and must not invoke
-// methods on the same Cache instance (doing so will deadlock). When both WithOnEvictValue and
-// WithOnEvictEntry are configured, OnEvictValue is invoked before OnEvictEntry. Capacity and
-// pressure evictions invoke callbacks in LRU-to-MRU order; DeletePrefix invokes callbacks once
-// per removed entry in an unspecified order.
+// The callback executes synchronously after the cache's internal state has been updated and its
+// exclusive write lock has been released. When both WithOnEvictValue and WithOnEvictEntry are
+// configured, OnEvictValue is invoked before OnEvictEntry. Capacity and pressure evictions invoke
+// callbacks in LRU-to-MRU order; DeletePrefix invokes callbacks once per removed entry in an
+// unspecified order.
 //
 // For zero heap allocations on hot paths, pass a function whose value parameter type V matches
 // the target Cache[V]. A type-erased WithOnEvictEntry[any] is also supported for shared Options
@@ -535,6 +535,9 @@ func advanceEvictionThreshold(compaction float64) float64 {
 	eviction := compaction + (DefaultEvictionThreshold - DefaultCompactionThreshold)
 	if math.IsInf(eviction, 1) {
 		eviction = math.MaxFloat64
+	}
+	if compaction <= 1.0 && eviction > 1.0 {
+		return 1.0
 	}
 	if eviction <= compaction {
 		if compaction < math.MaxFloat64 {

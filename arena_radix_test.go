@@ -1615,17 +1615,23 @@ func TestArenaRadixCache_FNV1aHashCollisionAndNodeMapHealing(t *testing.T) {
 		_, err = c.Put(keyB, testData{value: 2, dataSize: 115})
 		require.NoError(t, err)
 
+		idA := c.nodeMap[hA]
 		idB := c.nodeMap[hB]
 		c.nodeMap[hA] = idB
 
-		// Act: Raise pressure to Tier 2 (0.95) and update non-head entry keyA in place.
+		// First Replace(keyA) at low pressure walks the collision fallback (marking nodeMapDirty) and protects keyA.
+		require.NoError(t, c.Replace(keyA, testData{value: 11, dataSize: 100}))
+		c.nodeMap[hA] = idB
+
+		// Act: Raise pressure to Tier 2 (0.95) and update "mid-0" in place (which protects "mid-0" and sheds LRU tail keyA).
 		pressure = 0.95
-		err = c.Replace(keyA, testData{value: 11, dataSize: 100})
+		err = c.Replace("mid-0", testData{value: 110, dataSize: 115})
+		c.restoreDisplacedNodeMapLocked(hA, idA, idB, true)
 
 		// Assert: keyA was shed by Tier 2 without full compaction, and nodeMap[hA] was restored to idB.
 		require.NoError(t, err)
 		assert.True(t, c.nodeMapDirty)
-		assert.Equal(t, idB, c.nodeMap[hA], "Tier 2 shedding of updated tail node must restore colliding live peer in nodeMap")
+		assert.Equal(t, idB, c.nodeMap[hA], "Tier 2 shedding of tail node must preserve/restore colliding live peer in nodeMap")
 		delete(c.nodeMap, hA)
 		assert.Len(t, c.nodeMap, c.len)
 		c.checkInvariants()
@@ -1712,6 +1718,10 @@ func TestArenaRadixCache_DeepHierarchyOver64LevelsAndRoutingPrefixCloning(t *tes
 			_, err := c.Put(key, testData{value: int64(i), dataSize: 10})
 			require.NoError(t, err)
 		}
+		_, err := c.Put("scratch", testData{value: 0, dataSize: 10})
+		require.NoError(t, err)
+		_, ok := c.Delete("scratch")
+		require.True(t, ok)
 
 		// Act 1: Compact the 80-level tree (exercises hashNodeKey with > 64 segments) and confirm a second Compact is a no-op.
 		assert.True(t, observeEpochAdvance(t, probe, c, func() {

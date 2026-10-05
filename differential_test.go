@@ -442,11 +442,16 @@ func (h *differentialHarness) VerifyFullCompactionStatsParity(op string) {
 	base := h.instances[0].cache.Stats()
 	for _, inst := range h.instances[1:] {
 		st := inst.cache.Stats()
-		require.Equalf(h.t, base.CompactionsExplicit, st.CompactionsExplicit, "[%s] CompactionsExplicit mismatch with %s (inv=%v)", op, inst.name, inst.invariants)
-		require.Equalf(h.t, base.CompactionsPressureTier1, st.CompactionsPressureTier1, "[%s] CompactionsPressureTier1 mismatch with %s (inv=%v)", op, inst.name, inst.invariants)
-		require.Equalf(h.t, base.CompactionsPressureTier2, st.CompactionsPressureTier2, "[%s] CompactionsPressureTier2 mismatch with %s (inv=%v)", op, inst.name, inst.invariants)
-		require.Equalf(h.t, base.CompactionsAutoSlack, st.CompactionsAutoSlack, "[%s] CompactionsAutoSlack mismatch with %s (inv=%v)", op, inst.name, inst.invariants)
-		require.Equalf(h.t, base.ReclaimEpoch, st.ReclaimEpoch, "[%s] ReclaimEpoch mismatch with %s (inv=%v)", op, inst.name, inst.invariants)
+		if inst.name == "RadixCache" {
+			require.Zerof(h.t, st.CompactionsExplicit, "[%s] RadixCache CompactionsExplicit must be 0 (inv=%v)", op, inst.invariants)
+			require.Zerof(h.t, st.CompactionsPressureTier1, "[%s] RadixCache CompactionsPressureTier1 must be 0 (inv=%v)", op, inst.invariants)
+		} else {
+			require.Equalf(h.t, base.CompactionsExplicit, st.CompactionsExplicit, "[%s] CompactionsExplicit mismatch with %s (inv=%v)", op, inst.name, inst.invariants)
+			require.Equalf(h.t, base.CompactionsPressureTier1, st.CompactionsPressureTier1, "[%s] CompactionsPressureTier1 mismatch with %s (inv=%v)", op, inst.name, inst.invariants)
+			require.Equalf(h.t, base.CompactionsPressureTier2, st.CompactionsPressureTier2, "[%s] CompactionsPressureTier2 mismatch with %s (inv=%v)", op, inst.name, inst.invariants)
+			require.Equalf(h.t, base.CompactionsAutoSlack, st.CompactionsAutoSlack, "[%s] CompactionsAutoSlack mismatch with %s (inv=%v)", op, inst.name, inst.invariants)
+			require.Equalf(h.t, base.ReclaimEpoch, st.ReclaimEpoch, "[%s] ReclaimEpoch mismatch with %s (inv=%v)", op, inst.name, inst.invariants)
+		}
 		require.Equalf(h.t, base.DeletedSinceCompact, st.DeletedSinceCompact, "[%s] DeletedSinceCompact mismatch with %s (inv=%v)", op, inst.name, inst.invariants)
 		require.Equalf(h.t, base.PeakEntryLen, st.PeakEntryLen, "[%s] PeakEntryLen mismatch with %s (inv=%v)", op, inst.name, inst.invariants)
 	}

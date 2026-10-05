@@ -15,6 +15,7 @@
 package lru
 
 import (
+	"bytes"
 	"fmt"
 	"math"
 	"runtime"
@@ -29,22 +30,48 @@ var goroutineIDBufPool = sync.Pool{
 	},
 }
 
+var goroutineStackBufPool = sync.Pool{
+	New: func() any {
+		return new([4096]byte)
+	},
+}
+
+func parseDecimalUint64(b []byte) (uint64, int) {
+	var id uint64
+	var consumed int
+	for consumed < len(b) {
+		c := b[consumed]
+		if c < '0' || c > '9' {
+			break
+		}
+		id = id*10 + uint64(c-'0')
+		consumed++
+	}
+	return id, consumed
+}
+
 func currentGoroutineID() uint64 {
 	bufPtr := goroutineIDBufPool.Get().(*[32]byte)
 	n := runtime.Stack(bufPtr[:32], false)
 	const prefix = "goroutine "
 	var id uint64
 	if n > len(prefix) {
-		for i := len(prefix); i < n; i++ {
-			b := bufPtr[i]
-			if b < '0' || b > '9' {
-				break
-			}
-			id = id*10 + uint64(b-'0')
-		}
+		id, _ = parseDecimalUint64(bufPtr[len(prefix):n])
 	}
 	goroutineIDBufPool.Put(bufPtr)
 	return id
+}
+
+func parseStackGoroutineAndParentID(stack []byte) (gid, parentGID uint64) {
+	const prefix = "goroutine "
+	if len(stack) > len(prefix) {
+		gid, _ = parseDecimalUint64(stack[len(prefix):])
+	}
+	const createdIn = " in goroutine "
+	if idx := bytes.LastIndex(stack, []byte(createdIn)); idx >= 0 {
+		parentGID, _ = parseDecimalUint64(stack[idx+len(createdIn):])
+	}
+	return gid, parentGID
 }
 
 var byteStrings [256]string
@@ -167,6 +194,8 @@ type pressureState struct {
 	cachedPressureEpoch      atomic.Uint64
 	reclaimEpoch             atomic.Uint64
 	externalReclaimEpoch     atomic.Uint64
+	evictCallbackMu          sync.Mutex
+	evictCallbackGID         atomic.Uint64
 }
 
 const (
@@ -198,18 +227,71 @@ func (p *pressureState) isCurrentGoroutineSampling(gid uint64) bool {
 		p.hasOverflowSamplingGID(gid)
 }
 
+func (p *pressureState) resolvePrimaryFromAllStacks() uint64 {
+	if sGID := p.samplingGID.Load(); sGID != 0 {
+		return sGID
+	}
+	size := 16384
+	for size <= 1<<20 {
+		buf := make([]byte, size)
+		n := runtime.Stack(buf, true)
+		if n < len(buf) {
+			blocks := bytes.Split(buf[:n], []byte("\n\n"))
+			for _, blk := range blocks {
+				if bytes.Contains(blk, []byte("invokeAndStorePressure")) {
+					gid, _ := parseStackGoroutineAndParentID(blk)
+					if gid != 0 && gid != p.fallbackGID.Load() && !p.hasOverflowSamplingGID(gid) {
+						p.samplingGID.CompareAndSwap(0, gid)
+						return p.samplingGID.Load()
+					}
+				}
+			}
+			break
+		}
+		size *= 2
+	}
+	return p.samplingGID.Load()
+}
+
+func (p *pressureState) inspectCurrentAndResolvePrimary() (gid, parentGID uint64) {
+	bufPtr := goroutineStackBufPool.Get().(*[4096]byte)
+	n := runtime.Stack(bufPtr[:], false)
+	gid, parentGID = parseStackGoroutineAndParentID(bufPtr[:n])
+	if p.samplingPressure.Load() && p.samplingGID.Load() == 0 {
+		if bytes.Contains(bufPtr[:n], []byte("invokeAndStorePressure")) &&
+			gid != p.fallbackGID.Load() && !p.hasOverflowSamplingGID(gid) {
+			p.samplingGID.CompareAndSwap(0, gid)
+		} else {
+			p.resolvePrimaryFromAllStacks()
+		}
+	}
+	goroutineStackBufPool.Put(bufPtr)
+	return gid, parentGID
+}
+
+func (p *pressureState) hasActiveSampler() bool {
+	return p.samplingPressure.Load() ||
+		p.fallbackSampling.Load() ||
+		p.overflowSamplingCount.Load() > 0
+}
+
 func (p *pressureState) checkSamplingGoroutine() (bool, uint64) {
-	if !p.options.hasCustomPressureFunc {
+	if !p.options.hasCustomPressureFunc || !p.hasActiveSampler() {
 		return false, 0
 	}
-	sGID := p.samplingGID.Load()
-	fGID := p.fallbackGID.Load()
-	oCount := p.overflowSamplingCount.Load()
-	if sGID == 0 && fGID == 0 && oCount <= 0 {
-		return false, 0
-	}
-	gid := currentGoroutineID()
+	gid, _ := p.inspectCurrentAndResolvePrimary()
 	return p.isCurrentGoroutineSampling(gid), gid
+}
+
+func (p *pressureState) checkSamplingGoroutineOrChild() (bool, uint64) {
+	if !p.options.hasCustomPressureFunc || !p.hasActiveSampler() {
+		return false, 0
+	}
+	gid, parentGID := p.inspectCurrentAndResolvePrimary()
+	if p.isCurrentGoroutineSampling(gid) || p.isCurrentGoroutineSampling(parentGID) {
+		return true, gid
+	}
+	return false, gid
 }
 
 func (p *pressureState) isSamplingGoroutine() bool {
@@ -234,10 +316,13 @@ func (p *pressureState) recordReentrantReclaimGID(gid uint64) {
 func (p *pressureState) clearReentrantSlot(gid uint64, slot int) bool {
 	switch slot {
 	case samplerSlotPrimary:
-		return p.samplingReentrantReclaim.Swap(false)
+		return p.samplingReentrantReclaim.Load() && p.samplingReentrantReclaim.Swap(false)
 	case samplerSlotFallback:
-		return p.fallbackReentrantReclaim.Swap(false)
+		return p.fallbackReentrantReclaim.Load() && p.fallbackReentrantReclaim.Swap(false)
 	default:
+		if gid == 0 {
+			return false
+		}
 		_, reentrant := p.reentrantReclaimGIDs.LoadAndDelete(gid)
 		return reentrant
 	}
@@ -361,7 +446,7 @@ func (p *pressureState) storeSampledPressureWithSeq(epoch, extEpoch, invokeSeq u
 	}
 
 	val, stored := p.updateCachedPressureLocked(epoch, invokeSeq, val)
-	if gid != 0 {
+	if p.options.hasCustomPressureFunc {
 		reentrant := p.clearReentrantSlot(gid, slot)
 		if reentrant && !stored && p.externalReclaimEpoch.Load() == extEpoch {
 			epoch = p.reclaimEpoch.Load()
@@ -371,8 +456,9 @@ func (p *pressureState) storeSampledPressureWithSeq(epoch, extEpoch, invokeSeq u
 	return epoch, val, stored
 }
 
+//go:noinline
 func (p *pressureState) invokeAndStorePressure(gid uint64, slot int) (uint64, float64, bool) {
-	if p.options.hasCustomPressureFunc && gid != 0 {
+	if p.options.hasCustomPressureFunc {
 		p.clearReentrantSlot(gid, slot)
 	}
 	extEpoch := p.externalReclaimEpoch.Load()
@@ -397,10 +483,14 @@ func (p *pressureState) ensureSamplingGID(gid uint64) uint64 {
 
 func (p *pressureState) sampleWithSlot(gid uint64, slot int, slotGID *atomic.Uint64, slotFlag *atomic.Bool) (uint64, float64, bool) {
 	if p.options.hasCustomPressureFunc {
-		gid = p.ensureSamplingGID(gid)
-		slotGID.Store(gid)
+		if slot != samplerSlotPrimary {
+			gid = p.ensureSamplingGID(gid)
+			slotGID.Store(gid)
+		}
 		defer func() {
-			slotGID.Store(0)
+			if slot != samplerSlotPrimary || slotGID.Load() != 0 {
+				slotGID.Store(0)
+			}
 			slotFlag.Store(false)
 		}()
 	} else {
@@ -429,16 +519,19 @@ func (p *pressureState) samplePressureFreshWithEpoch() (uint64, float64, bool) {
 	if p.options.PressureFunc == nil {
 		return p.reclaimEpoch.Load(), 0.0, true
 	}
-	sampling, gid := p.checkSamplingGoroutine()
+	sampling, gid := p.checkSamplingGoroutineOrChild()
 	if sampling {
 		return p.reclaimEpoch.Load(), 0.0, false
 	}
 	if p.samplingPressure.CompareAndSwap(false, true) {
 		return p.sampleWithSlot(gid, samplerSlotPrimary, &p.samplingGID, &p.samplingPressure)
 	}
-	gid = p.ensureSamplingGID(gid)
-	if p.options.hasCustomPressureFunc && p.isCurrentGoroutineSampling(gid) {
-		return p.reclaimEpoch.Load(), 0.0, false
+	if p.options.hasCustomPressureFunc {
+		sampling, gid = p.checkSamplingGoroutineOrChild()
+		if sampling {
+			return p.reclaimEpoch.Load(), 0.0, false
+		}
+		gid = p.ensureSamplingGID(gid)
 	}
 	if p.fallbackSampling.CompareAndSwap(false, true) {
 		return p.sampleWithSlot(gid, samplerSlotFallback, &p.fallbackGID, &p.fallbackSampling)
@@ -629,18 +722,136 @@ func (p *pressureState) recordPressureShed(isBackground bool) {
 	}
 }
 
+func (p *pressureState) shouldEvictZeroWeightOnInsert(valueSize, maxSize, currentSize uint64, currentLen int) bool {
+	return valueSize == 0 && currentLen > 0 &&
+		((currentSize >= maxSize && uint64(currentLen) >= maxSize) || uint64(p.zeroSizeCount) >= maxSize)
+}
+
 func (p *pressureState) maybeMarkReclaimed(reclaimedOrReduced bool, sampledEpoch uint64, pressure float64) {
 	if reclaimedOrReduced && p.reclaimEpoch.Load() == sampledEpoch && p.hasElevatedPressureToInvalidate(pressure) {
 		p.markReclaimedLocked()
 	}
 }
 
-func (p *pressureState) finishClearAllLocked(hadCompactionSlack, hadReclaimable bool) {
+func (p *pressureState) finishClearAllLocked(hadCompactionSlack, hadReclaimable bool, sampledEpoch uint64, pressure float64) {
 	if hadCompactionSlack {
-		p.compactionsAutoSlack++
+		p.recordCompactionByPressure(pressure)
 	}
-	if hadReclaimable && p.hasElevatedPressureToInvalidate(0.0) {
-		p.markReclaimedLocked()
+	p.maybeMarkReclaimed(hadCompactionSlack || hadReclaimable, sampledEpoch, pressure)
+}
+
+type evictEvent[V any] struct {
+	key    string
+	value  V
+	reason EvictionReason
+}
+
+// evictCallbackQueue buffers eviction events on the stack during a cache mutation
+// so user OnEvictValue / OnEvictEntry callbacks execute only after all internal
+// structural invariants are restored and c.mu.Unlock() has completed.
+type evictCallbackQueue[V any] struct {
+	buf      [2]evictEvent[V]
+	overflow []evictEvent[V]
+	n        int
+}
+
+func (q *evictCallbackQueue[V]) enqueue(key string, value V, reason EvictionReason) {
+	if q.n < len(q.buf) {
+		q.buf[q.n] = evictEvent[V]{key: key, value: value, reason: reason}
+		q.n++
+		return
+	}
+	q.overflow = append(q.overflow, evictEvent[V]{key: key, value: value, reason: reason})
+	q.n++
+}
+
+func (p *pressureState) resolveEvictCallbackHolderFromAllStacks() uint64 {
+	if gid := p.evictCallbackGID.Load(); gid != 0 {
+		return gid
+	}
+	size := 16384
+	for size <= 1<<20 {
+		buf := make([]byte, size)
+		n := runtime.Stack(buf, true)
+		if n < len(buf) {
+			blocks := bytes.Split(buf[:n], []byte("\n\n"))
+			for _, blk := range blocks {
+				if bytes.Contains(blk, []byte("evictCallbackQueue")) && !bytes.Contains(blk, []byte("lockEvictCallback")) {
+					gid, _ := parseStackGoroutineAndParentID(blk)
+					if gid != 0 {
+						p.evictCallbackGID.CompareAndSwap(0, gid)
+						return p.evictCallbackGID.Load()
+					}
+				}
+			}
+			break
+		}
+		size *= 2
+	}
+	return p.evictCallbackGID.Load()
+}
+
+func (p *pressureState) lockEvictCallback() bool {
+	if p.evictCallbackMu.TryLock() {
+		return true
+	}
+	return p.lockEvictCallbackSlow()
+}
+
+//go:noinline
+func (p *pressureState) lockEvictCallbackSlow() bool {
+	bufPtr := goroutineStackBufPool.Get().(*[4096]byte)
+	n := runtime.Stack(bufPtr[:], false)
+	gid, parentGID := parseStackGoroutineAndParentID(bufPtr[:n])
+	isSelfHolder := bytes.Count(bufPtr[:n], []byte("evictCallbackQueue")) >= 2
+	goroutineStackBufPool.Put(bufPtr)
+	if isSelfHolder {
+		p.evictCallbackGID.CompareAndSwap(0, gid)
+		return false
+	}
+	if p.evictCallbackGID.Load() == 0 {
+		p.resolveEvictCallbackHolderFromAllStacks()
+	}
+	if holder := p.evictCallbackGID.Load(); holder != 0 && (holder == gid || holder == parentGID) {
+		return false
+	}
+	p.evictCallbackMu.Lock()
+	p.evictCallbackGID.Store(gid)
+	return true
+}
+
+func (p *pressureState) unlockEvictCallback() {
+	if p.evictCallbackGID.Load() != 0 {
+		p.evictCallbackGID.Store(0)
+	}
+	p.evictCallbackMu.Unlock()
+}
+
+//go:noinline
+func (q *evictCallbackQueue[V]) invoke(p *pressureState, onVal func(V, EvictionReason), onEntry func(string, V, EvictionReason)) {
+	if q.n == 0 || (onVal == nil && onEntry == nil) {
+		return
+	}
+	if p.lockEvictCallback() {
+		defer p.unlockEvictCallback()
+	}
+	inlineCount := min(q.n, len(q.buf))
+	for i := range inlineCount {
+		ev := q.buf[i]
+		if onVal != nil {
+			onVal(ev.value, ev.reason)
+		}
+		if onEntry != nil {
+			onEntry(ev.key, ev.value, ev.reason)
+		}
+	}
+	for _, ev := range q.overflow {
+		if onVal != nil {
+			onVal(ev.value, ev.reason)
+		}
+		if onEntry != nil {
+			onEntry(ev.key, ev.value, ev.reason)
+		}
 	}
 }
 

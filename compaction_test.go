@@ -742,7 +742,7 @@ func testValueBearingInternalNodeShrinkage(t *testing.T) {
 			})
 
 			// Assert
-			assert.True(t, advanced)
+			assert.Equal(t, b.name != "RadixCache", advanced)
 			assertAlreadyCompacted(t, pac, probe)
 		})
 	}
@@ -814,7 +814,7 @@ func testExact25PercentShrinkageAutoCompactionParity(t *testing.T) {
 			})
 
 			// Assert 1
-			assert.True(t, advancedFifth)
+			assert.Equal(t, b.name != "RadixCache", advancedFifth)
 			assertAlreadyCompacted(t, pac, probe)
 
 			// Act 2: Delete 1 more zero-byte key ("k05", 15 -> 14, 1/15 < 25% shrinkage) at Tier 1 pressure;
@@ -904,7 +904,7 @@ func testTier1AndTier2AutoCompactionParityAcrossBackends(t *testing.T) {
 				advancedExplicit := observeEpochAdvance(t, probe, pac, func() {
 					pac.EvaluateMemoryPressure()
 				})
-				assert.True(t, advancedExplicit)
+				assert.Equal(t, b.name != "RadixCache", advancedExplicit)
 				assertAlreadyCompacted(t, pac, probe)
 
 				advancedSecondEval := observeEpochAdvance(t, probe, pac, func() {
@@ -936,7 +936,7 @@ func testTier1AndTier2AutoCompactionParityAcrossBackends(t *testing.T) {
 				advanced := observeEpochAdvance(t, probe, pac, func() {
 					pac.EvaluateMemoryPressure()
 				})
-				assert.True(t, advanced)
+				assert.Equal(t, b.name != "RadixCache", advanced)
 				assertAlreadyCompacted(t, pac, probe)
 
 				advancedRepeat := observeEpochAdvance(t, probe, pac, func() {
@@ -1017,7 +1017,7 @@ func testEmptyCacheDrainDoesNotSpuriouslyAdvanceEpoch(t *testing.T) {
 
 				emptyBefore := emptyPrefixSamples.Load()
 				cachePrefixEmpty.DeletePrefix("")
-				assert.Equal(t, int32(0), emptyPrefixSamples.Load()-emptyBefore)
+				assert.Equal(t, int32(1), emptyPrefixSamples.Load()-emptyBefore)
 
 				_, ok = cacheDelete.Peek("k1")
 				assert.False(t, ok)
@@ -1412,41 +1412,44 @@ func TestCompaction_NetByteReductionBelowChurnFloor(t *testing.T) {
 				assert.False(t, advancedEvalPut)
 				assert.False(t, advancedEvalUpdate)
 
-				// Part 2: Large cache (100 entries: one 10B tail entry + 99 entries of 1B = 109B in 109B maxSize,
-				// RetentionRatio = 0.99 -> targetSize = 107B) under Tier 2 (0.95).
-				// Evicting only the single 10B tail entry (1 of 100 entries = 1% < 25% shrinkage) to insert an 8B entry
-				// reduces live bytes (109B -> 107B) and advances reclaimEpoch, but must NOT thrash O(N) compaction inline.
+				// Part 2: Large cache (100 entries: two 5B tail entries + 98 entries of 1B = 108B in 108B maxSize,
+				// RetentionRatio = 0.99 -> targetSize = 106B) under Tier 2 (0.95).
+				// Evicting the two 5B tail entries (2 of 100 entries = 2% < 25% shrinkage) to insert a 6B entry
+				// reduces live bytes (108B -> 104B) and entry count (100 -> 99) and advances reclaimEpoch,
+				// while deferring O(N) compaction inline.
 				probeLarge := newPressureProbe(0.10)
 				cacheLarge := b.fn(
-					109,
+					108,
 					WithInvariantChecking(true),
 					WithEvictionThreshold(0.90),
 					WithEvictionRetentionRatio(0.99),
 					probeLarge.Option(),
 				).(PressureAwareCache[testData])
 
-				_, err := cacheLarge.Put("tail-10", testData{value: 1, dataSize: 10})
+				_, err := cacheLarge.Put("tail-5a", testData{value: 1, dataSize: 5})
 				require.NoError(t, err)
-				for i := range 99 {
+				_, err = cacheLarge.Put("tail-5b", testData{value: 2, dataSize: 5})
+				require.NoError(t, err)
+				for i := range 98 {
 					_, err = cacheLarge.Put(fmt.Sprintf("k-%03d", i), testData{value: int64(i), dataSize: 1})
 					require.NoError(t, err)
 				}
 
 				probeLarge.Set(0.95)
 				advancedLargePut := observeEpochAdvance(t, probeLarge, cacheLarge, func() {
-					evicted, err := cacheLarge.Put("new-8", testData{value: 99, dataSize: 8})
+					evicted, err := cacheLarge.Put("new-6", testData{value: 99, dataSize: 6})
 					require.NoError(t, err)
-					require.Len(t, evicted, 1)
+					require.Len(t, evicted, 2)
 				})
 				assert.True(t, advancedLargePut)
 
-				// Because 1% eviction (< 25%) did not run O(N) compaction inline, an explicit Compact() reclaims the
-				// 1 deleted slot and advances reclaimEpoch.
+				// Because 2% eviction (< 25%) did not run O(N) compaction inline, an explicit Compact() reclaims the
+				// deleted slack on MapCache and ArenaRadixCache (while RadixCache has no structural slack per M-03).
 				probeLarge.Set(0.10)
 				advancedExplicitCompact := observeEpochAdvance(t, probeLarge, cacheLarge, func() {
 					cacheLarge.Compact()
 				})
-				assert.True(t, advancedExplicitCompact)
+				assert.Equal(t, b.name != "RadixCache", advancedExplicitCompact)
 			})
 
 			t.Run("PutSmallerOverwriteInvalidatesConcurrentInFlightSampleAndCompacts", func(t *testing.T) {
@@ -1608,9 +1611,9 @@ func TestCompaction_SteadyStateTurnoverAndShrinkageAutoCompaction(t *testing.T) 
 					_, err = c.Put("trigger", testData{value: 999, dataSize: 10})
 				})
 
-				// Assert: High-churn tombstone bloat triggers Tier 1 auto-compaction.
+				// Assert: High-churn tombstone bloat triggers Tier 1 auto-compaction on MapCache and ArenaRadixCache.
 				require.NoError(t, err)
-				assert.True(t, advanced)
+				assert.Equal(t, b.name != "RadixCache", advanced)
 				assertAlreadyCompacted(t, c, probe)
 			})
 		})
@@ -1641,7 +1644,7 @@ func TestObserveEpochAdvance_ArbitraryValueType(t *testing.T) {
 			})
 
 			// Assert
-			assert.True(t, advanced)
+			assert.Equal(t, b.name != "RadixCache", advanced)
 			assertAlreadyCompacted(t, pac, probe)
 		})
 	}

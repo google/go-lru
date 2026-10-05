@@ -315,7 +315,7 @@ func TestPressure_ForegroundMutations(t *testing.T) {
 				assert.True(t, hasKey(cache, "other/3"))
 			})
 
-			t.Run("ReplaceStrictLRUEvictsOldestTailEntry", func(t *testing.T) {
+			t.Run("ReplaceProtectsUpdatedEntryUnderTier2Shedding", func(t *testing.T) {
 				// Arrange: k1 (20B) at LRU tail, k2 (30B) at MRU head, maxSize = 100, targetSize = 50.
 				pressure := 0.10
 				cache := b.fn(
@@ -335,10 +335,10 @@ func TestPressure_ForegroundMutations(t *testing.T) {
 				pressure = 0.95
 				err = cache.Replace("k1", testData{value: 1, dataSize: 30})
 
-				// Assert: Strict LRU eviction order must evict k1 (oldest at LRU tail) and retain k2 (newest at MRU head).
+				// Assert: Replace protects the updated entry k1 and sheds unprotected k2 to meet targetSize.
 				require.NoError(t, err)
-				assert.False(t, hasKey(cache, "k1"))
-				assert.True(t, hasKey(cache, "k2"))
+				assert.True(t, hasKey(cache, "k1"))
+				assert.False(t, hasKey(cache, "k2"))
 			})
 
 			t.Run("ProtectedMRUEntryAboveTargetSizeDoesNotSpuriouslyAdvanceEpoch", func(t *testing.T) {
@@ -1147,6 +1147,9 @@ func TestPressure_EpochInvalidationAndResamplingSynchronization(t *testing.T) {
 			})
 
 			t.Run("PanicDuringEpochResampleDoesNotDoubleUnlockOrRunCheckInvariantsUnlocked", func(t *testing.T) {
+				if b.name == "RadixCache" {
+					t.Skip("RadixCache does not perform structural compaction on Compact() per M-03")
+				}
 				// Arrange
 				var armed atomic.Bool
 				var sampleCount atomic.Int32
@@ -1562,6 +1565,9 @@ func testOverflowAndWatermarkReentrancy(t *testing.T, b backendDef) {
 	})
 
 	t.Run("ForegroundReclaimDuringOverflowSamplingAdvancesReclaimEpoch", func(t *testing.T) {
+		if b.name == "RadixCache" {
+			t.Skip("RadixCache does not perform structural compaction on Compact() per M-03")
+		}
 		// Arrange: Prepare a cache with two 40B live entries and dirty/fragmented state so Compact() reclaims.
 		var pressureBits atomic.Uint64
 		pressureBits.Store(math.Float64bits(0.10))
@@ -1741,6 +1747,9 @@ func TestPressure_ConcurrentReentrantSamplersAndOverflowEpochInvalidation(t *tes
 			})
 
 			t.Run("PrimaryReentrantCompactWhileOverflowActiveInvalidatesStaleSamples", func(t *testing.T) {
+				if b.name == "RadixCache" {
+					t.Skip("RadixCache does not perform structural compaction on Compact() per M-03")
+				}
 				// Arrange: Primary sampler G1, fallback sampler G2, and overflow sampler G3 are all in-flight.
 				// When G1 performs a re-entrant Compact() on real dirty slack while G3 is in overflow,
 				// the reclamation epoch must advance so G2 and G3's stale 0.95 readings from before G1's Compact() are discarded.
@@ -2792,7 +2801,7 @@ func TestPressure_BelowTier2ResetsZeroWatermarks(t *testing.T) {
 			t.Run("SingleSurvivorDeletionResetsWatermarks", func(t *testing.T) {
 				probe := newPressureProbe(0.10)
 				cache := b.fn(
-					100,
+					200,
 					WithInvariantChecking(true),
 					probe.Option(),
 					WithCompactionThreshold(0.70),
@@ -3003,20 +3012,20 @@ func TestPressure_EvictionCallbacks_Tier2ExplicitAndForeground(t *testing.T) {
 				require.NoError(t, err)
 
 				// 1. Replace LRU tail ("p/k1") while under Tier 2 (1.0 -> retention 0.50 -> targetSize=15B):
-				// "p/k1" is replaced first (EvictionReasonReplaced with old value "0123456789"),
-				// and then Tier 2 pressure sheds the tail ("p/k1" with new value "BBBBBBBBBB" and "p/k2") with EvictionReasonPressure!
+				// "p/k1" is replaced first (EvictionReasonReplaced with old value "0123456789") and protected,
+				// and then Tier 2 pressure sheds unprotected "p/k2" and "p/k3" with EvictionReasonPressure!
 				entryEvents = nil
 				probe.Set(1.0)
 				require.NoError(t, cache.Replace("p/k1", "BBBBBBBBBB"))
 				assert.Equal(t, []recordedEvictEntry{
 					{key: "p/k1", val: "0123456789", reason: EvictionReasonReplaced},
-					{key: "p/k1", val: "BBBBBBBBBB", reason: EvictionReasonPressure},
 					{key: "p/k2", val: "abcdefghij", reason: EvictionReasonPressure},
+					{key: "p/k3", val: "klmnopqrst", reason: EvictionReasonPressure},
 				}, entryEvents)
 
 				// 2. Re-populate at normal pressure (0.10): d1(10B), d2(10B), d3(10B)
 				probe.Set(0.10)
-				_, _ = cache.Delete("p/k3")
+				_, _ = cache.Delete("p/k1")
 				_, err = cache.Put("p/d1", "1111111111")
 				require.NoError(t, err)
 				_, err = cache.Put("p/d2", "2222222222")

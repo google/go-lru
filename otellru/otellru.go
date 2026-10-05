@@ -161,9 +161,22 @@ func backendAttributeValue(b lru.Backend) string {
 	}
 }
 
+// maxOtelCounterInt64 is the largest int64 value (2^63 - 1024 = 9223372036854774784)
+// whose float64 conversion does not round up to 2^63. The OpenTelemetry Go SDK's
+// delta cumulative-to-delta rate calculator converts int64 counter deltas via float64,
+// and int64(float64(math.MaxInt64)) wraps to math.MinInt64 on x86_64.
+const maxOtelCounterInt64 = (1 << 63) - 1024
+
 func uint64ToInt64(v uint64) int64 {
 	if v > math.MaxInt64 {
 		return math.MaxInt64
+	}
+	return int64(v)
+}
+
+func uint64ToCounterInt64(v uint64) int64 {
+	if v > uint64(maxOtelCounterInt64) {
+		return maxOtelCounterInt64
 	}
 	return int64(v)
 }
@@ -382,22 +395,22 @@ func (inst *cacheInstruments) initArenaInstruments(meter metric.Meter, isArena b
 
 func (inst *cacheInstruments) observe(o metric.Observer, st lru.Stats, opts *observeSets, isArena bool) {
 	// 1. lru.cache.requests
-	o.ObserveInt64(inst.requestsCounter, uint64ToInt64(st.GetHits), opts.reqGetHit...)
-	o.ObserveInt64(inst.requestsCounter, uint64ToInt64(st.GetMisses), opts.reqGetMiss...)
-	o.ObserveInt64(inst.requestsCounter, uint64ToInt64(st.PeekHits), opts.reqPeekHit...)
-	o.ObserveInt64(inst.requestsCounter, uint64ToInt64(st.PeekMisses), opts.reqPeekMiss...)
+	o.ObserveInt64(inst.requestsCounter, uint64ToCounterInt64(st.GetHits), opts.reqGetHit...)
+	o.ObserveInt64(inst.requestsCounter, uint64ToCounterInt64(st.GetMisses), opts.reqGetMiss...)
+	o.ObserveInt64(inst.requestsCounter, uint64ToCounterInt64(st.PeekHits), opts.reqPeekHit...)
+	o.ObserveInt64(inst.requestsCounter, uint64ToCounterInt64(st.PeekMisses), opts.reqPeekMiss...)
 
 	// 2. lru.cache.evictions
-	o.ObserveInt64(inst.evictionsCounter, uint64ToInt64(st.EvictionsCapacity), opts.reasonCapacity...)
-	o.ObserveInt64(inst.evictionsCounter, uint64ToInt64(st.EvictionsPressure), opts.reasonPressure...)
-	o.ObserveInt64(inst.evictionsCounter, uint64ToInt64(st.EvictionsDeleted), opts.reasonDeleted...)
-	o.ObserveInt64(inst.evictionsCounter, uint64ToInt64(st.EvictionsReplaced), opts.reasonReplaced...)
+	o.ObserveInt64(inst.evictionsCounter, uint64ToCounterInt64(st.EvictionsCapacity), opts.reasonCapacity...)
+	o.ObserveInt64(inst.evictionsCounter, uint64ToCounterInt64(st.EvictionsPressure), opts.reasonPressure...)
+	o.ObserveInt64(inst.evictionsCounter, uint64ToCounterInt64(st.EvictionsDeleted), opts.reasonDeleted...)
+	o.ObserveInt64(inst.evictionsCounter, uint64ToCounterInt64(st.EvictionsReplaced), opts.reasonReplaced...)
 
 	// 3. lru.cache.evicted_weight
-	o.ObserveInt64(inst.evictedWeightCounter, uint64ToInt64(st.EvictedWeightCapacity), opts.reasonCapacity...)
-	o.ObserveInt64(inst.evictedWeightCounter, uint64ToInt64(st.EvictedWeightPressure), opts.reasonPressure...)
-	o.ObserveInt64(inst.evictedWeightCounter, uint64ToInt64(st.EvictedWeightDeleted), opts.reasonDeleted...)
-	o.ObserveInt64(inst.evictedWeightCounter, uint64ToInt64(st.EvictedWeightReplaced), opts.reasonReplaced...)
+	o.ObserveInt64(inst.evictedWeightCounter, uint64ToCounterInt64(st.EvictedWeightCapacity), opts.reasonCapacity...)
+	o.ObserveInt64(inst.evictedWeightCounter, uint64ToCounterInt64(st.EvictedWeightPressure), opts.reasonPressure...)
+	o.ObserveInt64(inst.evictedWeightCounter, uint64ToCounterInt64(st.EvictedWeightDeleted), opts.reasonDeleted...)
+	o.ObserveInt64(inst.evictedWeightCounter, uint64ToCounterInt64(st.EvictedWeightReplaced), opts.reasonReplaced...)
 
 	// 4–7. Capacity & entry gauges
 	o.ObserveInt64(inst.sizeGauge, uint64ToInt64(st.CurrentSize), opts.base...)
@@ -406,31 +419,31 @@ func (inst *cacheInstruments) observe(o metric.Observer, st lru.Stats, opts *obs
 	o.ObserveInt64(inst.zeroWeightEntriesGauge, int64(st.ZeroSizeCount), opts.base...)
 
 	// 8. lru.cache.mutations
-	o.ObserveInt64(inst.mutationsCounter, uint64ToInt64(st.PutInserted), opts.mutPutInserted...)
-	o.ObserveInt64(inst.mutationsCounter, uint64ToInt64(st.PutUpdated), opts.mutPutUpdated...)
-	o.ObserveInt64(inst.mutationsCounter, uint64ToInt64(st.PutRejectedOversized), opts.mutPutRejectedOversized...)
-	o.ObserveInt64(inst.mutationsCounter, uint64ToInt64(st.ReplaceUpdated), opts.mutReplaceUpdated...)
-	o.ObserveInt64(inst.mutationsCounter, uint64ToInt64(st.ReplaceNotFound), opts.mutReplaceNotFound...)
-	o.ObserveInt64(inst.mutationsCounter, uint64ToInt64(st.ReplaceSelfEvicted), opts.mutReplaceSelfEvicted...)
-	o.ObserveInt64(inst.mutationsCounter, uint64ToInt64(st.DeleteDeleted), opts.mutDeleteDeleted...)
-	o.ObserveInt64(inst.mutationsCounter, uint64ToInt64(st.DeleteNotFound), opts.mutDeleteNotFound...)
-	o.ObserveInt64(inst.mutationsCounter, uint64ToInt64(st.DeletePrefixExecuted), opts.mutDeletePrefixExecuted...)
+	o.ObserveInt64(inst.mutationsCounter, uint64ToCounterInt64(st.PutInserted), opts.mutPutInserted...)
+	o.ObserveInt64(inst.mutationsCounter, uint64ToCounterInt64(st.PutUpdated), opts.mutPutUpdated...)
+	o.ObserveInt64(inst.mutationsCounter, uint64ToCounterInt64(st.PutRejectedOversized), opts.mutPutRejectedOversized...)
+	o.ObserveInt64(inst.mutationsCounter, uint64ToCounterInt64(st.ReplaceUpdated), opts.mutReplaceUpdated...)
+	o.ObserveInt64(inst.mutationsCounter, uint64ToCounterInt64(st.ReplaceNotFound), opts.mutReplaceNotFound...)
+	o.ObserveInt64(inst.mutationsCounter, uint64ToCounterInt64(st.ReplaceSelfEvicted), opts.mutReplaceSelfEvicted...)
+	o.ObserveInt64(inst.mutationsCounter, uint64ToCounterInt64(st.DeleteDeleted), opts.mutDeleteDeleted...)
+	o.ObserveInt64(inst.mutationsCounter, uint64ToCounterInt64(st.DeleteNotFound), opts.mutDeleteNotFound...)
+	o.ObserveInt64(inst.mutationsCounter, uint64ToCounterInt64(st.DeletePrefixExecuted), opts.mutDeletePrefixExecuted...)
 
 	// 9. lru.cache.memory_pressure
 	o.ObserveFloat64(inst.memoryPressureGauge, st.MemoryPressure, opts.base...)
 
 	// 10. lru.cache.compactions
-	o.ObserveInt64(inst.compactionsCounter, uint64ToInt64(st.CompactionsExplicit), opts.compactExplicit...)
-	o.ObserveInt64(inst.compactionsCounter, uint64ToInt64(st.CompactionsPressureTier1), opts.compactTier1...)
-	o.ObserveInt64(inst.compactionsCounter, uint64ToInt64(st.CompactionsPressureTier2), opts.compactTier2...)
-	o.ObserveInt64(inst.compactionsCounter, uint64ToInt64(st.CompactionsAutoSlack), opts.compactAutoSlack...)
+	o.ObserveInt64(inst.compactionsCounter, uint64ToCounterInt64(st.CompactionsExplicit), opts.compactExplicit...)
+	o.ObserveInt64(inst.compactionsCounter, uint64ToCounterInt64(st.CompactionsPressureTier1), opts.compactTier1...)
+	o.ObserveInt64(inst.compactionsCounter, uint64ToCounterInt64(st.CompactionsPressureTier2), opts.compactTier2...)
+	o.ObserveInt64(inst.compactionsCounter, uint64ToCounterInt64(st.CompactionsAutoSlack), opts.compactAutoSlack...)
 
 	// 11. lru.cache.pressure_sheds
-	o.ObserveInt64(inst.pressureShedsCounter, uint64ToInt64(st.PressureShedsInline), opts.shedInline...)
-	o.ObserveInt64(inst.pressureShedsCounter, uint64ToInt64(st.PressureShedsExplicit), opts.shedExplicit...)
+	o.ObserveInt64(inst.pressureShedsCounter, uint64ToCounterInt64(st.PressureShedsInline), opts.shedInline...)
+	o.ObserveInt64(inst.pressureShedsCounter, uint64ToCounterInt64(st.PressureShedsExplicit), opts.shedExplicit...)
 
 	// 12–14. Reclamation epoch & structural watermark gauges
-	o.ObserveInt64(inst.reclaimEpochsCounter, uint64ToInt64(st.ReclaimEpoch), opts.base...)
+	o.ObserveInt64(inst.reclaimEpochsCounter, uint64ToCounterInt64(st.ReclaimEpoch), opts.base...)
 	o.ObserveInt64(inst.deletedSinceCompactGauge, int64(st.DeletedSinceCompact), opts.base...)
 	o.ObserveInt64(inst.peakEntriesGauge, int64(st.PeakEntryLen), opts.base...)
 
@@ -439,7 +452,7 @@ func (inst *cacheInstruments) observe(o metric.Observer, st lru.Stats, opts *obs
 		o.ObserveInt64(inst.arenaNodesGauge, int64(st.ArenaLiveNodes), opts.arenaLive...)
 		o.ObserveInt64(inst.arenaNodesGauge, int64(st.ArenaFreeNodes), opts.arenaFree...)
 		o.ObserveInt64(inst.arenaNodesGauge, int64(st.ArenaUnallocatedCap), opts.arenaUnallocatedCap...)
-		o.ObserveInt64(inst.arenaHashFallbacksCounter, uint64ToInt64(st.ArenaHashFallbacks), opts.base...)
+		o.ObserveInt64(inst.arenaHashFallbacksCounter, uint64ToCounterInt64(st.ArenaHashFallbacks), opts.base...)
 	}
 }
 
