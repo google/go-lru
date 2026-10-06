@@ -53,6 +53,7 @@ func (o *recordingObserver) ObserveFloat64(_ metric.Float64Observable, v float64
 // emits arena-only instruments exclusively for ArenaRadixCache, and cleanly
 // removes only the unregistered cache's series upon selective Unregister().
 func TestAdversarial_MultiCacheRegistrationAndSelectiveUnregister(t *testing.T) {
+	// Arrange
 	reader := sdkmetric.NewManualReader()
 	mp := sdkmetric.NewMeterProvider(sdkmetric.WithReader(reader))
 	t.Cleanup(func() {
@@ -77,7 +78,7 @@ func TestAdversarial_MultiCacheRegistrationAndSelectiveUnregister(t *testing.T) 
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = regArena.Unregister() })
 
-	// Mutate each cache with distinct entry counts and lookups.
+	// Act: Mutate each cache with distinct entry counts and lookups.
 	_, _ = mapC.Put("m/1", 1)
 	_, _ = mapC.Get("m/1")
 
@@ -90,6 +91,7 @@ func TestAdversarial_MultiCacheRegistrationAndSelectiveUnregister(t *testing.T) 
 	_, _ = arenaC.Put("a/3", 3)
 	_, _ = arenaC.Get("a/missing")
 
+	// Assert
 	metricsByName := collectMetricsByName(t, reader, otellru.ScopeName)
 	require.Len(t, metricsByName, 16)
 
@@ -172,6 +174,7 @@ func runChurnMutator(c lru.PressureAwareCache[weightedItem], w int, stopCh <-cha
 func TestAdversarial_HighChurnMonotonicityAndGaugeConsistencyUnderRace(t *testing.T) {
 	for _, b := range []lru.Backend{lru.BackendMap, lru.BackendRadix, lru.BackendArenaRadix} {
 		t.Run(b.String(), func(t *testing.T) {
+			// Arrange
 			reader := sdkmetric.NewManualReader()
 			mp := sdkmetric.NewMeterProvider(sdkmetric.WithReader(reader))
 			t.Cleanup(func() {
@@ -200,14 +203,13 @@ func TestAdversarial_HighChurnMonotonicityAndGaugeConsistencyUnderRace(t *testin
 			stopCh := make(chan struct{})
 			var mutWG sync.WaitGroup
 
-			// 8 concurrent mutators
+			// Act: 8 concurrent mutators and 3 background concurrent scrapers
 			for w := range 8 {
 				mutWG.Go(func() {
 					runChurnMutator(c, w, stopCh, &pressureBits)
 				})
 			}
 
-			// 3 background concurrent scrapers exercising ManualReader under -race
 			var scrapeWG sync.WaitGroup
 			for range 3 {
 				scrapeWG.Go(func() {
@@ -218,7 +220,7 @@ func TestAdversarial_HighChurnMonotonicityAndGaugeConsistencyUnderRace(t *testin
 				})
 			}
 
-			// Foreground verifier performing 50 sequential scrapes and checking monotonicity of all counters
+			// Assert: Foreground verifier performing 50 sequential scrapes and checking monotonicity of all counters
 			type counterKey struct {
 				metricName string
 				attrs      attribute.Set
@@ -289,8 +291,9 @@ func TestAdversarial_HighChurnMonotonicityAndGaugeConsistencyUnderRace(t *testin
 
 // TestAdversarial_Uint64OverflowClampingAllInstruments verifies that when all 26 uint64
 // fields in lru.Stats are set to math.MaxUint64, every single int64 counter and gauge
-// data point emitted by otellru clamps to math.MaxInt64 and never wraps negative.
+// data point emitted by otellru clamps safely and never wraps negative.
 func TestAdversarial_Uint64OverflowClampingAllInstruments(t *testing.T) {
+	// Arrange
 	stub := stubStatsProvider{
 		stats: lru.Stats{
 			Backend:                  lru.BackendArenaRadix,
@@ -336,8 +339,8 @@ func TestAdversarial_Uint64OverflowClampingAllInstruments(t *testing.T) {
 		},
 	}
 
-	// 1. Verify directly via callbackCapturingMeter that otellru's clampCounterToInt64 clamps
-	// cumulative counters to (1<<63)-1024 (avoiding OTel SDK int64 addition overflow in sum.go)
+	// Act & Assert 1: Verify directly via callbackCapturingMeter that otellru's uint64ToCounterInt64 clamps
+	// cumulative counters to (1<<63)-1024 (avoiding OTel SDK float64 precision wrap in sum.go)
 	// and uint64ToInt64 clamps gauges to math.MaxInt64 (never wrapping negative).
 	const maxClampedCounter = int64((uint64(1) << 63) - 1024)
 	capturingMeter := &callbackCapturingMeter{}
@@ -353,9 +356,9 @@ func TestAdversarial_Uint64OverflowClampingAllInstruments(t *testing.T) {
 			"observation %d (%d) must clamp to maxClampedCounter or MaxInt64", idx, v)
 	}
 	require.Len(t, recObs.float64Vals, 1)
-	assert.InDelta(t, 1.25, recObs.float64Vals[0], 1e-9)
+	assert.InDelta(t, 1.0, recObs.float64Vals[0], 1e-9)
 
-	// 2. Also verify through sdkmetric.ManualReader that all 16 instruments (38 int64 + 1 float64 data points)
+	// Act & Assert 2: Also verify through sdkmetric.ManualReader that all 16 instruments (38 int64 + 1 float64 data points)
 	// are emitted and that counter/gauge saturation works end-to-end without SDK int64 overflow across multiple scrapes.
 	reader := sdkmetric.NewManualReader()
 	mp := sdkmetric.NewMeterProvider(sdkmetric.WithReader(reader))
@@ -386,13 +389,48 @@ func TestAdversarial_Uint64OverflowClampingAllInstruments(t *testing.T) {
 			}
 		case metricdata.Gauge[float64]:
 			for _, dp := range data.DataPoints {
-				assert.InDelta(t, 1.25, dp.Value, 1e-9)
+				assert.InDelta(t, 1.0, dp.Value, 1e-9)
 			}
 		default:
-			t.Fatalf("unexpected metric data type for %s: %T", name, m.Data)
+			require.Failf(t, "unexpected metric data type", "for %s: %T", name, m.Data)
 		}
 	}
 	assert.Equal(t, 38, totalInt64Points, "all 38 int64 data points must be verified")
+}
+
+// TestAdversarial_NegativeIntAndInvalidPressureClamping verifies that negative int gauge fields
+// and NaN/negative MemoryPressure from a custom StatsProvider are defensively clamped to 0.
+func TestAdversarial_NegativeIntAndInvalidPressureClamping(t *testing.T) {
+	// Arrange
+	stub := stubStatsProvider{
+		stats: lru.Stats{
+			Backend:             lru.BackendArenaRadix,
+			Len:                 -5,
+			ZeroSizeCount:       -3,
+			MemoryPressure:      math.NaN(),
+			DeletedSinceCompact: -10,
+			PeakEntryLen:        -20,
+			ArenaLiveNodes:      -1,
+			ArenaFreeNodes:      -2,
+			ArenaUnallocatedCap: -4,
+		},
+	}
+
+	capturingMeter := &callbackCapturingMeter{}
+	reg, err := otellru.Register(stub, otellru.WithMeter(capturingMeter), otellru.WithName("clamp-negative"))
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = reg.Unregister() })
+
+	// Act
+	recObs := &recordingObserver{}
+	require.NoError(t, capturingMeter.cb(context.Background(), recObs))
+
+	// Assert
+	for idx, v := range recObs.int64Vals {
+		assert.Zero(t, v, "observation %d must clamp negative int to 0", idx)
+	}
+	require.Len(t, recObs.float64Vals, 1)
+	assert.InDelta(t, 0.0, recObs.float64Vals[0], 1e-9)
 }
 
 // TestDefect_L01_DuplicateRegistrationWithoutNameCollision characterizes L-01 / F-13 (Bucket 3 OTel SDK behavior):
@@ -400,6 +438,7 @@ func TestAdversarial_Uint64OverflowClampingAllInstruments(t *testing.T) {
 // unique WithName or WithAttributes emits identical attribute sets (`{"cache.backend": "map"}`),
 // which the OTel SDK deduplicates into a single series.
 func TestDefect_L01_DuplicateRegistrationWithoutNameCollision(t *testing.T) {
+	// Arrange
 	reader := sdkmetric.NewManualReader()
 	mp := sdkmetric.NewMeterProvider(sdkmetric.WithReader(reader))
 	t.Cleanup(func() {
@@ -413,6 +452,7 @@ func TestDefect_L01_DuplicateRegistrationWithoutNameCollision(t *testing.T) {
 		_, _ = c2.Put(fmt.Sprintf("k_%d", i), i)
 	}
 
+	// Act
 	reg1, err1 := otellru.Register(c1, otellru.WithMeterProvider(mp))
 	require.NoError(t, err1)
 	t.Cleanup(func() { _ = reg1.Unregister() })
@@ -421,6 +461,7 @@ func TestDefect_L01_DuplicateRegistrationWithoutNameCollision(t *testing.T) {
 	require.NoError(t, err2)
 	t.Cleanup(func() { _ = reg2.Unregister() })
 
+	// Assert
 	metricsByName := collectMetricsByName(t, reader, otellru.ScopeName)
 	entriesPts := requireInt64GaugePoints(t, metricsByName["lru.cache.entries"], "{entry}")
 	assert.Len(t, entriesPts, 1)

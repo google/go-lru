@@ -136,21 +136,38 @@ func containsCreatorCallFrame(stackPrefix, creatorFunc []byte) bool {
 	return false
 }
 
-func isParentCreatorAboveHook(parentGID uint64, creatorFunc, hookName []byte) bool {
+func isAncestorCreatorAboveHook(parentGID uint64, creatorFunc, hookName []byte, matchAncestor func(uint64) bool) bool {
 	if parentGID == 0 || len(creatorFunc) == 0 {
 		return false
 	}
 	allStacks := captureAllGoroutineStacks()
-	for _, blk := range bytes.Split(allStacks, []byte("\n\n")) {
-		gid, _ := parseStackGoroutineAndParentID(blk)
-		if gid != parentGID {
-			continue
-		}
-		hookIdx := bytes.Index(blk, hookName)
-		if hookIdx < 0 {
+	blocks := bytes.Split(allStacks, []byte("\n\n"))
+	currGID := parentGID
+	currCreator := creatorFunc
+	const maxAncestorHops = 8
+	for range maxAncestorHops {
+		if currGID == 0 || len(currCreator) == 0 {
 			return false
 		}
-		return containsCreatorCallFrame(blk[:hookIdx], creatorFunc)
+		foundBlock := false
+		for _, blk := range blocks {
+			gid, nextParentGID, nextCreator := parseStackGoroutineParentAndCreator(blk)
+			if gid != currGID {
+				continue
+			}
+			foundBlock = true
+			if matchAncestor(currGID) {
+				if hookIdx := bytes.Index(blk, hookName); hookIdx >= 0 && containsCreatorCallFrame(blk[:hookIdx], currCreator) {
+					return true
+				}
+			}
+			currGID = nextParentGID
+			currCreator = nextCreator
+			break
+		}
+		if !foundBlock {
+			return false
+		}
 	}
 	return false
 }
@@ -354,22 +371,9 @@ func (p *pressureState) isCurrentGoroutineSampling(gid uint64) bool {
 		p.hasOverflowSamplingGID(gid)
 }
 
-func isCandidatePrimarySamplerStack(blk []byte) bool {
-	if bytes.Contains(blk, []byte("invokeFastPrimaryPressure")) || bytes.Contains(blk, []byte("invokeAndStorePressure")) {
-		return true
-	}
-	return bytes.Contains(blk, []byte("sampleWithSlot")) &&
-		!bytes.Contains(blk, []byte("registerMultiCachePrimarySampler")) &&
-		!bytes.Contains(blk, []byte("releasePrimarySamplerSlot"))
-}
-
-func (p *pressureState) matchCandidatePrimarySamplerGID(blocks [][]byte, requireFastFrame bool) uint64 {
+func (p *pressureState) matchCandidatePrimarySamplerGID(blocks [][]byte) uint64 {
 	for _, blk := range blocks {
-		if requireFastFrame {
-			if !bytes.Contains(blk, []byte("invokeFastPrimaryPressure")) {
-				continue
-			}
-		} else if !isCandidatePrimarySamplerStack(blk) {
+		if !bytes.Contains(blk, []byte("invokeFastPrimaryPressure(")) {
 			continue
 		}
 		gid, _ := parseStackGoroutineAndParentID(blk)
@@ -398,10 +402,7 @@ func (p *pressureState) resolvePrimaryFromAllStacksLocked() uint64 {
 	}
 	allStacks := captureAllGoroutineStacks()
 	blocks := bytes.Split(allStacks, []byte("\n\n"))
-	if gid := p.matchCandidatePrimarySamplerGID(blocks, true); gid != 0 {
-		return gid
-	}
-	if gid := p.matchCandidatePrimarySamplerGID(blocks, false); gid != 0 {
+	if gid := p.matchCandidatePrimarySamplerGID(blocks); gid != 0 {
 		return gid
 	}
 	return p.samplingGID.Load()
@@ -444,7 +445,7 @@ func (p *pressureState) resolvePrimaryFromAllStacks(callerGID uint64, isFastPrim
 func (p *pressureState) inspectCurrentAndResolvePrimary() (gid, parentGID uint64, creatorFunc []byte) {
 	stack, bufPtr := captureCurrentGoroutineStack()
 	gid, parentGID, creatorFunc = parseStackGoroutineParentAndCreator(stack)
-	isFastPrimaryCaller := bytes.Contains(stack, []byte("invokeFastPrimaryPressure")) &&
+	isFastPrimaryCaller := bytes.Contains(stack, []byte("invokeFastPrimaryPressure(")) &&
 		gid != p.fallbackGID.Load() && !p.hasOverflowSamplingGID(gid)
 	if len(creatorFunc) > 0 && bufPtr != nil {
 		creatorFunc = bytes.Clone(creatorFunc)
@@ -471,6 +472,22 @@ func (p *pressureState) checkSamplingGoroutine() (bool, uint64) {
 	return p.isCurrentGoroutineSampling(gid), gid
 }
 
+func (p *pressureState) canBeDescendantOfActiveSampler(parentGID uint64) bool {
+	if parentGID == 0 {
+		return false
+	}
+	if p.isCurrentGoroutineSampling(parentGID) {
+		return true
+	}
+	if sGID := p.samplingGID.Load(); sGID != 0 && parentGID >= sGID {
+		return true
+	}
+	if fGID := p.fallbackGID.Load(); fGID != 0 && parentGID >= fGID {
+		return true
+	}
+	return p.overflowSamplingCount.Load() > 0
+}
+
 func (p *pressureState) checkSamplingGoroutineOrChild() (bool, uint64) {
 	if !p.options.hasCustomPressureFunc || !p.hasActiveSampler() {
 		return false, 0
@@ -479,7 +496,7 @@ func (p *pressureState) checkSamplingGoroutineOrChild() (bool, uint64) {
 	if p.isCurrentGoroutineSampling(gid) {
 		return true, gid
 	}
-	if p.isCurrentGoroutineSampling(parentGID) && isParentCreatorAboveHook(parentGID, creatorFunc, []byte("invokeAndStorePressure")) {
+	if p.canBeDescendantOfActiveSampler(parentGID) && isAncestorCreatorAboveHook(parentGID, creatorFunc, []byte("invokeAndStorePressure"), p.isCurrentGoroutineSampling) {
 		return true, gid
 	}
 	return false, gid
@@ -666,8 +683,14 @@ func (p *pressureState) invokeAndStorePressure(gid uint64, slot int) (uint64, fl
 }
 
 //go:noinline
-func (p *pressureState) invokeFastPrimaryPressure(gid uint64) (uint64, float64, bool) {
-	return p.invokeAndStorePressure(gid, samplerSlotPrimary)
+func (p *pressureState) invokeFastPrimaryPressure(gid *uint64, registeredMulti *bool) (uint64, float64, bool) {
+	p.samplingActive.Store(true)
+	if !fastPrimarySamplerOwner.CompareAndSwap(nil, p) {
+		p.samplingActive.Store(false)
+		*gid = p.registerMultiCachePrimarySampler(*gid)
+		*registeredMulti = true
+	}
+	return p.invokeAndStorePressure(*gid, samplerSlotPrimary)
 }
 
 func (p *pressureState) ensureSamplingGID(gid uint64) uint64 {
@@ -683,23 +706,21 @@ func (p *pressureState) registerMultiCachePrimarySampler(gid uint64) uint64 {
 	if gid == 0 {
 		gid, _, _ = parseStackGoroutineParentAndCreator(stack)
 	}
-	isFastPrimaryCaller := bytes.Contains(stack, []byte("invokeFastPrimaryPressure")) &&
+	isFastPrimaryCaller := bytes.Contains(stack, []byte("invokeFastPrimaryPressure(")) &&
 		gid != p.fallbackGID.Load() && !p.hasOverflowSamplingGID(gid)
 	releaseCurrentGoroutineStack(bufPtr)
 
 	multiCacheSamplerMu.Lock()
 	firstP := fastPrimarySamplerOwner.Swap(multiPrimarySamplerSentinel)
 	promoteFastPrimarySamplerLocked(firstP, gid, isFastPrimaryCaller)
-	var stored bool
 	p.samplingResolveMu.Lock()
-	if p.samplingActive.Load() {
-		p.samplingGID.Store(gid)
-		stored = true
-	}
+	prevGID := p.samplingGID.Swap(gid)
+	p.samplingActive.Store(true)
 	p.samplingResolveMu.Unlock()
-	if stored {
-		addMultiCacheOwner(multiCacheSamplerOwners, gid, p)
+	if prevGID != 0 && prevGID != gid {
+		removeMultiCacheOwner(multiCacheSamplerOwners, prevGID, p)
 	}
+	addMultiCacheOwner(multiCacheSamplerOwners, gid, p)
 	multiCacheSamplerMu.Unlock()
 	return gid
 }
@@ -718,50 +739,59 @@ func (p *pressureState) releasePrimarySamplerSlot(gid uint64, registeredMulti bo
 		if gid != 0 && gid != g {
 			removeMultiCacheOwner(multiCacheSamplerOwners, gid, p)
 		}
-		multiCacheSamplerMu.Unlock()
-	}
-	p.samplingPressure.Store(false)
-	if globalActivePrimarySamplers.Add(-1) == 0 {
-		multiCacheSamplerMu.Lock()
-		if globalActivePrimarySamplers.Load() == 0 {
+		if len(multiCacheSamplerOwners) == 0 {
 			fastPrimarySamplerOwner.CompareAndSwap(multiPrimarySamplerSentinel, nil)
 		}
 		multiCacheSamplerMu.Unlock()
 	}
+	if globalActivePrimarySamplers.Add(-1) == 0 {
+		multiCacheSamplerMu.Lock()
+		if globalActivePrimarySamplers.Load() == 0 || len(multiCacheSamplerOwners) == 0 {
+			fastPrimarySamplerOwner.CompareAndSwap(multiPrimarySamplerSentinel, nil)
+		}
+		multiCacheSamplerMu.Unlock()
+	}
+	p.samplingPressure.Store(false)
 }
 
 //go:noinline
-func (p *pressureState) sampleWithSlot(gid uint64, slot int, slotGID *atomic.Uint64, slotFlag *atomic.Bool) (uint64, float64, bool) {
+func (p *pressureState) sampleWithSlot(gid uint64) (uint64, float64, bool) {
 	var fastPrimary bool
+	var registeredMulti bool
 	if p.options.hasCustomPressureFunc {
-		var registeredMulti bool
-		if slot == samplerSlotPrimary {
-			p.samplingActive.Store(true)
-			if globalActivePrimarySamplers.Add(1) == 1 && gid == 0 && fastPrimarySamplerOwner.CompareAndSwap(nil, p) {
-				fastPrimary = true
-			} else {
-				gid = p.registerMultiCachePrimarySampler(gid)
-				registeredMulti = true
-			}
+		if globalActivePrimarySamplers.Add(1) == 1 && gid == 0 && fastPrimarySamplerOwner.Load() == nil {
+			fastPrimary = true
 		} else {
-			gid = p.ensureSamplingGID(gid)
-			slotGID.Store(gid)
+			gid = p.registerMultiCachePrimarySampler(gid)
+			registeredMulti = true
 		}
 		defer func() {
-			if slot == samplerSlotPrimary {
-				p.releasePrimarySamplerSlot(gid, registeredMulti)
-			} else {
-				slotGID.Store(0)
-				slotFlag.Store(false)
-			}
+			p.clearReentrantSlot(gid, samplerSlotPrimary)
+			p.releasePrimarySamplerSlot(gid, registeredMulti)
 		}()
 	} else {
-		defer slotFlag.Store(false)
+		defer p.samplingPressure.Store(false)
 	}
 	if fastPrimary {
-		return p.invokeFastPrimaryPressure(gid)
+		return p.invokeFastPrimaryPressure(&gid, &registeredMulti)
 	}
-	return p.invokeAndStorePressure(gid, slot)
+	return p.invokeAndStorePressure(gid, samplerSlotPrimary)
+}
+
+//go:noinline
+func (p *pressureState) sampleWithFallbackSlot(gid uint64) (uint64, float64, bool) {
+	if p.options.hasCustomPressureFunc {
+		gid = p.ensureSamplingGID(gid)
+		p.fallbackGID.Store(gid)
+		defer func() {
+			p.clearReentrantSlot(gid, samplerSlotFallback)
+			p.fallbackGID.Store(0)
+			p.fallbackSampling.Store(false)
+		}()
+	} else {
+		defer p.fallbackSampling.Store(false)
+	}
+	return p.invokeAndStorePressure(gid, samplerSlotFallback)
 }
 
 func (p *pressureState) sampleWithOverflowSlot(gid uint64) (uint64, float64, bool) {
@@ -771,6 +801,7 @@ func (p *pressureState) sampleWithOverflowSlot(gid uint64) (uint64, float64, boo
 	p.overflowSamplingCount.Add(1)
 	defer func() {
 		if p.options.hasCustomPressureFunc {
+			p.clearReentrantSlot(gid, samplerSlotOverflow)
 			p.overflowSamplingGIDs.Delete(gid)
 		}
 		p.overflowSamplingCount.Add(-1)
@@ -789,7 +820,7 @@ func (p *pressureState) samplePressureFreshWithEpoch() (uint64, float64, bool) {
 		return p.reclaimEpoch.Load(), 0.0, false
 	}
 	if p.samplingPressure.CompareAndSwap(false, true) {
-		return p.sampleWithSlot(gid, samplerSlotPrimary, &p.samplingGID, &p.samplingPressure)
+		return p.sampleWithSlot(gid)
 	}
 	if p.options.hasCustomPressureFunc {
 		sampling, gid = p.checkSamplingGoroutineOrChild()
@@ -799,7 +830,7 @@ func (p *pressureState) samplePressureFreshWithEpoch() (uint64, float64, bool) {
 		gid = p.ensureSamplingGID(gid)
 	}
 	if p.fallbackSampling.CompareAndSwap(false, true) {
-		return p.sampleWithSlot(gid, samplerSlotFallback, &p.fallbackGID, &p.fallbackSampling)
+		return p.sampleWithFallbackSlot(gid)
 	}
 	return p.sampleWithOverflowSlot(gid)
 }
@@ -938,9 +969,6 @@ func (p *pressureState) computeShedTargets(targetSize uint64, retention float64,
 		if (!hasProtected || protectedSize <= targetSize) && p.lastReclaimedLen > targetLen {
 			targetLen = p.lastReclaimedLen
 		}
-		if hasProtected && targetLen < 1 {
-			targetLen = 1
-		}
 	}
 	targetZeroCount, unprotectedZeroTarget = p.computeZeroShedTargets(retention, hasProtected, protectedSize)
 	return effectiveTarget, targetLen, targetZeroCount, unprotectedZeroTarget
@@ -949,7 +977,7 @@ func (p *pressureState) computeShedTargets(targetSize uint64, retention float64,
 func (p *pressureState) updateZeroWatermarkAfterShed(retention float64, currentLen int, unprotectedLenAllowed bool, unprotectedZeroTarget, targetLen int) {
 	if retention > 0.0 && p.zeroSizeCount > 0 {
 		p.lastReclaimedZeroCount = min(p.zeroSizeCount, unprotectedZeroTarget)
-		if unprotectedLenAllowed {
+		if unprotectedLenAllowed && currentLen > p.zeroSizeCount {
 			p.lastReclaimedLen = min(currentLen, targetLen)
 		} else {
 			p.lastReclaimedLen = 0
@@ -988,8 +1016,32 @@ func (p *pressureState) recordPressureShed(isBackground bool) {
 }
 
 func (p *pressureState) shouldEvictZeroWeightOnInsert(valueSize, maxSize, currentSize uint64, currentLen int) bool {
-	return valueSize == 0 && currentLen > 0 &&
-		((currentSize >= maxSize && uint64(currentLen) >= maxSize) || uint64(p.zeroSizeCount) >= maxSize)
+	if currentLen <= 0 {
+		return false
+	}
+	if valueSize == 0 {
+		return (currentSize >= maxSize && uint64(currentLen) >= maxSize) || uint64(p.zeroSizeCount) >= maxSize
+	}
+	if uint64(p.zeroSizeCount) <= maxSize {
+		return false
+	}
+	excessZero := uint64(p.zeroSizeCount) - maxSize
+	avail := maxSize - currentSize
+	return excessZero >= avail || valueSize > avail-excessZero
+}
+
+func (p *pressureState) shouldEvictPreInsertOnPut(valueSize, maxSize, currentSize uint64, currentLen int, evictedPrePut bool) bool {
+	if valueSize > maxSize-currentSize {
+		return true
+	}
+	if valueSize == 0 && evictedPrePut {
+		return false
+	}
+	return p.shouldEvictZeroWeightOnInsert(valueSize, maxSize, currentSize, currentLen)
+}
+
+func (p *pressureState) shouldEvictOnZeroWeightShrink(oldSize, newSize, maxSize uint64) bool {
+	return oldSize > 0 && newSize == 0 && uint64(p.zeroSizeCount) >= maxSize
 }
 
 func (p *pressureState) maybeMarkReclaimed(reclaimedOrReduced bool, sampledEpoch uint64, pressure float64) {
@@ -1030,23 +1082,9 @@ func (q *evictCallbackQueue[V]) enqueue(key string, value V, reason EvictionReas
 	q.n++
 }
 
-func isCandidateEvictCallbackStack(blk []byte) bool {
-	if bytes.Contains(blk, []byte("deliverFastCallbacks")) || bytes.Contains(blk, []byte("deliverCallbacks")) {
-		return true
-	}
-	return bytes.Contains(blk, []byte("evictCallbackQueue")) &&
-		!bytes.Contains(blk, []byte("lockEvictCallbackSlow")) &&
-		!bytes.Contains(blk, []byte("registerMultiCacheEvictHolder")) &&
-		!bytes.Contains(blk, []byte("unlockEvictCallback"))
-}
-
-func (p *pressureState) matchCandidateEvictCallbackGID(blocks [][]byte, requireFastFrame bool) uint64 {
+func (p *pressureState) matchCandidateEvictCallbackGID(blocks [][]byte) uint64 {
 	for _, blk := range blocks {
-		if requireFastFrame {
-			if !bytes.Contains(blk, []byte("deliverFastCallbacks")) {
-				continue
-			}
-		} else if !isCandidateEvictCallbackStack(blk) {
+		if !bytes.Contains(blk, []byte("deliverFastCallbacks(")) {
 			continue
 		}
 		gid, _ := parseStackGoroutineAndParentID(blk)
@@ -1075,10 +1113,7 @@ func (p *pressureState) resolveEvictCallbackHolderFromAllStacksLocked() uint64 {
 	}
 	allStacks := captureAllGoroutineStacks()
 	blocks := bytes.Split(allStacks, []byte("\n\n"))
-	if gid := p.matchCandidateEvictCallbackGID(blocks, true); gid != 0 {
-		return gid
-	}
-	if gid := p.matchCandidateEvictCallbackGID(blocks, false); gid != 0 {
+	if gid := p.matchCandidateEvictCallbackGID(blocks); gid != 0 {
 		return gid
 	}
 	return p.evictCallbackGID.Load()
@@ -1107,47 +1142,47 @@ func promoteFastEvictCallbackLocked(firstP *pressureState, callerGID uint64, isF
 }
 
 //go:noinline
-func (p *pressureState) registerMultiCacheEvictHolder(gid uint64) {
+func (p *pressureState) registerMultiCacheEvictHolder(gid uint64) uint64 {
 	stack, bufPtr := captureCurrentGoroutineStack()
 	if gid == 0 {
 		gid, _, _ = parseStackGoroutineParentAndCreator(stack)
 	}
-	isFastCallbackCaller := bytes.Contains(stack, []byte("deliverFastCallbacks"))
+	isFastCallbackCaller := bytes.Contains(stack, []byte("deliverFastCallbacks("))
 	releaseCurrentGoroutineStack(bufPtr)
 
 	multiCacheEvictMu.Lock()
 	firstP := fastEvictCallbackOwner.Swap(multiEvictCallbackSentinel)
 	promoteFastEvictCallbackLocked(firstP, gid, isFastCallbackCaller)
-	var stored bool
 	p.evictCallbackResolveMu.Lock()
-	if p.evictCallbackActive.Load() {
-		p.evictCallbackGID.Store(gid)
-		stored = true
-	}
+	prevGID := p.evictCallbackGID.Swap(gid)
+	p.evictCallbackActive.Store(true)
 	p.evictCallbackResolveMu.Unlock()
-	if stored {
+	if prevGID != 0 && prevGID != gid {
+		removeMultiCacheOwner(multiCacheEvictOwners, prevGID, p)
+	}
+	if gid != 0 {
 		addMultiCacheOwner(multiCacheEvictOwners, gid, p)
 	}
 	multiCacheEvictMu.Unlock()
+	return gid
 }
 
-func (p *pressureState) lockEvictCallback() (locked, fastOwner bool) {
+func (p *pressureState) lockEvictCallback() (locked, fastOwner bool, gid uint64) {
 	if p.evictCallbackMu.TryLock() {
-		p.evictCallbackActive.Store(true)
-		if globalActiveEvictCallbacks.Add(1) == 1 && fastEvictCallbackOwner.CompareAndSwap(nil, p) {
-			return true, true
+		if globalActiveEvictCallbacks.Add(1) == 1 && fastEvictCallbackOwner.Load() == nil {
+			return true, true, 0
 		}
-		p.registerMultiCacheEvictHolder(0)
-		return true, false
+		return true, false, p.registerMultiCacheEvictHolder(0)
 	}
-	return p.lockEvictCallbackSlow(), false
+	locked, gid = p.lockEvictCallbackSlow()
+	return locked, false, gid
 }
 
 //go:noinline
-func (p *pressureState) lockEvictCallbackSlow() bool {
+func (p *pressureState) lockEvictCallbackSlow() (bool, uint64) {
 	stack, bufPtr := captureCurrentGoroutineStack()
 	gid, parentGID, creatorFunc := parseStackGoroutineParentAndCreator(stack)
-	isFastCallbackCaller := bytes.Contains(stack, []byte("deliverFastCallbacks"))
+	isFastCallbackCaller := bytes.Contains(stack, []byte("deliverFastCallbacks("))
 	if len(creatorFunc) > 0 && bufPtr != nil {
 		creatorFunc = bytes.Clone(creatorFunc)
 	}
@@ -1160,12 +1195,14 @@ func (p *pressureState) lockEvictCallbackSlow() bool {
 		if holder == gid {
 			return true
 		}
-		return holder == parentGID && isParentCreatorAboveHook(parentGID, creatorFunc, []byte("deliverCallbacks"))
+		return parentGID >= holder && isAncestorCreatorAboveHook(parentGID, creatorFunc, []byte("deliverCallbacks"), func(ancGID uint64) bool {
+			return ancGID == holder
+		})
 	}
 
 	if holder := p.evictCallbackGID.Load(); holder != 0 {
 		if isHolderOrChild(holder) {
-			return false
+			return false, 0
 		}
 	} else {
 		multiCacheEvictMu.Lock()
@@ -1178,20 +1215,18 @@ func (p *pressureState) lockEvictCallbackSlow() bool {
 		}
 		multiCacheEvictMu.Unlock()
 		if isHolderOrChild(p.evictCallbackGID.Load()) {
-			return false
+			return false, 0
 		}
 	}
 
 	p.evictCallbackMu.Lock()
-	p.evictCallbackActive.Store(true)
 	globalActiveEvictCallbacks.Add(1)
-	p.registerMultiCacheEvictHolder(gid)
-	return true
+	return true, p.registerMultiCacheEvictHolder(gid)
 }
 
-func (p *pressureState) unlockEvictCallback() {
+func (p *pressureState) unlockEvictCallback(gid uint64) {
 	p.evictCallbackActive.Store(false)
-	if p.evictCallbackGID.Load() != 0 || !fastEvictCallbackOwner.CompareAndSwap(p, nil) {
+	if gid != 0 || p.evictCallbackGID.Load() != 0 || !fastEvictCallbackOwner.CompareAndSwap(p, nil) {
 		multiCacheEvictMu.Lock()
 		p.evictCallbackResolveMu.Lock()
 		g := p.evictCallbackGID.Swap(0)
@@ -1199,11 +1234,17 @@ func (p *pressureState) unlockEvictCallback() {
 		if g != 0 {
 			removeMultiCacheOwner(multiCacheEvictOwners, g, p)
 		}
+		if gid != 0 && gid != g {
+			removeMultiCacheOwner(multiCacheEvictOwners, gid, p)
+		}
+		if len(multiCacheEvictOwners) == 0 {
+			fastEvictCallbackOwner.CompareAndSwap(multiEvictCallbackSentinel, nil)
+		}
 		multiCacheEvictMu.Unlock()
 	}
 	if globalActiveEvictCallbacks.Add(-1) == 0 {
 		multiCacheEvictMu.Lock()
-		if globalActiveEvictCallbacks.Load() == 0 {
+		if globalActiveEvictCallbacks.Load() == 0 || len(multiCacheEvictOwners) == 0 {
 			fastEvictCallbackOwner.CompareAndSwap(multiEvictCallbackSentinel, nil)
 		}
 		multiCacheEvictMu.Unlock()
@@ -1245,7 +1286,12 @@ func (q *evictCallbackQueue[V]) deliverCallbacks(onVal func(V, EvictionReason), 
 }
 
 //go:noinline
-func (q *evictCallbackQueue[V]) deliverFastCallbacks(onVal func(V, EvictionReason), onEntry func(string, V, EvictionReason)) {
+func (q *evictCallbackQueue[V]) deliverFastCallbacks(p *pressureState, gid *uint64, onVal func(V, EvictionReason), onEntry func(string, V, EvictionReason)) {
+	p.evictCallbackActive.Store(true)
+	if !fastEvictCallbackOwner.CompareAndSwap(nil, p) {
+		p.evictCallbackActive.Store(false)
+		*gid = p.registerMultiCacheEvictHolder(0)
+	}
 	q.deliverCallbacks(onVal, onEntry)
 }
 
@@ -1258,12 +1304,14 @@ func (q *evictCallbackQueue[V]) invoke(p *pressureState, onVal func(V, EvictionR
 		q.reset()
 		return
 	}
-	locked, fastOwner := p.lockEvictCallback()
+	locked, fastOwner, gid := p.lockEvictCallback()
 	if locked {
-		defer p.unlockEvictCallback()
+		defer func() {
+			p.unlockEvictCallback(gid)
+		}()
 	}
 	if fastOwner {
-		q.deliverFastCallbacks(onVal, onEntry)
+		q.deliverFastCallbacks(p, &gid, onVal, onEntry)
 		return
 	}
 	q.deliverCallbacks(onVal, onEntry)

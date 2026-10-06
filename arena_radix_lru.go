@@ -18,6 +18,7 @@ import (
 	"fmt"
 	"iter"
 	"math"
+	"slices"
 )
 
 // NewArenaRadixCache returns a new arena-backed radix LRU Cache[V] bounded by maxSize.
@@ -250,6 +251,28 @@ func (c *arenaRadix[V]) checkTreeInvariants() int {
 	return treeNodeCount
 }
 
+func (c *arenaRadix[V]) checkCollisionPeerBucketInvariants(h uint64, peers []uint32) int {
+	if len(peers) == 0 {
+		panic(fmt.Sprintf("arenaRadix invariant violation: collisionPeers[%d] is empty", h))
+	}
+	mappedID, ok := c.nodeMap[h]
+	if !ok {
+		panic(fmt.Sprintf("arenaRadix invariant violation: collisionPeers[%d] exists without nodeMap[%d]", h, h))
+	}
+	for i, peerID := range peers {
+		if peerID >= uint32(len(c.nodes)) || !c.nodes[peerID].hasValue || c.hashNodeKey(peerID) != h {
+			panic(fmt.Sprintf("arenaRadix invariant violation: invalid collision peer %d for hash %d", peerID, h))
+		}
+		if mappedID == peerID {
+			panic(fmt.Sprintf("arenaRadix invariant violation: collision peer %d duplicates nodeMap[%d]", peerID, h))
+		}
+		if slices.Contains(peers[:i], peerID) {
+			panic(fmt.Sprintf("arenaRadix invariant violation: duplicate collision peer %d for hash %d", peerID, h))
+		}
+	}
+	return len(peers)
+}
+
 func (c *arenaRadix[V]) checkNodeMapInvariants() {
 	for h, id := range c.nodeMap {
 		if id >= uint32(len(c.nodes)) {
@@ -264,18 +287,7 @@ func (c *arenaRadix[V]) checkNodeMapInvariants() {
 	}
 	totalPeers := 0
 	for h, peers := range c.collisionPeers {
-		if len(peers) == 0 {
-			panic(fmt.Sprintf("arenaRadix invariant violation: collisionPeers[%d] is empty", h))
-		}
-		for _, peerID := range peers {
-			if peerID >= uint32(len(c.nodes)) || !c.nodes[peerID].hasValue || c.hashNodeKey(peerID) != h {
-				panic(fmt.Sprintf("arenaRadix invariant violation: invalid collision peer %d for hash %d", peerID, h))
-			}
-			if mappedID, ok := c.nodeMap[h]; ok && mappedID == peerID {
-				panic(fmt.Sprintf("arenaRadix invariant violation: collision peer %d duplicates nodeMap[%d]", peerID, h))
-			}
-			totalPeers++
-		}
+		totalPeers += c.checkCollisionPeerBucketInvariants(h, peers)
 	}
 	if c.collisionCount != totalPeers {
 		panic(fmt.Sprintf("arenaRadix invariant violation: collisionCount %d != totalPeers %d", c.collisionCount, totalPeers))
@@ -435,10 +447,11 @@ func (c *arenaRadix[V]) updateExistingOnPutLocked(evictQ *evictCallbackQueue[V],
 	evictedPrePut := false
 	oldValue := c.nodes[nodeID].value
 	oldSize := c.nodes[nodeID].size
+	hadZeroCap := c.shouldEvictOnZeroWeightShrink(oldSize, valueSize, c.maxSize)
 	c.onEntrySizeUpdated(oldSize, valueSize)
 	c.moveToFront(nodeID)
 	c.currentSize -= oldSize
-	for valueSize > c.maxSize-c.currentSize && c.tail != nilNode && c.tail != nodeID {
+	for (valueSize > c.maxSize-c.currentSize || (hadZeroCap && !evictedPrePut)) && c.tail != nilNode && c.tail != nodeID {
 		if evicted, ok := c.evictOne(evictQ); ok {
 			evictedValues = append(evictedValues, evicted)
 			evictedPrePut = true
@@ -474,7 +487,7 @@ func (c *arenaRadix[V]) insertNewOnPutLocked(evictQ *evictCallbackQueue[V], key 
 
 	// Evict from the LRU tail before allocating new arena nodes when valueSize would exceed remaining capacity
 	// (using subtraction to avoid uint64 addition overflow when maxSize is near math.MaxUint64).
-	for (valueSize > c.maxSize-c.currentSize || (!evictedPrePut && c.shouldEvictZeroWeightOnInsert(valueSize, c.maxSize, c.currentSize, c.len))) && c.tail != nilNode {
+	for c.shouldEvictPreInsertOnPut(valueSize, c.maxSize, c.currentSize, c.len, evictedPrePut) && c.tail != nilNode {
 		if evicted, ok := c.evictOne(evictQ); ok {
 			evictedValues = append(evictedValues, evicted)
 			evictedPrePut = true
@@ -624,13 +637,6 @@ func (c *arenaRadix[V]) canFitGrowthLocked(nodeID uint32, newSize, sizeDelta, av
 	}
 }
 
-func (c *arenaRadix[V]) restoreDisplacedNodeMapLocked(keyHash uint64, nodeID, prevMappedID uint32, hadPrevMapped bool) {
-	if c.nodeMapDirty && (nodeID >= uint32(len(c.nodes)) || !c.nodes[nodeID].hasValue) &&
-		hadPrevMapped && prevMappedID != nodeID && prevMappedID < uint32(len(c.nodes)) && c.nodes[prevMappedID].hasValue {
-		c.promoteCollisionPeerLocked(keyHash, prevMappedID)
-	}
-}
-
 // Replace updates the value of an existing key and recomputes its weight
 // without modifying its LRU position.
 // If the entry's updated weight exceeds maxSize (or cannot fit alongside entries more recent than node),
@@ -686,6 +692,10 @@ func (c *arenaRadix[V]) Replace(key string, value V) error {
 		c.onEntrySizeUpdated(oldSize, newSize)
 		c.currentSize += sizeDelta
 	case newSize < oldSize:
+		if c.shouldEvictOnZeroWeightShrink(oldSize, newSize, c.maxSize) && c.tail != nodeID {
+			c.evictOne(&evictQ)
+			evictedAny = true
+		}
 		c.onEntrySizeUpdated(oldSize, newSize)
 		c.currentSize -= oldSize - newSize
 	}
@@ -693,20 +703,12 @@ func (c *arenaRadix[V]) Replace(key string, value V) error {
 	c.nodes[nodeID].hasValue = true
 	c.nodes[nodeID].size = newSize
 
-	prevMappedID, hadPrevMapped := c.nodeMap[keyHash]
-	if !hadPrevMapped || prevMappedID != nodeID {
-		c.promoteCollisionPeerLocked(keyHash, nodeID)
-	}
+	c.promoteCollisionPeerLocked(keyHash, nodeID)
 	c.replaceUpdated++
 	c.notifyEvict(&evictQ, key, oldValue, oldSize, EvictionReasonReplaced)
 	reclaimedPreUpdate := c.shouldReclaimSingleSurvivorOnMutation(c.len, c.freeCount > 0 || c.nodeMapDirty, c.freeCount >= minSingleSurvivorFreeNodes, evictedAny, c.currentSize, sizeBefore, pressure)
 
-	protectedID := foregroundNoProtect
-	if c.nodes[nodeID].hasValue {
-		protectedID = nodeID
-	}
-	c.finishMutationReclaimLocked(&evictQ, nil, protectedID, reclaimedPreUpdate, false, sizeBefore, sampledEpoch, pressure)
-	c.restoreDisplacedNodeMapLocked(keyHash, nodeID, prevMappedID, hadPrevMapped)
+	c.finishMutationReclaimLocked(&evictQ, nil, nodeID, reclaimedPreUpdate, false, sizeBefore, sampledEpoch, pressure)
 	return nil
 }
 

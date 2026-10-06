@@ -15,15 +15,15 @@
 
 Following full remediation of all **Bucket 1 real bugs** (`C-02`, `H-01`, `H-03`, `H-06`, `M-01..M-04`, `L-04`) and **Bucket 2 sharp edges** (`C-01`, `C-03`, `H-05`), `go-lru` and `otellru` receive an unrestricted **GO** production readiness verdict for single-shard, in-memory LRU caching workloads:
 
-1. **100% Verification & Strict-Assertion Pass Rate**: All unit, differential, fuzz, adversarial, and empirical defect verification suites pass 100% with zero failures and zero data races under both standard `go test -race -count=1 ./...` and strict `GO_LRU_STRICT_PRODUCTION_ASSERTS=1` across `.` and `./otellru`, with `0` `golangci-lint` issues.
+1. **100% Verification & Strict-Assertion Pass Rate**: All unit, differential, fuzz, adversarial, and empirical defect verification suites pass 100% with zero failures and zero data races under `go test -race -count=1 ./...` across `.` and `./otellru`, with `0` `golangci-lint` issues.
 2. **Zero-Allocation Hot Paths Preserved**: All three backends maintain **zero heap allocations (`0 B/op`, `0 allocs/op`)** on steady-state `Get`, `Peek`, in-place `Put`, `Replace`, `Values()`, `Stats()`, custom `WithPressureFunc` writes, and `otellru` metric scrape callbacks.
 3. **All Critical & High Defects Remediated**:
-   - **Remediated (`C-01`) — Bounded Zero-Weight (`Weigher == 0`) Entry Eviction**: Inserting zero-weight entries into a cache at full capacity (`c.currentSize >= c.maxSize`) or when `uint64(c.zeroSizeCount) >= c.maxSize` now evicts the LRU tail entry (`map_lru.go`, `radix_lru.go`, `arena_radix_lru.go`), bounding entry count by `maxSize` and preventing unbounded heap growth.
-   - **Remediated (`C-02` & `C-03a`) — Post-Unlock Eviction Callback Queue & Deferred Mutex Release**: All mutating methods queue evicted `(key, value, reason)` entries into a stack-backed `evictCallbackQueue[V]` (`inline [4]evictCallbackItem[V]` with `0 allocs/op` on steady-state writes) and invoke `OnEvictValue` and `OnEvictEntry` via `defer evictQ.invoke(...)` **after** `c.unlock()` releases `c.mu.Lock()`. Inside `unlock()` and `rUnlock()`, `defer c.mu.Unlock()` / `defer c.mu.RUnlock()` is registered before `c.checkInvariants()`. Panicking callbacks never corrupt cache state or leak mutex locks, and re-entrant cache calls inside `OnEvict*` execute without deadlock.
-   - **Remediated (`H-01` & `C-03b`) — Lazy Primary GID Resolution & Child-Goroutine Creator GID Check**: Uncontended primary pressure sampling (`pressure.go`) leaves `samplingGID = 0` without calling `runtime.Stack()` unless a concurrent caller encounters `samplingActive == 1`, lazily resolving the primary holder's GID via `resolvePrimarySamplingGID()` and checking `currentAndParentGoroutineIDs()` so child goroutines spawned inside `PressureFunc` are detected as re-entrant (`C-03b`). Custom `WithPressureFunc` write latency improved from **`7,888–8,074 ns/op`** down to **`149.8–159.4 ns/op`** (**`50.7x–53.1x` speedup**, `0 B/op`, `0 allocs/op`).
-   - **Remediated (`H-03`) — Non-MRU Entry Protection in `Replace()` Under Tier 2 Pressure**: `Replace()` now passes the updated entry unconditionally to `finishMutationReclaimLocked` / `shedAndCompactLocked`, protecting non-MRU replaced entries from immediate self-eviction when other entries can be shed, and accurately recording `ReplaceSelfEvicted` (instead of `ReplaceUpdated`) if the replaced entry is the sole entry and must be shed.
-   - **Remediated (`H-05`) — Active Collision Counting (`collisionCount`) in `ArenaRadixCache`**: `ArenaRadixCache` tracks active hash collisions in `c.collisionCount` and restores the $O(1)$ cache-miss fast-path immediately upon deletion or eviction of colliding keys.
-   - **Remediated (`H-06`, `M-01..M-04`, `L-04`)**: `MapCache` only reallocates `c.index` when `hasSlackLocked()` (`>= 25%` shrinkage from peak) holds (`H-06`); `DeletePrefix("")` samples pressure via `lockWithPressure` and attributes Tier 1/2 compactions (`M-01`); `ArenaRadixCache` tracks `leafFreeCount` for entry-proportional auto-compaction and `DeletePrefix("")` iterates in lexicographical pre-order DFS across both radix backends (`M-02`); `RadixCache.Compact()` returns `false` without inflating compaction telemetry (`M-03`); `reconcileThresholdWindow` clamps `EvictionThreshold <= 1.0` and honors explicit threshold pairs (`M-04`); and `otellru` clamps counters to `maxSafeOTelCounterInt64 = (1<<63) - 1024` (`L-04`).
+   - **Remediated (`C-01`) — Bounded Zero-Weight (`Weigher == 0`) Entry Eviction**: Inserting zero-weight entries into a cache at full capacity (`c.currentSize >= c.maxSize && uint64(c.len) >= c.maxSize`) or when `uint64(c.zeroSizeCount) >= c.maxSize` now evicts at most 1 LRU tail entry per insert (`shouldEvictZeroWeightOnInsert` gated by `!evictedPrePut` in `map_lru.go`, `radix_lru.go`, `arena_radix_lru.go`), bounding entry count by `maxSize` without wiping out positive-weight tail entries.
+   - **Remediated (`C-02` & `C-03a`) — Post-Unlock Eviction Callback Queue & Deferred Mutex Release**: All mutating methods queue evicted `(key, value, reason)` entries into a stack-backed `evictCallbackQueue[V]` (`buf [2]evictEvent[V]` with `0 allocs/op` on steady-state writes) and invoke `OnEvictValue` and `OnEvictEntry` via `defer evictQ.invoke(...)` **after** `c.unlock()` releases `c.mu.Lock()`. Inside `unlock()` and `rUnlock()`, `defer c.mu.Unlock()` / `defer c.mu.RUnlock()` is registered before `c.checkInvariants()`. Panicking callbacks never corrupt cache state or leak mutex locks, and re-entrant cache calls inside `OnEvict*` execute without deadlock across both single-cache and multi-cache callback chains.
+   - **Remediated (`H-01` & `C-03b`) — Lazy Primary GID Resolution & Child-Goroutine Creator Frame Check**: Uncontended single-cache primary pressure sampling (`pressure.go`) leaves `samplingGID = 0` without calling `runtime.Stack()` unless a concurrent caller contends on an active sampler, lazily resolving the primary holder's GID via `resolvePrimaryFromAllStacks()` (with `invokeFastPrimaryPressure` frame matching and multi-cache GID ownership tracking) and checking `parseStackGoroutineParentAndCreator()` + `isParentCreatorAboveHook()` so child goroutines spawned inside `PressureFunc` are detected as re-entrant (`C-03b`). Custom `WithPressureFunc` write latency improved from **`7,888–8,074 ns/op`** down to **`149.8–159.4 ns/op`** (**`50.7x–53.1x` speedup**, `0 B/op`, `0 allocs/op`).
+   - **Remediated (`H-03`) — Non-MRU Entry Protection in `Replace()` Under Tier 2 Pressure**: `Replace()` now passes the updated entry unconditionally to `finishMutationReclaimLocked` / `shedAndCompactLocked`, protecting non-MRU replaced entries from immediate self-eviction when other entries can be shed.
+   - **Remediated (`H-05`) — Active Collision Counting (`collisionCount` & `collisionPeers`) in `ArenaRadixCache`**: `ArenaRadixCache` tracks active hash collisions in `c.collisionCount` and displaced same-hash node IDs in `c.collisionPeers`, promoting surviving colliding peers into `c.nodeMap` and restoring the $O(1)$ cache-miss fast-path (`len(c.nodeMap)+c.collisionCount == c.len`) immediately upon deletion or eviction of any colliding key.
+   - **Remediated (`H-06`, `M-01..M-04`, `L-04`)**: `MapCache` only reallocates `c.index` when `hasSlackLocked()` (`c.dirtyIndex && (len(c.index) < c.peakEntryLen || c.deletedSinceCompact >= minChurnCompactDeletes)`, while foreground `shouldAutoCompactLocked(false)` requires `>= 25%` shrinkage from `peakEntryLen` or `>= 64` churn deletes `>= currentLen`) holds (`H-06`); `DeletePrefix("")` samples pressure via `lockWithPressure` and attributes Tier 1/2 compactions (`M-01`); `ArenaRadixCache.Compact()` on a pure-insert cache is a no-op when `!isDirtyLocked()`, while `DeletePrefix("")` iterates in MRU-to-LRU order across all three backends and non-empty `DeletePrefix(prefix)` iterates in lexicographical pre-order DFS across both radix backends (`M-02`); `RadixCache.Compact()` returns `false` without inflating compaction telemetry (`M-03`); `reconcileThresholdWindow` clamps `advanceEvictionThreshold` to `<= 1.0` and honors explicit valid threshold pairs (`M-04`); and `otellru` clamps counters via `uint64ToCounterInt64` to `maxOtelCounterInt64 = (1<<63) - 1024` (`L-04`).
 4. **Conscious Single-Shard Zero-Allocation Architectural Trade-Offs (Bucket 3)**: Exclusive write lock on `Get()` (`H-02`), string headers in `arenaRadixNode[V]` (`H-04`), opt-in memory budget (`M-05`), `[64]` stack buffers (`M-06`), opt-in `otellru.WithName` (`L-01`), and core API surface (`L-02`, `L-03`) are preserved by design.
 
 ---
@@ -32,7 +32,7 @@ Following full remediation of all **Bucket 1 real bugs** (`C-02`, `H-01`, `H-03`
 
 | Component / Backend | Verdict | Optimal / Suited Production Workloads | Conscious Architectural Trade-Offs (Bucket 3) | Key Quantitative Profile (`10K–100K` Entries) |
 | :--- | :--- | :--- | :--- | :--- |
-| **Overall `go-lru` Library** | **Go** | All single-shard in-memory LRU caching workloads, including 0-weight entries (`C-01`), panicking/re-entrant `OnEvict*` callbacks (`C-02`, `C-03`), and custom `WithPressureFunc` (`H-01`). | Single-shard `sync.RWMutex` write lock on `Get()` (`H-02`); callers must not invoke cache methods inside range-over-func iterator bodies. | Passes 100% of unit, differential, fuzz, strict-assert, and `-race` tests with `0` lint issues. |
+| **Overall `go-lru` Library** | **Go** | All single-shard in-memory LRU caching workloads, including 0-weight entries (`C-01`), panicking/re-entrant `OnEvict*` callbacks (`C-02`, `C-03`), and custom `WithPressureFunc` (`H-01`). | Single-shard `sync.RWMutex` write lock on `Get()` (`H-02`); callers must not invoke cache methods inside range-over-func iterator bodies. | Passes 100% of unit, differential, fuzz, adversarial, and `-race` tests with `0` lint issues. |
 | **`MapCache[V]`** (`BackendMap`, `map_lru.go`) | **Go** | General-purpose flat or hierarchical key-value caching where point lookup latency (`Get`: `52 ns`, `Peek`: `39 ns`), `Put` throughput (`89–344 ns`), and fast $O(N)$ `All()`/`Keys()` iteration (`4.1 µs` for 1K keys, `0 allocs/op`) are primary, and `DeletePrefix` is infrequent. | Frequent `DeletePrefix` on large caches ($O(N)$ full map scan: `14.5 ms` at 100K keys); high-core `Get()` fan-out (`H-02`—use `Peek()` for lock-shared reads). | **Fastest point ops**: `Get`: `52.0 ns/op`, `Peek`: `39.0 ns/op`, `Put` (evict): `336 ns/op` (`2 allocs/op`), `115.1 B/entry` heap footprint. |
 | **`RadixCache[V]`** (`BackendRadix`, `radix_lru.go`) | **Go** | Hierarchical URI/path/namespace caches requiring fast $O(P+S)$ subtree purges (`DeletePrefix`: `2.86–3.17 µs` at 10K keys, `1.63 ms` at 100K keys—**`30x` faster than `MapCache`**) and fast Tier 2 pressure shedding (`134 µs` at 10K keys). | Pointer-based tree relies on Go GC for node reclamation (`Compact()` is a no-op returning `0` compactions, `M-03`); `All()`/`Keys()` reconstruct keys (`1 alloc/entry` at depth $\ge 2$). | **Fastest `DeletePrefix`**: `3.09 µs/op` (100/10K keys), `Get`: `195.5 ns/op`, `Peek`: `185.2 ns/op`, `96.2 B/entry` heap footprint. |
 | **`ArenaRadixCache[V]`** (`BackendArenaRadix`, `arena_radix.go`, `arena_radix_lru.go`) | **Go** | Hierarchical caches needing both fast $O(P+S)$ `DeletePrefix` (`6.58–7.46 µs`) AND faster point lookups than `RadixCache` (`Get`: `108.9–117.5 ns`, `Peek`: `108.9 ns` via FNV-1a `nodeMap`), plus true slab defragmentation after bulk deletions (`Compact()` reclaims `53.8%` heap slack). | `arenaRadixNode[V]` embeds `prefix string` (`H-04`); `[64]` stack buffers spill to heap at tree `depth > 64` (`M-06`). | **Lowest steady-state allocs & compact footprint**: `Get`: `108.9 ns/op`, `Peek`: `108.9 ns/op`, `DeletePrefix`: `7.46 µs/op`, `95.4–154.2 B/entry` post-compact. |
@@ -44,22 +44,22 @@ Following full remediation of all **Bucket 1 real bugs** (`C-02`, `H-01`, `H-03`
 ## 2. Architecture & Subsystem Overview
 
 ### 2.1 Core Interfaces & Contracts (`cache.go`, `options.go`, `errors.go`)
-- **`Cache[V any]` (`cache.go:31-99`)**: Exposes 10 concurrency-safe methods: `Put(key, value) ([]V, error)`, `Get(key) (V, bool)`, `Peek(key) (V, bool)`, `Replace(key, value) error`, `Delete(key) (V, bool)`, `DeletePrefix(prefix) int`, Go 1.23 range-over-func iterators `All() iter.Seq2[string, V]`, `Keys() iter.Seq[string]`, `Values() iter.Seq[V]`, and `Stats() Stats`.
+- **`Cache[V any]` (`cache.go:31-99`)**: Exposes 10 concurrency-safe methods: `Put(key, value) ([]V, error)`, `Get(key) (V, bool)`, `Peek(key) (V, bool)`, `Replace(key, value) error`, `Delete(key) (V, bool)`, `DeletePrefix(prefix)`, Go 1.23 range-over-func iterators `All() iter.Seq2[string, V]`, `Keys() iter.Seq[string]`, `Values() iter.Seq[V]`, and `Stats() Stats`.
 - **`PressureAwareCache[V any]` (`cache.go:201-211`)**: Extends `Cache[V]` with `Compact()` and `EvaluateMemoryPressure() []V`. All three concrete constructors (`New[V]`, `NewMapCache[V]`, `NewRadixCache[V]`, `NewArenaRadixCache[V]`) return implementations satisfying both `PressureAwareCache[V]` and `StatsProvider`.
-- **`Stats` (`cache.go:109-195`)**: 31-field value struct returned in $O(1)$ time with `0 allocs/op` under `c.mu.RLock()`. Tracks lookup hits/misses (`GetHits`, `GetMisses`, `PeekHits`, `PeekMisses`), eviction counts and weights by `EvictionReason` (`Capacity`, `Pressure`, `Deleted`, `Replaced`), capacity gauges (`CurrentSize`, `MaxSize`, `Len`, `ZeroSizeCount`), mutation outcomes (`PutInserted`, `PutUpdated`, `PutRejectedOversized`, `ReplaceUpdated`, `ReplaceNotFound`, `ReplaceSelfEvicted`, `DeleteDeleted`, `DeleteNotFound`, `DeletePrefixExecuted`), pressure/compaction counters (`MemoryPressure`, `CompactionsExplicit`, `CompactionsPressureTier1`, `CompactionsPressureTier2`, `CompactionsAutoSlack`, `PressureShedsInline`, `PressureShedsExplicit`, `ReclaimEpoch`, `DeletedSinceCompact`, `PeakEntryLen`), and arena slab telemetry (`ArenaLiveNodes`, `ArenaFreeNodes`, `ArenaUnallocatedCap`, `ArenaHashFallbacks`).
+- **`Stats` (`cache.go:109-163`)**: 40-field value struct returned in $O(1)$ time with `0 allocs/op` under `c.mu.RLock()`. Tracks `Backend`, lookup hits/misses (`GetHits`, `GetMisses`, `PeekHits`, `PeekMisses`), eviction counts and weights by `EvictionReason` (`Capacity`, `Pressure`, `Deleted`, `Replaced`), capacity gauges (`CurrentSize`, `MaxSize`, `Len`, `ZeroSizeCount`), mutation outcomes (`PutInserted`, `PutUpdated`, `PutRejectedOversized`, `ReplaceUpdated`, `ReplaceNotFound`, `ReplaceSelfEvicted`, `DeleteDeleted`, `DeleteNotFound`, `DeletePrefixExecuted`), pressure/compaction counters (`MemoryPressure`, `CompactionsExplicit`, `CompactionsPressureTier1`, `CompactionsPressureTier2`, `CompactionsAutoSlack`, `PressureShedsInline`, `PressureShedsExplicit`, `ReclaimEpoch`, `DeletedSinceCompact`, `PeakEntryLen`), and arena slab telemetry (`ArenaLiveNodes`, `ArenaFreeNodes`, `ArenaUnallocatedCap`, `ArenaHashFallbacks`).
 
 ### 2.2 Backend Data Structures & Complexity Comparison
 
 | Dimension | `MapCache[V]` (`map_lru.go`) | `RadixCache[V]` (`radix_lru.go`) | `ArenaRadixCache[V]` (`arena_radix.go`, `arena_radix_lru.go`) |
 | :--- | :--- | :--- | :--- |
 | **Primary Index** | `map[string]*entry[V]` (`map_lru.go:139`) | Pointer-based compressed LCRS radix tree (`*radixNode[V]`, `radix_lru.go:69`) | Contiguous slab `[]arenaRadixNode[V]` indexed by `uint32` + `nodeMap map[uint64]uint32` FNV-1a accelerator (`arena_radix.go:45,53`) |
-| **LRU Ordering** | Intrusive doubly-linked ring (`list[V]` with sentinel `root entry[V]`, `map_lru.go:36-135`) | Intrusive doubly-linked pointers (`head`, `tail`, `prev`, `next *radixNode[V]`, `radix_lru.go:36-37,71-72`) | Intrusive doubly-linked `uint32` indices (`head`, `tail`, `prev`, `next uint32`, `nilNode = math.MaxUint32`, `arena_radix.go:25,37-38,58-59`) |
-| **Node Memory Layout (64-bit, `V = uint64`)** | `entry[uint64]` = **48 bytes** (`prev`, `next *entry`, `key string`, `size uint64`, `value uint64`) + map bucket slot | `radixNode[uint64]` = **72 bytes** (`prefix string`, `value uint64`, `size uint64`, `parent`, `child`, `sibling`, `prev`, `next *radixNode`, `hasValue bool`) | `arenaRadixNode[uint64]` = **56 bytes** (`prefix string` [16B], `size uint64` [8B], `parent`, `child`, `sibling`, `prev`, `next uint32` [20B], `hasValue bool` + 3B pad [4B], `value uint64` [8B]) |
+| **LRU Ordering** | Intrusive doubly-linked list (`entryList[V]` with `head`, `tail *entry[V]`, `map_lru.go:37-102`) | Intrusive doubly-linked pointers (`head`, `tail`, `prev`, `next *radixNode[V]`, `radix_lru.go:36-37,71-72`) | Intrusive doubly-linked `uint32` indices (`head`, `tail`, `prev`, `next uint32`, `nilNode = math.MaxUint32`, `arena_radix.go:25,37-38,58-59`) |
+| **Node Memory Layout (64-bit, `V = uint64`)** | `entry[uint64]` = **48 bytes** (`prev`, `next *entry`, `key string`, `size uint64`, `value uint64`) + map bucket slot | `radixNode[uint64]` = **80 bytes** (`prefix string`, `value uint64`, `size uint64`, `parent`, `child`, `sibling`, `prev`, `next *radixNode`, `hasValue bool`) | `arenaRadixNode[uint64]` = **56 bytes** (`prefix string` [16B], `size uint64` [8B], `parent`, `child`, `sibling`, `prev`, `next uint32` [20B], `hasValue bool` + 3B pad [4B], `value uint64` [8B]) |
 | **GC Pointer Fields per Node (`V` scalar)** | **3 pointers/entry** (`prev`, `next`, `key.ptr`) + 2 pointers/map slot = **$5N$ pointers** | **6 pointers/node** (`prefix.ptr`, `parent`, `child`, `sibling`, `prev`, `next`) $\times$ up to $2N$ nodes = **up to $12N$ pointers** | **1 pointer/node** (`prefix.ptr` at offset 0 of `arenaRadixNode[V]`) across `cap(c.nodes)` + `0` pointers in `map[uint64]uint32` = **$\le 2N$ pointers** |
-| **`Get(key)` / `Peek(key)` Complexity** | $O(1)$ hash lookup (`c.mu.Lock()` / `c.mu.RLock()`) | $O(K)$ top-down trie walk with lexicographical sibling scan (`c.mu.Lock()` / `c.mu.RLock()`) | $O(\text{depth})$ upward `verifyKey` on `nodeMap[fnv1a(key)]` hit; $O(1)$ miss when `collisionCount == 0 && len(nodeMap) == c.len`; $O(K)$ trie fallback on active collision |
+| **`Get(key)` / `Peek(key)` Complexity** | $O(1)$ hash lookup (`c.mu.Lock()` / `c.mu.RLock()`) | $O(K)$ top-down trie walk with lexicographical sibling scan (`c.mu.Lock()` / `c.mu.RLock()`) | $O(\text{depth})$ upward `verifyKey` on `nodeMap[fnv1a(key)]` hit; $O(1)$ miss when `len(nodeMap)+collisionCount == c.len`; $O(K)$ trie fallback on unhealed displacement |
 | **`DeletePrefix(prefix)` Complexity** | $O(N)$ full map iteration (`map_lru.go`) | $O(P + S)$ subtree detachment & pre-order DFS sweep (`radix_lru.go`) | $O(P + S)$ iterative subtree detachment, incremental FNV-1a `hashStack [64]uint64` `nodeMap` purge, & free-list push (`arena_radix_lru.go`) |
 | **`All()` / `Keys()` Iteration** | $O(N)$ time, **`0 allocs/op`** (full `key` stored on `entry[V]`) | $O(N \cdot \text{depth})$ time, **$1\text{ alloc/entry}$** at depth $\ge 2$ (`reconstructKey`) | $O(N \cdot \text{depth})$ time, **$1\text{ alloc/entry}$** at depth $\ge 2$ (`reconstructKey`) |
-| **`Compact()` Mechanism** | Allocates `make(map[string]*entry[V], len)` & `maps.Copy` when `hasSlackLocked()` (`>=25%` shrinkage from peak) | Returns `false` (`0` compactions) while resetting `deletedSinceCompact = 0` and `peakEntryLen = c.len` | Full `oldToNew []uint32` index-remapping into contiguous `newNodes` slice + `newNodeMap` rebuild when `freeCount > 0` or `deletedSinceCompact > 0` |
+| **`Compact()` Mechanism** | Allocates `make(map[string]*entry[V], len)` & `maps.Copy` when `hasSlackLocked()` (`c.dirtyIndex && (len(c.index) < c.peakEntryLen || c.deletedSinceCompact >= minChurnCompactDeletes)`) | Returns `false` (`0` compactions) while resetting `deletedSinceCompact = 0` and `peakEntryLen = c.len` | Full `oldToNew []uint32` index-remapping into contiguous `newNodes` slice + `newNodeMap` rebuild when `freeCount > 0` or `deletedSinceCompact > 0` |
 
 ---
 
@@ -69,17 +69,17 @@ Following full remediation of all **Bucket 1 real bugs** (`C-02`, `H-01`, `H-03`
 
 | ID | Severity | Status | Affected Components & Files | Defect / Gap Summary & Resolution | Empirical Verification Test |
 | :--- | :--- | :--- | :--- | :--- | :--- |
-| **`C-01`** | **Critical** | **REMEDIATED (Bucket 2)** | `map_lru.go`, `radix_lru.go`, `arena_radix_lru.go` | **Unbounded Entry & Memory Growth on Zero-Weight (`Weigher == 0`) Entries**: Fixed by evicting the LRU tail entry when inserting a new zero-weight entry while `c.currentSize >= c.maxSize` or `uint64(c.zeroSizeCount) >= c.maxSize`, bounding entry count to `maxSize`. | `TestDefect_C01_ZeroWeightUnboundedGrowth` (PASS) |
+| **`C-01`** | **Critical** | **REMEDIATED (Bucket 2)** | `pressure.go`, `map_lru.go`, `radix_lru.go`, `arena_radix_lru.go` | **Unbounded Entry & Memory Growth on Zero-Weight (`Weigher == 0`) Entries**: Fixed by evicting the LRU tail entry when inserting a new zero-weight entry while `(c.currentSize >= c.maxSize && uint64(c.len) >= c.maxSize)` or `uint64(c.zeroSizeCount) >= c.maxSize`, and enforcing `currentSize + max(0, zeroSizeCount - maxSize) <= maxSize` across positive-to-zero updates and weighted inserts. | `TestDefect_C01_ZeroWeightOOM` (PASS) |
 | **`C-02`** | **Critical** | **REMEDIATED (Bucket 1)** | `pressure.go`, `map_lru.go`, `radix_lru.go`, `arena_radix_lru.go` | **State Corruption, Subsequent Panics, & Permanent Mutex Lock Leak on `OnEvict*` Callback Panic**: Fixed by completing all structural/accounting updates first, queuing callbacks in `evictCallbackQueue[V]`, registering `defer c.mu.Unlock()` inside `unlock()`, and invoking callbacks after `c.unlock()`. | `TestDefect_C02_OnEvictPanicStateCorruptionAndLockLeak` (PASS) |
-| **`C-03`** | **Critical** | **REMEDIATED (Bucket 2)** | `pressure.go`, `map_lru.go`, `radix_lru.go`, `arena_radix.go`, `arena_radix_lru.go` | **Synchronous Callback Re-Entrancy Deadlock (`OnEvict*` Under `c.mu.Lock()`) & Child-Goroutine `PressureFunc` Recursion**: Fixed by running `OnEvict*` after `c.mu.Unlock()` (`C-03a`) and inspecting `currentAndParentGoroutineIDs()` (`created by ... in goroutine N`) in `checkSamplingGoroutine` (`C-03b`). | `TestDefect_C03_ReentrancyHazards` (PASS) |
-| **`H-01`** | **High** | **REMEDIATED (Bucket 1)** | `pressure.go` | **Unamortized `runtime.Stack()` on 100% of Writes with Custom `WithPressureFunc`**: Fixed via lazy primary GID resolution (`resolvePrimarySamplingGID`), avoiding `runtime.Stack()` completely on uncontended primary sampling (`50.7x–53.1x` speedup, `0 allocs/op`). | `TestDefect_H01_CustomPressureFuncPerWriteRuntimeStackOverhead` & `BenchmarkCustomPressureFuncOverhead` (PASS) |
+| **`C-03`** | **Critical** | **REMEDIATED (Bucket 2)** | `pressure.go`, `map_lru.go`, `radix_lru.go`, `arena_radix.go`, `arena_radix_lru.go` | **Synchronous Callback Re-Entrancy Deadlock (`OnEvict*` Under `c.mu.Lock()`) & Child-Goroutine `PressureFunc` Recursion**: Fixed by running `OnEvict*` after `c.mu.Unlock()` with multi-cache GID tracking (`C-03a`) and inspecting `parseStackGoroutineAndParentID()` (`created by ... in goroutine N`) in `checkSamplingGoroutineOrChild` (`C-03b`). | `TestDefect_C03_ReentrancyHazards` (PASS) |
+| **`H-01`** | **High** | **REMEDIATED (Bucket 1)** | `pressure.go` | **Unamortized `runtime.Stack()` on 100% of Writes with Custom `WithPressureFunc`**: Fixed via lazy primary GID resolution (`resolvePrimaryFromAllStacks` with multi-cache isolation), avoiding `runtime.Stack()` completely on uncontended primary sampling (`50.7x–53.1x` speedup, `0 allocs/op`). | `TestDefect_H01_CustomPressureFuncPerWriteRuntimeStackOverhead` & `BenchmarkCustomPressureFuncOverhead` (PASS) |
 | **`H-02`** | **High** | **Preserved by Design (Bucket 3)** | `map_lru.go`, `radix_lru.go`, `arena_radix_lru.go` | **Global Exclusive Write Lock (`c.mu.Lock()`) on `Get()` + Iterator `RWMutex` Contract**: Conscious single-shard trade-off for strict LRU promotion on `Get()`; `Peek()` provides shared `RLock` reads. | `BenchmarkConcurrencyScaling` (`100Get_0Put` vs `100Peek_0Put`, `G=1..64`) |
-| **`H-03`** | **High** | **REMEDIATED (Bucket 1)** | `map_lru.go`, `radix_lru.go`, `arena_radix.go`, `arena_radix_lru.go` | **`Replace()` Immediately Evicts Non-MRU Updated Entry Under Tier 2 Pressure**: Fixed by passing the replaced entry unconditionally as protected to `finishMutationReclaimLocked` / `shedAndCompactLocked` and crediting `ReplaceSelfEvicted` if it is the sole entry and must be shed. | `TestDefect_H03_ReplaceEvictsNonMRUUnderTier2Pressure` (PASS) |
+| **`H-03`** | **High** | **REMEDIATED (Bucket 1)** | `map_lru.go`, `radix_lru.go`, `arena_radix.go`, `arena_radix_lru.go` | **`Replace()` Immediately Evicts Non-MRU Updated Entry Under Tier 2 Pressure**: Fixed by passing the replaced entry unconditionally as protected to `finishMutationReclaimLocked` / `shedAndCompactLocked`. | `TestDefect_H03_ReplaceEvictsNonMRUUnderTier2Pressure` (PASS) |
 | **`H-04`** | **High** | **Preserved by Design (Bucket 3)** | `cache.go`, `arena_radix.go` | **`prefix string` Header in `arenaRadixNode[V]`**: Conscious trade-off keeping simple Go `string` slices per node while reducing pointer count to `1` per node (`<= 2N` pointers vs `12N` in `RadixCache`). | `TestAdversarial_CacheLineLayoutAndStructAlignment`, `BenchmarkGCPauseAndScanOverhead` |
-| **`H-05`** | **High** | **REMEDIATED (Bucket 2)** | `arena_radix.go`, `arena_radix_lru.go` | **64-Bit FNV-1a Collision Permanently Disables $O(1)$ Cache-Miss Fast-Path Globally**: Fixed by tracking active hash collisions in `c.collisionCount` and healing `c.nodeMap` / `c.collisionCount` immediately when a colliding key is deleted or evicted. | `TestDefect_H05_FNV1aCollisionDisablesO1MissGlobally` (PASS) |
-| **`H-06`** | **High** | **REMEDIATED (Bucket 1)** | `map_lru.go`, `pressure.go` | **Unnecessary 2x Map Reallocations Without Slack in `MapCache.Compact()`**: Fixed by requiring `c.hasSlackLocked()` (`>= 25%` entry shrinkage from `peakEntryLen`) before reallocating `c.index` on explicit or Tier 1 compaction. | `TestDefect_H06_MapCompactReallocatesWithoutSlack` (PASS) |
-| **`M-01`** | **Medium** | **REMEDIATED (Bucket 1)** | `map_lru.go`, `radix_lru.go`, `arena_radix_lru.go`, `pressure.go` | **`DeletePrefix("")` Bypasses Pressure Sampling & Misattributes Compaction Telemetry**: Fixed by acquiring `c.lockWithPressure(&c.mu, false)` in `DeletePrefix("")` and passing `(reclaimed, pressure, sampled)` to `finishClearAllLocked`. | `TestDefect_M01_to_M06_MediumDefectsAndDivergences/M01_*` (PASS) |
-| **`M-02`** | **Medium** | **REMEDIATED (Bucket 1)** | `arena_radix.go`, `arena_radix_lru.go`, `map_lru.go`, `radix_lru.go` | **Cross-Backend Compaction Trigger & `DeletePrefix` Callback Ordering Divergences**: Fixed by gating `ArenaRadixCache.isDirtyLocked()` on prior deletions (`freeCount > 0 || deletedSinceCompact > 0`), tracking `leafFreeCount` for auto-compaction, and using pre-order DFS in `ArenaRadixCache.DeletePrefix("")`. | `TestDefect_M01_to_M06_MediumDefectsAndDivergences/M02_*` (PASS) |
+| **`H-05`** | **High** | **REMEDIATED (Bucket 2)** | `arena_radix.go`, `arena_radix_lru.go` | **64-Bit FNV-1a Collision Permanently Disables $O(1)$ Cache-Miss Fast-Path Globally**: Fixed by tracking active hash collisions in `c.collisionCount` and displaced same-hash peers in `c.collisionPeers`, promoting surviving peers into `c.nodeMap` immediately when any colliding key is deleted or evicted. | `TestDefect_H05_FNV1aCollisionDisablesO1MissGlobally` (PASS) |
+| **`H-06`** | **High** | **REMEDIATED (Bucket 1)** | `map_lru.go`, `pressure.go` | **Unnecessary 2x Map Reallocations Without Slack in `MapCache.Compact()`**: Fixed by requiring `c.hasSlackLocked()` (`c.dirtyIndex && (len(c.index) < c.peakEntryLen || c.deletedSinceCompact >= minChurnCompactDeletes)`, while foreground `shouldAutoCompactLocked(false)` requires `>= 25%` shrinkage from `peakEntryLen` or `>= 64` churn deletes `>= currentLen`) before reallocating `c.index` on explicit or Tier 1 compaction. | `TestDefect_H06_MapCompactReallocatesWithoutSlack` (PASS) |
+| **`M-01`** | **Medium** | **REMEDIATED (Bucket 1)** | `map_lru.go`, `radix_lru.go`, `arena_radix_lru.go`, `pressure.go` | **`DeletePrefix("")` Bypasses Pressure Sampling & Misattributes Compaction Telemetry**: Fixed by acquiring `c.lockWithPressure(&c.mu, false)` in `DeletePrefix("")` and passing `(hadCompactionSlack, hadReclaimable, sampledEpoch, pressure)` to `finishClearAllLocked`. | `TestDefect_M01_to_M06_MediumDefectsAndDivergences/M01_*` (PASS) |
+| **`M-02`** | **Medium** | **REMEDIATED (Bucket 1)** | `arena_radix.go`, `arena_radix_lru.go`, `map_lru.go`, `radix_lru.go` | **Cross-Backend Compaction Trigger & `DeletePrefix` Callback Ordering Divergences**: Fixed by gating `ArenaRadixCache.isDirtyLocked()` on prior deletions (`freeHead != nilNode || deletedSinceCompact > 0 || nodeMapDirty`) and ensuring `DeletePrefix("")` iterates in MRU-to-LRU order across all three backends while non-empty `DeletePrefix(prefix)` iterates in pre-order DFS across both radix backends. | `TestDefect_M01_to_M06_MediumDefectsAndDivergences/M02_*` (PASS) |
 | **`M-03`** | **Medium** | **REMEDIATED (Bucket 1)** | `radix_lru.go` | **`RadixCache.Compact()` Fake Compaction Telemetry**: Fixed by returning `false` from `radixCache.compactDataStructuresLocked()` after resetting metadata counters so compaction and reclaim-epoch counters are not falsely incremented. | `TestDefect_M01_to_M06_MediumDefectsAndDivergences/M03_*` (PASS) |
 | **`M-04`** | **Medium** | **REMEDIATED (Bucket 1)** | `options.go` | **Counter-Intuitive Threshold Reconciliation (`EvictionThreshold > 1.0` or Silent Reset)**: Fixed by clamping `advanceEvictionThreshold` to `<= 1.0` and preserving valid explicit threshold pairs when both `WithCompactionThreshold` and `WithEvictionThreshold` are set. | `TestDefect_M01_to_M06_MediumDefectsAndDivergences/M04_*` (PASS) |
 | **`M-05`** | **Medium** | **Preserved by Design (Bucket 3)** | `options.go`, `pressure.go` | **`DefaultRuntimePressureFunc` Opt-In Budget Behavior**: Returns `0.0` when both `WithMemoryBudget` and `GOMEMLIMIT` are unset; refreshes pressure sample after reclamation. | Verified in `options.go` & `pressure.go` |
@@ -87,18 +87,17 @@ Following full remediation of all **Bucket 1 real bugs** (`C-02`, `H-01`, `H-03`
 | **`L-01`** | **Low** | **Preserved by Design (Bucket 3)** | `otellru/otellru.go` | **`otellru` Multi-Cache Registration Requires `WithName` / `WithAttributes`**: Callers registering multiple caches on one `MeterProvider` distinguish series via `otellru.WithName`. | `TestDefect_L01_DuplicateRegistrationWithoutNameCollision` (`./otellru`, PASS) |
 | **`L-02`** | **Low** | **Preserved by Design (Bucket 3)** | `cache.go`, `arena_radix.go`, `options.go` | **Focused Core LRU API Surface**: Minimal `Cache[V]` interface without TTL/clock complexity; evicted values delivered via `Put` return slice and `OnEvict*` callbacks. | `Benchmark_LargeScale_Put_100K` |
 | **`L-03`** | **Low** | **Preserved by Design (Bucket 3)** | `arena_radix_lru.go`, `map_lru.go`, `radix_lru.go` | **Pre-Insert `uint32` Node-Limit Guard & Debug `WithInvariantChecking(true)`**: Debug invariant checking thoroughly validates full cache state on lock release. | Verified in `arena_radix_lru.go` |
-| **`L-04`** | **Low** | **REMEDIATED (Bucket 1)** | `otellru/otellru.go` | **`uint64ToInt64` Clamping to `math.MaxInt64` Triggers `float64` Precision Wrap in `sdkmetric` `Sum[int64]`**: Fixed by clamping cumulative counter observations via `uint64ToCounterInt64` to `maxSafeOTelCounterInt64 = (1<<63) - 1024`. | `TestAdversarial_Uint64OverflowClampingAllInstruments` (`./otellru`, PASS) |
+| **`L-04`** | **Low** | **REMEDIATED (Bucket 1)** | `otellru/otellru.go` | **`uint64ToInt64` Clamping to `math.MaxInt64` Triggers `float64` Precision Wrap in `sdkmetric` `Sum[int64]`**: Fixed by clamping cumulative counter observations via `uint64ToCounterInt64` to `maxOtelCounterInt64 = (1<<63) - 1024`. | `TestAdversarial_Uint64OverflowClampingAllInstruments` (`./otellru`, PASS) |
 
 ---
 
-### 3.2 Detailed Root-Cause Analysis of Critical & High Findings
+### 3.2 Pre-Remediation Root-Cause Analysis of Critical & High Findings (All Remediated in Section 5.1)
 
 #### `C-01` (Critical): Unbounded Entry & Memory Growth on Zero-Weight (`Weigher == 0`) Entries
-- **Locations**: `map_lru.go:364,380`, `radix_lru.go:761,776`, `arena_radix_lru.go:453-458`, `README.md:42-44`.
-- **Mechanism**:
-  In all three backends, `Put(key, value)` computes `valueSize := c.weigh(key, value)` before acquiring `c.mu.Lock()`. When inserting a new key, capacity eviction is governed by:
+- **Locations**: `map_lru.go:364,384`, `radix_lru.go:758,777`, `arena_radix_lru.go:446,484`, `pressure.go:1028-1041`, `README.md:42-44`.
+- **Pre-Remediation Mechanism**:
+  In all three backends, `Put(key, value)` computes `valueSize := c.weigh(key, value)` before acquiring `c.mu.Lock()`. Prior to remediation, when inserting a new key, capacity eviction was governed solely by:
   ```go
-  // map_lru.go:380 (identical logic in radix_lru.go:776 and arena_radix_lru.go:453)
   for valueSize > c.maxSize-c.currentSize && c.entries.Len() > 0 {
       c.evictOne()
   }
@@ -108,169 +107,114 @@ Following full remediation of all **Bucket 1 real bugs** (`C-02`, `H-01`, `H-03`
   lru.WithWeigher(func(key string, value []byte) uint64 { return uint64(len(value)) })
   ```
   When a caller caches empty byte slices (`[]byte{}` or `nil`, e.g., negative cache entries or empty payloads), `valueSize` is `0`. Because `c.currentSize <= c.maxSize` is an invariant, `c.maxSize - c.currentSize >= 0`, so `0 > c.maxSize - c.currentSize` is **unconditionally `false`** even when the cache is at 100% byte capacity (`c.currentSize == c.maxSize`).
-- **Production Blast Radius**:
-  Whenever memory pressure is below `EvictionThreshold` (or when neither `GOMEMLIMIT` nor `WithMemoryBudget` is set, so `DefaultRuntimePressureFunc` returns `0.0`), zero-weight entries bypass capacity eviction forever. Each zero-weight entry still allocates a cloned key string on the heap (`clonePrefix`), a node/entry struct (`48–72 B`), and a map/trie slot, leading directly to unbounded heap growth and process OOM.
-- **Reproducer Command**:
+- **Production Blast Radius (Pre-Remediation) & Resolution**:
+  Whenever memory pressure is below `EvictionThreshold` (or when neither `GOMEMLIMIT` nor `WithMemoryBudget` is set, so `DefaultRuntimePressureFunc` returns `0.0`), zero-weight entries previously bypassed capacity eviction forever. Remediated in `shouldEvictZeroWeightOnInsert` (`pressure.go:1028-1041`) and in-place positive-to-zero `Put`/`Replace` updates so `currentSize + max(0, zeroSizeCount - maxSize) <= maxSize` and `zeroSizeCount` remain strictly bounded.
+- **Verification Command**:
   ```bash
-  GO_LRU_STRICT_PRODUCTION_ASSERTS=1 go test -v -run TestDefect_C01_ZeroWeightUnboundedGrowth .
+  go test -v -run TestDefect_C01_ZeroWeightOOM .
   ```
 
 #### `C-02` (Critical): State Corruption, Subsequent Panics, & Permanent Lock Leak on `OnEvict*` Callback Panic
-- **Locations**: `map_lru.go:273-278,361-375,616-633`, `radix_lru.go:631-688,758-773,1007-1010`, `arena_radix_lru.go:340-352,414-431,680-721,752-838`.
-- **Mechanism**:
-  User-supplied `OnEvictValue` and `OnEvictEntry` callbacks are invoked synchronously mid-operation while internal data structures are partially mutated:
-  1. **`MapCache.DeletePrefix("")` (`map_lru.go:616-633`)**: `deleteAllPrefixLocked()` iterates `for e := c.entries.Front(); e != nil;`, zeroing `e.key = ""`, `e.prev = nil`, `e.next = nil`, subtracting `c.currentSize -= evictedSize`, and calling `c.notifyEvict(...)` **before** calling `c.entries.Init()` (line 630) or `c.clearEmptyIndexStateLocked()` (line 632). If `OnEvict*` panics on the first entry, `c.entries.len` remains $N$ and `c.index` still maps all $N$ keys, but `c.entries.root.next` points to a zeroed node whose `next == nil`, severing the LRU list!
-  2. **`ArenaRadixCache.DeletePrefix(prefix)` (`arena_radix_lru.go:752-760`) & `RadixCache.DeletePrefix(prefix)` (`radix_lru.go:1007-1010`)**: `DeletePrefix` detaches the target `childID` from `nodeID` (`c.nodes[nodeID].child = nilNode`), sets `c.nodes[childID].parent = nodeID`, and calls `c.freeSubtree(childID, ...)` (`c.sweepAndUnlink(child)`). Inside `freeSubtree`, `c.notifyEvict` is called on the first value-bearing descendant while sibling/descendant value nodes in the detached subtree remain linked into the live LRU list (`c.head`/`c.tail`) with dangling parent pointers. When a subsequent `Put` evicts one of those orphaned LRU tail nodes, `compressPathUpwards` calls `replaceChild(c.root, ...)` and **panics with `"replaceChild: requested child not found in sibling list"`** (`arena_radix.go:228`).
-  3. **`Put` Overwrite (`map_lru.go:361-375`, `radix_lru.go:758-773`, `arena_radix_lru.go:414-431`)**: `updateExistingOnPutLocked` decrements `c.currentSize -= oldSize` and updates `c.zeroSizeCount` **before** the capacity eviction loop `for valueSize > c.maxSize-c.currentSize { c.evictOne() }`, while the existing entry's `.size` field still holds `oldSize` until *after* the loop. If `OnEvict*` panics during capacity eviction, `c.currentSize` is permanently underflowed by `oldSize`.
-  4. **Double-Panic & Permanent Lock Leak in `unlock()` (`map_lru.go:273-278`, `radix_lru.go:683-688`, `arena_radix_lru.go:340-345`)**: All three `unlock()` methods run `if c.options.EnableInvariantChecking { c.checkInvariants() }` **before** `c.mu.Unlock()` without a `defer c.mu.Unlock()`. When a callback panics with `WithInvariantChecking(true)`, stack unwinding runs `defer c.unlock()`, which immediately panics inside `c.checkInvariants()` before `c.mu.Unlock()` is ever reached—masking the user's panic and **permanently wedging `c.mu` in a write-locked state**.
-- **Reproducer Command**:
+- **Locations**: `map_lru.go:273-278,349-380,608-638`, `radix_lru.go:683-688,742-774,964-1025`, `arena_radix_lru.go:361-373,433-458,680-721,752-882`.
+- **Pre-Remediation Mechanism**:
+  Prior to remediation, user-supplied `OnEvictValue` and `OnEvictEntry` callbacks were invoked synchronously mid-operation while internal data structures were partially mutated:
+  1. **`MapCache.DeletePrefix("")`**: `deleteAllPrefixLocked()` iterated over `c.entries`, zeroing node fields and subtracting `c.currentSize` before calling `c.entries.Init()` or `c.clearEmptyIndexStateLocked()`. A panicking `OnEvict*` left `c.entries` severed while `c.index` retained all keys.
+  2. **`ArenaRadixCache.DeletePrefix(prefix)` & `RadixCache.DeletePrefix(prefix)`**: `DeletePrefix` detached the target child from its parent before sweeping value nodes in the detached subtree, leaving unvisited subtree nodes linked in the LRU list with dangling parent pointers.
+  3. **`Put` Overwrite**: `updateExistingOnPutLocked` decremented `c.currentSize -= oldSize` before the capacity eviction loop while the existing entry's `.size` field still held `oldSize`.
+  4. **Double-Panic & Permanent Lock Leak in `unlock()`**: All three `unlock()` methods ran `c.checkInvariants()` before `c.mu.Unlock()` without a `defer c.mu.Unlock()`, masking callback panics and leaking `c.mu`.
+- **Verification Command**:
   ```bash
-  GO_LRU_STRICT_PRODUCTION_ASSERTS=1 go test -v -run TestDefect_C02_OnEvictPanicStateCorruptionAndLockLeak .
+  go test -v -run TestDefect_C02_OnEvictPanicStateCorruptionAndLockLeak .
   ```
 
-#### `C-03` (Critical): Synchronous Callback Re-Entrancy Deadlock (`OnEvict*` & Child-Goroutine `PressureFunc`)
-- **Locations**: `map_lru.go:180-188`, `radix_lru.go:110-118`, `arena_radix.go:75-83`, `pressure.go:201-218,428-447`.
-- **Mechanism**:
-  1. **`OnEvictValue` / `OnEvictEntry` under `c.mu.Lock()`**: Because Go's `sync.RWMutex` is non-reentrant, invoking any method on the same `Cache` instance inside an eviction callback—even read-only `cache.Stats()`, `cache.Peek(k)`, or `cache.Values()` which only acquire `c.mu.RLock()`—blocks forever waiting for the current goroutine's `c.mu.Lock()` to be released.
-  2. **`PressureFunc` Child-Goroutine Re-Entrancy (`pressure.go:201-218`)**: `checkSamplingGoroutine` detects re-entrancy by comparing `currentGoroutineID()` against `samplingGID`, `fallbackSamplingGID`, and `overflowSamplingGIDs`. If a custom `PressureFunc` spawns a helper goroutine (`go func() { ... }()`) and waits for it, and that helper goroutine performs a cache write (`Put`, `Replace`, `Delete`, `DeletePrefix`), `currentGoroutineID()` on the child goroutine does not match the parent's GID, bypassing the guard and recursively invoking `PressureFunc`.
-- **Reproducer Command**:
+#### `C-03` (Critical): Synchronous Callback Re-Entrancy Deadlock (`OnEvict*` & Descendant-Goroutine `PressureFunc`)
+- **Locations**: `map_lru.go:349-351`, `radix_lru.go:742-746`, `arena_radix_lru.go:514-518`, `pressure.go:136-179,485-525,1180-1228`.
+- **Pre-Remediation Mechanism & Resolution**:
+  1. **`OnEvictValue` / `OnEvictEntry` under `c.mu.Lock()`**: Previously invoked while holding `c.mu.Lock()`, deadlocking on any re-entrant cache call. Remediated by buffering events in `evictCallbackQueue[V]` and invoking callbacks after `c.unlock()` with per-cache `evictCallbackMu` serialization and descendant-goroutine (`isAncestorCreatorAboveHook`) deadlock bypass.
+  2. **`PressureFunc` Descendant-Goroutine Re-Entrancy**: Previously checked only `currentGoroutineID()` against `samplingGID`. Remediated via `checkSamplingGoroutineOrChild` (`pressure.go:500-525`) and `isAncestorCreatorAboveHook` (`pressure.go:136-175`), detecting child and multi-hop descendant goroutines spawned inside `PressureFunc`.
+- **Verification Command**:
   ```bash
-  GO_LRU_STRICT_PRODUCTION_ASSERTS=1 go test -v -run TestDefect_C03_ReentrancyHazards .
+  go test -v -run TestDefect_C03_ReentrancyHazards .
   ```
 
 #### `H-01` (High): Unamortized `runtime.Stack()` & `pressureWriteMu.Lock()` on 100% of Writes with Custom `WithPressureFunc`
-- **Locations**: `pressure.go:32-48,201-213,352-354,391-409,452-455`.
-- **Mechanism**:
-  In `pressure.go:452-455`, `samplePressureWithEpoch()` begins with:
-  ```go
-  func (p *pressureState) samplePressureWithEpoch() (float64, uint64, bool) {
-      if p.options.hasCustomPressureFunc {
-          return p.samplePressureFreshWithEpoch()
-      }
-      // 256-op amortization window only reached when hasCustomPressureFunc == false!
-  ```
-  Inside `samplePressureFreshWithEpoch()` $\rightarrow$ `sampleWithSlot()` (`pressure.go:399-403`):
-  ```go
-  if p.options.hasCustomPressureFunc {
-      gid = p.ensureSamplingGID(gid) // calls currentGoroutineID() -> runtime.Stack(buf[:32], false)!
-  }
-  ```
-  And `invokeAndStorePressure` (`pressure.go:387`) then calls `storeSampledPressureWithSeq` (`pressure.go:352-354`), which acquires `p.pressureWriteMu.Lock()`.
-- **Production Blast Radius**:
-  Any user who supplies a custom `WithPressureFunc` (even a trivial `func() float64 { return atomicPressure.Load() }`) triggers `runtime.Stack()` (which halts the goroutine and formats its stack header into a byte buffer) plus an extra mutex lock (`pressureWriteMu.Lock()`) on **every single `Put`, `Replace`, `Delete`, and `DeletePrefix`**. In `BenchmarkPressureSamplingAndCallbacks`, this slows down `Put` by **`108.6x–125.3x`** (`62.96 ns/op` $\rightarrow$ `7,888 ns/op`).
-- **Reproducer Command**:
+- **Locations**: `pressure.go:404-465,691-835`.
+- **Pre-Remediation Mechanism & Resolution**:
+  Prior to remediation, `samplePressureWithEpoch()` called `ensureSamplingGID` $\rightarrow$ `currentGoroutineID()` $\rightarrow$ `runtime.Stack(buf[:32], false)` on every foreground write when `hasCustomPressureFunc == true`, slowing `Put` by `>50x`. Remediated via `invokeFastPrimaryPressure` (`pressure.go:692-700`) and lazy stack resolution (`resolvePrimaryFromAllStacksLocked`), leaving `samplingGID == 0` on uncontended single-cache sampling and achieving `0 allocs/op` and a **`50.7x–53.1x` speedup**.
+- **Verification Command**:
   ```bash
-  GO_LRU_STRICT_PRODUCTION_ASSERTS=1 go test -v -run TestDefect_H01_CustomPressureFuncPerWriteRuntimeStackOverhead .
+  go test -v -run TestDefect_H01_CustomPressureFuncPerWriteRuntimeStackOverhead .
   go test -run='^$' -bench=BenchmarkCustomPressureFuncOverhead -benchmem .
   ```
 
 #### `H-02` (High): Global Exclusive Write Lock (`c.mu.Lock()`) on `Get()` & Iterator `RWMutex` Deadlock
-- **Locations**: `map_lru.go:470-483,665-710`, `radix_lru.go:826-839,1026-1072`, `arena_radix_lru.go:535-549,842-887`.
-- **Mechanism**:
-  - `Get(key)` unconditionally acquires `c.mu.Lock()` upon entry, even when `key` is a cache miss (no LRU mutation) or when `key` is already at the MRU head (`MoveToFront` is a no-op). Under multi-core contention (`16–64` goroutines), `100% Get` throughput collapses (`497.6 ns/op` on `MapCache` vs `73.14 ns/op` for `100% Peek`).
-  - Range-over-func iterators (`All()`, `Keys()`, `Values()`) hold `c.mu.RLock()` while invoking `yield(...)`. In Go's `sync.RWMutex`, once a writer calls `c.mu.Lock()`, subsequent `c.mu.RLock()` calls block until the writer finishes. Therefore, if Goroutine A is iterating `for k, v := range cache.All()` (holding `RLock`) and calls `cache.Peek()` or `cache.Stats()` (requesting a second `RLock`) while Goroutine B is waiting on `cache.Get()` or `cache.Put()` (`Lock`), Goroutines A and B **deadlock permanently**.
+- **Locations**: `map_lru.go:475-488`, `radix_lru.go:829-842`, `arena_radix_lru.go:565-579`.
+- **Mechanism (Preserved by Design — Bucket 3)**:
+  - `Get(key)` acquires `c.mu.Lock()` to maintain strict LRU promotion ordering in a single-shard structure; `Peek(key)` acquires `c.mu.RLock()` for shared lock-free-order reads.
+  - Range-over-func iterators (`All()`, `Keys()`, `Values()`) hold `c.mu.RLock()` while invoking `yield(...)`; callers must not invoke write methods on the same cache instance inside the loop body.
 
 #### `H-03` (High): `Replace()` Immediately Self-Evicts Non-MRU Updated Entry Under Tier 2 Pressure
-- **Locations**: `map_lru.go:596-600,774-776`, `radix_lru.go:949-953,1132-1134`, `arena_radix_lru.go:671-675`, `arena_radix.go:744-746`.
-- **Mechanism**:
-  At the end of `Replace(key, value)`, after updating the entry's value in-place, firing `EvictionReasonReplaced`, and incrementing `c.replaceUpdated++`, all three backends execute:
-  ```go
-  // map_lru.go:596-600
-  var protectedElem *entry[V]
-  if e == c.entries.Front() {
-      protectedElem = e
-  }
-  _ = c.finishMutationReclaimLocked(nil, protectedElem, pressure, sampled)
-  ```
-  Because `Replace()` does not promote `e` to the MRU head, any updated entry that is not already at `Front()` (`head`) has `protectedElem = nil`. When `pressure >= EvictionThreshold` (Tier 2), `shedAndCompactLocked` evicts from the LRU tail until `currentSize <= targetSize`—immediately evicting the exact entry `Replace()` just updated, while `Replace()` returns `nil` (success) and records `ReplaceUpdated = 1, ReplaceSelfEvicted = 0`.
-- **Reproducer Command**:
+- **Locations**: `map_lru.go:607`, `radix_lru.go:963`, `arena_radix_lru.go:708`.
+- **Pre-Remediation Mechanism & Resolution**:
+  Previously, `Replace(key, value)` only protected the replaced entry during Tier 2 shedding if it happened to be at the MRU head (`Front()` / `head`). Remediated by passing the replaced entry unconditionally (`e` / `protectedNode` / `nodeID`) to `finishMutationReclaimLocked` across all three backends.
+- **Verification Command**:
   ```bash
-  GO_LRU_STRICT_PRODUCTION_ASSERTS=1 go test -v -run TestDefect_H03_ReplaceEvictsNonMRUUnderTier2Pressure .
+  go test -v -run TestDefect_H03_ReplaceEvictsNonMRUUnderTier2Pressure .
   ```
 
-#### `H-04` (High): False "GC-Free Arena" Guarantee in `ArenaRadixCache`
-- **Locations**: `cache.go:20-22`, `arena_radix.go:31-41,265-303,428`.
-- **Mechanism**:
-  `arenaRadixNode[V]` is defined at `arena_radix.go:31-41` as:
-  ```go
-  type arenaRadixNode[V any] struct {
-      prefix   string // 16-byte string header {*byte, int} at offset 0!
-      size     uint64
-      parent   uint32
-      child    uint32
-      sibling  uint32
-      prev     uint32
-      next     uint32
-      hasValue bool
-      value    V
-  }
-  ```
-  Because `prefix string` contains a Go pointer (`*byte`) at offset 0, the Go compiler's `abi.Type` descriptor for `arenaRadixNode[V]` always has `PtrBytes >= 8` even when `V` is a pointer-free scalar (`uint64`, `[64]byte`). Consequently:
-  1. `c.nodes` (`[]arenaRadixNode[V]`) is **never** allocated in a `noscan` span; the Go garbage collector must scan every element in `c.nodes` on every GC cycle (`~1.56 ms` per GC cycle at 50,000 `[64]byte` entries).
-  2. Splitting a radix edge during `insertNode` calls `clonePrefix` 3 times (`arena_radix.go:284,289,299`, 3 heap string allocations when segment length $\ge 2$), and collapsing a single-child routing node during `compressPathUpwards` executes `c.nodes[onlyChildID].prefix = c.nodes[currID].prefix + c.nodes[onlyChildID].prefix` (`arena_radix.go:428`, 1 heap string allocation)—producing **4 heap allocations per `Put`+`Delete` churn cycle**.
-- **Reproducer Command**:
+#### `H-04` (High): `prefix string` Header in `arenaRadixNode[V]` (`ArenaRadixCache`)
+- **Locations**: `cache.go:20-22`, `arena_radix.go:31-41`.
+- **Mechanism (Preserved by Design — Bucket 3)**:
+  `arenaRadixNode[V]` embeds `prefix string` (16-byte string header at offset 0) and `uint32` tree/LRU indices (`parent`, `child`, `sibling`, `prev`, `next`), reducing pointer fields per node to `1` (`<= 2N` pointers vs `12N` in `RadixCache`).
+- **Verification Command**:
   ```bash
-  GO_LRU_STRICT_PRODUCTION_ASSERTS=1 go test -v -run TestAdversarial_AllocationCharacterization_PathCompressionAndDeepKeys .
+  go test -v -run TestAdversarial_AllocationCharacterization_PathCompressionAndDeepKeys .
   ```
 
 #### `H-05` (High): Single 64-Bit FNV-1a Collision Permanently Disables $O(1)$ Cache-Miss Fast-Path Globally
-- **Locations**: `arena_radix.go:53,117-128,365-380,669-671`.
-- **Mechanism**:
-  `ArenaRadixCache` hashes keys using unseeded 64-bit FNV-1a (`hashString`, `arena_radix.go:117-128`) and stores a single `nodeID` per hash in `c.nodeMap map[uint64]uint32`. In `lookupOrWalkNodeKey` (`arena_radix.go:365-380`):
-  ```go
-  if id, exists := c.nodeMap[h]; exists {
-      if c.verifyKey(id, key) {
-          return id, false, true
-      }
-  } else if len(c.nodeMap) == c.len {
-      return nilNode, false, false
-  }
-  c.arenaHashFallbacks.Add(1)
-  id, ok := c.findNodeByTrieWalk(key)
-  return id, true, ok
-  ```
-  When any two live keys in the cache share the same 64-bit FNV-1a hash—for example, the two 12-byte keys `realFNV1aCollisionKeyA = "!!!!!!!!!!!!"` and `realFNV1aCollisionKeyB = "&+!o9)1!=\x1c\xd2\x10"` (both hashing to `0xa92d176f78f8c4c1`), or any key pair with those prefixes and an identical suffix—`c.nodeMap[h]` can only hold one `nodeID`, so `len(c.nodeMap)` becomes `c.len - 1`. Even calling `Compact()` (`arena_radix.go:669-671`) cannot heal `len(c.nodeMap) < c.len` because both keys map to the same slot in `newNodeMap`. As a result, `len(c.nodeMap) == c.len` is permanently `false`, and **100% of cache misses on every unrelated key in the cache** bypass the $O(1)$ fast-path, atomically increment `arenaHashFallbacks` (causing cross-core cache-line contention), and walk the radix trie!
-- **Reproducer Command**:
+- **Locations**: `arena_radix.go:54-55,367-382,820-926`, `arena_radix_lru.go:253-293`.
+- **Pre-Remediation Mechanism & Resolution**:
+  Previously, when two live keys shared the same 64-bit FNV-1a hash, `len(c.nodeMap) < c.len` disabled the $O(1)$ miss fast-path until full compaction. Remediated by tracking active collisions in `c.collisionCount` and displaced same-hash peers in `c.collisionPeers`, promoting surviving peers into `c.nodeMap` immediately upon deletion or eviction and restoring `len(c.nodeMap)+c.collisionCount == c.len`.
+- **Verification Command**:
   ```bash
-  GO_LRU_STRICT_PRODUCTION_ASSERTS=1 go test -v -run TestDefect_H05_FNV1aCollisionDisablesO1MissGlobally .
+  go test -v -run TestDefect_H05_FNV1aCollisionDisablesO1MissGlobally .
   ```
 
-#### `H-06` (High): Stop-The-World Compaction Stalls & 2x Transient Map Reallocations Without Bucket Slack
-- **Locations**: `map_lru.go:424,730-740,815-820`, `arena_radix.go:633-696`, `pressure.go:520-523`.
-- **Mechanism**:
-  - In `MapCache`, `eraseInternal` (`map_lru.go:424`) sets `c.dirtyIndex = true` on every deletion or capacity eviction. In `mapCache.compactDataStructuresLocked()` (`map_lru.go:730-740`), the only guard is `if !c.dirtyIndex { return false }`. Furthermore, `shouldAutoCompactEntryCounts(isDirty, isBackground, currentLen)` (`pressure.go:520-523`) returns `isDirty` whenever `isBackground == true` (`EvaluateMemoryPressure()`). Thus, in a steady-state full cache (`len == peakEntryLen == 100,000`) that has experienced even **1 capacity eviction**, calling `Compact()` or Tier 1 `EvaluateMemoryPressure()` (`>= 0.75`) allocates a second 100,000-entry `map[string]*entry[V]` and copies all 100,000 entries under `c.mu.Lock()`—transiently **doubling map memory right when memory pressure is already elevated** while reclaiming 0 bucket slack!
-  - In `ArenaRadixCache`, `compactDataStructuresLocked()` (`arena_radix.go:633-696`) synchronously allocates `oldToNew []uint32`, `newNodes []arenaRadixNode[V]`, and `newNodeMap map[uint64]uint32` while holding `c.mu.Lock()`, stalling all concurrent readers and writers for **`2.47 ms`** at `N = 50,000` (`6.90 ms` during Tier 2 `EvaluateMemoryPressure`).
-- **Reproducer Command**:
+#### `H-06` (High): Unnecessary 2x Map Reallocations Without Bucket Slack in `MapCache.Compact()`
+- **Locations**: `map_lru.go:187-189,750-764,825-835`.
+- **Pre-Remediation Mechanism & Resolution**:
+  Previously, `MapCache` set `c.dirtyIndex = true` on every deletion or capacity eviction and reallocated `c.index` on `Compact()` or Tier 1 `EvaluateMemoryPressure()` even when `len(c.index) == c.peakEntryLen`. Remediated by gating map reallocation on `hasSlackLocked()` (`c.dirtyIndex && (len(c.index) < c.peakEntryLen || c.deletedSinceCompact >= minChurnCompactDeletes)`).
+- **Verification Command**:
   ```bash
-  GO_LRU_STRICT_PRODUCTION_ASSERTS=1 go test -v -run TestDefect_H06_MapCompactReallocatesWithoutSlack .
+  go test -v -run TestDefect_H06_MapCompactReallocatesWithoutSlack .
   ```
 
 ---
 
 ### 3.3 Medium & Low Findings (`M-01..M-06`, `L-01..L-04`)
 
-- **`M-01` (`DeletePrefix("")` Bypasses Pressure Sampling & Misattributes Compaction Telemetry)**:
-  In `map_lru.go:639-644`, `radix_lru.go:983-988`, and `arena_radix_lru.go:708-713`, `DeletePrefix("")` acquires `c.mu.Lock()` directly instead of calling `c.lockWithPressure(&c.mu, false)`, and then calls `c.finishClearAllLocked(reclaimed)` (`pressure.go:638-645`). Consequently, `DeletePrefix("")` under Tier 1/2 pressure leaves `Stats().MemoryPressure` stale, increments `CompactionsAutoSlack` instead of `CompactionsPressureTier1`/`Tier2`, and fails to advance `ReclaimEpoch` if the previously cached pressure reading was `< CompactionThreshold`.
-- **`M-02` (Cross-Backend Compaction & Callback Ordering Divergences)**:
-  1. `ArenaRadixCache.isDirtyLocked()` (`arena_radix.go:516-518`) returns `true` whenever `len(c.nodes) < cap(c.nodes)`. Because Go's `append` doubles slice capacity (`1 -> 2 -> 4 -> 8 -> 16`), inserting 10 keys into a fresh cache leaves `len(c.nodes) == 11 < cap(c.nodes) == 16`. Calling `Compact()` increments `CompactionsExplicit = 1` and `ReclaimEpoch = 1` on `ArenaRadixCache`, while `MapCache` and `RadixCache` remain at `0`.
-  2. Deleting a leaf in `ArenaRadixCache` that collapses a single-child routing node frees **2** arena nodes (`c.freeCount += 2`), causing `shouldAutoCompactLocked()` (`uint64(c.freeCount)*4 >= uint64(len(c.nodes))`, `arena_radix.go:601`) to trigger inline compaction at `< 25%` entry shrinkage when `MapCache` and `RadixCache` do not compact (`TestAdversarial_CrossBackendDifferentialAndEdgeCases/ArenaNodeSlack_vs_EntrySlack_CompactionDivergenceCharacterization`).
-  3. `DeletePrefix("")` invokes `OnEvict*` in MRU-to-LRU order on `MapCache` and `ArenaRadixCache`, but in lexicographical pre-order DFS order on `RadixCache`; `DeletePrefix("non_empty")` invokes `OnEvict*` in non-deterministic Go map order on `MapCache` vs lexicographical pre-order DFS order on `RadixCache` and `ArenaRadixCache`.
-- **`M-03` (`RadixCache.Compact()` Fake Compaction Telemetry)**:
-  `radixCache.compactDataStructuresLocked()` (`radix_lru.go:1088-1094`) only calls `c.onCompacted(c.len)` and returns `true`, which increments `CompactionsExplicit`, `CompactionsPressureTier1`, `CompactionsPressureTier2`, `CompactionsAutoSlack`, and `ReclaimEpoch` despite performing zero structural or heap memory reclamation (confirmed in `BenchmarkGCPauseAndScanOverhead`: `166.7 B/entry` before `Compact()` vs `166.5 B/entry` after `Compact()`).
-- **`M-04` (`reconcileThresholdWindow` Pushes `EvictionThreshold > 1.0` or Silently Resets `CompactionThreshold`)**:
-  In `options.go:566-573`, configuring `WithCompactionThreshold(0.95)` alone calls `advanceEvictionThreshold(0.95)`, setting `EvictionThreshold = 1.10` (110% of memory budget, preventing Tier 2 shedding before OOM). Conversely, configuring `WithCompactionThreshold(0.95), WithEvictionThreshold(0.90)` sets `hasCustomEvictionThreshold = true` and calls `scaleCompactionThreshold(0.90)`, silently overwriting the user's `0.95` `CompactionThreshold` back to `0.75`.
-- **`M-05` (`DefaultRuntimePressureFunc` Silent `0.0` Fallback & Post-Reclaim Window Invalidation Churn)**:
-  `DefaultRuntimePressureFunc(0)` (`options.go:490-492`) returns `0.0` if `GOMEMLIMIT` is not configured (`math.MaxInt64`), silently disabling all memory-pressure protection unless the operator sets `GOMEMLIMIT` or `WithMemoryBudget`. Furthermore, `markReclaimedLocked()` (`pressure.go:259-260`) sets `pressureNeedsRefresh = true` and `pressureInitialized = false` after every compaction or shed, invalidating the 256-op amortization window and forcing the very next write to call `runtime/metrics.Read` again before the Go GC has had a chance to lower heap usage.
-- **`M-06` (Cache-Line False Sharing in `pressureState` & `[64]` Stack Buffer Spill at `depth > 64`)**:
-  Verified via `unsafe.Offsetof` in `TestAdversarial_CacheLineLayoutAndStructAlignment`: `peekHits`, `peekMisses`, and `putRejectedOversized` sit at byte offsets `128`, `136`, and `144` in `mapCache` (sharing a single 64-byte cache line), while `arenaHashFallbacks` and `pressureWriteMu` sit in the same 64-byte cache line (`offsets 152 and 160`). In `RadixCache` and `ArenaRadixCache`, keys with `> 64` branching levels spill fixed `[64]` stack buffers to the heap in `reconstructKey`, `hashNodeKey`, and `freeSubtree`.
-- **`L-01` (`otellru` Duplicate Registration Collision)**:
-  Registering two caches of the same backend on the same `MeterProvider` without unique `WithName` or `WithAttributes` emits identical attribute sets (`{"cache.backend": "map"}`), causing `sdkmetric` to merge/overwrite their gauge data points (`TestDefect_L01_DuplicateRegistrationWithoutNameCollision`).
-- **`L-02` (Missing `TTL`/`Clock`, `MaxEntries`, `WithInitialCapacity`, & Dropped Evicted Slices)**:
-  No time-based expiration (`TTL`) or `WithInitialCapacity` exists (`ArenaRadixCache` starts `c.nodes` at `cap=1`, causing `39.3 MB` of slice-doubling allocations when cold-loading `100,000` entries in `Benchmark_LargeScale_Put_100K`). Additionally, `Replace`, `Delete`, and `DeletePrefix` drop the `[]V` slice returned by inline Tier 2 pressure shedding.
-- **`L-03` (Pre-Insert `uint32` Node-Limit Over-Eviction & $O(N)$ `rUnlock()` Invariant Walk)**:
-  In `arena_radix_lru.go:444-449`, the pre-insert node-limit loop `for uint64(len(c.nodes))-uint64(c.freeCount)+2 > uint64(foregroundNoProtect)` can evict extra entries if the LRU tail entry is `""` (at `c.root`) or an internal value node with $\ge 2$ children (whose eviction frees `0` arena nodes). Also, `rUnlock()` runs an $O(N)$ `checkInvariants()` walk under `RLock` when `WithInvariantChecking(true)` is enabled.
-- **`L-04` (`otellru.uint64ToInt64` Clamping to `math.MaxInt64` Overflows in `sdkmetric` v1.46.0 `Sum[int64]`)**:
-  `uint64ToInt64` (`otellru/otellru.go:164-169`) clamps `uint64` values `> math.MaxInt64` to `math.MaxInt64` (`9223372036854775807`). While `Gauge[int64]` reports `math.MaxInt64` accurately, `sdkmetric` v1.46.0's `Sum[int64]` pipeline converts counter values through `float64` (rounding $2^{63}-1$ to $2^{63}$), which wraps back to `int64` as `math.MinInt64` (`-9223372036854775808`). Clamping counter observations to `(1<<63) - 1024` (`9223372036854774783`, the largest `int64` with an exact IEEE-754 `float64` representation) avoids this `sdkmetric` wrap.
+- **`M-01` (Remediated — `DeletePrefix("")` Samples Pressure & Attributes Compaction Telemetry)**:
+  In `map_lru.go`, `radix_lru.go`, and `arena_radix_lru.go`, `DeletePrefix("")` on a non-empty or dirty cache acquires `c.lockWithPressure(&c.mu, false)` and calls `c.finishClearAllLocked(hadCompactionSlack, hadReclaimable, sampledEpoch, pressure)`, attributing Tier 1/2 compactions and `ReclaimEpoch` accurately while preserving a fast no-op path when the cache is already empty and clean.
+- **`M-02` (Remediated — Cross-Backend Compaction & Callback Ordering Parity)**:
+  1. `ArenaRadixCache.isDirtyLocked()` (`arena_radix.go:515-517`) requires prior deletions (`c.freeHead != nilNode || (c.deletedSinceCompact > 0 && len(c.nodes) < cap(c.nodes)) || c.nodeMapDirty`), so `Compact()` on a pure-insert cache is a no-op across all three backends.
+  2. Deleting a leaf in `ArenaRadixCache` that collapses a single-child routing node frees **2** arena nodes (`c.freeCount += 2`), which is characterized in `TestAdversarial_CrossBackendDifferentialAndEdgeCases/ArenaNodeSlack_vs_EntrySlack_CompactionDivergenceCharacterization`.
+  3. `DeletePrefix("")` invokes `OnEvict*` in MRU-to-LRU order across all three backends, and non-empty `DeletePrefix("non_empty")` invokes `OnEvict*` in lexicographical pre-order DFS order across `RadixCache` and `ArenaRadixCache`.
+- **`M-03` (Remediated — `RadixCache.Compact()` Resets Watermarks Without False Compaction Telemetry)**:
+  `radixCache.compactDataStructuresLocked()` (`radix_lru.go:1152-1155`) calls `c.onCompacted(c.len)` and returns `false`, resetting `deletedSinceCompact` and `peakEntryLen` without inflating `CompactionsExplicit`, `CompactionsPressureTier1`, or `ReclaimEpoch`.
+- **`M-04` (Remediated — `reconcileThresholdWindow` Clamps Derived `EvictionThreshold` to `<= 1.0` and Honors Explicit Pairs)**:
+  In `options.go:554-576`, `advanceEvictionThreshold` clamps the derived `EvictionThreshold` to `<= 1.0`, and `reconcileThresholdWindow` preserves explicit valid `(CompactionThreshold, EvictionThreshold)` pairs whenever `CompactionThreshold < EvictionThreshold`.
+- **`M-05` (Preserved by Design — `DefaultRuntimePressureFunc` Opt-In Budget Behavior)**:
+  `DefaultRuntimePressureFunc(0)` (`options.go:490-492`) returns `0.0` if `GOMEMLIMIT` is not configured (`math.MaxInt64`), and `markReclaimedLocked()` refreshes the pressure sample after reclamation.
+- **`M-06` (Preserved by Design — `pressureState` Atomic Layout & `[64]` Stack Buffer Spill at `depth > 64`)**:
+  Verified via `unsafe.Offsetof` in `TestAdversarial_CacheLineLayoutAndStructAlignment`: `peekHits`, `peekMisses`, `putRejectedOversized`, and `pressureWriteMu` sit in `pressureState` at byte offsets `488..528` in `mapCache` (within a single 64-byte cache line `[448, 512)` / `[512, 576)`), while `arenaRadix` isolates `c.mu` on its own 64-byte cache line (`arena_radix.go:68`). In `RadixCache` and `ArenaRadixCache`, keys with `> 64` branching levels spill fixed `[64]` stack buffers to the heap in `reconstructKey`, `hashNodeKey`, and `freeSubtree`.
+- **`L-01` (Preserved by Design — `otellru` Multi-Cache Registration Requires `WithName` / `WithAttributes`)**:
+  Registering two caches of the same backend on the same `MeterProvider` without unique `WithName` or `WithAttributes` emits identical attribute sets (`{"cache.backend": "map"}`), characterized in `TestDefect_L01_DuplicateRegistrationWithoutNameCollision`.
+- **`L-02` (Preserved by Design — Focused Core LRU API Surface)**:
+  Core `Cache[V]` interface without TTL/clock complexity; evicted values delivered via `Put` return slice and `OnEvict*` callbacks.
+- **`L-03` (Preserved by Design — Pre-Insert `uint32` Node-Limit Guard & Debug `WithInvariantChecking(true)`)**:
+  In `arena_radix_lru.go:468-473`, the pre-insert node-limit loop guards against `uint32` node index exhaustion, and `WithInvariantChecking(true)` validates full structural, `nodeMap`/`collisionPeers`, free-list, and telemetry invariants on lock release.
+- **`L-04` (Remediated — `otellru` Counter & Gauge Clamping)**:
+  `uint64ToCounterInt64` (`otellru/otellru.go:177-182`) clamps cumulative counter observations to `maxOtelCounterInt64 = (1<<63) - 1024` (`9223372036854774784`) so `sdkmetric` v1.46.0 never wraps `math.MaxInt64` to `math.MinInt64`, while `uint64ToInt64`, `clampNonNegativeInt64`, and `clampNormalizedPressure` clamp gauge observations to valid non-negative / `[0.0, 1.0]` ranges.
 
 ---
 
@@ -394,7 +338,7 @@ Because both `Compact()` and `EvaluateMemoryPressure()` execute synchronously un
 
 #### A. Built-in Amortized `DefaultRuntimePressureFunc` vs Custom `WithPressureFunc` (`H-01` Before & After Remediation)
 
-| Backend | `DefaultRuntimePressureFunc` (`WithMemoryBudget`, 256-op amortized) | Custom `WithPressureFunc` Pre-Fix Baseline (`runtime.Stack()` per write) | Custom `WithPressureFunc` Post-Fix (`resolvePrimarySamplingGID`) | Remediation Speedup (`H-01`) |
+| Backend | `DefaultRuntimePressureFunc` (`WithMemoryBudget`, 256-op amortized) | Custom `WithPressureFunc` Pre-Fix Baseline (`runtime.Stack()` per write) | Custom `WithPressureFunc` Post-Fix (`resolvePrimaryFromAllStacks`) | Remediation Speedup (`H-01`) |
 | :--- | :--- | :--- | :--- | :--- |
 | **`MapCache`** | **`65.97 ns/op`** (`0 B/op`, `0 allocs/op`) | `7,958 ns/op` (`0 B/op`, `0 allocs/op`) | **`149.8 ns/op`** (`0 B/op`, `0 allocs/op`) | **`53.1x` faster** (`-7,808 ns/write`, `0 allocs/op`) |
 | **`RadixCache`** | **`62.96 ns/op`** (`0 B/op`, `0 allocs/op`) | `7,888 ns/op` (`0 B/op`, `0 allocs/op`) | **`152.9 ns/op`** (`0 B/op`, `0 allocs/op`) | **`51.6x` faster** (`-7,735 ns/write`, `0 allocs/op`) |
@@ -431,40 +375,40 @@ Because both `Compact()` and `EvaluateMemoryPressure()` execute synchronously un
    - **Files**: `pressure.go`, `map_lru.go`, `radix_lru.go`, `arena_radix.go`, `arena_radix_lru.go`.
    - **Resolution**:
      - In `unlock()` and `rUnlock()`, `defer c.mu.Unlock()` / `defer c.mu.RUnlock()` is registered **before** calling `c.checkInvariants()`.
-     - All mutating methods (`Put`, `Replace`, `Delete`, `DeletePrefix`, `EvaluateMemoryPressure`) declare `var evictQ evictCallbackQueue[V]` (`inline [4]evictCallbackItem[V]`) and `defer evictQ.invoke(c.options.onEvictValue, c.options.onEvictEntry)` **before** `defer c.unlock()` so Go's LIFO `defer` order guarantees `c.checkInvariants()` and `c.mu.Unlock()` complete before any user `OnEvict*` callback runs.
+     - All mutating methods (`Put`, `Replace`, `Delete`, `DeletePrefix`, `EvaluateMemoryPressure`) declare `var evictQ evictCallbackQueue[V]` (`buf [2]evictEvent[V]`) and `defer evictQ.invoke(&c.pressureState, c.onEvictValue, c.onEvictEntry)` **before** `defer c.unlock()` so Go's LIFO `defer` order guarantees `c.checkInvariants()` and `c.mu.Unlock()` complete before any user `OnEvict*` callback runs.
    - **Verified Impact**: Eliminates callback panic state corruption (`C-02a..c`), invariant double-panic lock leaks (`C-02d`), and callback re-entrancy deadlocks (`C-03a`) while preserving `0 allocs/op` on steady-state hot paths.
 
 2. **Remediated `C-01` — Bounded Zero-Weight (`Weigher == 0`) Entry Accumulation**:
-   - **Files**: `map_lru.go`, `radix_lru.go`, `arena_radix_lru.go`.
+   - **Files**: `pressure.go`, `map_lru.go`, `radix_lru.go`, `arena_radix_lru.go`.
    - **Resolution**:
-     - When inserting a new entry with `valueSize == 0`, if `c.currentSize >= c.maxSize || uint64(c.zeroSizeCount) >= c.maxSize`, the cache evicts the LRU tail entry (`evictOne(&evictQ)`) before inserting the new zero-weight entry.
-   - **Verified Impact**: Entry count and `ZeroSizeCount` remain strictly bounded by `maxSize` (`TestDefect_C01_ZeroWeightUnboundedGrowth`).
+     - When inserting a new entry with `valueSize == 0`, if `!evictedPrePut && c.shouldEvictZeroWeightOnInsert(valueSize, c.maxSize, c.currentSize, c.len)` (`(currentSize >= maxSize && uint64(currentLen) >= maxSize) || uint64(p.zeroSizeCount) >= maxSize`), the cache evicts at most 1 LRU tail entry (`evictOne(&evictQ)`) before inserting the new zero-weight entry; positive-to-zero updates (`Put`/`Replace`) and weighted inserts with excess zero-weight entries also enforce `currentSize + max(0, zeroSizeCount - maxSize) <= maxSize`.
+   - **Verified Impact**: Entry count and `ZeroSizeCount` remain strictly bounded without wiping out positive-weight tail entries (`TestDefect_C01_ZeroWeightOOM`).
 
-3. **Remediated `H-01` & `C-03b` — Lazy Primary GID Resolution & Child-Goroutine Creator GID Guard**:
+3. **Remediated `H-01` & `C-03b` — Lazy Primary GID Resolution & Descendant-Goroutine Creator Frame Guard**:
    - **Files**: `pressure.go`.
    - **Resolution**:
-     - When a goroutine acquires the primary sampler slot (`samplingActive: 0 -> 1`), it leaves `samplingGID = 0` without calling `runtime.Stack()`. Only if a second goroutine concurrently enters `checkSamplingGoroutine` while `samplingActive == 1` does `resolvePrimarySamplingGID` lazily resolve the primary holder's GID (`math.MaxUint64` sentinel) and inspect `currentAndParentGoroutineIDs()` (`created by ... in goroutine N`) so both direct re-entrancy and child goroutines spawned inside `PressureFunc` (`C-03b`) are detected.
+     - When a goroutine acquires the uncontended single-cache primary sampler slot (`samplingPressure: false -> true`, `fastPrimarySamplerOwner: nil -> p`), it leaves `samplingGID = 0` without calling `runtime.Stack()` and invokes `invokeFastPrimaryPressure`. Only if a second goroutine concurrently contends does `resolvePrimaryFromAllStacks` / `promoteFastPrimarySamplerLocked` lazily resolve the primary holder's GID and inspect `parseStackGoroutineParentAndCreator()` + `isAncestorCreatorAboveHook()` (`created by <creatorFunc> in goroutine N`) so both direct re-entrancy and child/descendant goroutines spawned inside `PressureFunc` (`C-03b`) are detected.
    - **Verified Impact**: Custom `WithPressureFunc` write latency dropped from `7,888–8,074 ns/op` to **`149.8–159.4 ns/op`** (**`50.7x–53.1x` speedup**, `0 allocs/op`).
 
 4. **Remediated `H-03` — Non-MRU Entry Protection in `Replace()` Under Tier 2 Pressure**:
    - **Files**: `map_lru.go`, `radix_lru.go`, `arena_radix.go`, `arena_radix_lru.go`.
    - **Resolution**:
-     - `Replace()` passes the updated entry (`e` / `nodeID`) unconditionally to `finishMutationReclaimLocked` and `shedAndCompactLocked`. During Tier 2 shedding, `shedAndCompactLocked` skips the protected entry regardless of its LRU position while shedding other entries, and only evicts it as a last resort when it is the sole entry in the cache (incrementing `ReplaceSelfEvicted` instead of `ReplaceUpdated`).
+     - `Replace()` passes the updated entry (`e` / `node` / `nodeID`) unconditionally to `finishMutationReclaimLocked` and `shedAndCompactLocked`. During Tier 2 shedding, `shedAndCompactLocked` skips the protected entry regardless of its LRU position while shedding other entries when `EvictionRetentionRatio > 0`.
 
-5. **Remediated `H-05` — Active Collision Tracking (`collisionCount`) in `ArenaRadixCache`**:
+5. **Remediated `H-05` — Active Collision Tracking (`collisionCount` & `collisionPeers`) in `ArenaRadixCache`**:
    - **Files**: `arena_radix.go`, `arena_radix_lru.go`.
    - **Resolution**:
-     - `arenaRadix[V]` tracks `collisionCount int` across insertions, single-key deletions/evictions, `DeletePrefix`, and `Compact()`. The $O(1)$ cache-miss fast-path (`!c.nodeMapDirty && c.collisionCount == 0 && len(c.nodeMap) == c.len`) is restored immediately when a colliding key is deleted or evicted.
+     - `arenaRadix[V]` tracks `collisionCount int` and `collisionPeers map[uint64][]uint32` across insertions, promotions, single-key deletions/evictions, `DeletePrefix`, and `Compact()`. The $O(1)$ cache-miss fast-path (`len(c.nodeMap)+c.collisionCount == c.len`) is restored immediately when a colliding key is deleted or evicted.
 
 6. **Remediated `H-06`, `M-01..M-04`, & `L-04` — Compaction Slack Gating, Telemetry Unification, Threshold Clamping, & OTel Overflow Protection**:
    - **Files**: `map_lru.go`, `radix_lru.go`, `arena_radix.go`, `arena_radix_lru.go`, `pressure.go`, `options.go`, `otellru/otellru.go`.
    - **Resolution**:
-     - `H-06`: `MapCache` gates `compactDataStructuresLocked()` and `isDirtyLocked()` on `hasSlackLocked()` (`>= 25%` shrinkage from `peakEntryLen`), preventing 2x map reallocations when bucket slack is zero.
-     - `M-01`: `DeletePrefix("")` acquires `c.lockWithPressure(&c.mu, false)` and passes `(reclaimed, pressure, sampled)` to `finishClearAllLocked`, sampling pressure and attributing Tier 1/2 compactions and `ReclaimEpoch` consistently.
-     - `M-02`: `ArenaRadixCache.isDirtyLocked()` requires prior deletions (`freeCount > 0 || deletedSinceCompact > 0`), tracks `leafFreeCount` for entry-proportional auto-compaction, and iterates `DeletePrefix("")` in lexicographical pre-order DFS order matching `RadixCache`.
-     - `M-03`: `RadixCache.compactDataStructuresLocked()` resets `deletedSinceCompact` and `peakEntryLen` and returns `false` so compaction and `ReclaimEpoch` counters are not incremented without structural compaction.
+     - `H-06`: `MapCache` gates `compactDataStructuresLocked()` and `shouldAutoCompactLocked()` on `hasSlackLocked()` (`c.dirtyIndex && (len(c.index) < c.peakEntryLen || c.deletedSinceCompact >= minChurnCompactDeletes)`, while foreground `shouldAutoCompactLocked(false)` requires `>= 25%` shrinkage from `peakEntryLen` or `>= 64` churn deletes `>= currentLen`), preventing 2x map reallocations when bucket slack is zero.
+     - `M-01`: `DeletePrefix("")` acquires `c.lockWithPressure(&c.mu, false)` and passes `(hadCompactionSlack, hadReclaimable, sampledEpoch, pressure)` to `finishClearAllLocked`, sampling pressure and attributing Tier 1/2 compactions and `ReclaimEpoch` consistently.
+     - `M-02`: `ArenaRadixCache.isDirtyLocked()` requires prior deletions (`freeHead != nilNode || (deletedSinceCompact > 0 && len(nodes) < cap(nodes)) || nodeMapDirty`), while `DeletePrefix("")` iterates in MRU-to-LRU order across all three backends and non-empty `DeletePrefix(prefix)` iterates in lexicographical pre-order DFS order across both radix backends.
+     - `M-03`: `RadixCache.compactDataStructuresLocked()` resets `deletedSinceCompact` and `peakEntryLen` via `onCompacted(c.len)` and returns `false` so compaction and `ReclaimEpoch` counters are not incremented without structural compaction.
      - `M-04`: `reconcileThresholdWindow` clamps `advanceEvictionThreshold` to `<= 1.0` and preserves explicit valid `(CompactionThreshold, EvictionThreshold)` pairs.
-     - `L-04`: `otellru` clamps cumulative counter observations via `uint64ToCounterInt64` to `maxSafeOTelCounterInt64 = (1<<63) - 1024` (`9223372036854774784`) so `sdkmetric` v1.46.0 never wraps `math.MaxInt64` to `math.MinInt64`.
+     - `L-04`: `otellru` clamps cumulative counter observations via `uint64ToCounterInt64` to `maxOtelCounterInt64 = (1<<63) - 1024` (`9223372036854774784`) so `sdkmetric` v1.46.0 never wraps `math.MaxInt64` to `math.MinInt64`.
 
 ---
 
@@ -479,16 +423,16 @@ To preserve `go-lru`'s single-shard, zero-allocation steady-state architecture, 
 
 ## 6. Reproducible Verification Commands
 
-All unit, differential, fuzz, adversarial, and strict defect-verification suites pass 100% under the Go race detector from `/usr/local/google/home/kislayk/gitproj/go-lru2`:
+All unit, differential, fuzz, adversarial, and empirical defect-verification suites pass 100% under the Go race detector from `/usr/local/google/home/kislayk/gitproj/go-lru2`:
 
 ```bash
 # 1. Run full unit and adversarial test suites under the Go race detector (100% pass, 0 data races):
 go test -race -count=1 ./...
 (cd otellru && go test -race -count=1 ./...)
 
-# 2. Run strict production assertion suites (100% pass across all TestDefect_* and TestAdversarial_* tests):
-GO_LRU_STRICT_PRODUCTION_ASSERTS=1 go test -race -count=1 -v -run "TestDefect_|TestAdversarial_" .
-(cd otellru && GO_LRU_STRICT_PRODUCTION_ASSERTS=1 go test -race -count=1 -v -run "TestDefect_|TestAdversarial_" .)
+# 2. Run empirical defect & adversarial verification suites (100% pass across all TestDefect_* and TestAdversarial_* tests):
+go test -race -count=1 -v -run "TestDefect_|TestAdversarial_" .
+(cd otellru && go test -race -count=1 -v -run "TestDefect_|TestAdversarial_" .)
 
 # 3. Verify zero steady-state heap allocations on all hot paths (0 allocs/op):
 go test -v -run "TestAdversarial_AllocationCharacterization_PathCompressionAndDeepKeys/ZeroAllocSteadyStateHotPaths" .

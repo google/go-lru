@@ -1592,54 +1592,58 @@ func TestArenaRadixCache_FNV1aHashCollisionAndNodeMapHealing(t *testing.T) {
 
 	t.Run("ReplaceTier2SheddingRestoresCollidingPeerInNodeMap", func(t *testing.T) {
 		// Arrange: Populate 5 entries (peakEntryLen == 5 <= 8, currentSize = 560B > targetSize = 500B)
-		// with keyA (100B) at the LRU tail and keyB (115B) at the MRU head. When Tier 2 pressure (0.95)
-		// sheds only the updated tail node keyA (deletedSinceCompact = 1, deletedSinceCompact*4 = 4 < 5),
-		// full compaction does not run and nodeMap[hA] must be restored to surviving peer idB.
-		hA := hashString(keyA)
-		hB := hashString(keyB)
+		// with collidingKeyA (100B) at the LRU tail and collidingKeyB (115B) at the MRU head. When Tier 2 pressure (0.95)
+		// sheds only the tail node collidingKeyA (deletedSinceCompact = 1, deletedSinceCompact*4 = 4 < 5),
+		// full compaction does not run and nodeMap[hColl] must be restored to surviving peer idB via collisionPeers.
+		const (
+			collidingKeyA = "!!!!!!!!!!!!"
+			collidingKeyB = "&+!o9)1!=\x1c\xd2\x10"
+		)
+		hColl := hashString(collidingKeyA)
+		require.Equal(t, hColl, hashString(collidingKeyB))
+
 		pressure := 0.10
 		c := NewArenaRadixCache[testData](
 			1000,
+			WithInvariantChecking(true),
 			testDataWeigher,
 			WithEvictionThreshold(0.90),
 			WithEvictionRetentionRatio(0.50),
 			WithPressureFunc(func() float64 { return pressure }),
 		).(*arenaRadix[testData])
 
-		_, err := c.Put(keyA, testData{value: 1, dataSize: 100})
+		_, err := c.Put(collidingKeyA, testData{value: 1, dataSize: 100})
 		require.NoError(t, err)
+		idA := c.nodeMap[hColl]
 		for i := range 3 {
 			_, err = c.Put(fmt.Sprintf("mid-%d", i), testData{value: int64(i + 10), dataSize: 115})
 			require.NoError(t, err)
 		}
-		_, err = c.Put(keyB, testData{value: 2, dataSize: 115})
+		_, err = c.Put(collidingKeyB, testData{value: 2, dataSize: 115})
 		require.NoError(t, err)
+		idB := c.nodeMap[hColl]
+		require.NotEqual(t, idA, idB)
 
-		idA := c.nodeMap[hA]
-		idB := c.nodeMap[hB]
-		c.nodeMap[hA] = idB
+		// First Replace(collidingKeyA) at low pressure walks the collision fallback (marking nodeMapDirty) and promotes idA to nodeMap[hColl].
+		require.NoError(t, c.Replace(collidingKeyA, testData{value: 11, dataSize: 100}))
+		require.Equal(t, idA, c.nodeMap[hColl])
 
-		// First Replace(keyA) at low pressure walks the collision fallback (marking nodeMapDirty) and protects keyA.
-		require.NoError(t, c.Replace(keyA, testData{value: 11, dataSize: 100}))
-		c.nodeMap[hA] = idB
-
-		// Act: Raise pressure to Tier 2 (0.95) and update "mid-0" in place (which protects "mid-0" and sheds LRU tail keyA).
+		// Act: Raise pressure to Tier 2 (0.95) and update "mid-0" in place (which protects "mid-0" and sheds LRU tail collidingKeyA).
 		pressure = 0.95
 		err = c.Replace("mid-0", testData{value: 110, dataSize: 115})
-		c.restoreDisplacedNodeMapLocked(hA, idA, idB, true)
 
-		// Assert: keyA was shed by Tier 2 without full compaction, and nodeMap[hA] was restored to idB.
+		// Assert: collidingKeyA was shed by Tier 2 without full compaction, and nodeMap[hColl] was restored to idB.
 		require.NoError(t, err)
 		assert.True(t, c.nodeMapDirty)
-		assert.Equal(t, idB, c.nodeMap[hA], "Tier 2 shedding of tail node must preserve/restore colliding live peer in nodeMap")
-		delete(c.nodeMap, hA)
+		assert.Equal(t, idB, c.nodeMap[hColl], "Tier 2 shedding of tail node must preserve/restore colliding live peer in nodeMap")
+		assert.Zero(t, c.collisionCount)
+		assert.Nil(t, c.collisionPeers)
 		assert.Len(t, c.nodeMap, c.len)
-		c.checkInvariants()
-		_, ok := c.Peek(keyA)
+		_, ok := c.Peek(collidingKeyA)
 		assert.False(t, ok)
 		_, ok = c.Peek("missing-key")
 		assert.False(t, ok)
-		valB, ok := c.Peek(keyB)
+		valB, ok := c.Peek(collidingKeyB)
 		require.True(t, ok)
 		assert.Equal(t, int64(2), valB.value)
 	})

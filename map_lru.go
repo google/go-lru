@@ -332,6 +332,35 @@ func (c *mapCache[V]) finishMutationReclaimLocked(evictQ *evictCallbackQueue[V],
 	return evictedValues
 }
 
+func (c *mapCache[V]) updateExistingOnPutLocked(
+	evictQ *evictCallbackQueue[V],
+	e *entry[V],
+	value V,
+	valueSize, sizeBefore uint64,
+	pressure float64,
+) (evictedValues []V, reclaimedPrePut bool) {
+	oldValue := e.value
+	oldSize := e.size
+	hadZeroCap := c.shouldEvictOnZeroWeightShrink(oldSize, valueSize, c.maxSize)
+	c.onEntrySizeUpdated(oldSize, valueSize)
+	c.entries.MoveToFront(e)
+	c.currentSize -= oldSize
+	evictedPrePut := false
+	for (valueSize > c.maxSize-c.currentSize || (hadZeroCap && !evictedPrePut)) && c.entries.Len() > 1 {
+		if evicted, evictedOK := c.evictOne(evictQ); evictedOK {
+			evictedValues = append(evictedValues, evicted)
+			evictedPrePut = true
+		}
+	}
+	e.value = value
+	e.size = valueSize
+	c.currentSize += valueSize
+	c.putUpdated++
+	c.notifyEvict(evictQ, e.key, oldValue, oldSize, EvictionReasonReplaced)
+	reclaimedPrePut = c.shouldReclaimSingleSurvivorOnMutation(c.entries.Len(), c.hasSlackLocked(), false, evictedPrePut, c.currentSize, sizeBefore, pressure)
+	return evictedValues, reclaimedPrePut
+}
+
 // Put inserts or updates the given key and value in the cache.
 // If the key already exists, its value is replaced and moved to the most recently used (MRU) position.
 // If the cache exceeds capacity after insertion, least recently used (LRU) entries are evicted
@@ -358,29 +387,10 @@ func (c *mapCache[V]) Put(key string, value V) ([]V, error) {
 
 	e, ok := c.index[key]
 	if ok {
-		// Update existing entry in place (0 heap allocations).
-		oldValue := e.value
-		oldSize := e.size
-		c.onEntrySizeUpdated(oldSize, valueSize)
-		c.entries.MoveToFront(e)
-		c.currentSize -= oldSize
-		for valueSize > c.maxSize-c.currentSize && c.entries.Len() > 1 {
-			if evicted, evictedOK := c.evictOne(&evictQ); evictedOK {
-				evictedValues = append(evictedValues, evicted)
-				evictedPrePut = true
-			}
-		}
-		e.value = value
-		e.size = valueSize
-		c.currentSize += valueSize
-		c.putUpdated++
-		c.notifyEvict(&evictQ, e.key, oldValue, oldSize, EvictionReasonReplaced)
-		if c.shouldReclaimSingleSurvivorOnMutation(c.entries.Len(), c.hasSlackLocked(), false, evictedPrePut, c.currentSize, sizeBefore, pressure) {
-			reclaimedPrePut = true
-		}
+		evictedValues, reclaimedPrePut = c.updateExistingOnPutLocked(&evictQ, e, value, valueSize, sizeBefore, pressure)
 	} else {
 		// Evict prior to adding new entry if valueSize would exceed remaining capacity (prevents uint64 overflow).
-		for (valueSize > c.maxSize-c.currentSize || (!evictedPrePut && c.shouldEvictZeroWeightOnInsert(valueSize, c.maxSize, c.currentSize, c.entries.Len()))) && c.entries.Len() > 0 {
+		for c.shouldEvictPreInsertOnPut(valueSize, c.maxSize, c.currentSize, c.entries.Len(), evictedPrePut) && c.entries.Len() > 0 {
 			if evicted, evictedOK := c.evictOne(&evictQ); evictedOK {
 				evictedValues = append(evictedValues, evicted)
 				evictedPrePut = true
@@ -587,6 +597,10 @@ func (c *mapCache[V]) Replace(key string, value V) error {
 		c.onEntrySizeUpdated(oldSize, newSize)
 		c.currentSize += sizeDelta
 	case newSize < oldSize:
+		if c.shouldEvictOnZeroWeightShrink(oldSize, newSize, c.maxSize) && c.entries.Back() != e {
+			c.evictOne(&evictQ)
+			evictedAny = true
+		}
 		c.onEntrySizeUpdated(oldSize, newSize)
 		c.currentSize -= oldSize - newSize
 	}

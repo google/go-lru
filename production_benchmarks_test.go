@@ -16,7 +16,6 @@ package lru
 
 import (
 	"fmt"
-	"math"
 	"math/rand/v2"
 	"runtime"
 	"strings"
@@ -417,9 +416,9 @@ func BenchmarkCompactionAndPressureShedLatency(b *testing.B) {
 					for i := range n {
 						_, _ = c.Put(keys[i], uint64(i))
 					}
-					// Delete 20% of entries (< 25% auto-slack threshold) so the cache holds genuine
+					// Delete 75% of entries (leaving 25% > 1 survivors at pressure 0.0) so the cache holds genuine
 					// uncompacted free-list holes / deleted map slots when explicit Compact() is called.
-					delCount := n / 5
+					delCount := (n * 3) / 4
 					for i := range delCount {
 						_, _ = c.Delete(keys[i])
 					}
@@ -450,6 +449,8 @@ func BenchmarkCompactionAndPressureShedLatency(b *testing.B) {
 					case *arenaRadix[uint64]:
 						savedNodes := impl.nodes
 						savedNodeMap := impl.nodeMap
+						savedCollisionPeers := impl.collisionPeers
+						savedCollisionCount := impl.collisionCount
 						savedRoot := impl.root
 						savedHead := impl.head
 						savedTail := impl.tail
@@ -461,6 +462,8 @@ func BenchmarkCompactionAndPressureShedLatency(b *testing.B) {
 						restorePreCompact = func() {
 							impl.nodes = savedNodes
 							impl.nodeMap = savedNodeMap
+							impl.collisionPeers = savedCollisionPeers
+							impl.collisionCount = savedCollisionCount
 							impl.root = savedRoot
 							impl.head = savedHead
 							impl.tail = savedTail
@@ -688,5 +691,3 @@ func BenchmarkPressureSamplingAndCallbacks(b *testing.B) {
 		}
 	})
 }
-
-var _ = math.Float64bits

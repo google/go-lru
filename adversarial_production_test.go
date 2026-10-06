@@ -244,6 +244,7 @@ func TestAdversarial_CrossBackendDifferentialAndEdgeCases(t *testing.T) {
 	t.Run("BinaryKeys_HighBit_NullBytes_UTF8_And_SingleByteChain_Depth80", runBinaryKeysDifferentialTest)
 
 	t.Run("ZeroWeightStorm_MixedWithWeightedEntries_And_PressureShedding", func(t *testing.T) {
+		// Arrange
 		var pressureBits atomic.Uint64
 		setPressure := func(p float64) {
 			pressureBits.Store(math.Float64bits(p))
@@ -275,7 +276,7 @@ func TestAdversarial_CrossBackendDifferentialAndEdgeCases(t *testing.T) {
 		radixC := makeCache(BackendRadix)
 		arenaC := makeCache(BackendArenaRadix)
 
-		// Insert 200 zero-weight entries interleaved with 50 weighted entries (weight=10, total=500).
+		// Act: Insert 200 zero-weight entries interleaved with 50 weighted entries (weight=10, total=500).
 		for i := range 250 {
 			var k string
 			var v int
@@ -316,6 +317,8 @@ func TestAdversarial_CrossBackendDifferentialAndEdgeCases(t *testing.T) {
 		evM := mapC.EvaluateMemoryPressure()
 		evR := radixC.EvaluateMemoryPressure()
 		evA := arenaC.EvaluateMemoryPressure()
+
+		// Assert
 		require.Equal(t, evM, evR)
 		require.Equal(t, evM, evA)
 		require.LessOrEqual(t, mapC.Stats().CurrentSize, uint64(250))
@@ -324,6 +327,7 @@ func TestAdversarial_CrossBackendDifferentialAndEdgeCases(t *testing.T) {
 	})
 
 	t.Run("DeletePrefixEmpty_vs_NonEmpty_PressureSamplingAndCallbackOrderCharacterization", func(t *testing.T) {
+		// Arrange
 		recordOrder := func(b Backend, prefix string) ([]string, Stats) {
 			var evictedKeys []string
 			pressure := 0.10
@@ -347,12 +351,12 @@ func TestAdversarial_CrossBackendDifferentialAndEdgeCases(t *testing.T) {
 			return evictedKeys, c.Stats()
 		}
 
-		// When prefix == "":
-		// All 3 backends (MapCache, RadixCache, ArenaRadixCache) iterate head -> tail (MRU-to-LRU: p/b, p/a, p/c).
+		// Act: When prefix == "", all 3 backends iterate head -> tail (MRU-to-LRU: p/b, p/a, p/c).
 		mapEmptyKeys, mapEmptyStats := recordOrder(BackendMap, "")
 		radixEmptyKeys, radixEmptyStats := recordOrder(BackendRadix, "")
 		arenaEmptyKeys, arenaEmptyStats := recordOrder(BackendArenaRadix, "")
 
+		// Assert
 		assert.Equal(t, []string{"p/b", "p/a", "p/c"}, mapEmptyKeys)
 		assert.Equal(t, []string{"p/b", "p/a", "p/c"}, arenaEmptyKeys)
 		assert.Equal(t, []string{"p/b", "p/a", "p/c"}, radixEmptyKeys)
@@ -377,7 +381,7 @@ func TestAdversarial_CrossBackendDifferentialAndEdgeCases(t *testing.T) {
 	})
 
 	t.Run("ArenaNodeSlack_vs_EntrySlack_CompactionDivergenceCharacterization", func(t *testing.T) {
-		// Construct a workload where intermediate routing nodes are split and freed.
+		// Arrange: Construct a workload where intermediate routing nodes are split and freed.
 		// Under Tier 1 pressure (0.80), ArenaRadixCache.shouldAutoCompactLocked checks
 		// node-level free-list slack (freeCount*4 >= len(nodes)), whereas MapCache and
 		// RadixCache check entry-level shrinkage ((peakEntryLen-len)*4 >= peakEntryLen).
@@ -405,7 +409,7 @@ func TestAdversarial_CrossBackendDifferentialAndEdgeCases(t *testing.T) {
 			}
 		}
 
-		// Raise pressure to Tier 1 (0.80) and delete 1 leaf from 7 branches.
+		// Act: Raise pressure to Tier 1 (0.80) and delete 1 leaf from 7 branches.
 		// Entry shrinkage is only 7/32 = 21.875% (< 25%), so MapCache and RadixCache do NOT compact.
 		// However, each deleted leaf in ArenaRadixCache also collapses its single-child routing node
 		// via compressPathUpwards, freeing 2 arena nodes per delete (14 freed nodes / 49 total >= 25%)!
@@ -417,6 +421,7 @@ func TestAdversarial_CrossBackendDifferentialAndEdgeCases(t *testing.T) {
 			}
 		}
 
+		// Assert
 		assert.Equal(t, uint64(0), mapC.Stats().CompactionsPressureTier1)
 		assert.Equal(t, uint64(0), radixC.Stats().CompactionsPressureTier1)
 		assert.Equal(t, uint64(1), arenaC.Stats().CompactionsPressureTier1)
@@ -432,7 +437,7 @@ func TestAdversarial_CrossBackendDifferentialAndEdgeCases(t *testing.T) {
 // ============================================================================
 
 func TestAdversarial_ArenaRadix_DeepTreeHashCollisionsAndCompaction(t *testing.T) {
-	// Verify that our two 12-byte keys genuinely collide in 64-bit FNV-1a.
+	// Arrange: Verify that our two 12-byte keys genuinely collide in 64-bit FNV-1a.
 	require.NotEqual(t, realFNV1aCollisionKeyA, realFNV1aCollisionKeyB)
 	require.Equal(t, hashString(realFNV1aCollisionKeyA), hashString(realFNV1aCollisionKeyB),
 		"realFNV1aCollisionKeyA and realFNV1aCollisionKeyB must have identical 64-bit FNV-1a hashes")
@@ -459,6 +464,7 @@ func TestAdversarial_ArenaRadix_DeepTreeHashCollisionsAndCompaction(t *testing.T
 	sbA.WriteString(realFNV1aCollisionKeyA)
 	sbB.WriteString(realFNV1aCollisionKeyB)
 
+	// Act
 	for depth := 1; depth <= 75; depth++ {
 		seg := fmt.Sprintf("/%02d", depth)
 		sbA.WriteString(seg)
@@ -505,6 +511,8 @@ func TestAdversarial_ArenaRadix_DeepTreeHashCollisionsAndCompaction(t *testing.T
 	_ = c.EvaluateMemoryPressure()
 
 	c.Compact()
+
+	// Assert
 	st := c.Stats()
 	assert.Zero(t, st.ArenaFreeNodes, "ArenaFreeNodes must be 0 immediately after Compact()")
 	assert.Zero(t, st.ArenaUnallocatedCap, "ArenaUnallocatedCap must be 0 immediately after Compact()")
@@ -662,6 +670,7 @@ func TestAdversarial_HighContentionConcurrencyTorture(t *testing.T) {
 
 	for _, b := range backends {
 		t.Run(b.name, func(t *testing.T) {
+			// Arrange
 			var pressureBits atomic.Uint64
 			pressureBits.Store(math.Float64bits(0.20))
 
@@ -703,9 +712,10 @@ func TestAdversarial_HighContentionConcurrencyTorture(t *testing.T) {
 				keys[i] = fmt.Sprintf("tenantB/svc2/cold_%03d", i)
 			}
 
+			// Act
 			runHighContentionTortureWorkers(c, keys, &pressureBits)
 
-			// Post-quiescence Conservation Law Assertions
+			// Assert: Post-quiescence Conservation Law Assertions
 			st := c.Stats()
 			totalRemoved := st.EvictionsCapacity + st.EvictionsPressure + st.EvictionsDeleted
 			assert.Equal(t, st.PutInserted, uint64(st.Len)+totalRemoved,
@@ -744,6 +754,7 @@ func TestAdversarial_HighContentionConcurrencyTorture(t *testing.T) {
 // ============================================================================
 
 func TestAdversarial_CacheLineLayoutAndStructAlignment(t *testing.T) {
+	// Arrange
 	const cacheLineSize = uintptr(64)
 
 	mc := NewMapCache[uint64](100).(*mapCache[uint64])
@@ -753,13 +764,13 @@ func TestAdversarial_CacheLineLayoutAndStructAlignment(t *testing.T) {
 	require.NotNil(t, rc)
 	require.NotNil(t, ac)
 
-	// 1. Verify ArenaRadixCache separates c.nodes from c.mu across 64-byte cache lines.
+	// Act & Assert 1: Verify ArenaRadixCache separates c.nodes from c.mu across 64-byte cache lines.
 	acNodesEnd := unsafe.Offsetof(ac.nodes) + unsafe.Sizeof(ac.nodes)
 	acMuOffset := unsafe.Offsetof(ac.mu)
 	assert.GreaterOrEqual(t, acMuOffset-acNodesEnd, cacheLineSize,
 		"arenaRadix.mu must be separated from arenaRadix.nodes by at least 64 bytes")
 
-	// 2. Characterize pressureState atomic counter packing:
+	// Act & Assert 2: Characterize pressureState atomic counter packing:
 	// peekHits, peekMisses, and putRejectedOversized are packed contiguously (8 bytes apart)
 	// in the same 64-byte cache line, and arenaHashFallbacks shares a 64-byte cache line with pressureWriteMu.
 	peekHitsOff := unsafe.Offsetof(mc.peekHits)
@@ -781,7 +792,7 @@ func TestAdversarial_CacheLineLayoutAndStructAlignment(t *testing.T) {
 		unsafe.Offsetof(rc.root), unsafe.Offsetof(rc.mu),
 		unsafe.Offsetof(ac.nodes), acMuOffset)
 
-	// 3. Verify H-04 (HIGH-1): arenaRadixNode[uint64] embeds `prefix string` at offset 0,
+	// Act & Assert 3: Verify H-04 (HIGH-1): arenaRadixNode[uint64] embeds `prefix string` at offset 0,
 	// meaning even for pointer-free scalar V = uint64, the node struct contains a Go pointer
 	// (`string` header {*byte, int}) and cannot be placed in a `noscan` span by the Go GC.
 	var node arenaRadixNode[uint64]
@@ -799,11 +810,13 @@ func TestAdversarial_CacheLineLayoutAndStructAlignment(t *testing.T) {
 func TestAdversarial_AllocationCharacterization_PathCompressionAndDeepKeys(t *testing.T) {
 	t.Run("ZeroAllocSteadyStateHotPaths", func(t *testing.T) {
 		for _, b := range []Backend{BackendMap, BackendRadix, BackendArenaRadix} {
+			// Arrange
 			c := New[uint64](100, WithBackend(b))
 			_, _ = c.Put("dir/sub/k1", 1)
 			_, _ = c.Put("dir/sub/k2", 2)
 			valSeq := c.Values()
 
+			// Act & Assert
 			assert.Zero(t, testing.AllocsPerRun(50, func() {
 				_, _ = c.Get("dir/sub/k1")
 			}), "backend %v Get must be 0 allocs/op", b)
@@ -826,22 +839,26 @@ func TestAdversarial_AllocationCharacterization_PathCompressionAndDeepKeys(t *te
 	})
 
 	t.Run("RadixSplitAndCompressStringAllocationChurn", func(t *testing.T) {
-		// In RadixCache and ArenaRadixCache, inserting a sibling key that splits an edge
+		// Arrange: In RadixCache and ArenaRadixCache, inserting a sibling key that splits an edge
 		// into multi-byte segments calls clonePrefix 3 times (3 heap allocs), and deleting
 		// that key calls compressPathUpwards which executes `curr.prefix + onlyChild.prefix` (1 heap alloc).
 		arenaC := NewArenaRadixCache[int](100)
 		_, _ = arenaC.Put("service/users/profile/1001_alpha", 1)
 		k2 := "service/users/profile/1002_beta"
 
+		// Act
 		allocs := testing.AllocsPerRun(100, func() {
 			_, _ = arenaC.Put(k2, 2)
 			_, _ = arenaC.Delete(k2)
 		})
+
+		// Assert
 		assert.GreaterOrEqual(t, allocs, 4.0,
 			"ArenaRadixCache split+compress cycle allocates >= 4 heap strings per Put+Delete")
 	})
 
 	t.Run("DeepTreeStackBufferSpillAboveDepth64", func(t *testing.T) {
+		// Arrange
 		arenaShallow := NewArenaRadixCache[int](200).(*arenaRadix[int])
 		arenaDeep := NewArenaRadixCache[int](200).(*arenaRadix[int])
 
@@ -854,12 +871,15 @@ func TestAdversarial_AllocationCharacterization_PathCompressionAndDeepKeys(t *te
 		deepLeafKey := deepSB.String()
 		deepLeafID := arenaDeep.nodeMap[hashString(deepLeafKey)]
 
+		// Act
 		shallowHashAllocs := testing.AllocsPerRun(100, func() {
 			_ = arenaShallow.hashNodeKey(arenaShallow.head)
 		})
 		deepHashAllocs := testing.AllocsPerRun(100, func() {
 			_ = arenaDeep.hashNodeKey(deepLeafID)
 		})
+
+		// Assert
 		assert.Zero(t, shallowHashAllocs, "depth <= 64 hashNodeKey uses stackBuf [64]uint32 (0 allocs)")
 		assert.GreaterOrEqual(t, deepHashAllocs, 1.0, "depth > 64 hashNodeKey spills stackBuf [64]uint32 to heap")
 	})
@@ -871,10 +891,12 @@ func TestAdversarial_AllocationCharacterization_PathCompressionAndDeepKeys(t *te
 
 // TestDefect_C01_ZeroWeightUnboundedGrowth verifies C-01 / F-01 / HIGH-5 remediation:
 // When Weigher returns 0, inserting new zero-weight entries into a cache at capacity or when
-// zeroSizeCount >= maxSize evicts the LRU tail entry so entry count remains bounded by maxSize.
+// zeroSizeCount >= maxSize evicts at most 1 LRU tail entry per insert so entry count remains
+// bounded by maxSize without wiping out positive-weight tail entries.
 func TestDefect_C01_ZeroWeightUnboundedGrowth(t *testing.T) {
 	for _, b := range []Backend{BackendMap, BackendRadix, BackendArenaRadix} {
 		t.Run(b.String(), func(t *testing.T) {
+			// Arrange
 			c := New[[]byte](10,
 				WithBackend(b),
 				WithInvariantChecking(true),
@@ -887,7 +909,7 @@ func TestDefect_C01_ZeroWeightUnboundedGrowth(t *testing.T) {
 			require.NoError(t, err)
 			require.Equal(t, uint64(10), c.Stats().CurrentSize)
 
-			// Insert 5,000 zero-weight entries into a full cache (maxSize = 10).
+			// Act: Insert 5,000 zero-weight entries into a full cache (maxSize = 10).
 			totalEvicted := 0
 			for i := range 5000 {
 				evicted, putErr := c.Put(fmt.Sprintf("zero_weight_key_%d", i), nil)
@@ -895,11 +917,80 @@ func TestDefect_C01_ZeroWeightUnboundedGrowth(t *testing.T) {
 				totalEvicted += len(evicted)
 			}
 
+			// Assert
 			st := c.Stats()
 			assert.Equal(t, 10, st.Len)
 			assert.Equal(t, 10, st.ZeroSizeCount)
 			assert.Equal(t, 4991, totalEvicted)
 			assert.Equal(t, uint64(4991), st.EvictionsCapacity)
+		})
+
+		t.Run(b.String()+"_SingleZeroWeightInsertDoesNotWipeWeightedTailEntries", func(t *testing.T) {
+			// Arrange: Populate 3 weighted entries (size 1 each) at the LRU tail followed by
+			// 5 zero-weight entries (zeroSizeCount == maxSize == 5).
+			c := New[int](5,
+				WithBackend(b),
+				WithInvariantChecking(true),
+				WithWeigher(func(_ string, v int) uint64 { return uint64(v) }),
+				WithPressureFunc(func() float64 { return 0.0 }),
+			)
+			for i := range 3 {
+				_, err := c.Put(fmt.Sprintf("weighted_%d", i), 1)
+				require.NoError(t, err)
+			}
+			for i := range 5 {
+				_, err := c.Put(fmt.Sprintf("zero_%d", i), 0)
+				require.NoError(t, err)
+			}
+			require.Equal(t, 8, c.Stats().Len)
+			require.Equal(t, 5, c.Stats().ZeroSizeCount)
+
+			// Act: Insert 1 more zero-weight entry while weighted entries sit at the LRU tail.
+			evicted, err := c.Put("zero_extra", 0)
+
+			// Assert: At most 1 entry is evicted on this single insert, preserving the remaining weighted entries.
+			require.NoError(t, err)
+			assert.Len(t, evicted, 1)
+			assert.Equal(t, 8, c.Stats().Len)
+			assert.Equal(t, uint64(2), c.Stats().CurrentSize)
+		})
+
+		t.Run(b.String()+"_PositiveToZeroUpdateAndPumpingBounded", func(t *testing.T) {
+			// Arrange
+			c := New[int](10,
+				WithBackend(b),
+				WithInvariantChecking(true),
+				WithWeigher(func(_ string, v int) uint64 { return uint64(v) }),
+				WithPressureFunc(func() float64 { return 0.0 }),
+			)
+
+			// Act: Repeatedly insert a positive-weight entry and downgrade it to zero-weight via Put and Replace,
+			// and alternate maxSize weighted inserts with zero-weight inserts.
+			for i := range 500 {
+				key := fmt.Sprintf("pump_%04d", i)
+				_, err := c.Put(key, 1)
+				require.NoError(t, err)
+				if i%2 == 0 {
+					_, err = c.Put(key, 0)
+					require.NoError(t, err)
+				} else {
+					err = c.Replace(key, 0)
+					require.NoError(t, err)
+				}
+			}
+			for i := range 200 {
+				_, err := c.Put(fmt.Sprintf("alt_pos_%04d", i), 10)
+				require.NoError(t, err)
+				for j := range 10 {
+					_, err = c.Put(fmt.Sprintf("alt_zero_%04d_%02d", i, j), 0)
+					require.NoError(t, err)
+				}
+			}
+
+			// Assert: Entry count and zero-size count remain strictly bounded by 2*maxSize (and <= maxSize+1 here).
+			st := c.Stats()
+			assert.LessOrEqual(t, st.Len, 11)
+			assert.LessOrEqual(t, st.ZeroSizeCount, 10)
 		})
 	}
 }
@@ -911,6 +1002,7 @@ func TestDefect_C01_ZeroWeightUnboundedGrowth(t *testing.T) {
 //     never masking user callback panics or leaking c.mu.
 func TestDefect_C02_OnEvictPanicStateCorruptionAndLockLeak(t *testing.T) {
 	t.Run("MapCache_DeletePrefixEmpty_PreservesStateOnCallbackPanic", func(t *testing.T) {
+		// Arrange
 		panicNow := false
 		c := NewMapCache[string](100,
 			WithInvariantChecking(true),
@@ -923,12 +1015,14 @@ func TestDefect_C02_OnEvictPanicStateCorruptionAndLockLeak(t *testing.T) {
 		_, _ = c.Put("k1", "v1")
 		_, _ = c.Put("k2", "v2")
 
+		// Act
 		panicNow = true
 		require.PanicsWithValue(t, "simulated user callback panic", func() {
 			c.DeletePrefix("")
 		})
 		panicNow = false
 
+		// Assert
 		st := c.Stats()
 		keys := slices.Collect(c.Keys())
 		assert.Equal(t, 0, st.Len)
@@ -937,6 +1031,7 @@ func TestDefect_C02_OnEvictPanicStateCorruptionAndLockLeak(t *testing.T) {
 	})
 
 	t.Run("ArenaRadixCache_DeletePrefix_PreservesTreeAndSubsequentEvictionAfterCallbackPanic", func(t *testing.T) {
+		// Arrange
 		panicNow := false
 		c := NewArenaRadixCache[int](20,
 			WithInvariantChecking(true),
@@ -950,12 +1045,14 @@ func TestDefect_C02_OnEvictPanicStateCorruptionAndLockLeak(t *testing.T) {
 		_, _ = c.Put("app/db/1", 10)
 		_, _ = c.Put("app/db/2", 10)
 
+		// Act
 		panicNow = true
 		require.PanicsWithValue(t, "simulated arena callback panic", func() {
 			c.DeletePrefix("app/db/")
 		})
 		panicNow = false
 
+		// Assert
 		require.NotPanics(t, func() {
 			_, err := c.Put("new_entry", 15)
 			require.NoError(t, err)
@@ -967,6 +1064,7 @@ func TestDefect_C02_OnEvictPanicStateCorruptionAndLockLeak(t *testing.T) {
 
 	t.Run("AllBackends_PutOverwrite_PreservesCurrentSizeOnCallbackPanic", func(t *testing.T) {
 		for _, b := range []Backend{BackendMap, BackendRadix, BackendArenaRadix} {
+			// Arrange
 			panicOnCap := false
 			c := New[int](100,
 				WithBackend(b),
@@ -981,12 +1079,14 @@ func TestDefect_C02_OnEvictPanicStateCorruptionAndLockLeak(t *testing.T) {
 			_, _ = c.Put("lru_victim", 50)
 			_, _ = c.Put("updated_key", 40) // total = 90
 
+			// Act
 			panicOnCap = true
 			require.PanicsWithValue(t, "simulated capacity eviction panic", func() {
 				_, _ = c.Put("updated_key", 80)
 			})
 			panicOnCap = false
 
+			// Assert
 			st := c.Stats()
 			assert.Equal(t, 1, st.Len)
 			assert.Equal(t, uint64(80), st.CurrentSize)
@@ -997,6 +1097,7 @@ func TestDefect_C02_OnEvictPanicStateCorruptionAndLockLeak(t *testing.T) {
 	})
 
 	t.Run("InvariantChecking_PreservesOriginalPanicAndReleasesMutexLock", func(t *testing.T) {
+		// Arrange
 		panicNow := false
 		c := NewArenaRadixCache[string](100,
 			WithInvariantChecking(true),
@@ -1009,6 +1110,7 @@ func TestDefect_C02_OnEvictPanicStateCorruptionAndLockLeak(t *testing.T) {
 		_, _ = c.Put("dir/a", "v1")
 		_, _ = c.Put("dir/b", "v2")
 
+		// Act
 		panicNow = true
 		var recovered any
 		func() {
@@ -1019,6 +1121,7 @@ func TestDefect_C02_OnEvictPanicStateCorruptionAndLockLeak(t *testing.T) {
 		}()
 		panicNow = false
 
+		// Assert
 		require.Equal(t, "original user callback panic", recovered)
 
 		done := make(chan struct{})
@@ -1032,20 +1135,73 @@ func TestDefect_C02_OnEvictPanicStateCorruptionAndLockLeak(t *testing.T) {
 
 		select {
 		case <-done:
-		case <-time.After(100 * time.Millisecond):
-			t.Fatal("c.mu remained locked after callback panic")
+		case <-time.After(2 * time.Second):
+			require.Fail(t, "c.mu remained locked after callback panic")
 		}
+	})
+
+	t.Run("EvictCallbackQueue_ZeroesBufAndOverflowOnCompletionAndMidBatchPanic", func(t *testing.T) {
+		// Arrange
+		var p pressureState
+		var q evictCallbackQueue[*int]
+		vals := [4]int{10, 20, 30, 40}
+		for i := range vals {
+			q.enqueue(fmt.Sprintf("key_%d", i), &vals[i], EvictionReasonDeleted)
+		}
+		require.Equal(t, 4, q.n)
+		require.Len(t, q.overflow, 2)
+		overflowBacking := q.overflow[:len(q.overflow)]
+
+		// Act: Normal completion across inline buf and overflow slice.
+		callIdx := 0
+		q.invoke(&p, func(v *int, _ EvictionReason) {
+			require.NotNil(t, v)
+			if callIdx < len(q.buf) {
+				assert.Equal(t, evictEvent[*int]{}, q.buf[callIdx], "inline buf slot must be zeroed before callback runs")
+			} else {
+				assert.Equal(t, evictEvent[*int]{}, overflowBacking[callIdx-len(q.buf)], "overflow slot must be zeroed before callback runs")
+			}
+			callIdx++
+		}, nil)
+
+		// Assert: Normal completion zeroes all inline and overflow slots.
+		assert.Equal(t, 4, callIdx)
+		assert.Zero(t, q.n)
+		assert.Nil(t, q.overflow)
+		assert.Equal(t, [2]evictEvent[*int]{}, q.buf)
+		assert.Equal(t, []evictEvent[*int]{{}, {}}, overflowBacking)
+
+		// Arrange: Re-populate queue and panic mid-batch on the first event.
+		for i := range vals {
+			q.enqueue(fmt.Sprintf("panic_key_%d", i), &vals[i], EvictionReasonDeleted)
+		}
+		overflowBackingPanic := q.overflow[:len(q.overflow)]
+
+		// Act: Panic on the first callback while inline buf[1] and overflow[0..1] remain unconsumed.
+		require.PanicsWithValue(t, "mid-batch callback panic", func() {
+			q.invoke(&p, nil, func(_ string, _ *int, _ EvictionReason) {
+				panic("mid-batch callback panic")
+			})
+		})
+
+		// Assert: Deferred reset clears all remaining inline buf and overflow slots.
+		assert.Zero(t, q.n)
+		assert.Nil(t, q.overflow)
+		assert.Equal(t, [2]evictEvent[*int]{}, q.buf)
+		assert.Equal(t, []evictEvent[*int]{{}, {}}, overflowBackingPanic)
 	})
 }
 
 // TestDefect_C03_ReentrancyHazards verifies C-03 / F-03 / CRITICAL-2 remediation:
 //  1. OnEvict* callbacks execute after c.mu.Unlock(), allowing re-entrant read and write calls
 //     on the same cache instance without deadlocking.
-//  2. PressureFunc re-entrancy detection inspects the parent creator GID of child goroutines,
-//     preventing recursive PressureFunc execution when a child goroutine touches the cache.
+//  2. PressureFunc re-entrancy detection inspects the parent creator GID and creator frame of child goroutines,
+//     preventing recursive PressureFunc execution when a child goroutine touches the cache while allowing
+//     pre-existing sibling worker goroutines spawned before PressureFunc to sample normally.
 func TestDefect_C03_ReentrancyHazards(t *testing.T) {
 	t.Run("OnEvictCallbackCallingCacheMethodsSucceedsWithoutDeadlock", func(t *testing.T) {
 		for _, b := range []Backend{BackendMap, BackendRadix, BackendArenaRadix} {
+			// Arrange
 			var cache Cache[int]
 			callbackDone := make(chan struct{})
 
@@ -1067,6 +1223,7 @@ func TestDefect_C03_ReentrancyHazards(t *testing.T) {
 			_, err := cache.Put("k1", 1)
 			require.NoError(t, err)
 
+			// Act
 			putDone := make(chan struct{})
 			go func() {
 				_, putErr := cache.Put("k2", 2)
@@ -1074,16 +1231,18 @@ func TestDefect_C03_ReentrancyHazards(t *testing.T) {
 				close(putDone)
 			}()
 
+			// Assert
 			select {
 			case <-putDone:
-			case <-time.After(200 * time.Millisecond):
-				t.Fatalf("backend=%s OnEvictValue calling cache.Stats()/Peek() deadlocked", b)
+			case <-time.After(2 * time.Second):
+				require.Failf(t, "deadlocked", "backend=%v OnEvictValue calling cache.Stats()/Peek() deadlocked", b)
 			}
 			<-callbackDone
 		}
 	})
 
 	t.Run("PressureFuncChildGoroutineDetectedByParentGIDGuard", func(t *testing.T) {
+		// Arrange
 		var cache Cache[int]
 		var depth atomic.Int32
 
@@ -1100,29 +1259,80 @@ func TestDefect_C03_ReentrancyHazards(t *testing.T) {
 			return 0.10
 		}))
 
+		// Act
 		_, err := cache.Put("k1", 1)
+
+		// Assert
 		require.NoError(t, err)
 		observedDepth := depth.Load()
 		assert.Equal(t, int32(1), observedDepth)
+	})
+
+	t.Run("PreExistingWorkerGoroutineNotMisclassifiedAsChildOfSampler", func(t *testing.T) {
+		// Arrange: Spawn a worker goroutine BEFORE entering cache.Put so its parentGID is the
+		// current test goroutine, but its creator frame lies below invokeAndStorePressure.
+		var cache Cache[int]
+		var calls atomic.Int32
+		inPrimary := make(chan struct{})
+		workerTrigger := make(chan struct{})
+		workerDone := make(chan struct{})
+
+		go func() {
+			<-workerTrigger
+			_, err := cache.Put("worker_key", 2)
+			assert.NoError(t, err)
+			close(workerDone)
+		}()
+
+		var primaryOnce sync.Once
+		cache = NewMapCache[int](10, WithPressureFunc(func() float64 {
+			c := calls.Add(1)
+			if c == 1 {
+				primaryOnce.Do(func() {
+					close(inPrimary)
+					close(workerTrigger)
+				})
+				for calls.Load() < 2 {
+					runtime.Gosched()
+				}
+			}
+			return 0.10
+		}))
+
+		// Act
+		_, err := cache.Put("parent_key", 1)
+		<-inPrimary
+		<-workerDone
+
+		// Assert: Both the parent goroutine and the pre-existing worker goroutine sampled PressureFunc.
+		require.NoError(t, err)
+		assert.Equal(t, int32(2), calls.Load())
 	})
 }
 
 // TestDefect_H01_CustomPressureFuncPerWriteRuntimeStackOverhead verifies H-01 / F-04 / HIGH-3 remediation:
 // Custom WithPressureFunc is evaluated on every foreground write without invoking runtime.Stack on the
-// uncontended primary sampler slot (achieving 0 allocs/op and >10x speedup).
+// uncontended primary sampler slot (leaving samplingGID == 0 while samplingPressure == true and achieving 0 allocs/op).
 func TestDefect_H01_CustomPressureFuncPerWriteRuntimeStackOverhead(t *testing.T) {
+	// Arrange
 	var calls atomic.Uint64
+	var mc *mapCache[int]
 	c := NewMapCache[int](1000, WithPressureFunc(func() float64 {
 		calls.Add(1)
+		assert.True(t, mc.samplingPressure.Load(), "primary sampler slot must be active during PressureFunc")
+		assert.Zero(t, mc.samplingGID.Load(), "uncontended primary sampler must leave samplingGID == 0 without calling runtime.Stack")
 		return 0.10
 	}))
+	mc = c.(*mapCache[int])
 
+	// Act
 	const numWrites = 1000
 	for i := range numWrites {
 		_, err := c.Put(fmt.Sprintf("k_%d", i%10), i)
 		require.NoError(t, err)
 	}
 
+	// Assert
 	actualCalls := calls.Load()
 	assert.Equal(t, uint64(numWrites), actualCalls)
 
@@ -1138,6 +1348,7 @@ func TestDefect_H01_CustomPressureFuncPerWriteRuntimeStackOverhead(t *testing.T)
 func TestDefect_H03_ReplaceEvictsNonMRUUnderTier2Pressure(t *testing.T) {
 	for _, b := range []Backend{BackendMap, BackendRadix, BackendArenaRadix} {
 		t.Run(b.String(), func(t *testing.T) {
+			// Arrange
 			pressure := 0.10
 			c := New[string](100,
 				WithBackend(b),
@@ -1151,10 +1362,12 @@ func TestDefect_H03_ReplaceEvictsNonMRUUnderTier2Pressure(t *testing.T) {
 			_, _ = c.Put("lru_key", strings.Repeat("a", 20)) // 20B at LRU tail
 			_, _ = c.Put("mru_key", strings.Repeat("b", 40)) // 40B at MRU head (total = 60B > target 50B)
 
+			// Act
 			pressure = 0.95 // Tier 2 critical pressure
 			err := c.Replace("lru_key", strings.Repeat("x", 20))
 			require.NoError(t, err)
 
+			// Assert
 			val, exists := c.Peek("lru_key")
 			_, mruExists := c.Peek("mru_key")
 			st := c.Stats()
@@ -1169,24 +1382,55 @@ func TestDefect_H03_ReplaceEvictsNonMRUUnderTier2Pressure(t *testing.T) {
 }
 
 // TestDefect_H05_FNV1aCollisionDisablesO1MissGlobally verifies H-05 / HIGH-2 remediation:
-// ArenaRadixCache tracks active hash collisions via collisionCount, using the trie fallback only while
+// ArenaRadixCache tracks active hash collisions via collisionCount and collisionPeers, using the trie fallback only while
 // an active collision exists (collisionCount > 0) and immediately restoring the O(1) cache-miss fast-path
 // as soon as the colliding key is deleted or evicted.
 func TestDefect_H05_FNV1aCollisionDisablesO1MissGlobally(t *testing.T) {
-	c := NewArenaRadixCache[int](1000, WithInvariantChecking(true)).(*arenaRadix[int])
+	// Arrange: Construct two pairs of distinct keys that produce genuine 64-bit FNV-1a collisions.
+	k1a := realFNV1aCollisionKeyA + "_bucket1"
+	k1b := realFNV1aCollisionKeyB + "_bucket1"
+	k2a := realFNV1aCollisionKeyA + "_bucket2"
+	k2b := realFNV1aCollisionKeyB + "_bucket2"
+	require.Equal(t, hashString(k1a), hashString(k1b))
+	require.Equal(t, hashString(k2a), hashString(k2b))
 
-	_, err := c.Put(realFNV1aCollisionKeyA, 1)
+	c := NewArenaRadixCache[int](100,
+		WithInvariantChecking(true),
+		WithWeigher(func(_ string, v int) uint64 { return uint64(v) }),
+	).(*arenaRadix[int])
+
+	// Act: Insert all 4 colliding keys (2 independent collision buckets), exercise Get/Replace/Put-with-eviction
+	// promotion across peers, then remove the remaining colliding peer.
+	_, err := c.Put(k2b, 20)
 	require.NoError(t, err)
-	_, err = c.Put(realFNV1aCollisionKeyB, 2)
+	_, err = c.Put(k2a, 20)
 	require.NoError(t, err)
+	_, err = c.Put(k1a, 10)
+	require.NoError(t, err)
+	_, err = c.Put(k1b, 20)
+	require.NoError(t, err)
+	require.Equal(t, 2, c.collisionCount)
+	require.Len(t, c.nodeMap, 2)
+
+	// Promote k1a via Get and k1b via Replace, then overwrite k1a with a weight that evicts LRU tail k2b.
+	v1, ok := c.Get(k1a)
+	require.True(t, ok)
+	require.Equal(t, 10, v1)
+	require.NoError(t, c.Replace(k1b, 25))
+	evicted, err := c.Put(k1a, 55) // total 55 + 25 + 20 + 20 = 120 > 100 -> evicts LRU tail k2b (20)
+	require.NoError(t, err)
+	require.Equal(t, []int{20}, evicted)
 	require.Equal(t, 1, c.collisionCount)
 
-	// Delete the displaced colliding key; collisionCount immediately drops to 0 and len(nodeMap) == c.len == 1.
-	_, deleted := c.Delete(realFNV1aCollisionKeyA)
+	// Delete the remaining colliding peer k1b; collisionCount immediately drops to 0 and len(nodeMap) == c.len == 2.
+	_, deleted := c.Delete(k1b)
 	require.True(t, deleted)
+
+	// Assert
 	require.Equal(t, 0, c.collisionCount)
-	require.Equal(t, 1, c.len)
-	require.Len(t, c.nodeMap, 1)
+	require.Empty(t, c.collisionPeers)
+	require.Equal(t, 2, c.len)
+	require.Len(t, c.nodeMap, 2)
 
 	beforeFallbacks := c.Stats().ArenaHashFallbacks
 	const missProbes = 1000
@@ -1203,6 +1447,7 @@ func TestDefect_H05_FNV1aCollisionDisablesO1MissGlobally(t *testing.T) {
 // In MapCache, a single capacity eviction leaves len(c.index) == peakEntryLen (zero bucket slack).
 // Neither EvaluateMemoryPressure() at Tier 1 nor explicit Compact() reallocates the map when hasSlackLocked() is false.
 func TestDefect_H06_MapCompactReallocatesWithoutSlack(t *testing.T) {
+	// Arrange
 	pressure := 0.10
 	c := NewMapCache[int](100, WithPressureFunc(func() float64 { return pressure })).(*mapCache[int])
 
@@ -1214,15 +1459,21 @@ func TestDefect_H06_MapCompactReallocatesWithoutSlack(t *testing.T) {
 	require.Equal(t, 100, c.Stats().PeakEntryLen)
 	require.True(t, c.dirtyIndex)
 	require.False(t, c.hasSlackLocked())
+	indexPtrBefore := reflect.ValueOf(c.index).Pointer()
 
+	// Act
 	pressure = 0.80
-	var memBefore, memAfter runtime.MemStats
-	runtime.ReadMemStats(&memBefore)
 	_ = c.EvaluateMemoryPressure()
 	c.Compact()
-	runtime.ReadMemStats(&memAfter)
+	indexPtrAfter := reflect.ValueOf(c.index).Pointer()
+	compactAllocs := testing.AllocsPerRun(50, func() {
+		c.Compact()
+	})
 
+	// Assert
 	st := c.Stats()
+	assert.Equal(t, indexPtrBefore, indexPtrAfter, "c.index map must not be reallocated when hasSlackLocked() is false")
+	assert.Zero(t, compactAllocs, "Compact() without slack must perform 0 allocations")
 	assert.Equal(t, uint64(0), st.CompactionsPressureTier1)
 	assert.Equal(t, uint64(0), st.CompactionsExplicit)
 }
@@ -1231,10 +1482,11 @@ func TestDefect_H06_MapCompactReallocatesWithoutSlack(t *testing.T) {
 // - M-01 / F-08 / MEDIUM-3: DeletePrefix("") samples pressure via lockWithPressure and attributes compaction telemetry accurately.
 // - M-02 / MEDIUM-1: ArenaRadixCache.Compact() on a pure-insert cache is a no-op when !isDirtyLocked().
 // - M-03 / F-09: RadixCache.Compact() resets watermarks without incrementing compaction counters or ReclaimEpoch.
-// - M-04 / F-10 / MEDIUM-4: reconcileThresholdWindow clamps derived EvictionThreshold to <= 1.0.
+// - M-04 / F-10 / MEDIUM-4: reconcileThresholdWindow clamps derived EvictionThreshold to <= 1.0 and preserves valid explicit pairs.
 func TestDefect_M01_to_M06_MediumDefectsAndDivergences(t *testing.T) {
 	t.Run("M01_DeletePrefixEmptySamplesPressureAndAttributesTelemetry", func(t *testing.T) {
 		for _, b := range []Backend{BackendMap, BackendRadix, BackendArenaRadix} {
+			// Arrange
 			pressure := 0.10
 			c := New[string](100,
 				WithBackend(b),
@@ -1247,10 +1499,12 @@ func TestDefect_M01_to_M06_MediumDefectsAndDivergences(t *testing.T) {
 				_, _ = c.Put(fmt.Sprintf("p/%d", i), "val")
 			}
 
+			// Act
 			pressure = 0.95 // Tier 2 critical pressure
 			c.DeletePrefix("")
 			st := c.Stats()
 
+			// Assert
 			assert.InDelta(t, 0.95, st.MemoryPressure, 1e-9)
 			assert.Equal(t, uint64(0), st.CompactionsAutoSlack)
 			assert.Equal(t, uint64(1), st.CompactionsPressureTier2)
@@ -1259,6 +1513,7 @@ func TestDefect_M01_to_M06_MediumDefectsAndDivergences(t *testing.T) {
 	})
 
 	t.Run("M02_PureInsertCompactParityAcrossBackends", func(t *testing.T) {
+		// Arrange
 		mapC := NewMapCache[int](100).(PressureAwareCache[int])
 		radixC := NewRadixCache[int](100).(PressureAwareCache[int])
 		arenaC := NewArenaRadixCache[int](100).(PressureAwareCache[int])
@@ -1269,10 +1524,13 @@ func TestDefect_M01_to_M06_MediumDefectsAndDivergences(t *testing.T) {
 			_, _ = radixC.Put(k, i)
 			_, _ = arenaC.Put(k, i)
 		}
+
+		// Act
 		mapC.Compact()
 		radixC.Compact()
 		arenaC.Compact()
 
+		// Assert
 		assert.Equal(t, uint64(0), mapC.Stats().CompactionsExplicit)
 		assert.Equal(t, uint64(0), radixC.Stats().CompactionsExplicit)
 		assert.Equal(t, uint64(0), arenaC.Stats().CompactionsExplicit)
@@ -1280,24 +1538,36 @@ func TestDefect_M01_to_M06_MediumDefectsAndDivergences(t *testing.T) {
 	})
 
 	t.Run("M03_RadixCacheNoOpCompactionDoesNotIncrementTelemetry", func(t *testing.T) {
+		// Arrange
 		c := NewRadixCache[int](100).(PressureAwareCache[int])
 		_, _ = c.Put("k1", 1)
 		_, _ = c.Put("k2", 2)
 		_, _ = c.Delete("k1")
+
+		// Act
 		c.Compact()
 		st := c.Stats()
+
+		// Assert
 		assert.Equal(t, uint64(0), st.CompactionsExplicit)
 		assert.Equal(t, uint64(0), st.ReclaimEpoch)
 		assert.Equal(t, 0, st.DeletedSinceCompact)
 	})
 
 	t.Run("M04_ThresholdReconciliationClampsEvictionThresholdToOne", func(t *testing.T) {
+		// Arrange & Act
 		opts1 := ApplyOptions(WithCompactionThreshold(0.95))
+		opts2 := ApplyOptions(WithCompactionThreshold(0.95), WithEvictionThreshold(0.90))
+		opts3 := ApplyOptions(WithCompactionThreshold(0.60), WithEvictionThreshold(0.85))
+
+		// Assert
 		assert.InDelta(t, 0.95, opts1.CompactionThreshold, 1e-9)
 		assert.InDelta(t, 1.0, opts1.EvictionThreshold, 1e-9)
 
-		opts2 := ApplyOptions(WithCompactionThreshold(0.95), WithEvictionThreshold(0.90))
 		assert.InDelta(t, 0.75, opts2.CompactionThreshold, 1e-9)
 		assert.InDelta(t, 0.90, opts2.EvictionThreshold, 1e-9)
+
+		assert.InDelta(t, 0.60, opts3.CompactionThreshold, 1e-9)
+		assert.InDelta(t, 0.85, opts3.EvictionThreshold, 1e-9)
 	})
 }

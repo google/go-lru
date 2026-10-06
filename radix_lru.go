@@ -727,6 +727,37 @@ func (c *radixCache[V]) finishMutationReclaimLocked(evictQ *evictCallbackQueue[V
 	return evictedValues
 }
 
+func (c *radixCache[V]) updateExistingOnPutLocked(
+	evictQ *evictCallbackQueue[V],
+	node *radixNode[V],
+	key string,
+	value V,
+	valueSize, sizeBefore uint64,
+	pressure float64,
+) (evictedValues []V, reclaimedPrePut bool) {
+	oldValue := node.value
+	oldSize := node.size
+	hadZeroCap := c.shouldEvictOnZeroWeightShrink(oldSize, valueSize, c.maxSize)
+	c.onEntrySizeUpdated(oldSize, valueSize)
+	c.moveToFront(node)
+	c.currentSize -= oldSize
+	evictedPrePut := false
+	for (valueSize > c.maxSize-c.currentSize || (hadZeroCap && !evictedPrePut)) && c.tail != nil && c.tail != node {
+		if evicted, ok := c.evictOne(evictQ); ok {
+			evictedValues = append(evictedValues, evicted)
+			evictedPrePut = true
+		}
+	}
+	node.value = value
+	node.hasValue = true
+	node.size = valueSize
+	c.currentSize += valueSize
+	c.putUpdated++
+	c.notifyEvict(evictQ, key, oldValue, oldSize, EvictionReasonReplaced)
+	reclaimedPrePut = c.shouldReclaimSingleSurvivorOnMutation(c.len, c.deletedSinceCompact > 0, false, evictedPrePut, c.currentSize, sizeBefore, pressure)
+	return evictedValues, reclaimedPrePut
+}
+
 // Put inserts or updates a key-value entry in the cache.
 // If the key exists, its value is updated and moved to MRU.
 // If capacity is exceeded, excess LRU entries are evicted and returned.
@@ -753,27 +784,10 @@ func (c *radixCache[V]) Put(key string, value V) ([]V, error) {
 
 	node, exists := c.getNode(key)
 	if exists {
-		oldValue := node.value
-		oldSize := node.size
-		c.onEntrySizeUpdated(oldSize, valueSize)
-		c.moveToFront(node)
-		c.currentSize -= oldSize
-		for valueSize > c.maxSize-c.currentSize && c.tail != nil && c.tail != node {
-			if evicted, ok := c.evictOne(&evictQ); ok {
-				evictedValues = append(evictedValues, evicted)
-				evictedPrePut = true
-			}
-		}
-		node.value = value
-		node.hasValue = true
-		node.size = valueSize
-		c.currentSize += valueSize
-		c.putUpdated++
-		c.notifyEvict(&evictQ, key, oldValue, oldSize, EvictionReasonReplaced)
-		reclaimedPrePut = c.shouldReclaimSingleSurvivorOnMutation(c.len, c.deletedSinceCompact > 0, false, evictedPrePut, c.currentSize, sizeBefore, pressure)
+		evictedValues, reclaimedPrePut = c.updateExistingOnPutLocked(&evictQ, node, key, value, valueSize, sizeBefore, pressure)
 	} else {
 		// Evict from the LRU tail before inserting into the trie to avoid redundant node splits and merges.
-		for (valueSize > c.maxSize-c.currentSize || (!evictedPrePut && c.shouldEvictZeroWeightOnInsert(valueSize, c.maxSize, c.currentSize, c.len))) && c.tail != nil {
+		for c.shouldEvictPreInsertOnPut(valueSize, c.maxSize, c.currentSize, c.len, evictedPrePut) && c.tail != nil {
 			if evicted, ok := c.evictOne(&evictQ); ok {
 				evictedValues = append(evictedValues, evicted)
 				evictedPrePut = true
@@ -940,6 +954,10 @@ func (c *radixCache[V]) Replace(key string, value V) error {
 		c.onEntrySizeUpdated(oldSize, newSize)
 		c.currentSize += sizeDelta
 	case newSize < oldSize:
+		if c.shouldEvictOnZeroWeightShrink(oldSize, newSize, c.maxSize) && c.tail != nil && c.tail != node {
+			c.evictOne(&evictQ)
+			evictedAny = true
+		}
 		c.onEntrySizeUpdated(oldSize, newSize)
 		c.currentSize -= oldSize - newSize
 	}

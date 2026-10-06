@@ -181,6 +181,23 @@ func uint64ToCounterInt64(v uint64) int64 {
 	return int64(v)
 }
 
+func clampNonNegativeInt64(v int) int64 {
+	if v < 0 {
+		return 0
+	}
+	return int64(v)
+}
+
+func clampNormalizedPressure(v float64) float64 {
+	if math.IsNaN(v) || v <= 0.0 {
+		return 0.0
+	}
+	if v > 1.0 {
+		return 1.0
+	}
+	return v
+}
+
 // makeObserveOpts pre-allocates an immutable attribute.Set and wraps it in a 1-element
 // []metric.ObserveOption slice so calling o.ObserveInt64(inst, val, opts...) unpacks the
 // slice header with 0 heap allocations during scrape callbacks.
@@ -415,8 +432,8 @@ func (inst *cacheInstruments) observe(o metric.Observer, st lru.Stats, opts *obs
 	// 4–7. Capacity & entry gauges
 	o.ObserveInt64(inst.sizeGauge, uint64ToInt64(st.CurrentSize), opts.base...)
 	o.ObserveInt64(inst.maxSizeGauge, uint64ToInt64(st.MaxSize), opts.base...)
-	o.ObserveInt64(inst.entriesGauge, int64(st.Len), opts.base...)
-	o.ObserveInt64(inst.zeroWeightEntriesGauge, int64(st.ZeroSizeCount), opts.base...)
+	o.ObserveInt64(inst.entriesGauge, clampNonNegativeInt64(st.Len), opts.base...)
+	o.ObserveInt64(inst.zeroWeightEntriesGauge, clampNonNegativeInt64(st.ZeroSizeCount), opts.base...)
 
 	// 8. lru.cache.mutations
 	o.ObserveInt64(inst.mutationsCounter, uint64ToCounterInt64(st.PutInserted), opts.mutPutInserted...)
@@ -430,7 +447,7 @@ func (inst *cacheInstruments) observe(o metric.Observer, st lru.Stats, opts *obs
 	o.ObserveInt64(inst.mutationsCounter, uint64ToCounterInt64(st.DeletePrefixExecuted), opts.mutDeletePrefixExecuted...)
 
 	// 9. lru.cache.memory_pressure
-	o.ObserveFloat64(inst.memoryPressureGauge, st.MemoryPressure, opts.base...)
+	o.ObserveFloat64(inst.memoryPressureGauge, clampNormalizedPressure(st.MemoryPressure), opts.base...)
 
 	// 10. lru.cache.compactions
 	o.ObserveInt64(inst.compactionsCounter, uint64ToCounterInt64(st.CompactionsExplicit), opts.compactExplicit...)
@@ -444,14 +461,14 @@ func (inst *cacheInstruments) observe(o metric.Observer, st lru.Stats, opts *obs
 
 	// 12–14. Reclamation epoch & structural watermark gauges
 	o.ObserveInt64(inst.reclaimEpochsCounter, uint64ToCounterInt64(st.ReclaimEpoch), opts.base...)
-	o.ObserveInt64(inst.deletedSinceCompactGauge, int64(st.DeletedSinceCompact), opts.base...)
-	o.ObserveInt64(inst.peakEntriesGauge, int64(st.PeakEntryLen), opts.base...)
+	o.ObserveInt64(inst.deletedSinceCompactGauge, clampNonNegativeInt64(st.DeletedSinceCompact), opts.base...)
+	o.ObserveInt64(inst.peakEntriesGauge, clampNonNegativeInt64(st.PeakEntryLen), opts.base...)
 
 	// 15–16. ArenaRadixCache-only instruments
 	if isArena {
-		o.ObserveInt64(inst.arenaNodesGauge, int64(st.ArenaLiveNodes), opts.arenaLive...)
-		o.ObserveInt64(inst.arenaNodesGauge, int64(st.ArenaFreeNodes), opts.arenaFree...)
-		o.ObserveInt64(inst.arenaNodesGauge, int64(st.ArenaUnallocatedCap), opts.arenaUnallocatedCap...)
+		o.ObserveInt64(inst.arenaNodesGauge, clampNonNegativeInt64(st.ArenaLiveNodes), opts.arenaLive...)
+		o.ObserveInt64(inst.arenaNodesGauge, clampNonNegativeInt64(st.ArenaFreeNodes), opts.arenaFree...)
+		o.ObserveInt64(inst.arenaNodesGauge, clampNonNegativeInt64(st.ArenaUnallocatedCap), opts.arenaUnallocatedCap...)
 		o.ObserveInt64(inst.arenaHashFallbacksCounter, uint64ToCounterInt64(st.ArenaHashFallbacks), opts.base...)
 	}
 }

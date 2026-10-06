@@ -818,16 +818,7 @@ func (c *arenaRadix[V]) maybeReclaimUnderPressureLocked(evictQ *evictCallbackQue
 }
 
 func (c *arenaRadix[V]) recordNodeMapInsertLocked(keyHash uint64, nodeID uint32) {
-	if prevID, exists := c.nodeMap[keyHash]; exists && prevID != nodeID {
-		if prevID < uint32(len(c.nodes)) && c.nodes[prevID].hasValue && c.hashNodeKey(prevID) == keyHash {
-			c.collisionCount++
-			if c.collisionPeers == nil {
-				c.collisionPeers = make(map[uint64][]uint32)
-			}
-			c.collisionPeers[keyHash] = append(c.collisionPeers[keyHash], prevID)
-		}
-	}
-	c.nodeMap[keyHash] = nodeID
+	c.promoteCollisionPeerLocked(keyHash, nodeID)
 }
 
 func (c *arenaRadix[V]) promoteCollisionPeerLocked(keyHash uint64, nodeID uint32) {
@@ -872,6 +863,9 @@ func (c *arenaRadix[V]) popValidCollisionPeerLocked(hash uint64, excludeID uint3
 		if last != excludeID && last < uint32(len(c.nodes)) && c.nodes[last].hasValue && c.hashNodeKey(last) == hash {
 			if len(peers) == 0 {
 				delete(c.collisionPeers, hash)
+				if len(c.collisionPeers) == 0 {
+					c.collisionPeers = nil
+				}
 			} else {
 				c.collisionPeers[hash] = peers
 			}
@@ -880,6 +874,7 @@ func (c *arenaRadix[V]) popValidCollisionPeerLocked(hash uint64, excludeID uint3
 	}
 	delete(c.collisionPeers, hash)
 	if len(c.collisionPeers) == 0 {
+		c.collisionPeers = nil
 		c.collisionCount = 0
 	}
 	return nilNode, false
@@ -897,6 +892,9 @@ func (c *arenaRadix[V]) removeCollisionPeerLocked(hash uint64, nodeID uint32) {
 	peers = slices.Delete(peers, idx, idx+1)
 	if len(peers) == 0 {
 		delete(c.collisionPeers, hash)
+		if len(c.collisionPeers) == 0 {
+			c.collisionPeers = nil
+		}
 	} else {
 		c.collisionPeers[hash] = peers
 	}

@@ -3293,6 +3293,9 @@ func TestPressure_MultiCacheAndCircularReentrancy(t *testing.T) {
 		for !hasKey(cacheA, "from_b") || arenaA.evictCallbackGID.Load() == 0 {
 			runtime.Gosched()
 		}
+		for range 16 {
+			runtime.Gosched()
+		}
 		close(releaseFirstA)
 		wg.Wait()
 
@@ -3406,5 +3409,108 @@ func TestPressure_MultiCacheAndCircularReentrancy(t *testing.T) {
 		// Assert
 		assert.Equal(t, int32(2), callsA.Load(), "Cache A OnEvict should execute for both initial eviction and circular A->B->A eviction")
 		assert.Equal(t, int32(1), callsB.Load(), "Cache B OnEvict should execute once")
+	})
+
+	t.Run("GrandchildGoroutineReentrancyInPressureFuncAndOnEvict", func(t *testing.T) {
+		// Arrange: G1 invokes PressureFunc and OnEvictValue, each spawning child G2 which spawns grandchild G3
+		// while G1 blocks waiting for G2 and G2 blocks waiting for G3 to mutate the same cache.
+		var cache Cache[int]
+		var pressureCalls, evictCalls atomic.Int32
+
+		cache = NewArenaRadixCache[int](1,
+			WithInvariantChecking(true),
+			WithPressureFunc(func() float64 {
+				if pressureCalls.Add(1) == 1 {
+					childDone := make(chan struct{})
+					go func() {
+						defer close(childDone)
+						grandchildDone := make(chan struct{})
+						go func() {
+							defer close(grandchildDone)
+							_, _ = cache.Delete("missing_from_grandchild")
+						}()
+						<-grandchildDone
+					}()
+					<-childDone
+				}
+				return 0.10
+			}),
+			WithOnEvictValue(func(_ int, _ EvictionReason) {
+				if evictCalls.Add(1) == 1 {
+					childDone := make(chan struct{})
+					go func() {
+						defer close(childDone)
+						grandchildDone := make(chan struct{})
+						go func() {
+							defer close(grandchildDone)
+							_, putErr := cache.Put("k3_from_grandchild", 3)
+							assert.NoError(t, putErr)
+						}()
+						<-grandchildDone
+					}()
+					<-childDone
+				}
+			}),
+		)
+
+		_, err := cache.Put("k1", 1)
+		require.NoError(t, err)
+		require.Equal(t, int32(1), pressureCalls.Load())
+
+		// Act: Put("k2", 2) evicts "k1", triggering OnEvictValue -> G2 -> G3 -> Put("k3_from_grandchild", 3).
+		_, err = cache.Put("k2", 2)
+		require.NoError(t, err)
+
+		// Assert: Grandchild G3 bypassed recursive PressureFunc sampling during G1's sample and bypassed
+		// self-deadlock on evictCallbackMu during G1's OnEvictValue callback.
+		assert.Equal(t, int32(2), evictCalls.Load())
+		val, ok := cache.Peek("k3_from_grandchild")
+		require.True(t, ok)
+		assert.Equal(t, 3, val)
+	})
+
+	t.Run("ZeroWatermarkShedResetsLastReclaimedLenWhenOnlyZeroRemain", func(t *testing.T) {
+		// Arrange: maxSize = 60, EvictionRetentionRatio = 0.20 (targetSize = 12B).
+		// Populate p_0 (20B) and p_1 (10B) at LRU tail (currentSize = 30B) + 8 zero-weight entries at MRU head.
+		pressure := 0.10
+		c := NewMapCache[int](60,
+			WithInvariantChecking(true),
+			WithWeigher(func(_ string, v int) uint64 { return uint64(v) }),
+			WithPressureFunc(func() float64 { return pressure }),
+			WithEvictionThreshold(0.90),
+			WithEvictionRetentionRatio(0.20),
+		).(*mapCache[int])
+
+		_, err := c.Put("p_0", 20)
+		require.NoError(t, err)
+		_, err = c.Put("p_1", 10)
+		require.NoError(t, err)
+		for i := range 8 {
+			_, err = c.Put(fmt.Sprintf("z_%d", i), 0)
+			require.NoError(t, err)
+		}
+
+		// Act 1: Tier 2 shed (0.95) sheds p_0 (20B) and 7 zero-weight entries, leaving p_1 (10B) + z_7 (0B).
+		// Because currentLen (2) > zeroSizeCount (1), lastReclaimedLen is set to 2.
+		pressure = 0.95
+		_ = c.EvaluateMemoryPressure()
+		require.Equal(t, 2, c.Stats().Len)
+		require.Equal(t, 1, c.Stats().ZeroSizeCount)
+		require.Equal(t, 2, c.lastReclaimedLen)
+
+		// Act 2: Grow p_1 at the LRU tail to 20B (> targetSize 12B), add 3 zero-weight entries at MRU,
+		// and trigger Tier 2 shed so p_1 is evicted and only zero-weight entries survive.
+		pressure = 0.10
+		require.NoError(t, c.Replace("p_1", 20))
+		for i := range 3 {
+			_, err = c.Put(fmt.Sprintf("z2_%d", i), 0)
+			require.NoError(t, err)
+		}
+		pressure = 0.95
+		_ = c.EvaluateMemoryPressure()
+
+		// Assert: Because only zero-weight entries remain (currentLen == zeroSizeCount), lastReclaimedLen is reset to 0.
+		assert.Equal(t, c.Stats().Len, c.Stats().ZeroSizeCount)
+		assert.Equal(t, 0, c.lastReclaimedLen)
 	})
 }
