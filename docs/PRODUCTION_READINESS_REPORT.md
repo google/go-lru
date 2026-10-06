@@ -52,8 +52,8 @@ Following full remediation of all **Bucket 1 real bugs** (`C-02`, `H-01`, `H-03`
 
 | Dimension | `MapCache[V]` (`map_lru.go`) | `RadixCache[V]` (`radix_lru.go`) | `ArenaRadixCache[V]` (`arena_radix.go`, `arena_radix_lru.go`) |
 | :--- | :--- | :--- | :--- |
-| **Primary Index** | `map[string]*entry[V]` (`map_lru.go:139`) | Pointer-based compressed LCRS radix tree (`*radixNode[V]`, `radix_lru.go:69`) | Contiguous slab `[]arenaRadixNode[V]` indexed by `uint32` + `nodeMap map[uint64]uint32` FNV-1a accelerator (`arena_radix.go:45,53`) |
-| **LRU Ordering** | Intrusive doubly-linked list (`entryList[V]` with `head`, `tail *entry[V]`, `map_lru.go:37-102`) | Intrusive doubly-linked pointers (`head`, `tail`, `prev`, `next *radixNode[V]`, `radix_lru.go:36-37,71-72`) | Intrusive doubly-linked `uint32` indices (`head`, `tail`, `prev`, `next uint32`, `nilNode = math.MaxUint32`, `arena_radix.go:25,37-38,58-59`) |
+| **Primary Index** | `map[string]*entry[V]` (`map_lru.go:127`) | Pointer-based compressed LCRS radix tree (`*radixNode[V]`, `radix_lru.go:53`) | Contiguous slab `[]arenaRadixNode[V]` indexed by `uint32` + `nodeMap map[uint64]uint32` FNV-1a accelerator (`arena_radix.go:49,53`) |
+| **LRU Ordering** | Intrusive doubly-linked list (`entryList[V]` with `head`, `tail *entry[V]`, `map_lru.go:37-102`) | Intrusive doubly-linked pointers (`head`, `tail`, `prev`, `next *radixNode[V]`, `radix_lru.go:37-38,56-57`) | Intrusive doubly-linked `uint32` indices (`head`, `tail`, `prev`, `next uint32`, `nilNode = math.MaxUint32`, `arena_radix.go:25,37-38,60-61`) |
 | **Node Memory Layout (64-bit, `V = uint64`)** | `entry[uint64]` = **48 bytes** (`prev`, `next *entry`, `key string`, `size uint64`, `value uint64`) + map bucket slot | `radixNode[uint64]` = **80 bytes** (`prefix string`, `value uint64`, `size uint64`, `parent`, `child`, `sibling`, `prev`, `next *radixNode`, `hasValue bool`) | `arenaRadixNode[uint64]` = **56 bytes** (`prefix string` [16B], `size uint64` [8B], `parent`, `child`, `sibling`, `prev`, `next uint32` [20B], `hasValue bool` + 3B pad [4B], `value uint64` [8B]) |
 | **GC Pointer Fields per Node (`V` scalar)** | **3 pointers/entry** (`prev`, `next`, `key.ptr`) + 2 pointers/map slot = **$5N$ pointers** | **6 pointers/node** (`prefix.ptr`, `parent`, `child`, `sibling`, `prev`, `next`) $\times$ up to $2N$ nodes = **up to $12N$ pointers** | **1 pointer/node** (`prefix.ptr` at offset 0 of `arenaRadixNode[V]`) across `cap(c.nodes)` + `0` pointers in `map[uint64]uint32` = **$\le 2N$ pointers** |
 | **`Get(key)` / `Peek(key)` Complexity** | $O(1)$ hash lookup (`c.mu.Lock()` / `c.mu.RLock()`) | $O(K)$ top-down trie walk with lexicographical sibling scan (`c.mu.Lock()` / `c.mu.RLock()`) | $O(\text{depth})$ upward `verifyKey` on `nodeMap[fnv1a(key)]` hit; $O(1)$ miss when `len(nodeMap)+collisionCount == c.len`; $O(K)$ trie fallback on unhealed displacement |
@@ -69,7 +69,7 @@ Following full remediation of all **Bucket 1 real bugs** (`C-02`, `H-01`, `H-03`
 
 | ID | Severity | Status | Affected Components & Files | Defect / Gap Summary & Resolution | Empirical Verification Test |
 | :--- | :--- | :--- | :--- | :--- | :--- |
-| **`C-01`** | **Critical** | **REMEDIATED (Bucket 2)** | `pressure.go`, `map_lru.go`, `radix_lru.go`, `arena_radix_lru.go` | **Unbounded Entry & Memory Growth on Zero-Weight (`Weigher == 0`) Entries**: Fixed by evicting the LRU tail entry when inserting a new zero-weight entry while `(c.currentSize >= c.maxSize && uint64(c.len) >= c.maxSize)` or `uint64(c.zeroSizeCount) >= c.maxSize`, and enforcing `currentSize + max(0, zeroSizeCount - maxSize) <= maxSize` across positive-to-zero updates and weighted inserts. | `TestDefect_C01_ZeroWeightOOM` (PASS) |
+| **`C-01`** | **Critical** | **REMEDIATED (Bucket 2)** | `pressure.go`, `map_lru.go`, `radix_lru.go`, `arena_radix_lru.go` | **Unbounded Entry & Memory Growth on Zero-Weight (`Weigher == 0`) Entries**: Fixed by evicting the LRU tail entry when inserting a new zero-weight entry while `(c.currentSize >= c.maxSize && uint64(c.len) >= c.maxSize)` or `uint64(c.zeroSizeCount) >= c.maxSize`, and enforcing `currentSize + max(0, zeroSizeCount - maxSize) <= maxSize` across positive-to-zero updates and weighted inserts. | `TestDefect_C01_ZeroWeightUnboundedGrowth` (PASS) |
 | **`C-02`** | **Critical** | **REMEDIATED (Bucket 1)** | `pressure.go`, `map_lru.go`, `radix_lru.go`, `arena_radix_lru.go` | **State Corruption, Subsequent Panics, & Permanent Mutex Lock Leak on `OnEvict*` Callback Panic**: Fixed by completing all structural/accounting updates first, queuing callbacks in `evictCallbackQueue[V]`, registering `defer c.mu.Unlock()` inside `unlock()`, and invoking callbacks after `c.unlock()`. | `TestDefect_C02_OnEvictPanicStateCorruptionAndLockLeak` (PASS) |
 | **`C-03`** | **Critical** | **REMEDIATED (Bucket 2)** | `pressure.go`, `map_lru.go`, `radix_lru.go`, `arena_radix.go`, `arena_radix_lru.go` | **Synchronous Callback Re-Entrancy Deadlock (`OnEvict*` Under `c.mu.Lock()`) & Child-Goroutine `PressureFunc` Recursion**: Fixed by running `OnEvict*` after `c.mu.Unlock()` with multi-cache GID tracking (`C-03a`) and inspecting `parseStackGoroutineAndParentID()` (`created by ... in goroutine N`) in `checkSamplingGoroutineOrChild` (`C-03b`). | `TestDefect_C03_ReentrancyHazards` (PASS) |
 | **`H-01`** | **High** | **REMEDIATED (Bucket 1)** | `pressure.go` | **Unamortized `runtime.Stack()` on 100% of Writes with Custom `WithPressureFunc`**: Fixed via lazy primary GID resolution (`resolvePrimaryFromAllStacks` with multi-cache isolation), avoiding `runtime.Stack()` completely on uncontended primary sampling (`50.7x–53.1x` speedup, `0 allocs/op`). | `TestDefect_H01_CustomPressureFuncPerWriteRuntimeStackOverhead` & `BenchmarkCustomPressureFuncOverhead` (PASS) |
@@ -94,7 +94,7 @@ Following full remediation of all **Bucket 1 real bugs** (`C-02`, `H-01`, `H-03`
 ### 3.2 Pre-Remediation Root-Cause Analysis of Critical & High Findings (All Remediated in Section 5.1)
 
 #### `C-01` (Critical): Unbounded Entry & Memory Growth on Zero-Weight (`Weigher == 0`) Entries
-- **Locations**: `map_lru.go:364,384`, `radix_lru.go:758,777`, `arena_radix_lru.go:446,484`, `pressure.go:1028-1041`, `README.md:42-44`.
+- **Locations**: `map_lru.go:341,389`, `radix_lru.go:737,786`, `arena_radix_lru.go:446,484`, `pressure.go:1018-1045`, `README.md:42-44`.
 - **Pre-Remediation Mechanism**:
   In all three backends, `Put(key, value)` computes `valueSize := c.weigh(key, value)` before acquiring `c.mu.Lock()`. Prior to remediation, when inserting a new key, capacity eviction was governed solely by:
   ```go
@@ -108,10 +108,10 @@ Following full remediation of all **Bucket 1 real bugs** (`C-02`, `H-01`, `H-03`
   ```
   When a caller caches empty byte slices (`[]byte{}` or `nil`, e.g., negative cache entries or empty payloads), `valueSize` is `0`. Because `c.currentSize <= c.maxSize` is an invariant, `c.maxSize - c.currentSize >= 0`, so `0 > c.maxSize - c.currentSize` is **unconditionally `false`** even when the cache is at 100% byte capacity (`c.currentSize == c.maxSize`).
 - **Production Blast Radius (Pre-Remediation) & Resolution**:
-  Whenever memory pressure is below `EvictionThreshold` (or when neither `GOMEMLIMIT` nor `WithMemoryBudget` is set, so `DefaultRuntimePressureFunc` returns `0.0`), zero-weight entries previously bypassed capacity eviction forever. Remediated in `shouldEvictZeroWeightOnInsert` (`pressure.go:1028-1041`) and in-place positive-to-zero `Put`/`Replace` updates so `currentSize + max(0, zeroSizeCount - maxSize) <= maxSize` and `zeroSizeCount` remain strictly bounded.
+  Whenever memory pressure is below `EvictionThreshold` (or when neither `GOMEMLIMIT` nor `WithMemoryBudget` is set, so `DefaultRuntimePressureFunc` returns `0.0`), zero-weight entries previously bypassed capacity eviction forever. Remediated in `shouldEvictZeroWeightOnInsert` (`pressure.go:1018-1031`), `shouldEvictPreInsertOnPut` (`pressure.go:1033-1041`), and `shouldEvictOnZeroWeightShrink` (`pressure.go:1043-1045`) so `currentSize + max(0, zeroSizeCount - maxSize) <= maxSize` and `zeroSizeCount` remain strictly bounded.
 - **Verification Command**:
   ```bash
-  go test -v -run TestDefect_C01_ZeroWeightOOM .
+  go test -v -run TestDefect_C01_ZeroWeightUnboundedGrowth .
   ```
 
 #### `C-02` (Critical): State Corruption, Subsequent Panics, & Permanent Lock Leak on `OnEvict*` Callback Panic
@@ -206,7 +206,7 @@ Following full remediation of all **Bucket 1 real bugs** (`C-02`, `H-01`, `H-03`
 - **`M-05` (Preserved by Design — `DefaultRuntimePressureFunc` Opt-In Budget Behavior)**:
   `DefaultRuntimePressureFunc(0)` (`options.go:490-492`) returns `0.0` if `GOMEMLIMIT` is not configured (`math.MaxInt64`), and `markReclaimedLocked()` refreshes the pressure sample after reclamation.
 - **`M-06` (Preserved by Design — `pressureState` Atomic Layout & `[64]` Stack Buffer Spill at `depth > 64`)**:
-  Verified via `unsafe.Offsetof` in `TestAdversarial_CacheLineLayoutAndStructAlignment`: `peekHits`, `peekMisses`, `putRejectedOversized`, and `pressureWriteMu` sit in `pressureState` at byte offsets `488..528` in `mapCache` (within a single 64-byte cache line `[448, 512)` / `[512, 576)`), while `arenaRadix` isolates `c.mu` on its own 64-byte cache line (`arena_radix.go:68`). In `RadixCache` and `ArenaRadixCache`, keys with `> 64` branching levels spill fixed `[64]` stack buffers to the heap in `reconstructKey`, `hashNodeKey`, and `freeSubtree`.
+  Verified via `unsafe.Offsetof` in `TestAdversarial_CacheLineLayoutAndStructAlignment`: `peekHits`, `peekMisses`, `putRejectedOversized`, and `pressureWriteMu` sit in `pressureState` at byte offsets `488..528` in `mapCache` (within a single 64-byte cache line `[448, 512)` / `[512, 576)`), while `arenaRadix` isolates `c.mu` on its own 64-byte cache line (`arena_radix.go:72`). In `RadixCache` and `ArenaRadixCache`, keys with `> 64` branching levels spill fixed `[64]` stack buffers to the heap in `reconstructKey`, `hashNodeKey`, and `freeSubtree`.
 - **`L-01` (Preserved by Design — `otellru` Multi-Cache Registration Requires `WithName` / `WithAttributes`)**:
   Registering two caches of the same backend on the same `MeterProvider` without unique `WithName` or `WithAttributes` emits identical attribute sets (`{"cache.backend": "map"}`), characterized in `TestDefect_L01_DuplicateRegistrationWithoutNameCollision`.
 - **`L-02` (Preserved by Design — Focused Core LRU API Surface)**:
@@ -282,7 +282,7 @@ All benchmarks were executed on `linux/amd64` (Intel Xeon @ 2.60GHz, 96 logical 
 | :--- | :--- | :--- | :--- | :--- |
 | **`100Peek_0Put`** (`100% Peek`, shared `RLock`) | `73.14 ns` / `0 B` / `0` | **`57.16 ns`** / `0 B` / `0` | `58.22 ns` / `0 B` / `0` | Shared `RLock` scales across cores; only bottleneck is atomic `peekHits.Add(1)` cache-line bouncing (`M-06`). |
 | **`100Get_0Put`** (`100% Get`, exclusive `Lock`) | `497.6 ns` / `0 B` / `0` | **`394.3 ns`** / `0 B` / `0` | `468.5 ns` / `0 B` / `0` | **Finding `H-02` proven**: `100% Get` is **`6.8x–8.0x` slower** than `100% Peek` because every `Get` takes `c.mu.Lock()`. |
-| **`95Get_5Put`** (`95% Get`, `5% Put`) | `467.8 ns` / `0 B` / `0` | `506.5 ns` / `0 B` / `0` | **`417.6 ns`** / `0 B` / `0` | `ArenaRadixCache` outperforms `MapCache` and `RadixCache` under mixed contention due to cache-line isolation of `c.mu` (`arena_radix.go:68`). |
+| **`95Get_5Put`** (`95% Get`, `5% Put`) | `467.8 ns` / `0 B` / `0` | `506.5 ns` / `0 B` / `0` | **`417.6 ns`** / `0 B` / `0` | `ArenaRadixCache` outperforms `MapCache` and `RadixCache` under mixed contention due to cache-line isolation of `c.mu` (`arena_radix.go:72`). |
 | **`80Get_20Put`** (`80% Get`, `20% Put`) | `548.0 ns` / `0 B` / `0` | `470.7 ns` / `0 B` / `0` | **`392.5 ns`** / `0 B` / `0` | `ArenaRadixCache` is **`1.40x` faster** than `MapCache` under 80/20 contention. |
 | **`50Get_50Put`** (`50% Get`, `50% Put`) | `597.6 ns` / `0 B` / `0` | `519.0 ns` / `0 B` / `0` | **`449.5 ns`** / `0 B` / `0` | `ArenaRadixCache` is **`1.33x` faster** than `MapCache` under 50/50 write contention. |
 | **`0Get_100Put`** (`100% Put` with eviction) | **`576.9 ns`** / `40 B` / `1` | `840.4 ns` / `64 B` / `2` | `1,051 ns` / **`13 B`** / **`1`** | Under 100% eviction churn, `MapCache` has the highest throughput while `ArenaRadixCache` has `3x–5x` lower `B/op`. |
@@ -294,7 +294,7 @@ All benchmarks were executed on `linux/amd64` (Intel Xeon @ 2.60GHz, 96 logical 
 | **`G = 1`** | `56.7` / `154.3` / `122.6 ns` | `42.6` / `145.3` / `116.3 ns` | `57.3` / `155.2` / `133.5 ns` | Uncontended baseline: `MapCache` is fastest (`42.6–57.3 ns/op`). |
 | **`G = 2`** | `171.9` / `447.4` / `307.1 ns` | `216.3` / `197.7` / `254.1 ns` | `144.5` / `449.6` / `305.7 ns` | Cross-core cache-line transfer begins on `c.mu` and `peekHits`. |
 | **`G = 4`** | `350.0` / `437.5` / **`329.8 ns`** | **`159.3`** / `174.7` / `172.4 ns` | `352.7` / `474.6` / `377.1 ns` | `Peek_Hit` begins scaling downward in amortized `ns/op`, while `Get_Hit` climbs due to `c.mu.Lock()` serialization. |
-| **`G = 8`** | `538.3` / `452.0` / **`420.8 ns`** | `146.0` / `151.6` / **`142.1 ns`** | `522.3` / `447.6` / **`379.4 ns`** | At `G = 8`, `ArenaRadixCache` overtakes `MapCache` on both `Get_Hit` (`420.8` vs `538.3 ns`) and `Mixed_95Get_5Put` (`379.4` vs `522.3 ns`) because `ArenaRadixCache` isolates `c.mu` on its own 64-byte cache line (`arena_radix.go:68`) and touches contiguous slab memory. |
+| **`G = 8`** | `538.3` / `452.0` / **`420.8 ns`** | `146.0` / `151.6` / **`142.1 ns`** | `522.3` / `447.6` / **`379.4 ns`** | At `G = 8`, `ArenaRadixCache` overtakes `MapCache` on both `Get_Hit` (`420.8` vs `538.3 ns`) and `Mixed_95Get_5Put` (`379.4` vs `522.3 ns`) because `ArenaRadixCache` isolates `c.mu` on its own 64-byte cache line (`arena_radix.go:72`) and touches contiguous slab memory. |
 | **`G = 16`** | `545.7` / `285.8` / `436.6 ns` | `119.7` / **`115.0`** / `126.4 ns` | `629.1` / `448.7` / **`375.0 ns`** | `Peek_Hit` is **`3.5x–4.6x` faster** than `Get_Hit`. |
 | **`G = 32`** | `614.6` / **`390.7`** / `458.6 ns` | **`102.8`** / `106.9` / `121.4 ns` | `610.0` / `483.7` / **`419.5 ns`** | `MapCache` `Get_Hit` plateaus at `~615 ns/op` (`10.8x` slower than `G=1`). |
 | **`G = 64`** | `611.5` / `495.9` / **`416.3 ns`** | **`79.50`** / `81.15` / `93.98 ns` | `630.3` / `537.9` / **`422.1 ns`** | At `G = 64`, `Peek_Hit` achieves `79.5–94.0 ns/op` across all backends, whereas `Get_Hit` is serialized at `416.3–611.5 ns/op`. |
@@ -360,7 +360,7 @@ Because both `Compact()` and `EvaluateMemoryPressure()` execute synchronously un
 | Benchmark | Latency (`ns/op`) | Bytes (`B/op`) | Allocations (`allocs/op`) | Notes |
 | :--- | :--- | :--- | :--- | :--- |
 | **`BenchmarkOtelScrape_DirectCallback/MapCache`** | **`183.4 ns/op`** | **`0 B/op`** | **`0 allocs/op`** | Acquires `c.mu.RLock()`, copies `Stats`, and emits 35 observations (`14` instruments). |
-| **`BenchmarkOtelScrape_DirectCallback/RadixCache`** | **`181.7 ns/op`** | **`0 B/op`** | **`0 allocs/op`** | `0 allocs/op` via pre-allocated `[]metric.ObserveOption` slices (`otellru.go:174-180`). |
+| **`BenchmarkOtelScrape_DirectCallback/RadixCache`** | **`181.7 ns/op`** | **`0 B/op`** | **`0 allocs/op`** | `0 allocs/op` via pre-allocated `[]metric.ObserveOption` slices (`otellru.go:204-210`). |
 | **`BenchmarkOtelScrape_DirectCallback/ArenaRadixCache`** | **`198.2 ns/op`** | **`0 B/op`** | **`0 allocs/op`** | Emits all 39 observations (`16` instruments, including `arena.nodes` and `arena.hash_fallbacks`). |
 | **`BenchmarkOtelScrape_FullSDKCollect/Caches_1`** | `31,597 ns/op` (`31.6 µs`) | `9,500 B/op` | `169 allocs/op` | Full `sdkmetric.ManualReader.Collect` aggregation overhead inside OpenTelemetry SDK for 1 cache. |
 | **`BenchmarkOtelScrape_FullSDKCollect/Caches_10`** | `278,980 ns/op` (`279.0 µs`) | `78,626 B/op` | `1,281 allocs/op` | Linear scaling (`~27.9 µs/cache`) when scraping 10 registered caches on one `MeterProvider`. |
@@ -382,7 +382,7 @@ Because both `Compact()` and `EvaluateMemoryPressure()` execute synchronously un
    - **Files**: `pressure.go`, `map_lru.go`, `radix_lru.go`, `arena_radix_lru.go`.
    - **Resolution**:
      - When inserting a new entry with `valueSize == 0`, if `!evictedPrePut && c.shouldEvictZeroWeightOnInsert(valueSize, c.maxSize, c.currentSize, c.len)` (`(currentSize >= maxSize && uint64(currentLen) >= maxSize) || uint64(p.zeroSizeCount) >= maxSize`), the cache evicts at most 1 LRU tail entry (`evictOne(&evictQ)`) before inserting the new zero-weight entry; positive-to-zero updates (`Put`/`Replace`) and weighted inserts with excess zero-weight entries also enforce `currentSize + max(0, zeroSizeCount - maxSize) <= maxSize`.
-   - **Verified Impact**: Entry count and `ZeroSizeCount` remain strictly bounded without wiping out positive-weight tail entries (`TestDefect_C01_ZeroWeightOOM`).
+   - **Verified Impact**: Entry count and `ZeroSizeCount` remain strictly bounded without wiping out positive-weight tail entries (`TestDefect_C01_ZeroWeightUnboundedGrowth`).
 
 3. **Remediated `H-01` & `C-03b` — Lazy Primary GID Resolution & Descendant-Goroutine Creator Frame Guard**:
    - **Files**: `pressure.go`.
