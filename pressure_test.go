@@ -3513,4 +3513,113 @@ func TestPressure_MultiCacheAndCircularReentrancy(t *testing.T) {
 		assert.Equal(t, c.Stats().Len, c.Stats().ZeroSizeCount)
 		assert.Equal(t, 0, c.lastReclaimedLen)
 	})
+
+	t.Run("NestedCrossCacheHookChildGoroutineReentrancy", testNestedCrossCacheHookChildGoroutineReentrancy)
+	t.Run("GoidBatchInversionAndSiblingWorkerExclusion", testGoidBatchInversionAndSiblingWorkerExclusion)
+}
+
+func testGoidBatchInversionAndSiblingWorkerExclusion(t *testing.T) {
+	// Arrange: Model multi-P goid batch inversion (1491 -> holder 1483 -> child 1472 -> grandchild 1473)
+	// and a worker pool spawned by G_pool (1491) with primary (1483), fallback (1484), and overflow (1485) samplers.
+	var p pressureState
+	p.samplingParentGID.Store(1491)
+	p.samplingGID.Store(1483)
+	p.fallbackParentGID.Store(1491)
+	p.fallbackGID.Store(1484)
+	p.overflowSamplingGIDs.Store(uint64(1485), uint64(1491))
+	p.overflowSamplingCount.Store(1)
+
+	// Act
+	invertedGrandchildEvict := canBeDescendantOf(1472, 1483, 1491)
+	invertedGrandchildSampler := p.canBeDescendantOfActiveSampler(1472)
+	directChildSampler := p.canBeDescendantOfActiveSampler(1483)
+	siblingWorkerRejected := p.canBeDescendantOfActiveSampler(1491)
+	mainRootChildRejected := canBeDescendantOf(1, 1483, 1491)
+	zeroParentRejected := canBeDescendantOf(0, 1483, 1491)
+
+	// Assert
+	assert.True(t, invertedGrandchildEvict, "2-hop grandchild with lower per-P goid (parentGID 1472 < holder 1483) must be accepted")
+	assert.True(t, invertedGrandchildSampler, "active sampler check must accept 2-hop grandchild with inverted per-P goid")
+	assert.True(t, directChildSampler, "direct child of active sampler (parentGID == samplingGID) must be accepted")
+	assert.False(t, siblingWorkerRejected, "sibling worker sharing parentGID == ownerParentGID (1491) must be rejected in O(1) even with overflow active")
+	assert.False(t, mainRootChildRejected, "goroutine spawned directly by main (parentGID == 1) cannot be 2+-hop descendant of non-main owner")
+	assert.False(t, zeroParentRejected, "zero parentGID must be rejected")
+}
+
+func testNestedCrossCacheHookChildGoroutineReentrancy(t *testing.T) {
+	// Arrange: G1 inside cacheA's PressureFunc spawns child G2 and then enters cacheB's PressureFunc
+	// before blocking on G2; next, G1 inside cacheA's OnEvictValue spawns child G2 and then enters
+	// cacheB's OnEvictValue before blocking on G2.
+	var cacheA, cacheB Cache[int]
+	var pressureCallsA, pressureCallsB, pressureCallsDuringNestedSample atomic.Int32
+	var evictCallsA, evictCallsB atomic.Int32
+	inPressureB := make(chan struct{})
+	childPressureDone := make(chan struct{})
+	inEvictB := make(chan struct{})
+	childEvictDone := make(chan struct{})
+
+	cacheA = NewArenaRadixCache[int](1,
+		WithInvariantChecking(true),
+		WithPressureFunc(func() float64 {
+			if pressureCallsA.Add(1) == 1 {
+				go func() {
+					defer close(childPressureDone)
+					<-inPressureB
+					_, putErr := cacheA.Put("a_from_pressure_child", 10)
+					assert.NoError(t, putErr)
+				}()
+				_, putErr := cacheB.Put("b1", 1)
+				require.NoError(t, putErr)
+				pressureCallsDuringNestedSample.Store(pressureCallsA.Load())
+			}
+			return 0.10
+		}),
+		WithOnEvictValue(func(_ int, _ EvictionReason) {
+			if evictCallsA.Add(1) == 1 {
+				go func() {
+					defer close(childEvictDone)
+					<-inEvictB
+					_, deleted := cacheA.Delete("a1")
+					assert.True(t, deleted)
+					_, putErr := cacheA.Put("a2_from_evict_child", 20)
+					assert.NoError(t, putErr)
+				}()
+				_, putErr := cacheB.Put("b2", 2)
+				require.NoError(t, putErr)
+			}
+		}),
+	)
+
+	cacheB = NewArenaRadixCache[int](1,
+		WithInvariantChecking(true),
+		WithPressureFunc(func() float64 {
+			if pressureCallsB.Add(1) == 1 {
+				close(inPressureB)
+				<-childPressureDone
+			}
+			return 0.10
+		}),
+		WithOnEvictValue(func(_ int, _ EvictionReason) {
+			if evictCallsB.Add(1) == 1 {
+				close(inEvictB)
+				<-childEvictDone
+			}
+		}),
+	)
+
+	// Act: Put("a1", 1) on cacheA triggers nested A->B PressureFunc with child G2 mutating cacheA,
+	// then evicts "a_from_pressure_child" and triggers nested A->B OnEvictValue with child G2 mutating cacheA.
+	_, err := cacheA.Put("a1", 1)
+	require.NoError(t, err)
+
+	// Assert: Child G2 was detected as a re-entrant descendant on cacheA during both nested cross-cache hooks.
+	assert.Equal(t, int32(1), pressureCallsDuringNestedSample.Load(),
+		"child G2 spawned in cacheA PressureFunc must be detected as re-entrant even while G1 is nested in cacheB PressureFunc")
+	assert.Equal(t, int32(2), evictCallsA.Load(),
+		"cacheA OnEvictValue must execute for both initial eviction and child G2 deletion without deadlock")
+	assert.Equal(t, int32(1), evictCallsB.Load(),
+		"cacheB OnEvictValue must execute once")
+	valA, okA := cacheA.Peek("a2_from_evict_child")
+	require.True(t, okA)
+	assert.Equal(t, 20, valA)
 }
