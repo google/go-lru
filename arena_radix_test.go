@@ -1592,48 +1592,58 @@ func TestArenaRadixCache_FNV1aHashCollisionAndNodeMapHealing(t *testing.T) {
 
 	t.Run("ReplaceTier2SheddingRestoresCollidingPeerInNodeMap", func(t *testing.T) {
 		// Arrange: Populate 5 entries (peakEntryLen == 5 <= 8, currentSize = 560B > targetSize = 500B)
-		// with keyA (100B) at the LRU tail and keyB (115B) at the MRU head. When Tier 2 pressure (0.95)
-		// sheds only the updated tail node keyA (deletedSinceCompact = 1, deletedSinceCompact*4 = 4 < 5),
-		// full compaction does not run and nodeMap[hA] must be restored to surviving peer idB.
-		hA := hashString(keyA)
-		hB := hashString(keyB)
+		// with collidingKeyA (100B) at the LRU tail and collidingKeyB (115B) at the MRU head. When Tier 2 pressure (0.95)
+		// sheds only the tail node collidingKeyA (deletedSinceCompact = 1, deletedSinceCompact*4 = 4 < 5),
+		// full compaction does not run and nodeMap[hColl] must be restored to surviving peer idB via collisionPeers.
+		const (
+			collidingKeyA = "!!!!!!!!!!!!"
+			collidingKeyB = "&+!o9)1!=\x1c\xd2\x10"
+		)
+		hColl := hashString(collidingKeyA)
+		require.Equal(t, hColl, hashString(collidingKeyB))
+
 		pressure := 0.10
 		c := NewArenaRadixCache[testData](
 			1000,
+			WithInvariantChecking(true),
 			testDataWeigher,
 			WithEvictionThreshold(0.90),
 			WithEvictionRetentionRatio(0.50),
 			WithPressureFunc(func() float64 { return pressure }),
 		).(*arenaRadix[testData])
 
-		_, err := c.Put(keyA, testData{value: 1, dataSize: 100})
+		_, err := c.Put(collidingKeyA, testData{value: 1, dataSize: 100})
 		require.NoError(t, err)
+		idA := c.nodeMap[hColl]
 		for i := range 3 {
 			_, err = c.Put(fmt.Sprintf("mid-%d", i), testData{value: int64(i + 10), dataSize: 115})
 			require.NoError(t, err)
 		}
-		_, err = c.Put(keyB, testData{value: 2, dataSize: 115})
+		_, err = c.Put(collidingKeyB, testData{value: 2, dataSize: 115})
 		require.NoError(t, err)
+		idB := c.nodeMap[hColl]
+		require.NotEqual(t, idA, idB)
 
-		idB := c.nodeMap[hB]
-		c.nodeMap[hA] = idB
+		// First Replace(collidingKeyA) at low pressure walks the collision fallback (marking nodeMapDirty) and promotes idA to nodeMap[hColl].
+		require.NoError(t, c.Replace(collidingKeyA, testData{value: 11, dataSize: 100}))
+		require.Equal(t, idA, c.nodeMap[hColl])
 
-		// Act: Raise pressure to Tier 2 (0.95) and update non-head entry keyA in place.
+		// Act: Raise pressure to Tier 2 (0.95) and update "mid-0" in place (which protects "mid-0" and sheds LRU tail collidingKeyA).
 		pressure = 0.95
-		err = c.Replace(keyA, testData{value: 11, dataSize: 100})
+		err = c.Replace("mid-0", testData{value: 110, dataSize: 115})
 
-		// Assert: keyA was shed by Tier 2 without full compaction, and nodeMap[hA] was restored to idB.
+		// Assert: collidingKeyA was shed by Tier 2 without full compaction, and nodeMap[hColl] was restored to idB.
 		require.NoError(t, err)
 		assert.True(t, c.nodeMapDirty)
-		assert.Equal(t, idB, c.nodeMap[hA], "Tier 2 shedding of updated tail node must restore colliding live peer in nodeMap")
-		delete(c.nodeMap, hA)
+		assert.Equal(t, idB, c.nodeMap[hColl], "Tier 2 shedding of tail node must preserve/restore colliding live peer in nodeMap")
+		assert.Zero(t, c.collisionCount)
+		assert.Nil(t, c.collisionPeers)
 		assert.Len(t, c.nodeMap, c.len)
-		c.checkInvariants()
-		_, ok := c.Peek(keyA)
+		_, ok := c.Peek(collidingKeyA)
 		assert.False(t, ok)
 		_, ok = c.Peek("missing-key")
 		assert.False(t, ok)
-		valB, ok := c.Peek(keyB)
+		valB, ok := c.Peek(collidingKeyB)
 		require.True(t, ok)
 		assert.Equal(t, int64(2), valB.value)
 	})
@@ -1712,6 +1722,10 @@ func TestArenaRadixCache_DeepHierarchyOver64LevelsAndRoutingPrefixCloning(t *tes
 			_, err := c.Put(key, testData{value: int64(i), dataSize: 10})
 			require.NoError(t, err)
 		}
+		_, err := c.Put("scratch", testData{value: 0, dataSize: 10})
+		require.NoError(t, err)
+		_, ok := c.Delete("scratch")
+		require.True(t, ok)
 
 		// Act 1: Compact the 80-level tree (exercises hashNodeKey with > 64 segments) and confirm a second Compact is a no-op.
 		assert.True(t, observeEpochAdvance(t, probe, c, func() {
@@ -2083,6 +2097,73 @@ func TestArenaRadixCache_StatsArenaNodesAndHashFallbacks(t *testing.T) {
 		require.True(t, ok)
 		assert.Equal(t, int64(102), v.value)
 		assert.Equal(t, uint64(5), cCollide.Stats().ArenaHashFallbacks)
+	})
+
+	t.Run("RealFNV1aCollisionPeerPromotionAndMissFastPathRestoration", func(t *testing.T) {
+		const (
+			missProbes    = 1000
+			collisionKeyA = "!!!!!!!!!!!!"
+			collisionKeyB = "&+!o9)1!=\x1c\xd2\x10"
+		)
+
+		// Case A: Deleting the primary colliding key (KeyB) after Get/Replace peer swaps promotes KeyA and restores O(1) misses.
+		// Arrange
+		c := NewArenaRadixCache[int](1000, WithInvariantChecking(true))
+		_, err := c.Put(collisionKeyA, 1)
+		require.NoError(t, err)
+		_, err = c.Put(collisionKeyB, 2)
+		require.NoError(t, err)
+
+		valA, okA := c.Get(collisionKeyA)
+		require.True(t, okA)
+		require.Equal(t, 1, valA)
+		require.NoError(t, c.Replace(collisionKeyB, 20))
+
+		// Act
+		_, deleted := c.Delete(collisionKeyB)
+		require.True(t, deleted)
+
+		beforeFallbacks := c.Stats().ArenaHashFallbacks
+		for i := range missProbes {
+			_, ok := c.Peek(fmt.Sprintf("unrelated_missing_key_%d", i))
+			require.False(t, ok)
+		}
+		afterFallbacks := c.Stats().ArenaHashFallbacks
+
+		// Assert
+		assert.Equal(t, 1, c.Stats().Len)
+		assert.Equal(t, uint64(0), afterFallbacks-beforeFallbacks)
+
+		// Case B: Deleting an unrelated key while two colliding keys remain active preserves both colliding keys and O(1) misses for non-colliding probes.
+		// Arrange
+		c2 := NewArenaRadixCache[int](1000, WithInvariantChecking(true))
+		_, err = c2.Put("unrelated_key", 3)
+		require.NoError(t, err)
+		_, err = c2.Put(collisionKeyA, 1)
+		require.NoError(t, err)
+		_, err = c2.Put(collisionKeyB, 2)
+		require.NoError(t, err)
+
+		// Act
+		_, deleted = c2.Delete("unrelated_key")
+		require.True(t, deleted)
+
+		beforeFallbacks = c2.Stats().ArenaHashFallbacks
+		for i := range missProbes {
+			_, ok := c2.Peek(fmt.Sprintf("unrelated_missing_key_%d", i))
+			require.False(t, ok)
+		}
+		afterFallbacks = c2.Stats().ArenaHashFallbacks
+
+		// Assert
+		assert.Equal(t, 2, c2.Stats().Len)
+		assert.Equal(t, uint64(0), afterFallbacks-beforeFallbacks)
+		valA, okA = c2.Peek(collisionKeyA)
+		require.True(t, okA)
+		assert.Equal(t, 1, valA)
+		valB, okB := c2.Peek(collisionKeyB)
+		require.True(t, okB)
+		assert.Equal(t, 2, valB)
 	})
 }
 

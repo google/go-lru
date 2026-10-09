@@ -18,6 +18,7 @@ import (
 	"fmt"
 	"iter"
 	"math"
+	"slices"
 )
 
 // NewArenaRadixCache returns a new arena-backed radix LRU Cache[V] bounded by maxSize.
@@ -250,6 +251,28 @@ func (c *arenaRadix[V]) checkTreeInvariants() int {
 	return treeNodeCount
 }
 
+func (c *arenaRadix[V]) checkCollisionPeerBucketInvariants(h uint64, peers []uint32) int {
+	if len(peers) == 0 {
+		panic(fmt.Sprintf("arenaRadix invariant violation: collisionPeers[%d] is empty", h))
+	}
+	mappedID, ok := c.nodeMap[h]
+	if !ok {
+		panic(fmt.Sprintf("arenaRadix invariant violation: collisionPeers[%d] exists without nodeMap[%d]", h, h))
+	}
+	for i, peerID := range peers {
+		if peerID >= uint32(len(c.nodes)) || !c.nodes[peerID].hasValue || c.hashNodeKey(peerID) != h {
+			panic(fmt.Sprintf("arenaRadix invariant violation: invalid collision peer %d for hash %d", peerID, h))
+		}
+		if mappedID == peerID {
+			panic(fmt.Sprintf("arenaRadix invariant violation: collision peer %d duplicates nodeMap[%d]", peerID, h))
+		}
+		if slices.Contains(peers[:i], peerID) {
+			panic(fmt.Sprintf("arenaRadix invariant violation: duplicate collision peer %d for hash %d", peerID, h))
+		}
+	}
+	return len(peers)
+}
+
 func (c *arenaRadix[V]) checkNodeMapInvariants() {
 	for h, id := range c.nodeMap {
 		if id >= uint32(len(c.nodes)) {
@@ -261,6 +284,16 @@ func (c *arenaRadix[V]) checkNodeMapInvariants() {
 		if c.hashNodeKey(id) != h {
 			panic(fmt.Sprintf("arenaRadix invariant violation: nodeMap hash mismatch for node %d", id))
 		}
+	}
+	totalPeers := 0
+	for h, peers := range c.collisionPeers {
+		totalPeers += c.checkCollisionPeerBucketInvariants(h, peers)
+	}
+	if c.collisionCount != totalPeers {
+		panic(fmt.Sprintf("arenaRadix invariant violation: collisionCount %d != totalPeers %d", c.collisionCount, totalPeers))
+	}
+	if len(c.nodeMap)+c.collisionCount > c.len {
+		panic(fmt.Sprintf("arenaRadix invariant violation: len(nodeMap) (%d) + collisionCount (%d) > len (%d)", len(c.nodeMap), c.collisionCount, c.len))
 	}
 }
 
@@ -338,17 +371,17 @@ func (c *arenaRadix[V]) checkInvariants() {
 }
 
 func (c *arenaRadix[V]) unlock() {
+	defer c.mu.Unlock()
 	if c.options.EnableInvariantChecking {
 		c.checkInvariants()
 	}
-	c.mu.Unlock()
 }
 
 func (c *arenaRadix[V]) rUnlock() {
+	defer c.mu.RUnlock()
 	if c.options.EnableInvariantChecking {
 		c.checkInvariants()
 	}
-	c.mu.RUnlock()
 }
 
 // Compact performs lossless O(N) compaction of the arena node slice and hash lookup map
@@ -364,13 +397,16 @@ func (c *arenaRadix[V]) Compact() {
 // or Tier 1 (lossless compaction) if pressure meets or exceeds the configured thresholds.
 // Returns any values evicted during Tier 2 critical-pressure shedding.
 func (c *arenaRadix[V]) EvaluateMemoryPressure() []V {
+	var evictQ evictCallbackQueue[V]
+	defer evictQ.invoke(&c.pressureState, c.onEvictValue, c.onEvictEntry)
+
 	_, pressure := c.lockWithPressure(&c.mu, true)
 	defer c.unlock()
 
-	return c.maybeReclaimUnderPressureLocked(pressure, nilNode)
+	return c.maybeReclaimUnderPressureLocked(&evictQ, pressure, nilNode)
 }
 
-func (c *arenaRadix[V]) finishDeleteReclaimLocked(sizeBefore, sampledEpoch uint64, pressure float64) {
+func (c *arenaRadix[V]) finishDeleteReclaimLocked(evictQ *evictCallbackQueue[V], sizeBefore, sampledEpoch uint64, pressure float64) {
 	if c.len == 0 {
 		hadSlack := c.hasEmptyDeleteSlack(c.freeCount >= minChurnCompactDeletes)
 		if hadSlack {
@@ -387,12 +423,12 @@ func (c *arenaRadix[V]) finishDeleteReclaimLocked(sizeBefore, sampledEpoch uint6
 		}
 		reclaimedSingleSurvivor = true
 	}
-	c.maybeReclaimUnderPressureLocked(pressure, foregroundNoProtect)
+	c.maybeReclaimUnderPressureLocked(evictQ, pressure, foregroundNoProtect)
 	c.maybeMarkReclaimed(reclaimedSingleSurvivor || c.currentSize < sizeBefore, sampledEpoch, pressure)
 }
 
-func (c *arenaRadix[V]) finishMutationReclaimLocked(evictedValues []V, protectedID uint32, reclaimedPre, compactedPre bool, sizeBefore, sampledEpoch uint64, pressure float64) []V {
-	evictedByPressure := c.maybeReclaimUnderPressureLocked(pressure, protectedID)
+func (c *arenaRadix[V]) finishMutationReclaimLocked(evictQ *evictCallbackQueue[V], evictedValues []V, protectedID uint32, reclaimedPre, compactedPre bool, sizeBefore, sampledEpoch uint64, pressure float64) []V {
+	evictedByPressure := c.maybeReclaimUnderPressureLocked(evictQ, pressure, protectedID)
 	evictedValues = appendEvicted(evictedValues, evictedByPressure)
 	netByteReduced := c.currentSize < sizeBefore
 	if c.shouldCompactAfterMutation(reclaimedPre, netByteReduced, c.isDirtyLocked(), pressure) {
@@ -406,16 +442,17 @@ func (c *arenaRadix[V]) finishMutationReclaimLocked(evictedValues []V, protected
 	return evictedValues
 }
 
-func (c *arenaRadix[V]) updateExistingOnPutLocked(nodeID uint32, key string, keyHash uint64, value V, valueSize, sizeBefore uint64, pressure float64) ([]V, bool) {
+func (c *arenaRadix[V]) updateExistingOnPutLocked(evictQ *evictCallbackQueue[V], nodeID uint32, key string, keyHash uint64, value V, valueSize, sizeBefore uint64, pressure float64) ([]V, bool) {
 	var evictedValues []V
 	evictedPrePut := false
 	oldValue := c.nodes[nodeID].value
 	oldSize := c.nodes[nodeID].size
+	hadZeroCap := c.shouldEvictOnZeroWeightShrink(oldSize, valueSize, c.maxSize)
 	c.onEntrySizeUpdated(oldSize, valueSize)
 	c.moveToFront(nodeID)
 	c.currentSize -= oldSize
-	for valueSize > c.maxSize-c.currentSize && c.tail != nilNode && c.tail != nodeID {
-		if evicted, ok := c.evictOne(); ok {
+	for (valueSize > c.maxSize-c.currentSize || (hadZeroCap && !evictedPrePut)) && c.tail != nilNode && c.tail != nodeID {
+		if evicted, ok := c.evictOne(evictQ); ok {
 			evictedValues = append(evictedValues, evicted)
 			evictedPrePut = true
 		}
@@ -425,15 +462,15 @@ func (c *arenaRadix[V]) updateExistingOnPutLocked(nodeID uint32, key string, key
 	c.nodes[nodeID].size = valueSize
 	c.currentSize += valueSize
 	if evictedPrePut {
-		c.nodeMap[keyHash] = nodeID
+		c.promoteCollisionPeerLocked(keyHash, nodeID)
 	}
 	c.putUpdated++
-	c.notifyEvict(key, oldValue, oldSize, EvictionReasonReplaced)
+	c.notifyEvict(evictQ, key, oldValue, oldSize, EvictionReasonReplaced)
 	reclaimedPrePut := c.shouldReclaimSingleSurvivorOnMutation(c.len, c.freeCount > 0 || c.nodeMapDirty, c.freeCount >= minSingleSurvivorFreeNodes, evictedPrePut, c.currentSize, sizeBefore, pressure)
 	return evictedValues, reclaimedPrePut
 }
 
-func (c *arenaRadix[V]) insertNewOnPutLocked(key string, keyHash uint64, value V, valueSize, sizeBefore uint64, pressure float64) (uint32, []V, bool, bool) {
+func (c *arenaRadix[V]) insertNewOnPutLocked(evictQ *evictCallbackQueue[V], key string, keyHash uint64, value V, valueSize, sizeBefore uint64, pressure float64) (uint32, []V, bool, bool) {
 	var evictedValues []V
 	evictedPrePut := false
 	reclaimedPrePut := false
@@ -442,7 +479,7 @@ func (c *arenaRadix[V]) insertNewOnPutLocked(key string, keyHash uint64, value V
 	// A single new-key insert can allocate up to 2 nodes (one routing node, one leaf).
 	// If the slice has reached its physical uint32 maximum, ensure enough free slots exist.
 	for uint64(len(c.nodes))-uint64(c.freeCount)+2 > uint64(foregroundNoProtect) && c.tail != nilNode {
-		if evicted, ok := c.evictOne(); ok {
+		if evicted, ok := c.evictOne(evictQ); ok {
 			evictedValues = append(evictedValues, evicted)
 			evictedPrePut = true
 		}
@@ -450,8 +487,8 @@ func (c *arenaRadix[V]) insertNewOnPutLocked(key string, keyHash uint64, value V
 
 	// Evict from the LRU tail before allocating new arena nodes when valueSize would exceed remaining capacity
 	// (using subtraction to avoid uint64 addition overflow when maxSize is near math.MaxUint64).
-	for valueSize > c.maxSize-c.currentSize && c.tail != nilNode {
-		if evicted, ok := c.evictOne(); ok {
+	for c.shouldEvictPreInsertOnPut(valueSize, c.maxSize, c.currentSize, c.len, evictedPrePut) && c.tail != nilNode {
+		if evicted, ok := c.evictOne(evictQ); ok {
 			evictedValues = append(evictedValues, evicted)
 			evictedPrePut = true
 		}
@@ -471,7 +508,7 @@ func (c *arenaRadix[V]) insertNewOnPutLocked(key string, keyHash uint64, value V
 	c.putInserted++
 	c.onEntryPut(c.len, valueSize)
 	c.currentSize += valueSize
-	c.nodeMap[keyHash] = nodeID
+	c.recordNodeMapInsertLocked(keyHash, nodeID)
 	return nodeID, evictedValues, reclaimedPrePut, compactedPrePut
 }
 
@@ -487,6 +524,9 @@ func (c *arenaRadix[V]) Put(key string, value V) ([]V, error) {
 		return nil, ErrInvalidEntrySize
 	}
 
+	var evictQ evictCallbackQueue[V]
+	defer evictQ.invoke(&c.pressureState, c.onEvictValue, c.onEvictEntry)
+
 	sampledEpoch, pressure := c.lockWithPressure(&c.mu, false)
 	defer c.unlock()
 
@@ -498,17 +538,20 @@ func (c *arenaRadix[V]) Put(key string, value V) ([]V, error) {
 
 	nodeID, exists := c.getNodeKeyWithHash(key, keyHash)
 	if exists {
-		evictedValues, reclaimedPrePut = c.updateExistingOnPutLocked(nodeID, key, keyHash, value, valueSize, sizeBefore, pressure)
+		evictedValues, reclaimedPrePut = c.updateExistingOnPutLocked(&evictQ, nodeID, key, keyHash, value, valueSize, sizeBefore, pressure)
 	} else {
-		nodeID, evictedValues, reclaimedPrePut, compactedPrePut = c.insertNewOnPutLocked(key, keyHash, value, valueSize, sizeBefore, pressure)
+		nodeID, evictedValues, reclaimedPrePut, compactedPrePut = c.insertNewOnPutLocked(&evictQ, key, keyHash, value, valueSize, sizeBefore, pressure)
 	}
 
-	evictedValues = c.finishMutationReclaimLocked(evictedValues, nodeID, reclaimedPrePut, compactedPrePut, sizeBefore, sampledEpoch, pressure)
+	evictedValues = c.finishMutationReclaimLocked(&evictQ, evictedValues, nodeID, reclaimedPrePut, compactedPrePut, sizeBefore, sampledEpoch, pressure)
 	return evictedValues, nil
 }
 
 // Delete removes the entry associated with key from the cache, returning its value and true (or the zero value of V and false if not found).
 func (c *arenaRadix[V]) Delete(key string) (value V, ok bool) {
+	var evictQ evictCallbackQueue[V]
+	defer evictQ.invoke(&c.pressureState, c.onEvictValue, c.onEvictEntry)
+
 	sampledEpoch, pressure := c.lockWithPressure(&c.mu, false)
 	defer c.unlock()
 
@@ -520,13 +563,13 @@ func (c *arenaRadix[V]) Delete(key string) (value V, ok bool) {
 	}
 
 	sizeBefore := c.currentSize
-	deleted, erased := c.eraseInternalWithHash(nodeID, keyHash, key, EvictionReasonDeleted)
+	deleted, erased := c.eraseInternalWithHash(&evictQ, nodeID, keyHash, key, EvictionReasonDeleted)
 	if !erased {
 		c.deleteNotFound++
 		return value, false
 	}
 	c.deleteDeleted++
-	c.finishDeleteReclaimLocked(sizeBefore, sampledEpoch, pressure)
+	c.finishDeleteReclaimLocked(&evictQ, sizeBefore, sampledEpoch, pressure)
 	return deleted, true
 }
 
@@ -594,13 +637,6 @@ func (c *arenaRadix[V]) canFitGrowthLocked(nodeID uint32, newSize, sizeDelta, av
 	}
 }
 
-func (c *arenaRadix[V]) restoreDisplacedNodeMapLocked(keyHash uint64, nodeID, prevMappedID uint32, hadPrevMapped bool) {
-	if c.nodeMapDirty && (nodeID >= uint32(len(c.nodes)) || !c.nodes[nodeID].hasValue) &&
-		hadPrevMapped && prevMappedID != nodeID && prevMappedID < uint32(len(c.nodes)) && c.nodes[prevMappedID].hasValue {
-		c.nodeMap[keyHash] = prevMappedID
-	}
-}
-
 // Replace updates the value of an existing key and recomputes its weight
 // without modifying its LRU position.
 // If the entry's updated weight exceeds maxSize (or cannot fit alongside entries more recent than node),
@@ -610,6 +646,9 @@ func (c *arenaRadix[V]) restoreDisplacedNodeMapLocked(keyHash uint64, nodeID, pr
 // Returns ErrEntryNotExist if key is not present in the cache.
 func (c *arenaRadix[V]) Replace(key string, value V) error {
 	newSize := c.weigh(key, value)
+
+	var evictQ evictCallbackQueue[V]
+	defer evictQ.invoke(&c.pressureState, c.onEvictValue, c.onEvictEntry)
 
 	sampledEpoch, pressure := c.lockWithPressure(&c.mu, false)
 	defer c.unlock()
@@ -627,8 +666,8 @@ func (c *arenaRadix[V]) Replace(key string, value V) error {
 	if newSize > c.maxSize {
 		c.replaceSelfEvicted++
 		sizeBefore := c.currentSize
-		c.eraseInternalWithHash(nodeID, keyHash, key, EvictionReasonCapacity)
-		c.finishDeleteReclaimLocked(sizeBefore, sampledEpoch, pressure)
+		c.eraseInternalWithHash(&evictQ, nodeID, keyHash, key, EvictionReasonCapacity)
+		c.finishDeleteReclaimLocked(&evictQ, sizeBefore, sampledEpoch, pressure)
 		return nil
 	}
 
@@ -640,19 +679,23 @@ func (c *arenaRadix[V]) Replace(key string, value V) error {
 		sizeDelta := newSize - oldSize
 		if !c.canFitGrowthLocked(nodeID, newSize, sizeDelta, c.maxSize-c.currentSize) {
 			c.replaceSelfEvicted++
-			c.eraseInternalWithHash(nodeID, keyHash, key, EvictionReasonCapacity)
-			c.finishDeleteReclaimLocked(sizeBefore, sampledEpoch, pressure)
+			c.eraseInternalWithHash(&evictQ, nodeID, keyHash, key, EvictionReasonCapacity)
+			c.finishDeleteReclaimLocked(&evictQ, sizeBefore, sampledEpoch, pressure)
 			return nil
 		}
 
 		for sizeDelta > c.maxSize-c.currentSize && c.tail != nilNode && c.tail != nodeID {
-			c.evictOne()
+			c.evictOne(&evictQ)
 			evictedAny = true
 		}
 
 		c.onEntrySizeUpdated(oldSize, newSize)
 		c.currentSize += sizeDelta
 	case newSize < oldSize:
+		if c.shouldEvictOnZeroWeightShrink(oldSize, newSize, c.maxSize) && c.tail != nodeID {
+			c.evictOne(&evictQ)
+			evictedAny = true
+		}
 		c.onEntrySizeUpdated(oldSize, newSize)
 		c.currentSize -= oldSize - newSize
 	}
@@ -660,24 +703,16 @@ func (c *arenaRadix[V]) Replace(key string, value V) error {
 	c.nodes[nodeID].hasValue = true
 	c.nodes[nodeID].size = newSize
 
-	prevMappedID, hadPrevMapped := c.nodeMap[keyHash]
-	if !hadPrevMapped || prevMappedID != nodeID {
-		c.nodeMap[keyHash] = nodeID
-	}
+	c.promoteCollisionPeerLocked(keyHash, nodeID)
 	c.replaceUpdated++
-	c.notifyEvict(key, oldValue, oldSize, EvictionReasonReplaced)
+	c.notifyEvict(&evictQ, key, oldValue, oldSize, EvictionReasonReplaced)
 	reclaimedPreUpdate := c.shouldReclaimSingleSurvivorOnMutation(c.len, c.freeCount > 0 || c.nodeMapDirty, c.freeCount >= minSingleSurvivorFreeNodes, evictedAny, c.currentSize, sizeBefore, pressure)
 
-	protectedID := foregroundNoProtect
-	if nodeID == c.head && c.nodes[nodeID].hasValue {
-		protectedID = nodeID
-	}
-	c.finishMutationReclaimLocked(nil, protectedID, reclaimedPreUpdate, false, sizeBefore, sampledEpoch, pressure)
-	c.restoreDisplacedNodeMapLocked(keyHash, nodeID, prevMappedID, hadPrevMapped)
+	c.finishMutationReclaimLocked(&evictQ, nil, nodeID, reclaimedPreUpdate, false, sizeBefore, sampledEpoch, pressure)
 	return nil
 }
 
-func (c *arenaRadix[V]) evictAllForClearLocked() {
+func (c *arenaRadix[V]) evictAllForClearLocked(evictQ *evictCallbackQueue[V]) {
 	if c.len == 0 {
 		return
 	}
@@ -700,12 +735,12 @@ func (c *arenaRadix[V]) evictAllForClearLocked() {
 		c.nodes[currID].value = zero
 		c.nodes[currID].hasValue = false
 		c.nodes[currID].size = 0
-		c.notifyEvict(key, evictedVal, evictedSize, EvictionReasonDeleted)
+		c.notifyEvict(evictQ, key, evictedVal, evictedSize, EvictionReasonDeleted)
 		currID = nextID
 	}
 }
 
-func (c *arenaRadix[V]) deleteAllPrefixLocked() {
+func (c *arenaRadix[V]) deleteAllPrefixLocked(evictQ *evictCallbackQueue[V], sampledEpoch uint64, pressure float64) {
 	c.deletePrefixExecuted++
 	hadEntries := c.len > 0
 	hadDirtySlack := c.freeCount > 0 || c.nodeMapDirty || c.peakEntryLen > minPeakSlackEntries || c.deletedSinceCompact > 0 || (c.len == 0 && cap(c.nodes) > 1)
@@ -715,18 +750,31 @@ func (c *arenaRadix[V]) deleteAllPrefixLocked() {
 	hadReclaimable := c.currentSize > 0 || hadDirtySlack
 	c.deletedSinceCompact += c.len
 	hadCompactionSlack := c.hasEmptyDeleteSlack(len(c.nodes)-1 >= minChurnCompactDeletes)
-	c.evictAllForClearLocked()
+	c.evictAllForClearLocked(evictQ)
 	c.clearEmptyArenaStateLocked()
-	c.finishClearAllLocked(hadCompactionSlack, hadReclaimable)
+	c.finishClearAllLocked(hadCompactionSlack, hadReclaimable, sampledEpoch, pressure)
 }
 
 // DeletePrefix deletes all entries whose keys begin with prefix.
 // It severs the matching subtree in O(1) and iteratively reclaims all nodes into the free-list.
 func (c *arenaRadix[V]) DeletePrefix(prefix string) {
+	var evictQ evictCallbackQueue[V]
+	defer evictQ.invoke(&c.pressureState, c.onEvictValue, c.onEvictEntry)
+
 	if prefix == "" {
 		c.mu.Lock()
+		hadEntries := c.len > 0
+		hadDirtySlack := c.freeCount > 0 || c.nodeMapDirty || c.peakEntryLen > minPeakSlackEntries || c.deletedSinceCompact > 0 || (c.len == 0 && cap(c.nodes) > 1)
+		if !hadEntries && !hadDirtySlack && c.peakEntryLen == 0 && len(c.nodes) <= 1 {
+			c.deletePrefixExecuted++
+			c.unlock()
+			return
+		}
+		c.mu.Unlock()
+
+		sampledEpoch, pressure := c.lockWithPressure(&c.mu, false)
 		defer c.unlock()
-		c.deleteAllPrefixLocked()
+		c.deleteAllPrefixLocked(&evictQ, sampledEpoch, pressure)
 		return
 	}
 
@@ -755,9 +803,9 @@ func (c *arenaRadix[V]) DeletePrefix(prefix string) {
 			c.nodes[childID].parent = nodeID
 
 			// Now sweep the detached subtree to fix LRU, nodeMap, and currentSize
-			c.freeSubtree(childID)
+			c.freeSubtree(&evictQ, childID)
 			c.compressPathUpwards(nodeID)
-			c.finishDeleteReclaimLocked(sizeBefore, sampledEpoch, pressure)
+			c.finishDeleteReclaimLocked(&evictQ, sizeBefore, sampledEpoch, pressure)
 			return
 		}
 
@@ -771,7 +819,7 @@ func (c *arenaRadix[V]) DeletePrefix(prefix string) {
 	}
 }
 
-func (c *arenaRadix[V]) evictSubtreeValueNodeLocked(currID uint32, currHash uint64) {
+func (c *arenaRadix[V]) evictSubtreeValueNodeLocked(evictQ *evictCallbackQueue[V], currID uint32, currHash uint64) {
 	var zero V
 	var key string
 	if c.onEvictEntry != nil {
@@ -783,19 +831,17 @@ func (c *arenaRadix[V]) evictSubtreeValueNodeLocked(currID uint32, currHash uint
 	c.currentSize -= evictedSize
 	c.remove(currID)
 	c.nodeMapDirty = true
-	if mappedID, ok := c.nodeMap[currHash]; ok && mappedID == currID {
-		delete(c.nodeMap, currHash)
-	}
+	c.removeOrPromoteNodeMapLocked(currHash, currID)
 	c.nodes[currID].value = zero
 	c.nodes[currID].hasValue = false
 	c.nodes[currID].size = 0
-	c.notifyEvict(key, evictedVal, evictedSize, EvictionReasonDeleted)
+	c.notifyEvict(evictQ, key, evictedVal, evictedSize, EvictionReasonDeleted)
 }
 
 // freeSubtree iteratively reclaims all nodes in a detached subtree using O(1) stack space
 // and incremental FNV-1a prefix hashing (avoiding O(leaves * depth) ancestor walks),
 // removing active values from the LRU list, nodeMap, and accounting, and returning nodes to the free-list.
-func (c *arenaRadix[V]) freeSubtree(nodeID uint32) {
+func (c *arenaRadix[V]) freeSubtree(evictQ *evictCallbackQueue[V], nodeID uint32) {
 	if nodeID == nilNode {
 		return
 	}
@@ -807,7 +853,7 @@ func (c *arenaRadix[V]) freeSubtree(nodeID uint32) {
 	currID := nodeID
 	for currID != nilNode {
 		if c.nodes[currID].hasValue {
-			c.evictSubtreeValueNodeLocked(currID, currHash)
+			c.evictSubtreeValueNodeLocked(evictQ, currID, currHash)
 		}
 
 		if c.nodes[currID].child != nilNode {

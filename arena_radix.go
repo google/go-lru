@@ -50,8 +50,10 @@ type arenaRadix[V any] struct {
 	freeHead  uint32
 	freeCount uint32
 
-	nodeMap      map[uint64]uint32
-	nodeMapDirty bool
+	nodeMap        map[uint64]uint32
+	collisionPeers map[uint64][]uint32
+	nodeMapDirty   bool
+	collisionCount int
 
 	root uint32
 
@@ -72,13 +74,10 @@ type arenaRadix[V any] struct {
 	pressureState
 }
 
-func (c *arenaRadix[V]) notifyEvict(key string, value V, size uint64, reason EvictionReason) {
+func (c *arenaRadix[V]) notifyEvict(evictQ *evictCallbackQueue[V], key string, value V, size uint64, reason EvictionReason) {
 	c.recordEviction(reason, size)
-	if c.onEvictValue != nil {
-		c.onEvictValue(value, reason)
-	}
-	if c.onEvictEntry != nil {
-		c.onEvictEntry(key, value, reason)
+	if c.onEvictValue != nil || c.onEvictEntry != nil {
+		evictQ.enqueue(key, value, reason)
 	}
 }
 
@@ -368,9 +367,9 @@ func (c *arenaRadix[V]) lookupOrWalkNodeKey(key string, keyHash uint64) (nodeID 
 		if id < uint32(len(c.nodes)) && c.nodes[id].hasValue && c.verifyKey(id, key) {
 			return id, false, true
 		}
-	} else if len(c.nodeMap) == c.len {
-		// By Invariant 6 and the Pigeonhole Principle, when len(c.nodeMap) == c.len,
-		// there is an exact 1:1 bijection between c.nodeMap and all live value-bearing nodes,
+	} else if len(c.nodeMap)+c.collisionCount == c.len {
+		// By Invariant 6 and the Pigeonhole Principle, when len(c.nodeMap)+c.collisionCount == c.len,
+		// every live value-bearing node's hash is present in c.nodeMap,
 		// so a map miss is a guaranteed cache miss.
 		return nilNode, false, false
 	}
@@ -391,7 +390,7 @@ func (c *arenaRadix[V]) lookupNodeKeyWithHash(key string, keyHash uint64) (uint3
 func (c *arenaRadix[V]) getNodeKeyWithHash(key string, keyHash uint64) (uint32, bool) {
 	nodeID, walked, found := c.lookupOrWalkNodeKey(key, keyHash)
 	if walked && found {
-		c.nodeMap[keyHash] = nodeID
+		c.promoteCollisionPeerLocked(keyHash, nodeID)
 	}
 	return nodeID, found
 }
@@ -501,37 +500,42 @@ func (c *arenaRadix[V]) remove(nodeID uint32) {
 }
 
 // evictOne removes and returns the least recently used entry (tail) from the cache.
-func (c *arenaRadix[V]) evictOne() (V, bool) {
+func (c *arenaRadix[V]) evictOne(evictQ *evictCallbackQueue[V]) (V, bool) {
 	nodeID := c.tail
 	if nodeID == nilNode {
 		var zero V
 		return zero, false
 	}
 
-	return c.eraseInternal(nodeID, EvictionReasonCapacity)
+	return c.eraseInternal(evictQ, nodeID, EvictionReasonCapacity)
 }
 
 const foregroundNoProtect uint32 = nilNode - 1
 
+func (c *arenaRadix[V]) hasContiguousSlackLocked() bool {
+	return (c.nodeMapDirty || c.deletedSinceCompact > 0) &&
+		(c.len < c.peakEntryLen || c.deletedSinceCompact >= minChurnCompactDeletes || len(c.nodeMap)+c.collisionCount < c.len)
+}
+
 func (c *arenaRadix[V]) isDirtyLocked() bool {
-	return c.freeHead != nilNode || len(c.nodes) < cap(c.nodes) || c.nodeMapDirty
+	return c.freeHead != nilNode || c.hasContiguousSlackLocked()
 }
 
 // eraseInternal handles unlinking from LRU, cleaning up nodeMap, and deleting from the tree
 // when the caller does not already have the key or hash in hand.
-func (c *arenaRadix[V]) eraseInternal(nodeID uint32, reason EvictionReason) (V, bool) {
+func (c *arenaRadix[V]) eraseInternal(evictQ *evictCallbackQueue[V], nodeID uint32, reason EvictionReason) (V, bool) {
 	if nodeID == nilNode || !c.nodes[nodeID].hasValue {
 		var zero V
 		return zero, false
 	}
 	if c.onEvictEntry != nil {
 		key := c.reconstructKey(nodeID)
-		return c.eraseInternalWithHash(nodeID, hashString(key), key, reason)
+		return c.eraseInternalWithHash(evictQ, nodeID, hashString(key), key, reason)
 	}
-	return c.eraseInternalWithHash(nodeID, c.hashNodeKey(nodeID), "", reason)
+	return c.eraseInternalWithHash(evictQ, nodeID, c.hashNodeKey(nodeID), "", reason)
 }
 
-func (c *arenaRadix[V]) eraseInternalWithHash(nodeID uint32, hash uint64, key string, reason EvictionReason) (V, bool) {
+func (c *arenaRadix[V]) eraseInternalWithHash(evictQ *evictCallbackQueue[V], nodeID uint32, hash uint64, key string, reason EvictionReason) (V, bool) {
 	if nodeID == nilNode || !c.nodes[nodeID].hasValue {
 		var zero V
 		return zero, false
@@ -543,14 +547,12 @@ func (c *arenaRadix[V]) eraseInternalWithHash(nodeID uint32, hash uint64, key st
 	c.currentSize -= evictedSize
 	c.nodes[nodeID].size = 0
 
-	if mappedID, ok := c.nodeMap[hash]; ok && mappedID == nodeID {
-		delete(c.nodeMap, hash)
-	}
+	c.removeOrPromoteNodeMapLocked(hash, nodeID)
 
 	c.remove(nodeID)
 	c.deleteNode(nodeID)
 
-	c.notifyEvict(key, deletedEntry, evictedSize, reason)
+	c.notifyEvict(evictQ, key, deletedEntry, evictedSize, reason)
 	return deletedEntry, true
 }
 
@@ -579,6 +581,8 @@ func (c *arenaRadix[V]) clearEmptyArenaStateLocked() {
 		c.nodeMap = make(map[uint64]uint32)
 	}
 	c.nodeMapDirty = false
+	c.collisionPeers = nil
+	c.collisionCount = 0
 	c.resetWatermarks()
 }
 
@@ -601,26 +605,42 @@ func (c *arenaRadix[V]) shouldAutoCompactLocked(protectedNodeID uint32) bool {
 	if c.freeHead != nilNode && c.peakEntryLen > minPeakSlackEntries && len(c.nodes) > minPeakSlackEntries && c.freeCount >= 2 && uint64(c.freeCount)*slackQuarterMultiplier >= uint64(len(c.nodes)) {
 		return true
 	}
-	return c.shouldAutoCompactEntryCounts(c.nodeMapDirty, false, c.len)
+	return c.shouldAutoCompactEntryCounts(c.hasContiguousSlackLocked(), false, c.len)
 }
 
 func (c *arenaRadix[V]) compactContiguousLocked() bool {
-	if len(c.nodes) == cap(c.nodes) && !c.nodeMapDirty {
+	if !c.hasContiguousSlackLocked() {
 		return false
 	}
-	if len(c.nodes) < cap(c.nodes) {
+	hasSliceSlack := c.deletedSinceCompact > 0 && len(c.nodes) < cap(c.nodes)
+	if !hasSliceSlack && !c.nodeMapDirty {
+		return false
+	}
+	if hasSliceSlack {
 		newNodes := make([]arenaRadixNode[V], len(c.nodes))
 		copy(newNodes, c.nodes)
 		c.nodes = newNodes
 	}
 	if c.nodeMapDirty {
 		newNodeMap := make(map[uint64]uint32, c.len)
+		collisions := 0
+		var newCollisionPeers map[uint64][]uint32
 		for id := range uint32(len(c.nodes)) {
 			if c.nodes[id].hasValue {
-				newNodeMap[c.hashNodeKey(id)] = id
+				h := c.hashNodeKey(id)
+				if prevID, exists := newNodeMap[h]; exists {
+					collisions++
+					if newCollisionPeers == nil {
+						newCollisionPeers = make(map[uint64][]uint32)
+					}
+					newCollisionPeers[h] = append(newCollisionPeers[h], prevID)
+				}
+				newNodeMap[h] = id
 			}
 		}
 		c.nodeMap = newNodeMap
+		c.collisionPeers = newCollisionPeers
+		c.collisionCount = collisions
 		c.nodeMapDirty = false
 	}
 	c.onCompacted(c.len)
@@ -660,6 +680,8 @@ func (c *arenaRadix[V]) compactDataStructuresLocked() bool {
 	// and brand-new hash accelerator map healing any hash-collided surviving keys.
 	newNodes := make([]arenaRadixNode[V], liveCount)
 	newNodeMap := make(map[uint64]uint32, c.len)
+	collisions := 0
+	var newCollisionPeers map[uint64][]uint32
 	for oldID := range oldLen {
 		newID := oldToNew[oldID]
 		if newID == nilNode {
@@ -667,7 +689,15 @@ func (c *arenaRadix[V]) compactDataStructuresLocked() bool {
 		}
 		oldNode := &c.nodes[oldID]
 		if oldNode.hasValue {
-			newNodeMap[c.hashNodeKey(oldID)] = newID
+			h := c.hashNodeKey(oldID)
+			if prevID, exists := newNodeMap[h]; exists {
+				collisions++
+				if newCollisionPeers == nil {
+					newCollisionPeers = make(map[uint64][]uint32)
+				}
+				newCollisionPeers[h] = append(newCollisionPeers[h], prevID)
+			}
+			newNodeMap[h] = newID
 		}
 		newNodes[newID] = arenaRadixNode[V]{
 			prefix:   oldNode.prefix,
@@ -690,6 +720,8 @@ func (c *arenaRadix[V]) compactDataStructuresLocked() bool {
 	c.freeCount = 0
 	c.nodes = newNodes
 	c.nodeMap = newNodeMap
+	c.collisionPeers = newCollisionPeers
+	c.collisionCount = collisions
 	c.nodeMapDirty = false
 	c.onCompacted(c.len)
 	return true
@@ -734,12 +766,12 @@ func (c *arenaRadix[V]) completeShedAndCompactLocked(evictedCount int, retention
 
 // shedAndCompactLocked evicts least-recently-used entries strictly from c.tail in a single O(N) pass
 // until c.currentSize <= targetSize (and proportionally sheds zero-size entries down to targetZeroCount),
-// protecting protectedNodeID only when it resides at the MRU head (c.head),
+// protecting protectedNodeID when specified by the foreground mutation caller,
 // then performs lossless arena and map compaction if fragmentation warrants it.
 // Caller MUST hold c.mu.Lock().
-func (c *arenaRadix[V]) shedAndCompactLocked(targetSize uint64, retention float64, protectedNodeID uint32) []V {
+func (c *arenaRadix[V]) shedAndCompactLocked(evictQ *evictCallbackQueue[V], targetSize uint64, retention float64, protectedNodeID uint32) []V {
 	autoCompactID := protectedNodeID
-	if protectedNodeID == foregroundNoProtect || (protectedNodeID != nilNode && (protectedNodeID != c.head || c.nodes[protectedNodeID].prev != nilNode || !c.nodes[protectedNodeID].hasValue)) {
+	if protectedNodeID == foregroundNoProtect || (protectedNodeID != nilNode && !c.nodes[protectedNodeID].hasValue) {
 		protectedNodeID = nilNode
 	}
 
@@ -759,7 +791,7 @@ func (c *arenaRadix[V]) shedAndCompactLocked(targetSize uint64, retention float6
 		}
 		nextVictimID := c.nodes[victimID].prev
 		if c.shouldEvictShedVictim(victimID == protectedNodeID, c.nodes[victimID].size, needFullFlush, needByteShed, targetZeroCount) {
-			if val, ok := c.eraseInternal(victimID, EvictionReasonPressure); ok {
+			if val, ok := c.eraseInternal(evictQ, victimID, EvictionReasonPressure); ok {
 				evicted = append(evicted, val)
 			}
 		}
@@ -772,18 +804,18 @@ func (c *arenaRadix[V]) shedAndCompactLocked(targetSize uint64, retention float6
 
 // maybeReclaimUnderPressureLocked evaluates the sampled pressure against configured thresholds:
 //   - If pressure >= EvictionThreshold (Tier 2 Critical Pressure): evict from LRU tail down to
-//     c.maxSize * EvictionRetentionRatio (preserving protectedNodeID if at MRU head), then compact if needed.
+//     c.maxSize * EvictionRetentionRatio (preserving protectedNodeID if live), then compact if needed.
 //   - Else if pressure >= CompactionThreshold (Tier 1 Moderate Pressure): perform lossless arena and map compaction.
 //
 // Caller MUST hold c.mu.Lock().
-func (c *arenaRadix[V]) maybeReclaimUnderPressureLocked(pressure float64, protectedNodeID uint32) []V {
+func (c *arenaRadix[V]) maybeReclaimUnderPressureLocked(evictQ *evictCallbackQueue[V], pressure float64, protectedNodeID uint32) []V {
 	if c.isSamplingGoroutine() {
 		return nil
 	}
 	if pressure >= c.options.EvictionThreshold {
 		retention := c.options.EvictionRetentionRatio
 		targetSize := computeTargetSize(c.maxSize, retention)
-		return c.shedAndCompactLocked(targetSize, retention, protectedNodeID)
+		return c.shedAndCompactLocked(evictQ, targetSize, retention, protectedNodeID)
 	}
 	c.resetZeroWatermarkBelowTier2(pressure)
 	if pressure >= c.options.CompactionThreshold && c.shouldAutoCompactLocked(protectedNodeID) && c.compactDataStructuresLocked() {
@@ -791,4 +823,110 @@ func (c *arenaRadix[V]) maybeReclaimUnderPressureLocked(pressure float64, protec
 		c.markReclaimedLocked()
 	}
 	return nil
+}
+
+func (c *arenaRadix[V]) recordNodeMapInsertLocked(keyHash uint64, nodeID uint32) {
+	c.promoteCollisionPeerLocked(keyHash, nodeID)
+}
+
+func (c *arenaRadix[V]) promoteCollisionPeerLocked(keyHash uint64, nodeID uint32) {
+	prevID, ok := c.nodeMap[keyHash]
+	if !ok {
+		c.removeCollisionPeerLocked(keyHash, nodeID)
+		c.nodeMap[keyHash] = nodeID
+		return
+	}
+	if prevID == nodeID {
+		return
+	}
+	prevValid := prevID < uint32(len(c.nodes)) && c.nodes[prevID].hasValue && c.hashNodeKey(prevID) == keyHash
+	peers := c.collisionPeers[keyHash]
+	idx := slices.Index(peers, nodeID)
+	switch {
+	case idx >= 0 && prevValid:
+		peers[idx] = prevID
+	case idx >= 0 && !prevValid:
+		c.removeCollisionPeerLocked(keyHash, nodeID)
+	case idx < 0 && prevValid:
+		if c.collisionPeers == nil {
+			c.collisionPeers = make(map[uint64][]uint32)
+		}
+		c.collisionPeers[keyHash] = append(peers, prevID)
+		c.collisionCount++
+	}
+	c.nodeMap[keyHash] = nodeID
+}
+
+func (c *arenaRadix[V]) popValidCollisionPeerLocked(hash uint64, excludeID uint32) (uint32, bool) {
+	if c.collisionPeers == nil {
+		return nilNode, false
+	}
+	peers := c.collisionPeers[hash]
+	for len(peers) > 0 {
+		last := peers[len(peers)-1]
+		peers = peers[:len(peers)-1]
+		if c.collisionCount > 0 {
+			c.collisionCount--
+		}
+		if last != excludeID && last < uint32(len(c.nodes)) && c.nodes[last].hasValue && c.hashNodeKey(last) == hash {
+			if len(peers) == 0 {
+				delete(c.collisionPeers, hash)
+				if len(c.collisionPeers) == 0 {
+					c.collisionPeers = nil
+				}
+			} else {
+				c.collisionPeers[hash] = peers
+			}
+			return last, true
+		}
+	}
+	delete(c.collisionPeers, hash)
+	if len(c.collisionPeers) == 0 {
+		c.collisionPeers = nil
+		c.collisionCount = 0
+	}
+	return nilNode, false
+}
+
+func (c *arenaRadix[V]) removeCollisionPeerLocked(hash uint64, nodeID uint32) {
+	if c.collisionPeers == nil {
+		return
+	}
+	peers := c.collisionPeers[hash]
+	idx := slices.Index(peers, nodeID)
+	if idx < 0 {
+		return
+	}
+	peers = slices.Delete(peers, idx, idx+1)
+	if len(peers) == 0 {
+		delete(c.collisionPeers, hash)
+		if len(c.collisionPeers) == 0 {
+			c.collisionPeers = nil
+		}
+	} else {
+		c.collisionPeers[hash] = peers
+	}
+	if c.collisionCount > 0 {
+		c.collisionCount--
+	}
+}
+
+func (c *arenaRadix[V]) removeOrPromoteNodeMapLocked(hash uint64, nodeID uint32) {
+	mappedID, ok := c.nodeMap[hash]
+	if !ok {
+		c.removeCollisionPeerLocked(hash, nodeID)
+		return
+	}
+	if mappedID != nodeID {
+		c.removeCollisionPeerLocked(hash, nodeID)
+		return
+	}
+	if peerID, found := c.popValidCollisionPeerLocked(hash, nodeID); found {
+		c.nodeMap[hash] = peerID
+		return
+	}
+	delete(c.nodeMap, hash)
+	if c.collisionCount > 0 && len(c.collisionPeers) == 0 {
+		c.collisionCount = 0
+	}
 }

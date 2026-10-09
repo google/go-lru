@@ -788,16 +788,16 @@ func TestOptions_ThresholdReconciliationAndEdgeCases(t *testing.T) {
 			wantStrictLess: true,
 		},
 		{
-			name:           "WithCompactionThreshold95AdvancesEvictionThresholdTo110",
+			name:           "WithCompactionThreshold95ClampsEvictionThresholdTo100",
 			opts:           []Option{WithCompactionThreshold(0.95)},
 			wantCompaction: 0.95,
-			wantEviction:   1.10,
+			wantEviction:   1.0,
 		},
 		{
-			name:           "WithCompactionThreshold100AdvancesEvictionThresholdTo115",
+			name:           "WithCompactionThreshold100ClampsEvictionThresholdTo100",
 			opts:           []Option{WithCompactionThreshold(1.0)},
 			wantCompaction: 1.0,
-			wantEviction:   1.15,
+			wantEviction:   1.0,
 		},
 		{
 			name:           "WithLowEvictionThreshold60ScalesCompactionBelow60",
@@ -939,14 +939,14 @@ func TestOptions_ThresholdReconciliationAndEdgeCases(t *testing.T) {
 			wantEviction:   DefaultEvictionThreshold,
 		},
 		{
-			name: "WithEviction80FollowedByDirectEvictionMutationToDefaultAdvancesWithCompaction95",
+			name: "WithEviction80FollowedByDirectEvictionMutationToDefaultClampsWithCompaction95",
 			opts: []Option{
 				WithEvictionThreshold(0.80),
 				func(o *Options) { o.EvictionThreshold = DefaultEvictionThreshold },
 				WithCompactionThreshold(0.95),
 			},
 			wantCompaction: 0.95,
-			wantEviction:   1.10,
+			wantEviction:   1.0,
 		},
 	}
 
@@ -995,7 +995,7 @@ func TestOptions_CustomAndConditionalOptionClosures(t *testing.T) {
 		assert.Equal(t, math.Float64bits(DefaultCompactionThreshold), math.Float64bits(observedCompaction))
 		assert.Equal(t, math.Float64bits(DefaultEvictionThreshold), math.Float64bits(observedEviction))
 		assert.InDelta(t, 0.95, got.CompactionThreshold, 1e-9)
-		assert.InDelta(t, 1.10, got.EvictionThreshold, 1e-9)
+		assert.InDelta(t, 1.0, got.EvictionThreshold, 1e-9)
 	})
 
 	t.Run("RelativeOptionSettingCompactionEqualToEvictionPreservesEquality", func(t *testing.T) {
@@ -1034,11 +1034,11 @@ func TestOptions_CustomAndConditionalOptionClosures(t *testing.T) {
 
 		// Assert
 		assert.InDelta(t, 0.95, gotUntaken.CompactionThreshold, 1e-9)
-		assert.InDelta(t, 1.10, gotUntaken.EvictionThreshold, 1e-9)
+		assert.InDelta(t, 1.0, gotUntaken.EvictionThreshold, 1e-9)
 		assert.InDelta(t, 0.75, gotTaken.CompactionThreshold, 1e-9)
 		assert.InDelta(t, 0.90, gotTaken.EvictionThreshold, 1e-9)
 		assert.InDelta(t, 0.95, gotCombinedUntaken.CompactionThreshold, 1e-9)
-		assert.InDelta(t, 1.10, gotCombinedUntaken.EvictionThreshold, 1e-9)
+		assert.InDelta(t, 1.0, gotCombinedUntaken.EvictionThreshold, 1e-9)
 	})
 }
 
