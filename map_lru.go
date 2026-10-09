@@ -271,18 +271,30 @@ func (c *mapCache[V]) checkInvariants() {
 	c.checkTelemetryInvariants(c.entries.Len())
 }
 
-func (c *mapCache[V]) unlock() {
+func (c *mapCache[V]) unlockWithInvariants() {
 	defer c.mu.Unlock()
+	c.checkInvariants()
+}
+
+func (c *mapCache[V]) unlock() {
 	if c.options.EnableInvariantChecking {
-		c.checkInvariants()
+		c.unlockWithInvariants()
+		return
 	}
+	c.mu.Unlock()
+}
+
+func (c *mapCache[V]) rUnlockWithInvariants() {
+	defer c.mu.RUnlock()
+	c.checkInvariants()
 }
 
 func (c *mapCache[V]) rUnlock() {
-	defer c.mu.RUnlock()
 	if c.options.EnableInvariantChecking {
-		c.checkInvariants()
+		c.rUnlockWithInvariants()
+		return
 	}
+	c.mu.RUnlock()
 }
 
 // evictOne removes and returns the least recently used entry from the cache.
@@ -555,12 +567,11 @@ func (c *mapCache[V]) Replace(key string, value V) error {
 
 	sampledEpoch, pressure := c.lockWithPressure(&c.mu, false)
 	var evictQ evictCallbackQueue[V]
-	defer evictQ.invoke(&c.pressureState, c.onEvictValue, c.onEvictEntry)
-	defer c.unlock()
 
 	e, ok := c.index[key]
 	if !ok {
 		c.replaceNotFound++
+		c.unlock()
 		return ErrEntryNotExist
 	}
 
@@ -572,6 +583,8 @@ func (c *mapCache[V]) Replace(key string, value V) error {
 		sizeBefore := c.currentSize
 		c.eraseInternal(&evictQ, key, EvictionReasonCapacity)
 		c.finishDeleteReclaimLocked(&evictQ, sizeBefore, sampledEpoch, pressure)
+		c.unlock()
+		evictQ.invoke(&c.pressureState, c.onEvictValue, c.onEvictEntry)
 		return nil
 	}
 
@@ -586,6 +599,8 @@ func (c *mapCache[V]) Replace(key string, value V) error {
 			c.replaceSelfEvicted++
 			c.eraseInternal(&evictQ, key, EvictionReasonCapacity)
 			c.finishDeleteReclaimLocked(&evictQ, sizeBefore, sampledEpoch, pressure)
+			c.unlock()
+			evictQ.invoke(&c.pressureState, c.onEvictValue, c.onEvictEntry)
 			return nil
 		}
 
@@ -615,6 +630,8 @@ func (c *mapCache[V]) Replace(key string, value V) error {
 	}
 
 	c.finishMutationReclaimLocked(&evictQ, nil, e, reclaimedPreUpdate, false, sizeBefore, sampledEpoch, pressure)
+	c.unlock()
+	evictQ.invoke(&c.pressureState, c.onEvictValue, c.onEvictEntry)
 
 	return nil
 }

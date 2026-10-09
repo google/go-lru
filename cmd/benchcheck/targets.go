@@ -371,7 +371,7 @@ func DefaultTargets() []TargetRule {
 			Description:    "ArenaRadixCache Put under critical memory pressure",
 			MaxNsPerOp:     new(float64(12000)),
 			MaxBytesPerOp:  new(float64(512)),
-			MaxAllocsPerOp: new(float64(3)),
+			MaxAllocsPerOp: new(float64(2)),
 		},
 		// 40–46. Range Iterators (9 benchmarks: MapCache & Values 0 allocs/op; Radix/Arena All/Keys <= 1000 allocs/op, <= 24000 B/op)
 		{

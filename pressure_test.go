@@ -1247,10 +1247,10 @@ func testChildGoroutineReclaimingInsidePressureFunc(t *testing.T, b backendDef) 
 	_, err := cache.Put("target_key", testData{value: 1, dataSize: 10})
 	_ = cache.(PressureAwareCache[testData]).EvaluateMemoryPressure()
 
-	// Assert: Both Put and EvaluateMemoryPressure terminate in bounded retries (3 parent samples each = 6 total).
+	// Assert: Both Put and EvaluateMemoryPressure attribute child-goroutine reclamations to the parent sampler (1 parent sample each = 2 total).
 	require.NoError(t, err)
 	assert.True(t, hasKey(cache, "target_key"))
-	assert.Equal(t, int32(6), parentSampleCalls.Load())
+	assert.Equal(t, int32(2), parentSampleCalls.Load())
 }
 
 func testExhaustedEpochRetriesUseLatestEpochPressure(t *testing.T, b backendDef) {

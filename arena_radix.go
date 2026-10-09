@@ -512,8 +512,13 @@ func (c *arenaRadix[V]) evictOne(evictQ *evictCallbackQueue[V]) (V, bool) {
 
 const foregroundNoProtect uint32 = nilNode - 1
 
+func (c *arenaRadix[V]) hasContiguousSlackLocked() bool {
+	return (c.nodeMapDirty || c.deletedSinceCompact > 0) &&
+		(c.len < c.peakEntryLen || c.deletedSinceCompact >= minChurnCompactDeletes || len(c.nodeMap)+c.collisionCount < c.len)
+}
+
 func (c *arenaRadix[V]) isDirtyLocked() bool {
-	return c.freeHead != nilNode || (c.deletedSinceCompact > 0 && len(c.nodes) < cap(c.nodes)) || c.nodeMapDirty
+	return c.freeHead != nilNode || c.hasContiguousSlackLocked()
 }
 
 // eraseInternal handles unlinking from LRU, cleaning up nodeMap, and deleting from the tree
@@ -600,10 +605,13 @@ func (c *arenaRadix[V]) shouldAutoCompactLocked(protectedNodeID uint32) bool {
 	if c.freeHead != nilNode && c.peakEntryLen > minPeakSlackEntries && len(c.nodes) > minPeakSlackEntries && c.freeCount >= 2 && uint64(c.freeCount)*slackQuarterMultiplier >= uint64(len(c.nodes)) {
 		return true
 	}
-	return c.shouldAutoCompactEntryCounts(c.nodeMapDirty, false, c.len)
+	return c.shouldAutoCompactEntryCounts(c.hasContiguousSlackLocked(), false, c.len)
 }
 
 func (c *arenaRadix[V]) compactContiguousLocked() bool {
+	if !c.hasContiguousSlackLocked() {
+		return false
+	}
 	hasSliceSlack := c.deletedSinceCompact > 0 && len(c.nodes) < cap(c.nodes)
 	if !hasSliceSlack && !c.nodeMapDirty {
 		return false

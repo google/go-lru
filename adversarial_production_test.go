@@ -27,6 +27,7 @@ import (
 	"testing"
 	"time"
 	"unsafe"
+	"weak"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -1569,5 +1570,1611 @@ func TestDefect_M01_to_M06_MediumDefectsAndDivergences(t *testing.T) {
 
 		assert.InDelta(t, 0.60, opts3.CompactionThreshold, 1e-9)
 		assert.InDelta(t, 0.85, opts3.EvictionThreshold, 1e-9)
+	})
+}
+
+// ============================================================================
+// Suite 1.7: Remediation Verification (R1..R5: Contiguous Slack, Multi-Cache
+// Isolation, Zero-Alloc Reclaim, and Child-Goroutine Concurrency Invariants)
+// ============================================================================
+
+// TestDefect_R3_ArenaRadixContiguousCompactRequiresTrueSlack verifies R3:
+// When ArenaRadixCache is at capacity and a Put triggers 1 LRU eviction that is immediately
+// reused by allocNode() (leaving freeHead == nilNode, len(nodes) == cap(nodes), and
+// len(nodeMap) == peakEntryLen), Compact() and Tier 1 EvaluateMemoryPressure() must be
+// zero-allocation no-ops unless true contiguous slack exists.
+func TestDefect_R3_ArenaRadixContiguousCompactRequiresTrueSlack(t *testing.T) {
+	t.Run("SteadyStateTurnoverWithZeroSlackPerformsZeroAllocCompactAndTier1NoOp", func(t *testing.T) {
+		// Arrange: Fill ArenaRadixCache(100) with 100 entries and trigger 1 capacity eviction
+		// (matching TestDefect_H06_MapCompactReallocatesWithoutSlack). The evicted node is immediately
+		// reused by allocNode(), leaving freeHead == nilNode, len == peakEntryLen == 100, and deletedSinceCompact == 1.
+		var pressureBits atomic.Uint64
+		pressureBits.Store(math.Float64bits(0.10))
+		c := NewArenaRadixCache[int](100,
+			WithInvariantChecking(true),
+			WithPressureFunc(func() float64 {
+				return math.Float64frombits(pressureBits.Load())
+			}),
+			WithCompactionThreshold(0.75),
+			WithEvictionThreshold(0.90),
+		).(*arenaRadix[int])
+
+		for i := range 100 {
+			_, err := c.Put(fmt.Sprintf("key_%03d", i), i)
+			require.NoError(t, err)
+		}
+		evicted, err := c.Put("key_100", 100)
+		require.NoError(t, err)
+		require.Len(t, evicted, 1)
+
+		require.Equal(t, nilNode, c.freeHead)
+		require.Zero(t, c.freeCount)
+		require.Equal(t, 100, c.len)
+		require.Equal(t, 100, c.peakEntryLen)
+		require.False(t, c.hasContiguousSlackLocked())
+		require.False(t, c.isDirtyLocked())
+		require.False(t, c.shouldAutoCompactLocked(nilNode))
+
+		nodesPtrBefore := unsafe.SliceData(c.nodes)
+		mapPtrBefore := reflect.ValueOf(c.nodeMap).Pointer()
+
+		// Act: Evaluate Tier 1 pressure (0.80) and call explicit Compact().
+		pressureBits.Store(math.Float64bits(0.80))
+		_ = c.EvaluateMemoryPressure()
+		c.Compact()
+		compactAllocs := testing.AllocsPerRun(50, func() {
+			c.Compact()
+		})
+
+		// Assert
+		st := c.Stats()
+		assert.Same(t, nodesPtrBefore, unsafe.SliceData(c.nodes), "c.nodes must not be reallocated when contiguous slack is absent")
+		assert.Equal(t, mapPtrBefore, reflect.ValueOf(c.nodeMap).Pointer(), "c.nodeMap must not be reallocated when map slack is absent")
+		assert.Zero(t, compactAllocs, "Compact() without contiguous slack must perform 0 allocations")
+		assert.Zero(t, st.CompactionsPressureTier1)
+		assert.Zero(t, st.CompactionsExplicit)
+		assert.Zero(t, st.ReclaimEpoch)
+	})
+
+	t.Run("ContiguousUnallocatedSliceSlackAndMapChurnTriggersCompaction", func(t *testing.T) {
+		// Arrange: Insert 9 single-byte keys ("a".."i") into capacity 9 so c.nodes has len 10 in a 16-cap slice,
+		// then perform minChurnCompactDeletes (64) single-byte capacity evictions so freeHead == nilNode
+		// while deletedSinceCompact >= minChurnCompactDeletes and cap(c.nodes) (16) > len(c.nodes) (10).
+		var pressureBits atomic.Uint64
+		pressureBits.Store(math.Float64bits(0.10))
+		c := NewArenaRadixCache[int](9,
+			WithInvariantChecking(true),
+			WithPressureFunc(func() float64 {
+				return math.Float64frombits(pressureBits.Load())
+			}),
+		).(*arenaRadix[int])
+
+		for i := range 9 {
+			_, err := c.Put(string([]byte{byte('a' + i)}), i)
+			require.NoError(t, err)
+		}
+		for i := range minChurnCompactDeletes {
+			_, err := c.Put(string([]byte{byte(128 + i)}), i)
+			require.NoError(t, err)
+		}
+
+		require.Equal(t, nilNode, c.freeHead)
+		require.Greater(t, cap(c.nodes), len(c.nodes))
+		require.True(t, c.hasContiguousSlackLocked())
+		require.True(t, c.isDirtyLocked())
+
+		// Act: Explicit Compact() trims the unallocated tail capacity of c.nodes down to len(c.nodes) and rebuilds nodeMap.
+		c.Compact()
+
+		// Assert
+		st := c.Stats()
+		assert.Equal(t, len(c.nodes), cap(c.nodes), "Compact() must trim unallocated c.nodes capacity")
+		assert.Zero(t, st.ArenaUnallocatedCap)
+		assert.Equal(t, uint64(1), st.CompactionsExplicit)
+		assert.Equal(t, uint64(1), st.ReclaimEpoch)
+	})
+}
+
+// TestDefect_R1_R2_ZeroGlobalStackDumpContentionAndZeroAllocReclaim verifies R1 and R2:
+//  1. Independent cache instances executing OnEvict* or PressureFunc concurrently do not
+//     contend on global singleton slots or allocate 64 KiB runtime.Stack(_, true) buffers.
+//  2. Contended writers on the same cache instance do not repeatedly invoke captureAllGoroutineStacks
+//     once the active primary sampler has been resolved.
+//  3. Steady-state Put under Tier 2 pressure allocates <= 2 objects/op (restoring the PutUnderPressure target).
+func TestDefect_R1_R2_ZeroGlobalStackDumpContentionAndZeroAllocReclaim(t *testing.T) {
+	t.Run("IndependentCachesConcurrentOnEvictAndPressureFuncAllocateZeroStackBuffers", testMultiCacheConcurrentHooksZeroAllocs)
+
+	t.Run("SameCacheContendedWritersResolvePrimarySamplerOnceWithZeroAllocs", func(t *testing.T) {
+		// Arrange: Block primary sampler inside PressureFunc on cacheA, then run a contended writer
+		// from the same parent goroutine (spawned before PressureFunc) in a loop and verify 0 allocs/op.
+		inPrimary := make(chan struct{})
+		releasePrimary := make(chan struct{})
+		var armPrimary atomic.Bool
+
+		c := NewMapCache[int](100, WithPressureFunc(func() float64 {
+			if armPrimary.CompareAndSwap(true, false) {
+				close(inPrimary)
+				<-releasePrimary
+			}
+			return 0.10
+		}))
+		_, err := c.Put("seed", 1)
+		require.NoError(t, err)
+
+		armPrimary.Store(true)
+		var wg sync.WaitGroup
+		wg.Go(func() {
+			_, _ = c.Put("primary_write", 2)
+		})
+		<-inPrimary
+
+		// Act: Repeated contended writes on the same cache resolve the primary sampler once and allocate 0 objects/op.
+		allocs := testing.AllocsPerRun(50, func() {
+			_ = c.Replace("seed", 3)
+		})
+
+		close(releasePrimary)
+		wg.Wait()
+
+		// Assert
+		assert.Zero(t, allocs, "contended writer on same cache must not allocate after primary sampler resolution")
+	})
+
+	t.Run("ArenaRadixPutUnderPressureMeetsTwoAllocsPerOpTarget", func(t *testing.T) {
+		// Arrange
+		c := NewArenaRadixCache[int](512,
+			WithPressureFunc(func() float64 { return 0.95 }),
+			WithCompactionThreshold(0.75),
+			WithEvictionThreshold(0.90),
+			WithEvictionRetentionRatio(0.50),
+		)
+		keys := make([]string, 1024)
+		for i := range keys {
+			keys[i] = fmt.Sprintf("service/instance/item/%06d", i)
+		}
+		for i := range 512 {
+			_, err := c.Put(keys[i], i)
+			require.NoError(t, err)
+		}
+
+		// Act: Measure allocations per Put under continuous Tier 2 pressure (0.95).
+		idx := 512
+		allocs := testing.AllocsPerRun(200, func() {
+			_, _ = c.Put(keys[idx&1023], idx)
+			idx++
+		})
+
+		// Assert: Must be <= 2.0 allocs/op (1 evicted slice + at most 1 prefix string clone, 0 sync.Map Clear allocs).
+		assert.LessOrEqual(t, allocs, 2.0, "ArenaRadixCache PutUnderPressure must allocate <= 2 objects/op")
+	})
+}
+
+func testMultiCacheConcurrentHooksZeroAllocs(t *testing.T) {
+	t.Helper()
+	// Arrange: Hold cachePressureA inside PressureFunc and cacheEvictA inside OnEvictValue concurrently,
+	// while cacheB (with distinct hookTag) executes Replace with PressureFunc and OnEvictValue.
+	inPressureA := make(chan struct{})
+	releasePressureA := make(chan struct{})
+	inEvictA := make(chan struct{})
+	releaseEvictA := make(chan struct{})
+
+	var armPressureA, armEvictA atomic.Bool
+	cachePressureA := NewMapCache[int](2, WithPressureFunc(func() float64 {
+		if armPressureA.CompareAndSwap(true, false) {
+			close(inPressureA)
+			<-releasePressureA
+		}
+		return 0.10
+	}))
+	cacheEvictA := NewMapCache[int](1, WithOnEvictValue(func(_ int, _ EvictionReason) {
+		if armEvictA.CompareAndSwap(true, false) {
+			close(inEvictA)
+			<-releaseEvictA
+		}
+	}))
+	_, err := cacheEvictA.Put("e1", 1)
+	require.NoError(t, err)
+
+	var sinkB int
+	cacheB := NewMapCache[int](2,
+		WithPressureFunc(func() float64 { return 0.10 }),
+		WithOnEvictValue(func(v int, _ EvictionReason) { sinkB = v }),
+	)
+	_, err = cacheB.Put("b1", 1)
+	require.NoError(t, err)
+
+	armPressureA.Store(true)
+	armEvictA.Store(true)
+	var wg sync.WaitGroup
+	wg.Go(func() {
+		_, _ = cachePressureA.Put("p1", 1)
+	})
+	wg.Go(func() {
+		_, _ = cacheEvictA.Put("e2", 2)
+	})
+	<-inPressureA
+	<-inEvictA
+
+	// Act: Measure allocations on cacheB while both cachePressureA and cacheEvictA are blocked in their hooks.
+	allocsB := testing.AllocsPerRun(100, func() {
+		_ = cacheB.Replace("b1", 2)
+	})
+
+	close(releasePressureA)
+	close(releaseEvictA)
+	wg.Wait()
+
+	// Assert
+	assert.Zero(t, allocsB, "independent cacheB must allocate 0 objects while other caches are in PressureFunc and OnEvictValue")
+	assert.Equal(t, 2, sinkB)
+}
+
+// TestDefect_R4_WaitGroupGoReentrancyReclaimSurvivalAndEvictSerialization verifies R4 (CI-01..CI-04):
+//   - CI-01: Child goroutines spawned via sync.WaitGroup.Go or returning helper functions inside
+//     OnEvict* and PressureFunc are recognized as descendants and never deadlock or re-sample.
+//   - CI-02: Multi-hop child -> grandchild chains where the intermediate child goroutine exits
+//     before the grandchild accesses the cache are still recognized via the parent's creatorFunc.
+//   - CI-03: Reclamations performed by a child goroutine inside PressureFunc are attributed to the
+//     active root sampler so the parent sampler does not false-positive retry 3 times and over-evict.
+//   - CI-04: Re-entrant OnEvict* callbacks triggered by child goroutines are strictly serialized
+//     (maxConcurrent == 1) and delivered in FIFO order without deadlocking wg.Wait().
+func TestDefect_R4_WaitGroupGoReentrancyReclaimSurvivalAndEvictSerialization(t *testing.T) {
+	t.Run("CI01_WaitGroupGoAndHelperSpawnedChildInOnEvictAndPressureFunc", testCI01WaitGroupGoAndHelperChild)
+	t.Run("CI02_ExitedIntermediateGoroutineGrandchildDetection", testCI02ExitedIntermediateGrandchild)
+	t.Run("CI03_ChildGoroutineReclaimInsidePressureFuncPreservesSurvivors", testCI03ChildReclaimPreservesSurvivors)
+	t.Run("CI04_ReentrantChildGoroutineEvictCallbacksAreStrictlySerialized", testCI04ReentrantChildEvictSerialized)
+}
+
+func spawnViaReturningHelper(fn func()) {
+	go fn()
+}
+
+func testCI01WaitGroupGoAndHelperChild(t *testing.T) {
+	t.Helper()
+	for _, b := range []Backend{BackendMap, BackendRadix, BackendArenaRadix} {
+		// Arrange
+		var cache Cache[int]
+		var pressureSamples, evictCount atomic.Int32
+		var firstPressure, firstEvict atomic.Bool
+		firstPressure.Store(true)
+		firstEvict.Store(true)
+
+		cache = New[int](1,
+			WithBackend(b),
+			WithInvariantChecking(true),
+			WithPressureFunc(func() float64 {
+				pressureSamples.Add(1)
+				if firstPressure.CompareAndSwap(true, false) {
+					var wg sync.WaitGroup
+					wg.Go(func() {
+						_, _ = cache.Delete("nonexistent_from_wg_go")
+					})
+					wg.Wait()
+				}
+				return 0.10
+			}),
+			WithOnEvictEntry(func(_ string, _ int, _ EvictionReason) {
+				evictCount.Add(1)
+				if firstEvict.CompareAndSwap(true, false) {
+					var wg sync.WaitGroup
+					wg.Go(func() {
+						_, putErr := cache.Put("k3_from_wg_go", 3)
+						assert.NoError(t, putErr)
+					})
+					doneHelper := make(chan struct{})
+					spawnViaReturningHelper(func() {
+						defer close(doneHelper)
+						_, _ = cache.Delete("missing_from_helper")
+					})
+					wg.Wait()
+					<-doneHelper
+				}
+			}),
+		)
+
+		// Act
+		_, err := cache.Put("k1", 1)
+		require.NoError(t, err)
+		require.Equal(t, int32(1), pressureSamples.Load(), "wg.Go child inside PressureFunc must not re-sample")
+
+		done := make(chan struct{})
+		go func() {
+			_, putErr := cache.Put("k2", 2)
+			assert.NoError(t, putErr)
+			close(done)
+		}()
+
+		// Assert
+		select {
+		case <-done:
+		case <-time.After(2 * time.Second):
+			require.Failf(t, "deadlock", "backend %v deadlocked on wg.Go child inside OnEvictEntry", b)
+		}
+		assert.Equal(t, int32(2), evictCount.Load())
+		val, ok := cache.Peek("k3_from_wg_go")
+		require.True(t, ok)
+		assert.Equal(t, 3, val)
+	}
+}
+
+func testCI02ExitedIntermediateGrandchild(t *testing.T) {
+	t.Helper()
+	// Arrange: G1 (in OnEvictValue and PressureFunc) spawns intermediate child G2 via wg.Go;
+	// G2 spawns grandchild G3 and exits immediately (`childExited` closes before G3 touches cache).
+	var cache Cache[int]
+	var pressureCalls, evictCalls atomic.Int32
+
+	cache = NewArenaRadixCache[int](1,
+		WithInvariantChecking(true),
+		WithPressureFunc(func() float64 {
+			if pressureCalls.Add(1) == 1 {
+				grandchildDone := make(chan struct{})
+				childExited := make(chan struct{})
+				var wg sync.WaitGroup
+				wg.Go(func() {
+					go func() {
+						defer close(grandchildDone)
+						<-childExited
+						runtime.Gosched()
+						_, _ = cache.Delete("from_orphan_grandchild")
+					}()
+				})
+				wg.Wait()
+				close(childExited)
+				<-grandchildDone
+			}
+			return 0.10
+		}),
+		WithOnEvictValue(func(_ int, _ EvictionReason) {
+			if evictCalls.Add(1) == 1 {
+				grandchildDone := make(chan struct{})
+				childExited := make(chan struct{})
+				var wg sync.WaitGroup
+				wg.Go(func() {
+					go func() {
+						defer close(grandchildDone)
+						<-childExited
+						runtime.Gosched()
+						_, putErr := cache.Put("k3_from_orphan_grandchild", 30)
+						assert.NoError(t, putErr)
+					}()
+				})
+				wg.Wait()
+				close(childExited)
+				<-grandchildDone
+			}
+		}),
+	)
+
+	// Act
+	_, err := cache.Put("k1", 1)
+	require.NoError(t, err)
+	assert.Equal(t, int32(1), pressureCalls.Load(), "orphan grandchild inside PressureFunc must not re-sample")
+
+	_, err = cache.Put("k2", 2)
+	require.NoError(t, err)
+
+	// Assert
+	assert.Equal(t, int32(2), evictCalls.Load())
+	val, ok := cache.Peek("k3_from_orphan_grandchild")
+	require.True(t, ok)
+	assert.Equal(t, 30, val)
+}
+
+func testCI03ChildReclaimPreservesSurvivors(t *testing.T) {
+	t.Helper()
+	for _, b := range []Backend{BackendMap, BackendRadix, BackendArenaRadix} {
+		// Arrange: Populate 4 entries of 25B each at 0.10 pressure (100B total, retention = 0.50 -> targetSize = 50B).
+		// When EvaluateMemoryPressure() runs at 0.95, its PressureFunc spawns a child goroutine via wg.Go
+		// that reclaims 1 entry ("k1", 25B) via DeletePrefix, triggering markReclaimedLocked on the child goroutine.
+		var pac PressureAwareCache[int]
+		var pressureBits atomic.Uint64
+		pressureBits.Store(math.Float64bits(0.10))
+		var triggerChildDelete atomic.Bool
+		var sampleCount atomic.Int32
+
+		c := New[int](100,
+			WithBackend(b),
+			WithInvariantChecking(true),
+			WithWeigher(func(_ string, v int) uint64 { return uint64(v) }),
+			WithEvictionThreshold(0.90),
+			WithEvictionRetentionRatio(0.50),
+			WithPressureFunc(func() float64 {
+				sampleCount.Add(1)
+				if triggerChildDelete.CompareAndSwap(true, false) {
+					var wg sync.WaitGroup
+					wg.Go(func() {
+						pac.DeletePrefix("k1")
+					})
+					wg.Wait()
+				}
+				return math.Float64frombits(pressureBits.Load())
+			}),
+		)
+		pac = c.(PressureAwareCache[int])
+
+		for _, k := range []string{"k1", "k2", "k3", "k4"} {
+			_, err := c.Put(k, 25)
+			require.NoError(t, err)
+		}
+
+		// Act
+		pressureBits.Store(math.Float64bits(0.95))
+		sampleCount.Store(0)
+		triggerChildDelete.Store(true)
+		evicted := pac.EvaluateMemoryPressure()
+
+		// Assert: Parent sampler sampled only once (did not retry 3 times) and shed only "k2" (25B)
+		// to reach 50B (k3 + k4), rather than over-evicting k3 on a post-retry pass.
+		assert.Equal(t, int32(1), sampleCount.Load(), "backend %v parent sampler must not retry when child goroutine reclaims", b)
+		assert.Len(t, evicted, 1, "backend %v must shed only 1 entry (k2) to reach 50%% retention", b)
+		assert.Equal(t, 2, c.Stats().Len, "backend %v must preserve 2 survivors (k3, k4)", b)
+	}
+}
+
+func testCI04ReentrantChildEvictSerialized(t *testing.T) {
+	t.Helper()
+	for _, b := range []Backend{BackendMap, BackendRadix, BackendArenaRadix} {
+		// Arrange
+		var cache Cache[int]
+		var inFlight, maxConcurrent atomic.Int32
+		var mu sync.Mutex
+		var evictedOrder []string
+
+		cache = New[int](10,
+			WithBackend(b),
+			WithInvariantChecking(true),
+			WithOnEvictEntry(func(key string, _ int, _ EvictionReason) {
+				cur := inFlight.Add(1)
+				for {
+					prev := maxConcurrent.Load()
+					if cur <= prev || maxConcurrent.CompareAndSwap(prev, cur) {
+						break
+					}
+				}
+				mu.Lock()
+				evictedOrder = append(evictedOrder, key)
+				mu.Unlock()
+
+				if key == "k0" {
+					var wg sync.WaitGroup
+					wg.Go(func() {
+						_, _ = cache.Delete("k1")
+					})
+					wg.Go(func() {
+						_, _ = cache.Delete("k2")
+					})
+					wg.Wait()
+				}
+				time.Sleep(2 * time.Millisecond)
+				inFlight.Add(-1)
+			}),
+		)
+
+		_, err := cache.Put("k0", 0)
+		require.NoError(t, err)
+		_, err = cache.Put("k1", 1)
+		require.NoError(t, err)
+		_, err = cache.Put("k2", 2)
+		require.NoError(t, err)
+
+		// Act
+		_, ok := cache.Delete("k0")
+		require.True(t, ok)
+
+		// Assert: All 3 callbacks ran with strict mutual exclusion (maxConcurrent == 1), with "k0" first.
+		assert.Equal(t, int32(1), maxConcurrent.Load(), "backend %v OnEvictEntry must never execute concurrently (maxConcurrent == 1)", b)
+		mu.Lock()
+		assert.Len(t, evictedOrder, 3)
+		assert.Equal(t, "k0", evictedOrder[0])
+		assert.ElementsMatch(t, []string{"k0", "k1", "k2"}, evictedOrder)
+		mu.Unlock()
+	}
+}
+
+// TestAdv_Bug1_FastEvictTagOwnerGlobalMemoryLeak verifies that invoking OnEvict* and
+// PressureFunc on a cache instance never retains a strong pointer to the cache or its
+// cached entries in package-global tag state after the caller drops the cache.
+func TestAdv_Bug1_FastEvictTagOwnerGlobalMemoryLeak(t *testing.T) {
+	for _, b := range []Backend{BackendMap, BackendRadix, BackendArenaRadix} {
+		t.Run(b.String(), func(t *testing.T) {
+			// Arrange: Create a cache inside a non-inlined helper, trigger both PressureFunc
+			// and OnEvictValue on the fast path, and keep a weak.Pointer to a surviving value.
+			wp := createAndDropCacheForGCLeakCheck(t, b)
+
+			// Act: Force garbage collection cycles after the cache reference has been dropped.
+			for range 6 {
+				runtime.GC()
+				runtime.Gosched()
+			}
+
+			// Assert: Neither the cache struct nor its surviving cached entries remain reachable.
+			assert.Nil(t, wp.Value(), "dropped %v instance and its cached entries must be garbage-collected", b)
+		})
+	}
+}
+
+//go:noinline
+func createAndDropCacheForGCLeakCheck(t *testing.T, b Backend) weak.Pointer[byte] {
+	t.Helper()
+	c := New[*byte](2,
+		WithBackend(b),
+		WithPressureFunc(func() float64 { return 0.10 }),
+		WithOnEvictValue(func(_ *byte, _ EvictionReason) {}),
+	)
+	v1 := new(byte)
+	v2 := new(byte)
+	v3 := new(byte)
+	*v2 = 42
+	_, err := c.Put("k1", v1)
+	require.NoError(t, err)
+	_, err = c.Put("k2", v2)
+	require.NoError(t, err)
+	_, err = c.Put("k3", v3) // Evicts k1 on the fast path while k2 and k3 remain in c.
+	require.NoError(t, err)
+	return weak.Make(v2)
+}
+
+// TestAdv_Bug2_PendingChildCallbackPanicLeaksEvictCallbackMuAndDeadlocks verifies that
+// if a child goroutine spawned inside OnEvict* triggers a nested eviction whose queued
+// callback panics inside drainPendingEvictCallbacks, evictCallbackMu is unlocked, all
+// queued events/closures are zeroed, and subsequent evictions do not deadlock.
+func TestAdv_Bug2_PendingChildCallbackPanicLeaksEvictCallbackMuAndDeadlocks(t *testing.T) {
+	for _, b := range []Backend{BackendMap, BackendRadix, BackendArenaRadix} {
+		t.Run(b.String(), func(t *testing.T) {
+			// Arrange
+			var cache Cache[*int]
+			var panicOnBatch atomic.Bool
+			var evictedKeys []string
+			var mu sync.Mutex
+
+			cache = New[*int](10,
+				WithBackend(b),
+				WithInvariantChecking(true),
+				WithOnEvictEntry(func(key string, _ *int, _ EvictionReason) {
+					mu.Lock()
+					evictedKeys = append(evictedKeys, key)
+					mu.Unlock()
+
+					if key == "k1" {
+						var wg sync.WaitGroup
+						wg.Go(func() {
+							pac := cache.(PressureAwareCache[*int])
+							pac.DeletePrefix("batch/")
+						})
+						wg.Wait()
+					}
+					if panicOnBatch.Load() && strings.HasPrefix(key, "batch/") {
+						panic("simulated pending child callback panic")
+					}
+				}),
+			)
+
+			wpBatch2 := populateBug2Cache(t, cache)
+
+			// Act: Delete k1 so its OnEvictEntry spawns a child that deletes batch/1 and batch/2,
+			// and batch/1 panics when drained inside unlockEvictCallbackSlow.
+			panicOnBatch.Store(true)
+			require.PanicsWithValue(t, "simulated pending child callback panic", func() {
+				_, _ = cache.Delete("k1")
+			})
+			panicOnBatch.Store(false)
+
+			for range 6 {
+				runtime.GC()
+				runtime.Gosched()
+			}
+
+			done := make(chan struct{})
+			go func() {
+				_, delOk := cache.Delete("k3")
+				assert.True(t, delOk)
+				close(done)
+			}()
+
+			// Assert: Subsequent eviction completes without deadlocking on evictCallbackMu,
+			// and unconsumed events in the panicking child batch were zeroed for GC.
+			select {
+			case <-done:
+			case <-time.After(2 * time.Second):
+				require.Failf(t, "deadlock", "backend %v permanently deadlocked on evictCallbackMu after pending child callback panic", b)
+			}
+			assert.Nil(t, wpBatch2.Value(), "unconsumed event value in panicking pending callback batch must be zeroed")
+			mu.Lock()
+			assert.Contains(t, evictedKeys, "k3")
+			mu.Unlock()
+		})
+	}
+}
+
+//go:noinline
+func populateBug2Cache(t *testing.T, cache Cache[*int]) weak.Pointer[int] {
+	t.Helper()
+	v1, vBatch1, vBatch2, v3 := new(int), new(int), new(int), new(int)
+	wpBatch2 := weak.Make(vBatch2)
+	_, err := cache.Put("k1", v1)
+	require.NoError(t, err)
+	_, err = cache.Put("batch/1", vBatch1)
+	require.NoError(t, err)
+	_, err = cache.Put("batch/2", vBatch2)
+	require.NoError(t, err)
+	_, err = cache.Put("k3", v3)
+	require.NoError(t, err)
+	return wpBatch2
+}
+
+// TestAdv_Bug3_UnrelatedGoroutineWithExitedParentMisclassifiedAsChild verifies that:
+//  1. An unrelated worker goroutine whose parent goroutine has already exited is not
+//     misclassified as a re-entrant child of an active OnEvict* or PressureFunc holder.
+//  2. A pre-existing worker goroutine spawned via sync.WaitGroup.Go before cache.Put
+//     is not misclassified as a re-entrant child of PressureFunc.
+func TestAdv_Bug3_UnrelatedGoroutineWithExitedParentMisclassifiedAsChild(t *testing.T) {
+	t.Run("UnrelatedWorkerWithExitedParentReturnsFromDeleteOnlyAfterOnEvictRuns", func(t *testing.T) {
+		// Arrange: Spawn a worker from a parent goroutine that immediately exits.
+		parentExited := make(chan struct{})
+		startWorker := make(chan struct{})
+		workerDone := make(chan struct{})
+
+		var cache Cache[int]
+		inK1Evict := make(chan struct{})
+		releaseK1Evict := make(chan struct{})
+		var k2EvictCompleted atomic.Bool
+		var k2CompletedBeforeDeleteReturn atomic.Bool
+
+		go func() {
+			go func() {
+				<-startWorker
+				_, ok := cache.Delete("k2")
+				assert.True(t, ok)
+				k2CompletedBeforeDeleteReturn.Store(k2EvictCompleted.Load())
+				close(workerDone)
+			}()
+			close(parentExited)
+		}()
+		<-parentExited
+		time.Sleep(5 * time.Millisecond)
+
+		var k1Once sync.Once
+		cache = NewMapCache[int](10, WithOnEvictEntry(func(key string, _ int, _ EvictionReason) {
+			switch key {
+			case "k1":
+				k1Once.Do(func() {
+					close(inK1Evict)
+					<-releaseK1Evict
+				})
+			case "k2":
+				time.Sleep(15 * time.Millisecond)
+				k2EvictCompleted.Store(true)
+			}
+		}))
+		_, err := cache.Put("k1", 1)
+		require.NoError(t, err)
+		_, err = cache.Put("k2", 2)
+		require.NoError(t, err)
+
+		// Act: Hold G1 inside OnEvict("k1"), trigger the orphan-parent worker to call Delete("k2"),
+		// then release OnEvict("k1") once the worker is contending on evictCallbackMu.
+		g1Done := make(chan struct{})
+		go func() {
+			_, _ = cache.Delete("k1")
+			close(g1Done)
+		}()
+		<-inK1Evict
+		close(startWorker)
+		time.Sleep(10 * time.Millisecond)
+		close(releaseK1Evict)
+		<-g1Done
+		<-workerDone
+
+		// Assert: Unrelated worker waited for its own OnEvict("k2") to finish before Delete("k2") returned.
+		assert.True(t, k2CompletedBeforeDeleteReturn.Load(), "unrelated worker's Delete(k2) returned before OnEvict(k2) executed")
+	})
+
+	t.Run("UnrelatedWorkerSpawnedViaWaitGroupGoBeforePutNotMisclassifiedAsChildOfSampler", func(t *testing.T) {
+		// Arrange: Spawn a background worker via wg.Go BEFORE calling cache.Put on the same parent goroutine.
+		var cache Cache[int]
+		var calls atomic.Int32
+		workerTrigger := make(chan struct{})
+		workerDone := make(chan struct{})
+		var workerErr error
+		var wg sync.WaitGroup
+
+		wg.Go(func() {
+			<-workerTrigger
+			_, workerErr = cache.Put("worker_key", 2)
+			close(workerDone)
+		})
+
+		var primaryOnce sync.Once
+		cache = NewMapCache[int](10, WithPressureFunc(func() float64 {
+			c := calls.Add(1)
+			if c == 1 {
+				primaryOnce.Do(func() {
+					close(workerTrigger)
+				})
+				deadline := time.Now().Add(200 * time.Millisecond)
+				for calls.Load() < 2 && time.Now().Before(deadline) {
+					runtime.Gosched()
+				}
+			}
+			return 0.10
+		}))
+
+		// Act
+		_, err := cache.Put("parent_key", 1)
+		require.NoError(t, err)
+		<-workerDone
+		wg.Wait()
+		require.NoError(t, workerErr)
+
+		// Assert: Both the parent goroutine and the pre-existing wg.Go worker evaluated PressureFunc.
+		assert.Equal(t, int32(2), calls.Load(), "pre-existing worker spawned via wg.Go before cache.Put must not be misclassified as a child of PressureFunc")
+	})
+
+	t.Run("UnrelatedWorkerWithExitedParentSamplesPressureAndIncrementsExternalReclaimEpoch", func(t *testing.T) {
+		// Arrange: Spawn an unrelated worker from a parent goroutine that immediately exits.
+		parentExited := make(chan struct{})
+		workerTrigger := make(chan struct{})
+		workerDone := make(chan struct{})
+		var cache *mapCache[int]
+		var calls atomic.Int32
+		var workerErr error
+
+		go func() {
+			go func() {
+				<-workerTrigger
+				_, _ = cache.Delete("k_reclaim")
+				_, workerErr = cache.Put("worker_key", 2)
+				close(workerDone)
+			}()
+			close(parentExited)
+		}()
+		<-parentExited
+		time.Sleep(5 * time.Millisecond)
+
+		var armOnce sync.Once
+		var armed atomic.Bool
+		cache = NewMapCache[int](10, WithPressureFunc(func() float64 {
+			if !armed.Load() {
+				return 0.95
+			}
+			c := calls.Add(1)
+			if c == 1 {
+				armOnce.Do(func() {
+					close(workerTrigger)
+				})
+				<-workerDone
+			}
+			return 0.95
+		})).(*mapCache[int])
+
+		_, err := cache.Put("k_reclaim", 1)
+		require.NoError(t, err)
+		epochBefore := cache.externalReclaimEpoch.Load()
+		armed.Store(true)
+
+		// Act
+		_, err = cache.Put("parent_key", 1)
+		require.NoError(t, err)
+		require.NoError(t, workerErr)
+
+		// Assert: Unrelated worker with exited parent evaluated PressureFunc and incremented externalReclaimEpoch.
+		assert.GreaterOrEqual(t, calls.Load(), int32(2), "unrelated worker with exited parent must evaluate PressureFunc")
+		assert.Greater(t, cache.externalReclaimEpoch.Load(), epochBefore, "unrelated worker Delete must increment externalReclaimEpoch")
+	})
+}
+
+// TestAdv_Bug4_SiblingHelperClosureInSameOuterFunctionDeadlocksOnEvictAndBypassesPressureFunc
+// verifies that when an outer function defines both a helper closure (`spawn := func(fn func()) { go fn() }`)
+// and PressureFunc / OnEvict* closures, child goroutines spawned via `spawn` inside PressureFunc or OnEvict*
+// are recognized as descendants rather than rejected because the outer function frame lies below the hook.
+func TestAdv_Bug4_SiblingHelperClosureInSameOuterFunctionDeadlocksOnEvictAndBypassesPressureFunc(t *testing.T) {
+	// Arrange
+	spawnHelper := func(fn func()) {
+		go fn()
+	}
+
+	var cache Cache[int]
+	var pressureCalls, evictCalls atomic.Int32
+	var firstPressure, firstEvict atomic.Bool
+	firstPressure.Store(true)
+	firstEvict.Store(true)
+
+	cache = NewMapCache[int](1,
+		WithInvariantChecking(true),
+		WithPressureFunc(func() float64 {
+			pressureCalls.Add(1)
+			if firstPressure.CompareAndSwap(true, false) {
+				done := make(chan struct{})
+				spawnHelper(func() {
+					defer close(done)
+					_, _ = cache.Delete("missing_from_sibling_helper")
+				})
+				<-done
+			}
+			return 0.10
+		}),
+		WithOnEvictValue(func(_ int, _ EvictionReason) {
+			evictCalls.Add(1)
+			if firstEvict.CompareAndSwap(true, false) {
+				done := make(chan struct{})
+				spawnHelper(func() {
+					defer close(done)
+					_, err := cache.Put("k3_from_sibling_helper", 3)
+					assert.NoError(t, err)
+				})
+				<-done
+			}
+		}),
+	)
+
+	// Act: First Put triggers PressureFunc (where child spawned via spawnHelper must not re-sample);
+	// second Put evicts k1 and triggers OnEvictValue (where child spawned via spawnHelper must not deadlock).
+	_, err := cache.Put("k1", 1)
+	require.NoError(t, err)
+	callsAfterFirstPut := pressureCalls.Load()
+
+	putDone := make(chan struct{})
+	go func() {
+		_, putErr := cache.Put("k2", 2)
+		assert.NoError(t, putErr)
+		close(putDone)
+	}()
+
+	// Assert
+	select {
+	case <-putDone:
+	case <-time.After(2 * time.Second):
+		require.Fail(t, "OnEvictValue deadlocked on evictCallbackMu when child was spawned via sibling helper closure")
+	}
+	assert.Equal(t, int32(1), callsAfterFirstPut, "child spawned via sibling helper closure inside PressureFunc must not re-sample")
+	assert.Equal(t, int32(2), evictCalls.Load(), "both k1 and k2 eviction callbacks must complete")
+}
+
+// TestAdv_Bug5_DetachedChildDrainPendingCallbackNestedEvictionDeadlock verifies that when
+// pending callbacks are drained (either via unlockEvictCallbackSlow or via the post-unlock
+// TryLock path in enqueuePendingCallback), the draining goroutine is registered as the active
+// callback holder with "deliverCallbacks" on the stack so nested synchronous and child-goroutine
+// evictions inside the drained callback never self-deadlock on evictCallbackMu.
+func TestAdv_Bug5_DetachedChildDrainPendingCallbackNestedEvictionDeadlock(t *testing.T) {
+	for _, b := range []Backend{BackendMap, BackendRadix, BackendArenaRadix} {
+		t.Run(b.String(), func(t *testing.T) {
+			// Arrange
+			var cache Cache[int]
+			var evicted []string
+			var mu sync.Mutex
+			allDone := make(chan struct{})
+
+			onEntry := func(key string, _ int, _ EvictionReason) {
+				mu.Lock()
+				evicted = append(evicted, key)
+				n := len(evicted)
+				mu.Unlock()
+
+				switch key {
+				case "k1":
+					go func() {
+						_, _ = cache.Delete("k2")
+					}()
+				case "k2":
+					// Trigger both a synchronous nested eviction and a wg.Go child nested eviction
+					// while draining pending callbacks.
+					_, _ = cache.Delete("k3")
+					var wg sync.WaitGroup
+					wg.Go(func() {
+						_, _ = cache.Delete("k4")
+					})
+					wg.Wait()
+				}
+				if n == 4 {
+					close(allDone)
+				}
+			}
+
+			cache = New[int](10,
+				WithBackend(b),
+				WithInvariantChecking(true),
+				WithOnEvictEntry(onEntry),
+			)
+			for _, k := range []string{"k1", "k2", "k3", "k4"} {
+				_, err := cache.Put(k, 1)
+				require.NoError(t, err)
+			}
+
+			// Act: First verify the end-to-end detached child chain (k1 -> detached k2 -> k3 & k4).
+			_, ok := cache.Delete("k1")
+			require.True(t, ok)
+
+			select {
+			case <-allDone:
+			case <-time.After(2 * time.Second):
+				require.Failf(t, "deadlock", "backend %v deadlocked during detached child pending callback nested eviction", b)
+			}
+
+			// Also deterministically exercise enqueuePendingCallback's direct TryLock() drain path
+			// when evictCallbackMu is currently unlocked.
+			_, err := cache.Put("k2", 2)
+			require.NoError(t, err)
+			_, err = cache.Put("k3", 3)
+			require.NoError(t, err)
+			_, err = cache.Put("k4", 4)
+			require.NoError(t, err)
+
+			var p *pressureState
+			switch impl := cache.(type) {
+			case *mapCache[int]:
+				p = &impl.pressureState
+			case *radixCache[int]:
+				p = &impl.pressureState
+			case *arenaRadix[int]:
+				p = &impl.pressureState
+			}
+
+			directDone := make(chan struct{})
+			go func() {
+				var q evictCallbackQueue[int]
+				q.enqueue("k2", 2, EvictionReasonDeleted)
+				q.enqueuePendingCallback(p, nil, onEntry)
+				close(directDone)
+			}()
+
+			// Assert
+			select {
+			case <-directDone:
+			case <-time.After(2 * time.Second):
+				require.Failf(t, "deadlock", "backend %v enqueuePendingCallback TryLock drain self-deadlocked on nested eviction", b)
+			}
+		})
+	}
+}
+
+// TestAdv_Bug6_TagCollisionForcesIndependentCacheIntoStackDumpAllocations verifies that when
+// more than 8 caches exist (e.g. caches[0] and caches[8]), holding caches[0] inside OnEvict*
+// and PressureFunc does not force an uncontended caches[8] onto the slow stack-capture path
+// or mark caches[8] as contended.
+func TestAdv_Bug6_TagCollisionForcesIndependentCacheIntoStackDumpAllocations(t *testing.T) {
+	// Arrange: Create 17 caches so caches[0], caches[8], and caches[16] would collide under modulo-8 indexing.
+	const numCaches = 17
+	inEvict0 := make(chan struct{})
+	releaseEvict0 := make(chan struct{})
+	inPressure0 := make(chan struct{})
+	releasePressure0 := make(chan struct{})
+	var armEvict0, armPressure0 atomic.Bool
+
+	caches := make([]*mapCache[int], numCaches)
+	for i := range numCaches {
+		idx := i
+		c := NewMapCache[int](2,
+			WithPressureFunc(func() float64 {
+				if idx == 0 && armPressure0.CompareAndSwap(true, false) {
+					close(inPressure0)
+					<-releasePressure0
+				}
+				return 0.10
+			}),
+			WithOnEvictValue(func(_ int, _ EvictionReason) {
+				if idx == 0 && armEvict0.CompareAndSwap(true, false) {
+					close(inEvict0)
+					<-releaseEvict0
+				}
+			}),
+		).(*mapCache[int])
+		_, err := c.Put("k1", 1)
+		require.NoError(t, err)
+		_, err = c.Put("k2", 2)
+		require.NoError(t, err)
+		caches[i] = c
+	}
+
+	armEvict0.Store(true)
+	var wg sync.WaitGroup
+	wg.Go(func() {
+		_, _ = caches[0].Put("k3", 3) // Evicts k1 on caches[0] and blocks inside OnEvictValue.
+	})
+	<-inEvict0
+
+	// Act: Perform uncontended evictions and replacements on caches[8] and caches[16] while caches[0] is blocked.
+	_, err := caches[8].Put("k3", 3)
+	require.NoError(t, err)
+	_, err = caches[16].Put("k3", 3)
+	require.NoError(t, err)
+
+	allocs8 := testing.AllocsPerRun(50, func() {
+		_ = caches[8].Replace("k2", 20)
+	})
+
+	close(releaseEvict0)
+	wg.Wait()
+
+	armPressure0.Store(true)
+	wg.Go(func() {
+		_ = caches[0].Replace("k2", 30) // Blocks caches[0] inside PressureFunc.
+	})
+	<-inPressure0
+
+	_ = caches[8].Replace("k2", 40)
+	_ = caches[16].Replace("k2", 40)
+
+	close(releasePressure0)
+	wg.Wait()
+
+	// Assert: Neither caches[8] nor caches[16] was forced onto the slow stack-capture path or marked contended.
+	assert.Zero(t, allocs8)
+	assert.False(t, caches[8].evictCallbackContended.Load(), "uncontended caches[8] must not be marked evictCallbackContended")
+	assert.Zero(t, caches[8].evictCallbackGID.Load(), "uncontended caches[8] must not capture evictCallbackGID")
+	assert.False(t, caches[8].samplingContended.Load(), "uncontended caches[8] must not be marked samplingContended")
+	assert.Zero(t, caches[8].samplingGID.Load(), "uncontended caches[8] must not capture samplingGID")
+	assert.False(t, caches[16].evictCallbackContended.Load(), "uncontended caches[16] must not be marked evictCallbackContended")
+	assert.False(t, caches[16].samplingContended.Load(), "uncontended caches[16] must not be marked samplingContended")
+}
+
+//go:noinline
+func runWithWaitGroupWrapper(wg *sync.WaitGroup, fn func()) {
+	wg.Go(func() {
+		fn()
+	})
+}
+
+// TestAdv_Iter2_WaitGroupGoWrapperHelperDropsCallerFrame verifies Bug Iter2-1:
+// when sync.WaitGroup.Go is wrapped inside a helper function (pushing the caller's
+// closure to the third bottom stack frame fn2 above "created by"), child and
+// grandchild goroutines spawned inside OnEvict* or PressureFunc are still recognized
+// as descendants (even when an intermediate goroutine has exited), while pre-existing
+// workers spawned via the same wrapper before cache.Put are not misclassified as children.
+func TestAdv_Iter2_WaitGroupGoWrapperHelperDropsCallerFrame(t *testing.T) {
+	t.Run("ExitedIntermediateGoroutineSpawningViaWaitGroupGoWrapperDeadlocksOnEvictAndBypassesPressureFunc", func(t *testing.T) {
+		// Arrange
+		var cache Cache[int]
+		var pressureCalls, evictCalls atomic.Int32
+		var firstPressure, firstEvict atomic.Bool
+		firstPressure.Store(true)
+		firstEvict.Store(true)
+
+		cache = NewMapCache[int](1,
+			WithInvariantChecking(true),
+			WithPressureFunc(func() float64 {
+				pressureCalls.Add(1)
+				if firstPressure.CompareAndSwap(true, false) {
+					g2Exited := make(chan struct{})
+					g3Done := make(chan struct{})
+					var wg sync.WaitGroup
+					go func() {
+						runWithWaitGroupWrapper(&wg, func() {
+							defer close(g3Done)
+							<-g2Exited
+							time.Sleep(5 * time.Millisecond)
+							_, _ = cache.Delete("missing_from_wg_wrapper")
+						})
+						close(g2Exited)
+					}()
+					<-g3Done
+					wg.Wait()
+				}
+				return 0.10
+			}),
+			WithOnEvictValue(func(_ int, _ EvictionReason) {
+				evictCalls.Add(1)
+				if firstEvict.CompareAndSwap(true, false) {
+					g2Exited := make(chan struct{})
+					g3Done := make(chan struct{})
+					var wg sync.WaitGroup
+					go func() {
+						runWithWaitGroupWrapper(&wg, func() {
+							defer close(g3Done)
+							<-g2Exited
+							time.Sleep(5 * time.Millisecond)
+							_, putErr := cache.Put("k3_from_wg_wrapper", 3)
+							assert.NoError(t, putErr)
+						})
+						close(g2Exited)
+					}()
+					<-g3Done
+					wg.Wait()
+				}
+			}),
+		)
+
+		// Act
+		_, err := cache.Put("k1", 1)
+		require.NoError(t, err)
+		callsAfterFirstPut := pressureCalls.Load()
+
+		putDone := make(chan struct{})
+		go func() {
+			_, putErr := cache.Put("k2", 2)
+			assert.NoError(t, putErr)
+			close(putDone)
+		}()
+
+		// Assert
+		select {
+		case <-putDone:
+		case <-time.After(2 * time.Second):
+			require.Fail(t, "deadlock: OnEvictValue deadlocked on evictCallbackMu when exited child spawned grandchild via wg.Go wrapper")
+		}
+		assert.Equal(t, int32(1), callsAfterFirstPut, "grandchild spawned via wg.Go wrapper after intermediate child exited must not bypass PressureFunc guard")
+		assert.Equal(t, int32(2), evictCalls.Load(), "both k1 and k2 eviction callbacks must complete")
+	})
+
+	t.Run("PreExistingWorkerViaWaitGroupGoWrapperMisclassifiedWhenCallbackUsesWaitGroup", func(t *testing.T) {
+		// Arrange: Spawn a pre-existing worker via runWithWaitGroupWrapper before cache.Put,
+		// and also use a local sync.WaitGroup inside PressureFunc so "\nsync.(*WaitGroup)."
+		// is present in aboveHook while the pre-existing worker accesses the cache.
+		var cache Cache[int]
+		var calls atomic.Int32
+		workerTrigger := make(chan struct{})
+		workerDone := make(chan struct{})
+		var workerErr error
+		var preWG sync.WaitGroup
+
+		runWithWaitGroupWrapper(&preWG, func() {
+			<-workerTrigger
+			_, workerErr = cache.Put("worker_key", 2)
+			close(workerDone)
+		})
+
+		var primaryOnce sync.Once
+		cache = NewMapCache[int](10, WithPressureFunc(func() float64 {
+			c := calls.Add(1)
+			if c == 1 {
+				var innerWG sync.WaitGroup
+				innerWG.Go(func() {
+					primaryOnce.Do(func() {
+						close(workerTrigger)
+					})
+					deadline := time.Now().Add(200 * time.Millisecond)
+					for calls.Load() < 2 && time.Now().Before(deadline) {
+						runtime.Gosched()
+					}
+				})
+				innerWG.Wait()
+			}
+			return 0.10
+		}))
+
+		// Act
+		_, err := cache.Put("parent_key", 1)
+		require.NoError(t, err)
+		<-workerDone
+		preWG.Wait()
+		require.NoError(t, workerErr)
+
+		// Assert
+		assert.Equal(t, int32(2), calls.Load(), "pre-existing worker spawned via wg.Go wrapper before cache.Put was misclassified as child of PressureFunc")
+	})
+}
+
+//go:noinline
+func startPreExistingWorkerHelper(trigger <-chan struct{}, fn func()) {
+	go func() {
+		<-trigger
+		fn()
+	}()
+}
+
+// TestAdv_Iter2_PreExistingWorkerSpawnedViaHelperOrSetupClosureMisclassifiedAsChild
+// verifies Bug Iter2-2: pre-existing background goroutines spawned by the same parent
+// goroutine before cache.Delete or cache.Put via a helper function or local setup closure
+// are not misclassified as re-entrant children of OnEvict* or PressureFunc.
+func TestAdv_Iter2_PreExistingWorkerSpawnedViaHelperOrSetupClosureMisclassifiedAsChild(t *testing.T) {
+	t.Run("PreExistingWorkerStartedViaHelperBeforeDeleteReturnsBeforeOnEvictRuns", func(t *testing.T) {
+		// Arrange
+		startWorker := make(chan struct{})
+		workerDone := make(chan struct{})
+
+		var cache Cache[int]
+		var k2EvictCompleted atomic.Bool
+		var k2CompletedBeforeDeleteReturn atomic.Bool
+
+		startPreExistingWorkerHelper(startWorker, func() {
+			_, ok := cache.Delete("k2")
+			assert.True(t, ok)
+			k2CompletedBeforeDeleteReturn.Store(k2EvictCompleted.Load())
+			close(workerDone)
+		})
+
+		var k1Once sync.Once
+		cache = NewMapCache[int](10, WithOnEvictEntry(func(key string, _ int, _ EvictionReason) {
+			switch key {
+			case "k1":
+				k1Once.Do(func() {
+					close(startWorker)
+					time.Sleep(10 * time.Millisecond)
+				})
+			case "k2":
+				time.Sleep(15 * time.Millisecond)
+				k2EvictCompleted.Store(true)
+			}
+		}))
+		_, err := cache.Put("k1", 1)
+		require.NoError(t, err)
+		_, err = cache.Put("k2", 2)
+		require.NoError(t, err)
+
+		// Act: Call Delete("k1") directly on the same parent goroutine that started the helper worker.
+		_, ok := cache.Delete("k1")
+		require.True(t, ok)
+		<-workerDone
+
+		// Assert
+		assert.True(t, k2CompletedBeforeDeleteReturn.Load(), "pre-existing worker's Delete(k2) returned BEFORE OnEvict(k2) executed (misclassified as child of OnEvict(k1))")
+	})
+
+	t.Run("PreExistingWorkerStartedViaHelperBeforePutMisclassifiedAsChildOfSampler", func(t *testing.T) {
+		// Arrange
+		workerTrigger := make(chan struct{})
+		workerDone := make(chan struct{})
+		var cache *mapCache[int]
+		var calls atomic.Int32
+		var workerErr error
+
+		startPreExistingWorkerHelper(workerTrigger, func() {
+			_, _ = cache.Delete("k_reclaim")
+			_, workerErr = cache.Put("worker_key", 2)
+			close(workerDone)
+		})
+
+		var armOnce sync.Once
+		var armed atomic.Bool
+		cache = NewMapCache[int](10, WithPressureFunc(func() float64 {
+			if !armed.Load() {
+				return 0.95
+			}
+			c := calls.Add(1)
+			if c == 1 {
+				armOnce.Do(func() {
+					close(workerTrigger)
+				})
+				<-workerDone
+			}
+			return 0.95
+		})).(*mapCache[int])
+
+		_, err := cache.Put("k_reclaim", 1)
+		require.NoError(t, err)
+		epochBefore := cache.externalReclaimEpoch.Load()
+		armed.Store(true)
+
+		// Act
+		_, err = cache.Put("parent_key", 1)
+		require.NoError(t, err)
+		require.NoError(t, workerErr)
+
+		// Assert
+		assert.GreaterOrEqual(t, calls.Load(), int32(2), "pre-existing worker spawned via helper before cache.Put was misclassified as a child of PressureFunc")
+		assert.Greater(t, cache.externalReclaimEpoch.Load(), epochBefore, "pre-existing worker Delete was misclassified as child sampler reclaim and failed to increment externalReclaimEpoch")
+	})
+
+	t.Run("PreExistingWorkerStartedViaSetupClosureBeforePutMisclassifiedAsChildOfSampler", func(t *testing.T) {
+		// Arrange
+		workerTrigger := make(chan struct{})
+		workerDone := make(chan struct{})
+		var cache Cache[int]
+		var calls atomic.Int32
+		var workerErr error
+
+		startSetup := func() {
+			go func() {
+				<-workerTrigger
+				_, workerErr = cache.Put("worker_key", 2)
+				close(workerDone)
+			}()
+		}
+		startSetup()
+
+		var primaryOnce sync.Once
+		cache = NewMapCache[int](10, WithPressureFunc(func() float64 {
+			c := calls.Add(1)
+			if c == 1 {
+				primaryOnce.Do(func() {
+					close(workerTrigger)
+				})
+				deadline := time.Now().Add(200 * time.Millisecond)
+				for calls.Load() < 2 && time.Now().Before(deadline) {
+					runtime.Gosched()
+				}
+			}
+			return 0.10
+		}))
+
+		// Act
+		_, err := cache.Put("parent_key", 1)
+		require.NoError(t, err)
+		<-workerDone
+		require.NoError(t, workerErr)
+
+		// Assert
+		assert.Equal(t, int32(2), calls.Load(), "pre-existing worker spawned via setup closure before cache.Put was misclassified as a child of PressureFunc")
+	})
+}
+
+//go:noinline
+func runGenericWaitGroupWorkerScenario[T any](t *testing.T, val T) {
+	t.Helper()
+
+	// Arrange: Both the pre-existing wg.Go worker (.func1) and PressureFunc (.func2)
+	// are closures inside the same generic function runGenericWaitGroupWorkerScenario[...].
+	var cache Cache[T]
+	var calls atomic.Int32
+	workerTrigger := make(chan struct{})
+	workerDone := make(chan struct{})
+	var workerErr error
+	var wg sync.WaitGroup
+
+	wg.Go(func() {
+		<-workerTrigger
+		_, workerErr = cache.Put("worker_key", val)
+		close(workerDone)
+	})
+
+	var primaryOnce sync.Once
+	cache = NewMapCache[T](10, WithPressureFunc(func() float64 {
+		c := calls.Add(1)
+		if c == 1 {
+			var childWG sync.WaitGroup
+			childWG.Go(func() {
+				_, _ = cache.Delete("missing_generic_child")
+			})
+			childWG.Wait()
+
+			primaryOnce.Do(func() {
+				close(workerTrigger)
+			})
+			deadline := time.Now().Add(200 * time.Millisecond)
+			for calls.Load() < 2 && time.Now().Before(deadline) {
+				runtime.Gosched()
+			}
+		}
+		return 0.10
+	}))
+
+	// Act
+	_, err := cache.Put("parent_key", val)
+	require.NoError(t, err)
+	<-workerDone
+	wg.Wait()
+	require.NoError(t, workerErr)
+
+	// Assert
+	assert.Equal(t, int32(2), calls.Load(), "pre-existing wg.Go worker in generic function must not be misclassified as child of PressureFunc due to '[' truncation in trimFrameFuncName")
+}
+
+// TestAdv_Iter2_GenericFunctionClosuresTruncatedByTrimFrameFuncName verifies Bug Iter2-3:
+// trimFrameFuncName skips generic type parameter brackets "[...]" rather than truncating at '[',
+// so a pre-existing wg.Go worker closure (fn[...].func1) is not confused with a PressureFunc
+// closure (fn[...].func2) defined in the same generic function.
+func TestAdv_Iter2_GenericFunctionClosuresTruncatedByTrimFrameFuncName(t *testing.T) {
+	runGenericWaitGroupWorkerScenario(t, 42)
+}
+
+// TestAdv_Iter2_PanickingPendingCallbackLeavesNestedChildQueueLeaked verifies Bug Iter2-4:
+// when a drained pending child callback spawns another nested child goroutine that enqueues
+// a second-generation callback into pendingEvictCallbacks and the drained callback then panics,
+// unlockEvictCallbackSlow clears pendingEvictCallbacks and resets evictPendingEnqueues to 0.
+func TestAdv_Iter2_PanickingPendingCallbackLeavesNestedChildQueueLeaked(t *testing.T) {
+	for _, b := range []Backend{BackendMap, BackendRadix, BackendArenaRadix} {
+		t.Run(b.String(), func(t *testing.T) {
+			// Arrange
+			var cache Cache[*int]
+			cache = New[*int](10,
+				WithBackend(b),
+				WithInvariantChecking(true),
+				WithOnEvictEntry(func(key string, _ *int, _ EvictionReason) {
+					switch key {
+					case "k1":
+						var wg sync.WaitGroup
+						wg.Go(func() {
+							_, _ = cache.Delete("k2")
+						})
+						wg.Wait()
+					case "k2":
+						var wg sync.WaitGroup
+						wg.Go(func() {
+							_, _ = cache.Delete("k3")
+						})
+						wg.Wait()
+						panic("simulated panic after nested child enqueue")
+					}
+				}),
+			)
+
+			wpV3 := populateIter2Bug4Cache(t, cache)
+			p := extractPressureStateForIter2Test(cache)
+
+			// Act
+			require.PanicsWithValue(t, "simulated panic after nested child enqueue", func() {
+				_, _ = cache.Delete("k1")
+			})
+
+			for range 6 {
+				runtime.GC()
+				runtime.Gosched()
+			}
+
+			done := make(chan struct{})
+			go func() {
+				_, ok := cache.Delete("k4")
+				assert.True(t, ok)
+				close(done)
+			}()
+
+			// Assert
+			select {
+			case <-done:
+			case <-time.After(2 * time.Second):
+				require.Failf(t, "deadlock", "backend %v deadlocked on subsequent Delete after panicking pending callback", b)
+			}
+			assert.Zero(t, p.evictPendingEnqueues.Load(), "evictPendingEnqueues must be cleared when drainPendingEvictCallbacks unwinds on panic")
+			assert.Nil(t, wpV3.Value(), "nested pending callback closure and its captured value v3 must be cleared on panic")
+		})
+	}
+}
+
+//go:noinline
+func populateIter2Bug4Cache(t *testing.T, cache Cache[*int]) weak.Pointer[int] {
+	t.Helper()
+	v1, v2, v3, v4 := new(int), new(int), new(int), new(int)
+	wpV3 := weak.Make(v3)
+	_, err := cache.Put("k1", v1)
+	require.NoError(t, err)
+	_, err = cache.Put("k2", v2)
+	require.NoError(t, err)
+	_, err = cache.Put("k3", v3)
+	require.NoError(t, err)
+	_, err = cache.Put("k4", v4)
+	require.NoError(t, err)
+	return wpV3
+}
+
+func extractPressureStateForIter2Test[V any](cache Cache[V]) *pressureState {
+	switch impl := cache.(type) {
+	case *mapCache[V]:
+		return &impl.pressureState
+	case *radixCache[V]:
+		return &impl.pressureState
+	case *arenaRadix[V]:
+		return &impl.pressureState
+	default:
+		return nil
+	}
+}
+
+type methodChildWorker struct {
+	cache   Cache[int]
+	putDone chan struct{}
+	putErr  error
+}
+
+//go:noinline
+func (w *methodChildWorker) deleteFromChild() {
+	_, _ = w.cache.Delete("missing_from_named_method")
+}
+
+//go:noinline
+func (w *methodChildWorker) putFromChild() {
+	defer close(w.putDone)
+	_, w.putErr = w.cache.Put("k3_from_named_method", 3)
+}
+
+// TestAdv_Iter3_NamedMethodAndOuterWrapperChildGoroutines verifies Iteration 3 Findings 1 & 2:
+// (1) spawning child goroutines inside OnEvict* and PressureFunc via named methods or method
+// values (go w.putFromChild() and wg.Go(w.deleteFromChild)) does not match shared go-lru
+// entry frames in belowHook, and (2) spawning child goroutines via a returning outer helper
+// closure that wraps go func() { fn() }() does not abort at Frame 0 before matching the
+// callback's closure owner at Frame 1 in aboveHook.
+func TestAdv_Iter3_NamedMethodAndOuterWrapperChildGoroutines(t *testing.T) {
+	t.Run("MethodValueInWaitGroupGoAndGoStatementInsideOnEvictAndPressureFunc", func(t *testing.T) {
+		// Arrange
+		var pressureCalls, evictCalls atomic.Int32
+		var firstPressure, firstEvict, evictDeadlocked atomic.Bool
+		firstPressure.Store(true)
+		firstEvict.Store(true)
+
+		w := &methodChildWorker{
+			putDone: make(chan struct{}),
+		}
+
+		w.cache = NewMapCache[int](1,
+			WithInvariantChecking(true),
+			WithPressureFunc(func() float64 {
+				pressureCalls.Add(1)
+				if firstPressure.CompareAndSwap(true, false) {
+					var wg sync.WaitGroup
+					wg.Go(w.deleteFromChild)
+					wg.Wait()
+				}
+				return 0.10
+			}),
+			WithOnEvictValue(func(_ int, _ EvictionReason) {
+				evictCalls.Add(1)
+				if firstEvict.CompareAndSwap(true, false) {
+					go w.putFromChild()
+					select {
+					case <-w.putDone:
+					case <-time.After(500 * time.Millisecond):
+						evictDeadlocked.Store(true)
+					}
+					var wg sync.WaitGroup
+					wg.Go(w.deleteFromChild)
+					wg.Wait()
+				}
+			}),
+		)
+
+		// Act
+		_, err := w.cache.Put("k1", 1)
+		require.NoError(t, err)
+		callsAfterFirstPut := pressureCalls.Load()
+
+		_, err = w.cache.Put("k2", 2)
+		require.NoError(t, err)
+		<-w.putDone
+
+		// Assert
+		require.False(t, evictDeadlocked.Load(), "deadlock: OnEvictValue deadlocked when spawning child via go w.putFromChild()")
+		require.NoError(t, w.putErr)
+		assert.Equal(t, int32(1), callsAfterFirstPut, "child spawned via wg.Go(w.deleteFromChild) must not bypass PressureFunc re-entrancy guard")
+		assert.Equal(t, int32(2), evictCalls.Load(), "both k1 and k2 eviction callbacks must complete")
+	})
+
+	t.Run("ReturningOuterClosureSpawningInnerGoFuncWrapper", func(t *testing.T) {
+		// Arrange
+		spawnReturningInnerGoFunc := func(fn func()) <-chan struct{} {
+			done := make(chan struct{})
+			go func() {
+				defer close(done)
+				fn()
+			}()
+			return done
+		}
+
+		var cache Cache[int]
+		var pressureCalls, evictCalls atomic.Int32
+		var firstPressure, firstEvict, evictDeadlocked atomic.Bool
+		var childDone <-chan struct{}
+		var childPutErr error
+		firstPressure.Store(true)
+		firstEvict.Store(true)
+
+		cache = NewMapCache[int](1,
+			WithInvariantChecking(true),
+			WithPressureFunc(func() float64 {
+				pressureCalls.Add(1)
+				if firstPressure.CompareAndSwap(true, false) {
+					<-spawnReturningInnerGoFunc(func() {
+						_, _ = cache.Delete("missing_from_outer_closure_wrapper")
+					})
+				}
+				return 0.10
+			}),
+			WithOnEvictValue(func(_ int, _ EvictionReason) {
+				evictCalls.Add(1)
+				if firstEvict.CompareAndSwap(true, false) {
+					childDone = spawnReturningInnerGoFunc(func() {
+						_, childPutErr = cache.Put("k3_from_outer_closure_wrapper", 3)
+					})
+					select {
+					case <-childDone:
+					case <-time.After(500 * time.Millisecond):
+						evictDeadlocked.Store(true)
+					}
+				}
+			}),
+		)
+
+		// Act
+		_, err := cache.Put("k1", 1)
+		require.NoError(t, err)
+		callsAfterFirstPut := pressureCalls.Load()
+
+		_, err = cache.Put("k2", 2)
+		require.NoError(t, err)
+		<-childDone
+
+		// Assert
+		require.False(t, evictDeadlocked.Load(), "deadlock: OnEvictValue deadlocked when spawning child via returning outer helper closure")
+		require.NoError(t, childPutErr)
+		assert.Equal(t, int32(1), callsAfterFirstPut, "returning outer helper closure using go func() { fn() }() must not bypass PressureFunc re-entrancy guard")
+		assert.Equal(t, int32(2), evictCalls.Load(), "both k1 and k2 eviction callbacks must complete")
 	})
 }
