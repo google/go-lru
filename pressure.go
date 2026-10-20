@@ -1949,7 +1949,7 @@ func (p *pressureState) clearActiveFastEvictTag() {
 		return
 	}
 	if id := p.hookIDVal.Load(); id != 0 {
-		tag := p.evictTagHint.Load() & (numPressureHookTags - 1)
+		tag := p.evictTag(id)
 		fastEvictTagState[tag].CompareAndSwap((id<<1)|1, id<<1)
 	}
 }
