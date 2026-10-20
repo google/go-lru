@@ -271,6 +271,7 @@ func (c *mapCache[V]) checkInvariants() {
 	c.checkTelemetryInvariants(c.entries.Len())
 }
 
+//go:noinline
 func (c *mapCache[V]) unlockWithInvariants() {
 	defer c.mu.Unlock()
 	c.checkInvariants()
@@ -284,6 +285,7 @@ func (c *mapCache[V]) unlock() {
 	c.mu.Unlock()
 }
 
+//go:noinline
 func (c *mapCache[V]) rUnlockWithInvariants() {
 	defer c.mu.RUnlock()
 	c.checkInvariants()
@@ -330,6 +332,10 @@ func (c *mapCache[V]) finishDeleteReclaimLocked(evictQ *evictCallbackQueue[V], s
 }
 
 func (c *mapCache[V]) finishMutationReclaimLocked(evictQ *evictCallbackQueue[V], evictedValues []V, protectedElem *entry[V], reclaimedPre, compactedPre bool, sizeBefore, sampledEpoch uint64, pressure float64) []V {
+	if !reclaimedPre && c.currentSize >= sizeBefore && pressure < c.options.CompactionThreshold && pressure < c.options.EvictionThreshold {
+		c.resetZeroWatermarkBelowTier2(pressure)
+		return evictedValues
+	}
 	evictedByPressure := c.maybeReclaimUnderPressureLocked(evictQ, pressure, protectedElem, false)
 	evictedValues = appendEvicted(evictedValues, evictedByPressure)
 	netByteReduced := c.currentSize < sizeBefore
@@ -555,6 +561,32 @@ func (c *mapCache[V]) canFitGrowthLocked(e *entry[V], newSize, sizeDelta, avail 
 	}
 }
 
+func (c *mapCache[V]) replaceResizeOrEvictLocked(evictQ *evictCallbackQueue[V], e *entry[V], key string, oldSize, newSize, sizeBefore, sampledEpoch uint64, pressure float64) (evictedAny, selfEvicted bool) {
+	if newSize > oldSize {
+		sizeDelta := newSize - oldSize
+		if newSize > c.maxSize || !c.canFitGrowthLocked(e, newSize, sizeDelta, c.maxSize-c.currentSize) {
+			c.replaceSelfEvicted++
+			c.eraseInternal(evictQ, key, EvictionReasonCapacity)
+			c.finishDeleteReclaimLocked(evictQ, sizeBefore, sampledEpoch, pressure)
+			return false, true
+		}
+		for sizeDelta > c.maxSize-c.currentSize && c.entries.Len() > 0 && c.entries.Back() != e {
+			c.evictOne(evictQ)
+			evictedAny = true
+		}
+		c.onEntrySizeUpdated(oldSize, newSize)
+		c.currentSize += sizeDelta
+		return evictedAny, false
+	}
+	if c.shouldEvictOnZeroWeightShrink(oldSize, newSize, c.maxSize) && c.entries.Back() != e {
+		c.evictOne(evictQ)
+		evictedAny = true
+	}
+	c.onEntrySizeUpdated(oldSize, newSize)
+	c.currentSize -= oldSize - newSize
+	return evictedAny, false
+}
+
 // Replace updates the value of an existing key and recomputes its weight
 // without modifying its LRU position.
 // If the entry's updated weight exceeds maxSize (or cannot fit alongside entries more recent than key),
@@ -577,61 +609,41 @@ func (c *mapCache[V]) Replace(key string, value V) error {
 
 	oldSize := e.size
 	oldValue := e.value
-
-	if newSize > c.maxSize {
-		c.replaceSelfEvicted++
-		sizeBefore := c.currentSize
-		c.eraseInternal(&evictQ, key, EvictionReasonCapacity)
-		c.finishDeleteReclaimLocked(&evictQ, sizeBefore, sampledEpoch, pressure)
-		c.unlock()
-		evictQ.invoke(&c.pressureState, c.onEvictValue, c.onEvictEntry)
-		return nil
-	}
-
 	sizeBefore := c.currentSize
 	evictedAny := false
-	reclaimedPreUpdate := false
 
-	switch {
-	case newSize > oldSize:
-		sizeDelta := newSize - oldSize
-		if !c.canFitGrowthLocked(e, newSize, sizeDelta, c.maxSize-c.currentSize) {
-			c.replaceSelfEvicted++
-			c.eraseInternal(&evictQ, key, EvictionReasonCapacity)
-			c.finishDeleteReclaimLocked(&evictQ, sizeBefore, sampledEpoch, pressure)
+	if newSize != oldSize {
+		var selfEvicted bool
+		evictedAny, selfEvicted = c.replaceResizeOrEvictLocked(&evictQ, e, key, oldSize, newSize, sizeBefore, sampledEpoch, pressure)
+		if selfEvicted {
 			c.unlock()
 			evictQ.invoke(&c.pressureState, c.onEvictValue, c.onEvictEntry)
 			return nil
 		}
-
-		for sizeDelta > c.maxSize-c.currentSize && c.entries.Len() > 0 && c.entries.Back() != e {
-			c.evictOne(&evictQ)
-			evictedAny = true
-		}
-
-		c.onEntrySizeUpdated(oldSize, newSize)
-		c.currentSize += sizeDelta
-	case newSize < oldSize:
-		if c.shouldEvictOnZeroWeightShrink(oldSize, newSize, c.maxSize) && c.entries.Back() != e {
-			c.evictOne(&evictQ)
-			evictedAny = true
-		}
-		c.onEntrySizeUpdated(oldSize, newSize)
-		c.currentSize -= oldSize - newSize
 	}
+
 	e.value = value
 	e.size = newSize
-
 	c.replaceUpdated++
-	c.notifyEvict(&evictQ, e.key, oldValue, oldSize, EvictionReasonReplaced)
-
-	if c.shouldReclaimSingleSurvivorOnMutation(c.entries.Len(), c.hasSlackLocked(), false, evictedAny, c.currentSize, sizeBefore, pressure) {
-		reclaimedPreUpdate = true
+	c.evictionsReplaced++
+	c.evictedWeightReplaced += oldSize
+	hasEvictCB := c.onEvictValue != nil || c.onEvictEntry != nil
+	if hasEvictCB {
+		evictQ.enqueue(e.key, oldValue, EvictionReasonReplaced)
 	}
 
-	c.finishMutationReclaimLocked(&evictQ, nil, e, reclaimedPreUpdate, false, sizeBefore, sampledEpoch, pressure)
-	c.unlock()
-	evictQ.invoke(&c.pressureState, c.onEvictValue, c.onEvictEntry)
+	reclaimedPreUpdate := c.dirtyIndex && c.shouldReclaimSingleSurvivorSlow(c.entries.Len(), false, evictedAny, c.currentSize, sizeBefore, pressure)
+	if reclaimedPreUpdate || c.currentSize < sizeBefore || pressure >= c.options.CompactionThreshold || pressure >= c.options.EvictionThreshold {
+		c.finishMutationReclaimLocked(&evictQ, nil, e, reclaimedPreUpdate, false, sizeBefore, sampledEpoch, pressure)
+	}
+	if c.options.EnableInvariantChecking {
+		c.unlockWithInvariants()
+	} else {
+		c.mu.Unlock()
+	}
+	if evictQ.n != 0 {
+		evictQ.invoke(&c.pressureState, c.onEvictValue, c.onEvictEntry)
+	}
 
 	return nil
 }

@@ -3245,3 +3245,263 @@ func populateIter3Cache(t *testing.T, cache Cache[*[4]int]) weak.Pointer[[4]int]
 	require.NoError(t, err)
 	return wpV2
 }
+
+//go:noinline
+func runSyncGoroutineChain(depth int, leafFn func()) {
+	if depth <= 0 {
+		leafFn()
+		return
+	}
+	if depth%2 == 0 {
+		var wg sync.WaitGroup
+		wg.Go(func() {
+			runSyncGoroutineChain(depth-1, leafFn)
+		})
+		wg.Wait()
+		return
+	}
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		runSyncGoroutineChain(depth-1, leafFn)
+	}()
+	<-done
+}
+
+//go:noinline
+func runSyncGoroutineChainWithExitedMidHop(depth, exitAtDepth int, leafFn func()) {
+	leafDone := make(chan struct{})
+	var step func(rem int)
+	step = func(rem int) {
+		if rem <= 0 {
+			defer close(leafDone)
+			leafFn()
+			return
+		}
+		if rem == exitAtDepth {
+			midExited := make(chan struct{})
+			go func() {
+				<-midExited
+				time.Sleep(2 * time.Millisecond)
+				step(rem - 1)
+			}()
+			close(midExited)
+			return
+		}
+		childDone := make(chan struct{})
+		go func() {
+			defer close(childDone)
+			step(rem - 1)
+		}()
+		<-childDone
+	}
+	step(depth)
+	<-leafDone
+}
+
+func verifyDeepOnEvictChainForBackendAndDepth(t *testing.T, b Backend, depth int) {
+	t.Helper()
+
+	var cache Cache[int]
+	var traceMu sync.Mutex
+	var trace []string
+	var k1ValOnce, k1EntryOnce sync.Once
+	var leafPutErr error
+	var leafDeletedOK bool
+
+	recordTrace := func(ev string) {
+		traceMu.Lock()
+		trace = append(trace, ev)
+		traceMu.Unlock()
+	}
+
+	cache = New[int](3,
+		WithBackend(b),
+		WithInvariantChecking(true),
+		WithOnEvictValue(func(v int, r EvictionReason) {
+			recordTrace(fmt.Sprintf("val:%d:%v", v, r))
+			if v == 10 {
+				k1ValOnce.Do(func() {
+					runSyncGoroutineChain(depth, func() {
+						_, leafDeletedOK = cache.Delete("k2")
+					})
+				})
+			}
+		}),
+		WithOnEvictEntry(func(k string, v int, r EvictionReason) {
+			recordTrace(fmt.Sprintf("entry:%s=%d:%v", k, v, r))
+			if k == "k1" {
+				k1EntryOnce.Do(func() {
+					runSyncGoroutineChain(depth, func() {
+						_, leafPutErr = cache.Put("k3", 40)
+					})
+				})
+			}
+		}),
+	)
+
+	_, err := cache.Put("k1", 10)
+	require.NoError(t, err)
+	_, err = cache.Put("k2", 20)
+	require.NoError(t, err)
+	_, err = cache.Put("k3", 30)
+	require.NoError(t, err)
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		v, ok := cache.Delete("k1")
+		assert.True(t, ok)
+		assert.Equal(t, 10, v)
+	}()
+
+	select {
+	case <-done:
+	case <-time.After(3 * time.Second):
+		require.Failf(t, "deadlock", "backend %v deadlocked on OnEvict* synchronous goroutine chain at depth %d", b, depth)
+	}
+
+	require.True(t, leafDeletedOK)
+	require.NoError(t, leafPutErr)
+
+	expected := []string{
+		fmt.Sprintf("val:10:%v", EvictionReasonDeleted),
+		fmt.Sprintf("entry:k1=10:%v", EvictionReasonDeleted),
+		fmt.Sprintf("val:20:%v", EvictionReasonDeleted),
+		fmt.Sprintf("entry:k2=20:%v", EvictionReasonDeleted),
+		fmt.Sprintf("val:30:%v", EvictionReasonReplaced),
+		fmt.Sprintf("entry:k3=30:%v", EvictionReasonReplaced),
+	}
+	assert.Equal(t, expected, trace, "all OnEvictValue and OnEvictEntry callbacks must fire in strict FIFO order at depth %d on %v", depth, b)
+}
+
+func verifyDeepPressureFuncChainForBackendAndDepth(t *testing.T, b Backend, depth int) {
+	t.Helper()
+
+	var cache Cache[int]
+	var pressureCalls atomic.Int32
+	var firstSample sync.Once
+	var leafPutErr error
+	var leafDeletedOK bool
+
+	cache = New[int](10,
+		WithBackend(b),
+		WithInvariantChecking(true),
+		WithPressureFunc(func() float64 {
+			pressureCalls.Add(1)
+			firstSample.Do(func() {
+				runSyncGoroutineChain(depth, func() {
+					_, leafPutErr = cache.Put("leaf_temp", 100)
+					_, leafDeletedOK = cache.Delete("leaf_temp")
+				})
+			})
+			return 0.10
+		}),
+	)
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		_, err := cache.Put("root_key", 1)
+		assert.NoError(t, err)
+	}()
+
+	select {
+	case <-done:
+	case <-time.After(3 * time.Second):
+		require.Failf(t, "deadlock", "backend %v deadlocked on PressureFunc synchronous goroutine chain at depth %d", b, depth)
+	}
+
+	require.NoError(t, leafPutErr)
+	require.True(t, leafDeletedOK)
+	assert.Equal(t, int32(1), pressureCalls.Load(),
+		"depth-%d descendant Put/Delete inside PressureFunc must bypass re-entrant PressureFunc on %v", depth, b)
+	assert.Equal(t, 1, cache.Stats().Len)
+}
+
+func verifyDeepExitedMidHopForBackend(t *testing.T, b Backend) {
+	t.Helper()
+
+	var cache Cache[int]
+	var pressureCalls, evictCalls atomic.Int32
+	var firstSample, firstEvict sync.Once
+	var leafPutErr error
+
+	cache = New[int](1,
+		WithBackend(b),
+		WithInvariantChecking(true),
+		WithPressureFunc(func() float64 {
+			pressureCalls.Add(1)
+			firstSample.Do(func() {
+				runSyncGoroutineChainWithExitedMidHop(12, 6, func() {
+					_, _ = cache.Delete("missing_from_depth12_exited_midhop")
+				})
+			})
+			return 0.10
+		}),
+		WithOnEvictEntry(func(_ string, _ int, _ EvictionReason) {
+			evictCalls.Add(1)
+			firstEvict.Do(func() {
+				runSyncGoroutineChainWithExitedMidHop(12, 6, func() {
+					_, leafPutErr = cache.Put("k3_from_depth12_exited_midhop", 3)
+				})
+			})
+		}),
+	)
+
+	_, err := cache.Put("k1", 1)
+	require.NoError(t, err)
+	assert.Equal(t, int32(1), pressureCalls.Load(), "depth-12 chain with exited intermediate hop must bypass PressureFunc on %v", b)
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		_, putErr := cache.Put("k2", 2)
+		assert.NoError(t, putErr)
+	}()
+
+	select {
+	case <-done:
+	case <-time.After(3 * time.Second):
+		require.Failf(t, "deadlock", "backend %v deadlocked on depth-12 OnEvictEntry chain with exited intermediate hop", b)
+	}
+	require.NoError(t, leafPutErr)
+	assert.Equal(t, int32(2), evictCalls.Load())
+}
+
+// TestAdv_Iter4_DeepDescendantReentrancyChainBeyondEightHops verifies the C-03 fix
+// across depths 1, 8, 12, and 16 and all three backends (BackendMap, BackendRadix,
+// BackendArenaRadix) for both OnEvictValue/OnEvictEntry and WithPressureFunc,
+// including chains where an intermediate ancestor goroutine has already exited.
+func TestAdv_Iter4_DeepDescendantReentrancyChainBeyondEightHops(t *testing.T) {
+	backends := []Backend{BackendMap, BackendRadix, BackendArenaRadix}
+	depths := []int{1, 8, 12, 16}
+
+	t.Run("OnEvictEntryAndOnEvictValue_Depths_1_8_12_16_AllBackends", func(t *testing.T) {
+		for _, b := range backends {
+			for _, d := range depths {
+				t.Run(fmt.Sprintf("%s_Depth%d", b.String(), d), func(t *testing.T) {
+					verifyDeepOnEvictChainForBackendAndDepth(t, b, d)
+				})
+			}
+		}
+	})
+
+	t.Run("WithPressureFunc_Depths_1_8_12_16_AllBackends", func(t *testing.T) {
+		for _, b := range backends {
+			for _, d := range depths {
+				t.Run(fmt.Sprintf("%s_Depth%d", b.String(), d), func(t *testing.T) {
+					verifyDeepPressureFuncChainForBackendAndDepth(t, b, d)
+				})
+			}
+		}
+	})
+
+	t.Run("ExitedIntermediateAncestorAtDepth12_AllBackends", func(t *testing.T) {
+		for _, b := range backends {
+			t.Run(b.String(), func(t *testing.T) {
+				verifyDeepExitedMidHopForBackend(t, b)
+			})
+		}
+	})
+}

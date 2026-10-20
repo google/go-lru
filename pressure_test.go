@@ -18,6 +18,7 @@ import (
 	"fmt"
 	"math"
 	"runtime"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -3516,6 +3517,70 @@ func TestPressure_MultiCacheAndCircularReentrancy(t *testing.T) {
 
 	t.Run("NestedCrossCacheHookChildGoroutineReentrancy", testNestedCrossCacheHookChildGoroutineReentrancy)
 	t.Run("GoidBatchInversionAndSiblingWorkerExclusion", testGoidBatchInversionAndSiblingWorkerExclusion)
+	t.Run("FindAncestorCreatorAboveHookDeepChainAndCycleFallback", testFindAncestorCreatorAboveHookDeepChainAndCycleFallback)
+}
+
+func testFindAncestorCreatorAboveHookDeepChainAndCycleFallback(t *testing.T) {
+	// Arrange 1: Build a synthetic 20-hop goroutine stack snapshot rooted at goroutine 100
+	// where goroutine 100 is executing inside deliverCallbacks above userCallback.func1.
+	var sb strings.Builder
+	sb.WriteString("goroutine 100 [running]:\n")
+	sb.WriteString("github.com/google/go-lru.userCallback.func1()\n\t/app/cb.go:10 +0x20\n")
+	sb.WriteString("github.com/google/go-lru.(*evictCallbackQueue[...]).deliverCallbacks(0x1, 0x2, 0x3, 0x4)\n\t/app/pressure.go:1900 +0x40\n")
+	sb.WriteString("github.com/google/go-lru.(*mapCache[...]).Delete(0x1, {0x2, 0x3})\n\t/app/map_lru.go:480 +0x80\n\n")
+
+	for hop := 1; hop < 20; hop++ {
+		gid := 100 + hop
+		parentGID := 100 + hop - 1
+		creator := fmt.Sprintf("github.com/google/go-lru.hopFunc%d", hop-1)
+		if hop == 1 {
+			creator = "github.com/google/go-lru.userCallback.func1"
+		}
+		fmt.Fprintf(&sb, "goroutine %d [chan receive]:\n", gid)
+		fmt.Fprintf(&sb, "github.com/google/go-lru.hopFunc%d()\n\t/app/cb.go:%d +0x20\n", hop, 20+hop)
+		fmt.Fprintf(&sb, "created by %s in goroutine %d\n\t/app/cb.go:%d +0x10\n\n", creator, parentGID, 19+hop)
+	}
+
+	leafStack := []byte("goroutine 120 [running]:\ngithub.com/google/go-lru.leafFunc()\n\t/app/cb.go:99 +0x20\ncreated by github.com/google/go-lru.hopFunc19 in goroutine 119\n\t/app/cb.go:50 +0x10\n")
+	allStacks := []byte(sb.String())
+
+	// Act 1: Walk 20-hop synthetic chain.
+	ancGID, ok := findAncestorCreatorAboveHook(allStacks, leafStack, 119, []byte("github.com/google/go-lru.hopFunc19"), []byte("deliverCallbacks"), func(id uint64) bool {
+		return id == 100
+	})
+
+	// Assert 1
+	assert.True(t, ok, "20-hop ancestor chain must resolve root holder goroutine 100")
+	assert.Equal(t, uint64(100), ancGID)
+
+	// Arrange 2: Build a malformed synthetic cycle (goroutine 201 <-> goroutine 202) in allStacks
+	// alongside holder goroutine 200 to verify that exhausting maxAncestorHops falls back to
+	// matchAncestorFallbackInAllStacks without infinite looping or false negatives.
+	cycleStacks := []byte(
+		"goroutine 200 [running]:\n" +
+			"github.com/google/go-lru.cycleCallback.func1()\n\t/app/cb.go:10 +0x20\n" +
+			"github.com/google/go-lru.(*evictCallbackQueue[...]).deliverCallbacks(0x1, 0x2, 0x3, 0x4)\n\t/app/pressure.go:1900 +0x40\n\n" +
+			"goroutine 201 [chan receive]:\n" +
+			"github.com/google/go-lru.cycleCallback.func1.1()\n\t/app/cb.go:12 +0x20\n" +
+			"created by github.com/google/go-lru.cycleCallback.func1.2 in goroutine 202\n\t/app/cb.go:14 +0x10\n\n" +
+			"goroutine 202 [chan receive]:\n" +
+			"github.com/google/go-lru.cycleCallback.func1.2()\n\t/app/cb.go:14 +0x20\n" +
+			"created by github.com/google/go-lru.cycleCallback.func1.1 in goroutine 201\n\t/app/cb.go:12 +0x10\n",
+	)
+	cycleLeaf := []byte(
+		"goroutine 203 [running]:\n" +
+			"github.com/google/go-lru.cycleCallback.func1.3()\n\t/app/cb.go:16 +0x20\n" +
+			"created by github.com/google/go-lru.cycleCallback.func1.2 in goroutine 202\n\t/app/cb.go:14 +0x10\n",
+	)
+
+	// Act 2
+	cycleAncGID, cycleOK := findAncestorCreatorAboveHook(cycleStacks, cycleLeaf, 202, []byte("github.com/google/go-lru.cycleCallback.func1.2"), []byte("deliverCallbacks"), func(id uint64) bool {
+		return id == 200
+	})
+
+	// Assert 2
+	assert.True(t, cycleOK, "exhausting maxAncestorHops on malformed synthetic cycle must fall back to matchAncestorFallbackInAllStacks")
+	assert.Equal(t, uint64(200), cycleAncGID)
 }
 
 func testGoidBatchInversionAndSiblingWorkerExclusion(t *testing.T) {
