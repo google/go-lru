@@ -3745,80 +3745,99 @@ func TestAdv_Iter5_NamedMethodChildViaReturningHelperAndChannelSync(t *testing.T
 	}
 }
 
+func runMultiSamplerReentrantReclaimScenario(t *testing.T, b Backend, staleHasHigherSeq bool) {
+	t.Helper()
+
+	var cache PressureAwareCache[int]
+	var enabled atomic.Bool
+	g1Entered := make(chan struct{})
+	g2Entered := make(chan struct{})
+	staleSampledBeforePeerReclaim := make(chan struct{})
+	peerReclaimed := make(chan struct{})
+
+	var callNum atomic.Int32
+	cache = New[int](10,
+		WithBackend(b),
+		WithInvariantChecking(true),
+		WithPressureFunc(func() float64 {
+			if !enabled.Load() {
+				return 0.0
+			}
+			c := callNum.Add(1)
+			if (!staleHasHigherSeq && c == 1) || (staleHasHigherSeq && c == 2) {
+				if c == 1 {
+					close(g1Entered)
+					<-g2Entered
+				} else {
+					close(g2Entered)
+				}
+				_, _ = cache.Delete("reclaim_stale")
+				val := 0.95
+				close(staleSampledBeforePeerReclaim)
+				<-peerReclaimed
+				return val
+			}
+			if (!staleHasHigherSeq && c == 2) || (staleHasHigherSeq && c == 1) {
+				if c == 1 {
+					close(g1Entered)
+					<-g2Entered
+				} else {
+					close(g2Entered)
+				}
+				<-staleSampledBeforePeerReclaim
+				_, _ = cache.Delete("reclaim_fresh")
+				close(peerReclaimed)
+				return 0.10
+			}
+			return 0.10
+		}),
+	).(PressureAwareCache[int])
+
+	for i := range 8 {
+		_, err := cache.Put(fmt.Sprintf("k%d", i), i)
+		require.NoError(t, err)
+	}
+	_, err := cache.Put("reclaim_stale", 100)
+	require.NoError(t, err)
+	_, err = cache.Put("reclaim_fresh", 200)
+	require.NoError(t, err)
+
+	enabled.Store(true)
+
+	var wg sync.WaitGroup
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		_, putErr := cache.Put("new1", 1)
+		assert.NoError(t, putErr)
+	}()
+	<-g1Entered
+	go func() {
+		defer wg.Done()
+		_, putErr := cache.Put("new2", 2)
+		assert.NoError(t, putErr)
+	}()
+	wg.Wait()
+
+	st := cache.Stats()
+	assert.Zero(t, st.PressureShedsInline, "backend %v must not shed on stale pre-peer-reclamation pressure sample", b)
+	assert.Zero(t, st.EvictionsPressure, "backend %v must not evict entries under pressure after peer sampler reclaimed", b)
+	assert.Equal(t, 10, st.Len, "all 8 base entries + new1 + new2 must remain live on %v", b)
+	assert.InDelta(t, 0.10, st.MemoryPressure, 1e-9, "Stats().MemoryPressure must not be overwritten by rejected stale sample on %v", b)
+}
+
 // TestAdv_Iter5_ConcurrentMultiSamplerReentrantReclaimInvalidatesStalePeerSample verifies
-// that when Sampler 1 performs an earlier re-entrant reclamation at t1 and samples high
-// pressure (0.95) at t2, and concurrent Sampler 2 performs a later re-entrant reclamation
-// at t3 (after which pressure drops to 0.10), Sampler 1 does not fast-forward its stale
-// 0.95 sample across Sampler 2's reclamation epoch to falsely shed the cache.
+// that when one sampler performs an earlier re-entrant reclamation at t1 and samples high
+// pressure (0.95) at t2, and a concurrent sampler performs a later re-entrant reclamation
+// at t3 (after which pressure drops to 0.10), the stale 0.95 sample is invalidated regardless
+// of invokeSeq ordering and never overwrites Stats().MemoryPressure or sheds the cache.
 func TestAdv_Iter5_ConcurrentMultiSamplerReentrantReclaimInvalidatesStalePeerSample(t *testing.T) {
 	for _, b := range []Backend{BackendMap, BackendRadix, BackendArenaRadix} {
-		t.Run(b.String(), func(t *testing.T) {
-			var cache PressureAwareCache[int]
-			var enabled atomic.Bool
-			g1Entered := make(chan struct{})
-			g2Entered := make(chan struct{})
-			g1SampledBeforeG2Reclaim := make(chan struct{})
-			g2Reclaimed := make(chan struct{})
-
-			var callNum atomic.Int32
-			cache = New[int](10,
-				WithBackend(b),
-				WithInvariantChecking(true),
-				WithPressureFunc(func() float64 {
-					if !enabled.Load() {
-						return 0.0
-					}
-					switch callNum.Add(1) {
-					case 1:
-						close(g1Entered)
-						<-g2Entered
-						_, _ = cache.Delete("reclaim_g1")
-						val := 0.95
-						close(g1SampledBeforeG2Reclaim)
-						<-g2Reclaimed
-						return val
-					case 2:
-						close(g2Entered)
-						<-g1SampledBeforeG2Reclaim
-						_, _ = cache.Delete("reclaim_g2")
-						close(g2Reclaimed)
-						return 0.10
-					default:
-						return 0.10
-					}
-				}),
-			).(PressureAwareCache[int])
-
-			for i := range 8 {
-				_, err := cache.Put(fmt.Sprintf("k%d", i), i)
-				require.NoError(t, err)
-			}
-			_, err := cache.Put("reclaim_g1", 100)
-			require.NoError(t, err)
-			_, err = cache.Put("reclaim_g2", 200)
-			require.NoError(t, err)
-
-			enabled.Store(true)
-
-			var wg sync.WaitGroup
-			wg.Add(2)
-			go func() {
-				defer wg.Done()
-				_, putErr := cache.Put("new1", 1)
-				assert.NoError(t, putErr)
-			}()
-			<-g1Entered
-			go func() {
-				defer wg.Done()
-				_, putErr := cache.Put("new2", 2)
-				assert.NoError(t, putErr)
-			}()
-			wg.Wait()
-
-			st := cache.Stats()
-			assert.Zero(t, st.PressureShedsInline, "backend %v must not shed on stale pre-peer-reclamation pressure sample", b)
-			assert.Zero(t, st.EvictionsPressure, "backend %v must not evict entries under pressure after peer sampler reclaimed", b)
-			assert.Equal(t, 10, st.Len, "all 8 base entries + new1 + new2 must remain live on %v", b)
+		t.Run(b.String()+"_StaleLowerSeq", func(t *testing.T) {
+			runMultiSamplerReentrantReclaimScenario(t, b, false)
+		})
+		t.Run(b.String()+"_StaleHigherSeq", func(t *testing.T) {
+			runMultiSamplerReentrantReclaimScenario(t, b, true)
 		})
 	}
 }

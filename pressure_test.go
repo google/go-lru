@@ -3235,7 +3235,8 @@ func verifyBackendZeroAllocHotPaths(t *testing.T, name string, cache Cache[int])
 	assert.Zero(t, statsAllocs, "%s Stats() must be 0 allocs/op", name)
 }
 
-func waitForCrossCacheContention(cacheA Cache[int], arenaA *arenaRadix[int]) {
+func waitForCrossCacheContention(t *testing.T, cacheA Cache[int], arenaA *arenaRadix[int]) {
+	t.Helper()
 	deadline := time.Now().Add(5 * time.Second)
 	for time.Now().Before(deadline) {
 		if hasKey(cacheA, "from_b") && arenaA.evictCallbackGID.Load() != 0 {
@@ -3245,6 +3246,7 @@ func waitForCrossCacheContention(cacheA Cache[int], arenaA *arenaRadix[int]) {
 		}
 		runtime.Gosched()
 	}
+	assert.Fail(t, "timed out waiting for cross-cache contention on cacheA")
 }
 
 func TestPressure_MultiCacheAndCircularReentrancy(t *testing.T) {
@@ -3308,7 +3310,7 @@ func TestPressure_MultiCacheAndCircularReentrancy(t *testing.T) {
 
 		<-enteredB
 		arenaA := cacheA.(*arenaRadix[int])
-		waitForCrossCacheContention(cacheA, arenaA)
+		waitForCrossCacheContention(t, cacheA, arenaA)
 		assert.Zero(t, arenaA.evictPendingEnqueues.Load(), "cross-cache caller must block on evictCallbackMu rather than enqueueing as descendant")
 		close(releaseFirstA)
 		wg.Wait()

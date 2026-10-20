@@ -1084,12 +1084,18 @@ func (p *pressureState) hasElevatedPressureToInvalidate(pressure float64) bool {
 		p.pressureNeedsRefresh.Load() {
 		return true
 	}
-	if !p.samplingPressure.Load() &&
-		!p.fallbackSampling.Load() &&
-		p.overflowSamplingCount.Load() <= 0 {
+	if !p.hasActiveSampler() {
 		return false
 	}
 	return !p.isSamplingGoroutine()
+}
+
+func (p *pressureState) shouldInvalidatePressureOnReclaim(pressure float64) bool {
+	thresh := p.options.CompactionThreshold
+	return pressure >= thresh ||
+		math.Float64frombits(p.cachedPressureBits.Load()) >= thresh ||
+		p.pressureNeedsRefresh.Load() ||
+		p.hasActiveSampler()
 }
 
 func (p *pressureState) resolvePostRetryPressureLocked(sampledEpoch uint64, pressure float64, validSample bool) (uint64, float64) {
@@ -1209,33 +1215,39 @@ func (p *pressureState) updateCachedPressureLocked(epoch, invokeSeq uint64, val 
 	return val, true
 }
 
-func (p *pressureState) storeSampledPressureWithSeq(epoch, extEpoch, invokeSeq uint64, val float64, gid uint64, slot int) (uint64, float64, bool) {
-	p.pressureWriteMu.Lock()
-	defer p.pressureWriteMu.Unlock()
-
+func (p *pressureState) recordLastSampledTelemetryLocked(invokeSeq uint64, val float64, stored bool) {
+	if !stored && p.pressureInitialized.Load() && p.cachedPressureEpoch.Load() == p.reclaimEpoch.Load() {
+		return
+	}
 	if invokeSeq == 0 || invokeSeq >= p.lastSampledSeq.Load() {
 		if invokeSeq > p.lastSampledSeq.Load() {
 			p.lastSampledSeq.Store(invokeSeq)
 		}
 		p.lastSampledPressureBits.Store(math.Float64bits(val))
 	}
+}
+
+func (p *pressureState) storeSampledPressureWithSeq(epoch, extEpoch, invokeSeq uint64, val float64, gid uint64, slot int) (uint64, float64, bool) {
+	p.pressureWriteMu.Lock()
+	defer p.pressureWriteMu.Unlock()
 
 	val, stored := p.updateCachedPressureLocked(epoch, invokeSeq, val)
 	if p.options.hasCustomPressureFunc {
 		reentrant := p.clearReentrantSlot(gid, slot)
-		if reentrant && !stored && p.externalReclaimEpoch.Load() == extEpoch {
+		if !stored && p.externalReclaimEpoch.Load() == extEpoch {
 			resolvedGID := gid
 			if resolvedGID == 0 && slot == samplerSlotPrimary {
 				resolvedGID = p.samplingGID.Load()
 			}
 			lastGID := p.lastReentrantGID.Load()
-			if lastGID == 0 || lastGID == resolvedGID || val < p.options.CompactionThreshold {
+			if (reentrant && (lastGID == 0 || lastGID == resolvedGID)) || val < p.options.CompactionThreshold {
 				epoch = p.reclaimEpoch.Load()
 				val, stored = p.updateCachedPressureLocked(epoch, invokeSeq, val)
 			}
 		}
 	}
 
+	p.recordLastSampledTelemetryLocked(invokeSeq, val, stored)
 	return epoch, val, stored
 }
 
@@ -1552,7 +1564,7 @@ func (p *pressureState) shouldCompactAfterMutation(reclaimedPre, netByteReduced,
 }
 
 func (p *pressureState) shouldMarkReclaimedAfterMutation(reclaimedPre, netByteReduced bool, sampledEpoch uint64, pressure float64) bool {
-	return (reclaimedPre || netByteReduced) && p.reclaimEpoch.Load() == sampledEpoch && p.hasElevatedPressureToInvalidate(pressure)
+	return (reclaimedPre || netByteReduced) && p.reclaimEpoch.Load() == sampledEpoch && p.shouldInvalidatePressureOnReclaim(pressure)
 }
 
 func (p *pressureState) computeZeroShedTargets(retention float64, hasProtected bool, protectedSize uint64) (targetZeroCount, unprotectedZeroTarget int) {
@@ -1656,7 +1668,7 @@ func (p *pressureState) shouldEvictOnZeroWeightShrink(oldSize, newSize, maxSize 
 }
 
 func (p *pressureState) maybeMarkReclaimed(reclaimedOrReduced bool, sampledEpoch uint64, pressure float64) {
-	if reclaimedOrReduced && p.reclaimEpoch.Load() == sampledEpoch && p.hasElevatedPressureToInvalidate(pressure) {
+	if reclaimedOrReduced && p.reclaimEpoch.Load() == sampledEpoch && p.shouldInvalidatePressureOnReclaim(pressure) {
 		p.markReclaimedLocked()
 	}
 }
