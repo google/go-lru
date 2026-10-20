@@ -3372,7 +3372,8 @@ func runSyncGoroutineChain(depth int, leafFn func()) {
 }
 
 //go:noinline
-func runSyncGoroutineChainWithExitedMidHop(depth, exitAtDepth int, leafFn func()) {
+func runSyncGoroutineChainWithExitedMidHop(t *testing.T, depth, exitAtDepth int, leafFn func()) {
+	t.Helper()
 	leafDone := make(chan struct{})
 	var step func(rem int)
 	step = func(rem int) {
@@ -3382,10 +3383,12 @@ func runSyncGoroutineChainWithExitedMidHop(depth, exitAtDepth int, leafFn func()
 			return
 		}
 		if rem == exitAtDepth {
+			var midGID atomic.Uint64
+			midGID.Store(currentGoroutineID())
 			midExited := make(chan struct{})
 			go func() {
 				<-midExited
-				time.Sleep(2 * time.Millisecond)
+				waitForGoroutineExit(t, midGID.Load())
 				step(rem - 1)
 			}()
 			close(midExited)
@@ -3396,7 +3399,11 @@ func runSyncGoroutineChainWithExitedMidHop(depth, exitAtDepth int, leafFn func()
 			defer close(childDone)
 			step(rem - 1)
 		}()
-		<-childDone
+		if rem > exitAtDepth {
+			<-leafDone
+		} else {
+			<-childDone
+		}
 	}
 	step(depth)
 	<-leafDone
@@ -3536,7 +3543,7 @@ func verifyDeepExitedMidHopForBackend(t *testing.T, b Backend) {
 		WithPressureFunc(func() float64 {
 			pressureCalls.Add(1)
 			firstSample.Do(func() {
-				runSyncGoroutineChainWithExitedMidHop(12, 6, func() {
+				runSyncGoroutineChainWithExitedMidHop(t, 12, 6, func() {
 					_, _ = cache.Delete("missing_from_depth12_exited_midhop")
 				})
 			})
@@ -3545,7 +3552,7 @@ func verifyDeepExitedMidHopForBackend(t *testing.T, b Backend) {
 		WithOnEvictEntry(func(_ string, _ int, _ EvictionReason) {
 			evictCalls.Add(1)
 			firstEvict.Do(func() {
-				runSyncGoroutineChainWithExitedMidHop(12, 6, func() {
+				runSyncGoroutineChainWithExitedMidHop(t, 12, 6, func() {
 					_, leafPutErr = cache.Put("k3_from_depth12_exited_midhop", 3)
 				})
 			})
