@@ -3719,54 +3719,81 @@ func TestAdv_Iter5_NamedMethodChildViaReturningHelperAndChannelSync(t *testing.T
 	for _, b := range []Backend{BackendMap, BackendRadix, BackendArenaRadix} {
 		t.Run(b.String(), func(t *testing.T) {
 			var pressureCalls, evictCalls atomic.Int32
+			var evictArmed atomic.Bool
 
+			wPress := &methodChildWorker{
+				putDone: make(chan struct{}),
+			}
+			wPressWG := &methodChildWorker{
+				putDone: make(chan struct{}),
+			}
 			w := &methodChildWorker{
 				putDone: make(chan struct{}),
 			}
+			wWG := &methodChildWorker{
+				putDone: make(chan struct{}),
+			}
 
-			w.cache = New[int](2,
+			cache := New[int](4,
 				WithBackend(b),
 				WithInvariantChecking(true),
 				WithPressureFunc(func() float64 {
 					if pressureCalls.Add(1) == 1 {
-						done := make(chan struct{})
-						wPress := &methodChildWorker{
-							cache:   w.cache,
-							putDone: done,
-						}
 						spawnNamedTargetViaReturningHelper(wPress.putFromChild)
-						<-done
-						assert.NoError(t, wPress.putErr)
+						<-wPress.putDone
+
+						var wg sync.WaitGroup
+						wg.Go(wPressWG.putFromChild)
+						<-wPressWG.putDone
+						wg.Wait()
 					}
 					return 0.10
 				}),
 				WithOnEvictValue(func(_ int, _ EvictionReason) {
-					if evictCalls.Add(1) == 1 {
+					if !evictArmed.Load() {
+						return
+					}
+					switch evictCalls.Add(1) {
+					case 1:
 						spawnNamedTargetViaReturningHelper(w.putFromChild)
 						<-w.putDone
+					case 2:
+						var wg sync.WaitGroup
+						wg.Go(wWG.putFromChild)
+						<-wWG.putDone
+						wg.Wait()
 					}
 				}),
 			)
+			wPress.cache = cache
+			wPressWG.cache = cache
+			w.cache = cache
+			wWG.cache = cache
 
-			_, err := w.cache.Put("k1", 1)
+			_, err := cache.Put("k1", 1)
 			require.NoError(t, err)
-			assert.Equal(t, int32(1), pressureCalls.Load(), "named method child spawned via returning helper inside PressureFunc must not re-sample on %v", b)
+			require.NoError(t, wPress.putErr)
+			require.NoError(t, wPressWG.putErr)
+			assert.Equal(t, int32(1), pressureCalls.Load(), "named method child spawned via returning helper and wg.Go inside PressureFunc must not re-sample on %v", b)
+
+			evictArmed.Store(true)
 
 			done := make(chan struct{})
 			go func() {
 				defer close(done)
-				_, ok := w.cache.Delete("k1")
+				_, ok := cache.Delete("k1")
 				assert.True(t, ok)
 			}()
 
 			select {
 			case <-done:
 			case <-time.After(2 * time.Second):
-				require.Failf(t, "deadlock", "backend %v deadlocked on named method child spawned via returning helper inside OnEvictValue", b)
+				require.Failf(t, "deadlock", "backend %v deadlocked on named method child spawned via returning helper / wg.Go inside OnEvictValue", b)
 			}
 
 			require.NoError(t, w.putErr)
-			assert.Equal(t, int32(2), evictCalls.Load(), "Delete(k1) and child Put replacement of k3_from_named_method must both fire OnEvictValue on %v", b)
+			require.NoError(t, wWG.putErr)
+			assert.Equal(t, int32(3), evictCalls.Load(), "Delete(k1) and both child Put replacements of k3_from_named_method must fire OnEvictValue on %v", b)
 		})
 	}
 }
@@ -4216,6 +4243,85 @@ func testNonReclaimingLowPressureDoesNotOverwriteElevatedEpoch(t *testing.T) {
 
 			assert.InDelta(t, 0.95, cache.Stats().MemoryPressure, 1e-9, "non-reclaiming stale low-pressure sample must not overwrite elevated post-reclamation pressure")
 			assert.GreaterOrEqual(t, sampleSeq.Load(), int32(3), "G1 must retry sampling after rejecting stale low-pressure reading")
+		})
+	}
+}
+
+// TestAdv_Iter8_ConcurrentHookIDInitDoesNotClobberTagHints verifies that concurrent
+// initialization of hookID() and fast-tag claiming across PressureFunc and OnEvict*
+// never clobbers primaryTagHint or evictTagHint across all 8 tag modulo values.
+func TestAdv_Iter8_ConcurrentHookIDInitDoesNotClobberTagHints(t *testing.T) {
+	for _, b := range []Backend{BackendMap, BackendRadix, BackendArenaRadix} {
+		t.Run(b.String(), func(t *testing.T) {
+			for range numPressureHookTags * 2 {
+				var cache Cache[int]
+				var pressureArmed, evictArmed atomic.Bool
+				var pressureCalls, evictCalls atomic.Int32
+
+				cache = New[int](4,
+					WithBackend(b),
+					WithInvariantChecking(true),
+					WithPressureFunc(func() float64 {
+						if !pressureArmed.Load() {
+							return 0.10
+						}
+						if pressureCalls.Add(1) == 1 {
+							var wg sync.WaitGroup
+							wg.Go(func() {
+								_, _ = cache.Delete("missing_pressure_child")
+							})
+							wg.Wait()
+						}
+						return 0.10
+					}),
+					WithOnEvictValue(func(_ int, _ EvictionReason) {
+						if !evictArmed.Load() {
+							return
+						}
+						if evictCalls.Add(1) == 1 {
+							var wg sync.WaitGroup
+							wg.Go(func() {
+								_, _ = cache.Delete("k2")
+							})
+							wg.Wait()
+						}
+					}),
+				)
+
+				_, err := cache.Put("k1", 1)
+				require.NoError(t, err)
+				_, err = cache.Put("k2", 2)
+				require.NoError(t, err)
+
+				pressureArmed.Store(true)
+				evictArmed.Store(true)
+
+				start := make(chan struct{})
+				done := make(chan struct{})
+				go func() {
+					defer close(done)
+					var wg sync.WaitGroup
+					wg.Go(func() {
+						<-start
+						_, putErr := cache.Put("k3", 3)
+						assert.NoError(t, putErr)
+					})
+					wg.Go(func() {
+						<-start
+						_, _ = cache.Delete("k1")
+					})
+					close(start)
+					wg.Wait()
+				}()
+
+				select {
+				case <-done:
+				case <-time.After(2 * time.Second):
+					require.Failf(t, "deadlock", "backend %v deadlocked during concurrent hookID and fast-tag initialization", b)
+				}
+
+				assert.Equal(t, int32(2), evictCalls.Load(), "both k1 and child-deleted k2 eviction callbacks must complete on %v", b)
+			}
 		})
 	}
 }

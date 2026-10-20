@@ -783,22 +783,35 @@ func (p *pressureState) hookID() uint64 {
 	}
 	id := nextPressureHookID.Add(1)
 	if p.hookIDVal.CompareAndSwap(0, id) {
-		initTag := uint32(id-1) & (numPressureHookTags - 1)
-		p.primaryTagHint.Store(initTag)
-		p.evictTagHint.Store(initTag)
 		return id
 	}
 	return p.hookIDVal.Load()
 }
 
+func (p *pressureState) primaryTag(id uint64) uint32 {
+	return (uint32(id-1) + p.primaryTagHint.Load()) & (numPressureHookTags - 1)
+}
+
+func (p *pressureState) setPrimaryTag(id uint64, tag uint32) {
+	p.primaryTagHint.Store((tag - uint32(id-1)) & (numPressureHookTags - 1))
+}
+
+func (p *pressureState) evictTag(id uint64) uint32 {
+	return (uint32(id-1) + p.evictTagHint.Load()) & (numPressureHookTags - 1)
+}
+
+func (p *pressureState) setEvictTag(id uint64, tag uint32) {
+	p.evictTagHint.Store((tag - uint32(id-1)) & (numPressureHookTags - 1))
+}
+
 func (p *pressureState) claimFastPrimaryTag() (uint32, bool) {
 	id := p.hookID()
-	base := p.primaryTagHint.Load() & (numPressureHookTags - 1)
+	base := p.primaryTag(id)
 	for offset := range uint32(numPressureHookTags) {
 		tag := (base + offset) & (numPressureHookTags - 1)
 		if fastPrimaryTagOwner[tag].CompareAndSwap(0, id) {
 			if tag != base {
-				p.primaryTagHint.Store(tag)
+				p.setPrimaryTag(id, tag)
 			}
 			return tag, true
 		}
@@ -811,7 +824,7 @@ func (p *pressureState) activeFastPrimaryTag() (uint32, bool) {
 	if id == 0 {
 		return 0, false
 	}
-	tag := p.primaryTagHint.Load() & (numPressureHookTags - 1)
+	tag := p.primaryTag(id)
 	if fastPrimaryTagOwner[tag].Load() == id {
 		return tag, true
 	}
@@ -1724,7 +1737,7 @@ func (p *pressureState) activeFastEvictTag() (uint32, bool) {
 	if id == 0 {
 		return 0, false
 	}
-	tag := p.evictTagHint.Load() & (numPressureHookTags - 1)
+	tag := p.evictTag(id)
 	if fastEvictTagState[tag].Load() == (id<<1)|1 {
 		return tag, true
 	}
@@ -1895,9 +1908,9 @@ func (p *pressureState) drainPendingEvictCallbacks() {
 	}
 }
 
-func (p *pressureState) cacheFastEvictSlot(base, tag uint32, idleState uint64) (uint32, bool) {
+func (p *pressureState) cacheFastEvictSlot(id uint64, base, tag uint32, idleState uint64) (uint32, bool) {
 	if tag != base {
-		p.evictTagHint.Store(tag)
+		p.setEvictTag(id, tag)
 	}
 	p.evictFastSlot = &fastEvictTagState[tag]
 	p.evictFastIdle = idleState
@@ -1910,21 +1923,21 @@ func (p *pressureState) claimFastEvictTagSlow() (uint32, bool) {
 	if id == 0 {
 		id = p.hookID()
 	}
-	base := p.evictTagHint.Load() & (numPressureHookTags - 1)
+	base := p.evictTag(id)
 	idleState := id << 1
 	activeState := idleState | 1
 	for offset := range uint32(numPressureHookTags) {
 		tag := (base + offset) & (numPressureHookTags - 1)
 		cur := fastEvictTagState[tag].Load()
 		if (cur == 0 || cur == idleState) && fastEvictTagState[tag].CompareAndSwap(cur, activeState) {
-			return p.cacheFastEvictSlot(base, tag, idleState)
+			return p.cacheFastEvictSlot(id, base, tag, idleState)
 		}
 	}
 	for offset := range uint32(numPressureHookTags) {
 		tag := (base + offset) & (numPressureHookTags - 1)
 		cur := fastEvictTagState[tag].Load()
 		if cur&1 == 0 && fastEvictTagState[tag].CompareAndSwap(cur, activeState) {
-			return p.cacheFastEvictSlot(base, tag, idleState)
+			return p.cacheFastEvictSlot(id, base, tag, idleState)
 		}
 	}
 	return 0, false
