@@ -1277,6 +1277,7 @@ func TestDefect_C03_ReentrancyHazards(t *testing.T) {
 		var calls atomic.Int32
 		inPrimary := make(chan struct{})
 		workerTrigger := make(chan struct{})
+		workerSampled := make(chan struct{})
 		workerDone := make(chan struct{})
 
 		go func() {
@@ -1286,7 +1287,7 @@ func TestDefect_C03_ReentrancyHazards(t *testing.T) {
 			close(workerDone)
 		}()
 
-		var primaryOnce sync.Once
+		var primaryOnce, workerSampledOnce sync.Once
 		cache = NewMapCache[int](10, WithPressureFunc(func() float64 {
 			c := calls.Add(1)
 			if c == 1 {
@@ -1294,9 +1295,14 @@ func TestDefect_C03_ReentrancyHazards(t *testing.T) {
 					close(inPrimary)
 					close(workerTrigger)
 				})
-				for calls.Load() < 2 {
-					runtime.Gosched()
+				select {
+				case <-workerSampled:
+				case <-workerDone:
 				}
+			} else if c >= 2 {
+				workerSampledOnce.Do(func() {
+					close(workerSampled)
+				})
 			}
 			return 0.10
 		}))
@@ -4030,4 +4036,173 @@ func TestAdv_Iter6_SiblingClosureWorkerAndGenericClosureOwnerAttribution(t *test
 	t.Run("GenericFunctionAndGenericMethodClosureOwnerResolution", func(t *testing.T) {
 		runGenericSetupAndExitedChildScenario(t, [2]func(int){nil, nil})
 	})
+
+	t.Run("FastEvictContentionClearsEvictCallbackGIDAndHookBoundary", func(t *testing.T) {
+		testFastEvictContentionClearsEvictCallbackGID(t)
+	})
+
+	t.Run("NonReclaimingLowPressureSamplerDoesNotOverwriteElevatedReentrantEpoch", func(t *testing.T) {
+		testNonReclaimingLowPressureDoesNotOverwriteElevatedEpoch(t)
+	})
+}
+
+func testFastEvictContentionClearsEvictCallbackGID(t *testing.T) {
+	t.Helper()
+	for _, b := range []Backend{BackendMap, BackendRadix, BackendArenaRadix} {
+		t.Run(b.String(), func(t *testing.T) {
+			var cache Cache[int]
+			inEvict1 := make(chan struct{})
+			releaseEvict1 := make(chan struct{})
+			var evictCount atomic.Int32
+
+			cache = New[int](10,
+				WithBackend(b),
+				WithInvariantChecking(true),
+				WithOnEvictEntry(func(key string, _ int, _ EvictionReason) {
+					evictCount.Add(1)
+					switch key {
+					case "k1":
+						close(inEvict1)
+						<-releaseEvict1
+					case "k3":
+						_, _ = cache.Delete("k4")
+					}
+				}),
+			)
+
+			for _, k := range []string{"k1", "k2", "k3", "k4"} {
+				_, err := cache.Put(k, 1)
+				require.NoError(t, err)
+			}
+
+			g1Done := make(chan struct{})
+			go func() {
+				defer close(g1Done)
+				_, ok := cache.Delete("k1")
+				assert.True(t, ok)
+			}()
+			<-inEvict1
+
+			g2Done := make(chan struct{})
+			go func() {
+				defer close(g2Done)
+				_, ok := cache.Delete("k2")
+				assert.True(t, ok)
+			}()
+
+			// Wait until G2 resolves the holder via lockEvictCallbackSlow and sets evictCallbackContended.
+			ps := extractPressureStateForTest(cache)
+			deadline := time.Now().Add(5 * time.Second)
+			for !ps.evictCallbackContended.Load() && time.Now().Before(deadline) {
+				runtime.Gosched()
+			}
+			require.True(t, ps.evictCallbackContended.Load())
+
+			close(releaseEvict1)
+			<-g1Done
+			<-g2Done
+			assert.Zero(t, ps.evictCallbackGID.Load(), "evictCallbackGID must be cleared after contended fast delivery")
+
+			// Subsequent fast-path eviction with re-entrant Delete("k4") inside OnEvictEntry must not self-deadlock.
+			g3Done := make(chan struct{})
+			go func() {
+				defer close(g3Done)
+				_, ok := cache.Delete("k3")
+				assert.True(t, ok)
+			}()
+			select {
+			case <-g3Done:
+			case <-time.After(5 * time.Second):
+				require.Failf(t, "deadlock", "backend %v self-deadlocked on stale evictCallbackGID", b)
+			}
+			assert.Equal(t, int32(4), evictCount.Load())
+		})
+	}
+}
+
+func extractPressureStateForTest(cache Cache[int]) *pressureState {
+	switch c := cache.(type) {
+	case *mapCache[int]:
+		return &c.pressureState
+	case *radixCache[int]:
+		return &c.pressureState
+	case *arenaRadix[int]:
+		return &c.pressureState
+	default:
+		return nil
+	}
+}
+
+func testNonReclaimingLowPressureDoesNotOverwriteElevatedEpoch(t *testing.T) {
+	t.Helper()
+	for _, b := range []Backend{BackendMap, BackendRadix, BackendArenaRadix} {
+		t.Run(b.String(), func(t *testing.T) {
+			var cache Cache[int]
+			var pac PressureAwareCache[int]
+			var armed atomic.Bool
+			var sampleSeq atomic.Int32
+			g2Started := make(chan struct{})
+			g1Entered := make(chan struct{})
+			g2Stored := make(chan struct{})
+
+			cache = New[int](100,
+				WithBackend(b),
+				WithInvariantChecking(true),
+				WithCompactionThreshold(0.50),
+				WithEvictionThreshold(0.80),
+				WithEvictionRetentionRatio(0.50),
+				WithPressureFunc(func() float64 {
+					if !armed.Load() {
+						return 0.10
+					}
+					seq := sampleSeq.Add(1)
+					switch seq {
+					case 1:
+						// G2 (invokeSeq 1): wait for G1 (invokeSeq 2) to start at epoch 0, then perform re-entrant Delete and return 0.95.
+						close(g2Started)
+						<-g1Entered
+						_, _ = cache.Delete("tmp")
+						return 0.95
+					case 2:
+						// G1 (invokeSeq 2, non-reentrant): wait until G2 finishes storing 0.95 at epoch 1, then return stale 0.10.
+						close(g1Entered)
+						<-g2Stored
+						return 0.10
+					default:
+						return 0.95
+					}
+				}),
+			)
+			pac = cache.(PressureAwareCache[int])
+
+			for i := range 6 {
+				_, err := cache.Put(fmt.Sprintf("k%d", i), i)
+				require.NoError(t, err)
+			}
+			_, err := cache.Put("tmp", 99)
+			require.NoError(t, err)
+			armed.Store(true)
+
+			g2Done := make(chan struct{})
+			go func() {
+				defer close(g2Done)
+				_ = pac.EvaluateMemoryPressure()
+				close(g2Stored)
+			}()
+			<-g2Started
+
+			g1Done := make(chan struct{})
+			go func() {
+				defer close(g1Done)
+				_, putErr := cache.Put("new_key", 100)
+				assert.NoError(t, putErr)
+			}()
+
+			<-g2Done
+			<-g1Done
+
+			assert.InDelta(t, 0.95, cache.Stats().MemoryPressure, 1e-9, "non-reclaiming stale low-pressure sample must not overwrite elevated post-reclamation pressure")
+			assert.GreaterOrEqual(t, sampleSeq.Load(), int32(3), "G1 must retry sampling after rejecting stale low-pressure reading")
+		})
+	}
 }

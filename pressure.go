@@ -522,14 +522,14 @@ var (
 	}
 
 	fastEvictCallbackMarkers = [numPressureHookTags][]byte{
-		[]byte("deliverCallbacksFast0("),
-		[]byte("deliverCallbacksFast1("),
-		[]byte("deliverCallbacksFast2("),
-		[]byte("deliverCallbacksFast3("),
-		[]byte("deliverCallbacksFast4("),
-		[]byte("deliverCallbacksFast5("),
-		[]byte("deliverCallbacksFast6("),
-		[]byte("deliverCallbacksFast7("),
+		[]byte("invokeFastEvictCallbacks0("),
+		[]byte("invokeFastEvictCallbacks1("),
+		[]byte("invokeFastEvictCallbacks2("),
+		[]byte("invokeFastEvictCallbacks3("),
+		[]byte("invokeFastEvictCallbacks4("),
+		[]byte("invokeFastEvictCallbacks5("),
+		[]byte("invokeFastEvictCallbacks6("),
+		[]byte("invokeFastEvictCallbacks7("),
 	}
 )
 
@@ -998,6 +998,7 @@ func (p *pressureState) isSamplingGoroutine() bool {
 }
 
 func (p *pressureState) recordChildSamplerReclaim() {
+	p.lastReentrantGID.Store(0)
 	if p.samplingPressure.Load() {
 		p.samplingReentrantReclaim.Store(true)
 	}
@@ -1016,10 +1017,9 @@ func (p *pressureState) recordChildSamplerReclaim() {
 }
 
 func (p *pressureState) recordReentrantReclaimGID(gid uint64) {
-	if gid == 0 {
-		return
-	}
 	switch {
+	case gid == 0:
+		p.recordChildSamplerReclaim()
 	case p.samplingGID.Load() == gid:
 		p.samplingReentrantReclaim.Store(true)
 	case p.fallbackGID.Load() == gid:
@@ -1071,6 +1071,8 @@ func (p *pressureState) markReclaimedLocked() {
 	p.pressureNeedsRefresh.Store(true)
 	p.pressureInitialized.Store(false)
 	p.cachedPressureBits.Store(0)
+	p.pressureMaxStoredSeq.Store(0)
+	p.lastSampledSeq.Store(0)
 	p.reclaimEpoch.Add(1)
 	if !sampling {
 		p.externalReclaimEpoch.Add(1)
@@ -1219,12 +1221,22 @@ func (p *pressureState) recordLastSampledTelemetryLocked(invokeSeq uint64, val f
 	if !stored && p.pressureInitialized.Load() && p.cachedPressureEpoch.Load() == p.reclaimEpoch.Load() {
 		return
 	}
-	if invokeSeq == 0 || invokeSeq >= p.lastSampledSeq.Load() {
+	if stored || invokeSeq == 0 || invokeSeq >= p.lastSampledSeq.Load() {
 		if invokeSeq > p.lastSampledSeq.Load() {
 			p.lastSampledSeq.Store(invokeSeq)
 		}
 		p.lastSampledPressureBits.Store(math.Float64bits(val))
 	}
+}
+
+func (p *pressureState) canFastForwardLowPressureEpochLocked(val float64) bool {
+	if val >= p.options.CompactionThreshold {
+		return false
+	}
+	curEpoch := p.reclaimEpoch.Load()
+	return !p.pressureInitialized.Load() ||
+		p.cachedPressureEpoch.Load() != curEpoch ||
+		math.Float64frombits(p.cachedPressureBits.Load()) < p.options.CompactionThreshold
 }
 
 func (p *pressureState) storeSampledPressureWithSeq(epoch, extEpoch, invokeSeq uint64, val float64, gid uint64, slot int) (uint64, float64, bool) {
@@ -1240,9 +1252,11 @@ func (p *pressureState) storeSampledPressureWithSeq(epoch, extEpoch, invokeSeq u
 				resolvedGID = p.samplingGID.Load()
 			}
 			lastGID := p.lastReentrantGID.Load()
-			if (reentrant && (lastGID == 0 || lastGID == resolvedGID)) || val < p.options.CompactionThreshold {
+			if reentrant && (lastGID == 0 || lastGID == resolvedGID) {
 				epoch = p.reclaimEpoch.Load()
 				val, stored = p.updateCachedPressureLocked(epoch, invokeSeq, val)
+			} else if p.canFastForwardLowPressureEpochLocked(val) {
+				epoch = p.reclaimEpoch.Load()
 			}
 		}
 	}
@@ -1859,7 +1873,8 @@ func (p *pressureState) lockEvictCallbackSlow() (bool, uint64) {
 	return true, p.registerSlowEvictHolder(gid, parentGID)
 }
 
-func (p *pressureState) runPendingEvictBatch(queue []func()) {
+//go:noinline
+func (p *pressureState) deliverCallbacksPendingBatch(queue []func()) {
 	defer clear(queue)
 	for i, fn := range queue {
 		queue[i] = nil
@@ -1875,7 +1890,7 @@ func (p *pressureState) drainPendingEvictCallbacks() {
 		p.evictPendingEnqueues.Store(0)
 		p.evictCallbackResolveMu.Unlock()
 		if len(queue) > 0 {
-			p.runPendingEvictBatch(queue)
+			p.deliverCallbacksPendingBatch(queue)
 		}
 	}
 }
@@ -1927,14 +1942,14 @@ func (p *pressureState) clearActiveFastEvictTag() {
 }
 
 //go:noinline
-func (p *pressureState) deliverCallbacksDrainPending() {
+func (p *pressureState) drainPendingEvictCallbacksSlow() {
 	p.clearActiveFastEvictTag()
 	p.unlockEvictCallbackSlow(true)
 }
 
 func (p *pressureState) tryDrainPostUnlock() {
 	if p.evictPendingEnqueues.Load() != 0 && p.evictCallbackMu.TryLock() {
-		p.deliverCallbacksDrainPending()
+		p.drainPendingEvictCallbacksSlow()
 	}
 }
 
@@ -2024,7 +2039,7 @@ func (q *evictCallbackQueue[V]) enqueuePendingCallback(p *pressureState, onVal f
 	p.evictCallbackResolveMu.Unlock()
 
 	if p.evictPendingEnqueues.Load() != 0 && p.evictCallbackMu.TryLock() {
-		p.deliverCallbacksDrainPending()
+		p.drainPendingEvictCallbacksSlow()
 	}
 }
 
@@ -2057,6 +2072,25 @@ func (q *evictCallbackQueue[V]) deliverMultiCallbacks(onVal func(V, EvictionReas
 	q.n = 0
 }
 
+func (p *pressureState) finishFastEvictDelivery() bool {
+	if p.evictPendingEnqueues.Load() != 0 {
+		p.prepareSlowEvictDrain()
+		return true
+	}
+	p.evictFastSlot.Store(p.evictFastIdle)
+	if p.evictCallbackContended.Load() || p.evictPendingEnqueues.Load() != 0 {
+		p.prepareSlowEvictDrain()
+		return true
+	}
+	p.evictCallbackMu.Unlock()
+	if p.evictPendingEnqueues.Load() != 0 && p.evictCallbackMu.TryLock() {
+		p.prepareSlowEvictDrain()
+		return true
+	}
+	return false
+}
+
+//go:noinline
 func (q *evictCallbackQueue[V]) deliverCallbacks(p *pressureState, onVal func(V, EvictionReason), onEntry func(string, V, EvictionReason)) bool {
 	panicked := true
 	defer func() {
@@ -2078,66 +2112,58 @@ func (q *evictCallbackQueue[V]) deliverCallbacks(p *pressureState, onVal func(V,
 		q.deliverMultiCallbacks(onVal, onEntry)
 	}
 	panicked = false
-	if p.evictCallbackContended.Load() || p.evictPendingEnqueues.Load() != 0 {
-		p.prepareSlowEvictDrain()
-		return true
-	}
-	p.evictFastSlot.Store(p.evictFastIdle)
-	p.evictCallbackMu.Unlock()
-	if p.evictPendingEnqueues.Load() != 0 && p.evictCallbackMu.TryLock() {
-		p.prepareSlowEvictDrain()
-		return true
-	}
-	return false
+	return p.finishFastEvictDelivery()
 }
 
 //go:noinline
 func (q *evictCallbackQueue[V]) deliverCallbacksSlow(p *pressureState, onVal func(V, EvictionReason), onEntry func(string, V, EvictionReason)) {
-	completed := false
+	panicked := true
 	defer func() {
-		p.unlockEvictCallbackSlow(completed)
+		if panicked {
+			p.unlockEvictCallbackSlow(false)
+		}
 	}()
 	q.deliverMultiCallbacks(onVal, onEntry)
-	completed = true
+	panicked = false
 }
 
 //go:noinline
-func (q *evictCallbackQueue[V]) deliverCallbacksFast0(p *pressureState, onVal func(V, EvictionReason), onEntry func(string, V, EvictionReason)) bool {
+func (q *evictCallbackQueue[V]) invokeFastEvictCallbacks0(p *pressureState, onVal func(V, EvictionReason), onEntry func(string, V, EvictionReason)) bool {
 	return q.deliverCallbacks(p, onVal, onEntry)
 }
 
 //go:noinline
-func (q *evictCallbackQueue[V]) deliverCallbacksFast1(p *pressureState, onVal func(V, EvictionReason), onEntry func(string, V, EvictionReason)) bool {
+func (q *evictCallbackQueue[V]) invokeFastEvictCallbacks1(p *pressureState, onVal func(V, EvictionReason), onEntry func(string, V, EvictionReason)) bool {
 	return q.deliverCallbacks(p, onVal, onEntry)
 }
 
 //go:noinline
-func (q *evictCallbackQueue[V]) deliverCallbacksFast2(p *pressureState, onVal func(V, EvictionReason), onEntry func(string, V, EvictionReason)) bool {
+func (q *evictCallbackQueue[V]) invokeFastEvictCallbacks2(p *pressureState, onVal func(V, EvictionReason), onEntry func(string, V, EvictionReason)) bool {
 	return q.deliverCallbacks(p, onVal, onEntry)
 }
 
 //go:noinline
-func (q *evictCallbackQueue[V]) deliverCallbacksFast3(p *pressureState, onVal func(V, EvictionReason), onEntry func(string, V, EvictionReason)) bool {
+func (q *evictCallbackQueue[V]) invokeFastEvictCallbacks3(p *pressureState, onVal func(V, EvictionReason), onEntry func(string, V, EvictionReason)) bool {
 	return q.deliverCallbacks(p, onVal, onEntry)
 }
 
 //go:noinline
-func (q *evictCallbackQueue[V]) deliverCallbacksFast4(p *pressureState, onVal func(V, EvictionReason), onEntry func(string, V, EvictionReason)) bool {
+func (q *evictCallbackQueue[V]) invokeFastEvictCallbacks4(p *pressureState, onVal func(V, EvictionReason), onEntry func(string, V, EvictionReason)) bool {
 	return q.deliverCallbacks(p, onVal, onEntry)
 }
 
 //go:noinline
-func (q *evictCallbackQueue[V]) deliverCallbacksFast5(p *pressureState, onVal func(V, EvictionReason), onEntry func(string, V, EvictionReason)) bool {
+func (q *evictCallbackQueue[V]) invokeFastEvictCallbacks5(p *pressureState, onVal func(V, EvictionReason), onEntry func(string, V, EvictionReason)) bool {
 	return q.deliverCallbacks(p, onVal, onEntry)
 }
 
 //go:noinline
-func (q *evictCallbackQueue[V]) deliverCallbacksFast6(p *pressureState, onVal func(V, EvictionReason), onEntry func(string, V, EvictionReason)) bool {
+func (q *evictCallbackQueue[V]) invokeFastEvictCallbacks6(p *pressureState, onVal func(V, EvictionReason), onEntry func(string, V, EvictionReason)) bool {
 	return q.deliverCallbacks(p, onVal, onEntry)
 }
 
 //go:noinline
-func (q *evictCallbackQueue[V]) deliverCallbacksFast7(p *pressureState, onVal func(V, EvictionReason), onEntry func(string, V, EvictionReason)) bool {
+func (q *evictCallbackQueue[V]) invokeFastEvictCallbacks7(p *pressureState, onVal func(V, EvictionReason), onEntry func(string, V, EvictionReason)) bool {
 	return q.deliverCallbacks(p, onVal, onEntry)
 }
 
@@ -2145,24 +2171,24 @@ func (q *evictCallbackQueue[V]) dispatchFastCallbacks(p *pressureState, tag uint
 	var drainSlow bool
 	switch tag {
 	case 0:
-		drainSlow = q.deliverCallbacksFast0(p, onVal, onEntry)
+		drainSlow = q.invokeFastEvictCallbacks0(p, onVal, onEntry)
 	case 1:
-		drainSlow = q.deliverCallbacksFast1(p, onVal, onEntry)
+		drainSlow = q.invokeFastEvictCallbacks1(p, onVal, onEntry)
 	case 2:
-		drainSlow = q.deliverCallbacksFast2(p, onVal, onEntry)
+		drainSlow = q.invokeFastEvictCallbacks2(p, onVal, onEntry)
 	case 3:
-		drainSlow = q.deliverCallbacksFast3(p, onVal, onEntry)
+		drainSlow = q.invokeFastEvictCallbacks3(p, onVal, onEntry)
 	case 4:
-		drainSlow = q.deliverCallbacksFast4(p, onVal, onEntry)
+		drainSlow = q.invokeFastEvictCallbacks4(p, onVal, onEntry)
 	case 5:
-		drainSlow = q.deliverCallbacksFast5(p, onVal, onEntry)
+		drainSlow = q.invokeFastEvictCallbacks5(p, onVal, onEntry)
 	case 6:
-		drainSlow = q.deliverCallbacksFast6(p, onVal, onEntry)
+		drainSlow = q.invokeFastEvictCallbacks6(p, onVal, onEntry)
 	default:
-		drainSlow = q.deliverCallbacksFast7(p, onVal, onEntry)
+		drainSlow = q.invokeFastEvictCallbacks7(p, onVal, onEntry)
 	}
 	if drainSlow {
-		p.deliverCallbacksDrainPending()
+		p.drainPendingEvictCallbacksSlow()
 	}
 }
 
@@ -2173,6 +2199,7 @@ func (q *evictCallbackQueue[V]) invokeLockedSlow(p *pressureState, onVal func(V,
 	}
 	p.registerSlowEvictHolder(0, 0)
 	q.deliverCallbacksSlow(p, onVal, onEntry)
+	p.unlockEvictCallbackSlow(true)
 }
 
 func (q *evictCallbackQueue[V]) invokeSlow(p *pressureState, onVal func(V, EvictionReason), onEntry func(string, V, EvictionReason)) {
@@ -2186,6 +2213,7 @@ func (q *evictCallbackQueue[V]) invokeSlow(p *pressureState, onVal func(V, Evict
 		return
 	}
 	q.deliverCallbacksSlow(p, onVal, onEntry)
+	p.unlockEvictCallbackSlow(true)
 }
 
 func (q *evictCallbackQueue[V]) invoke(p *pressureState, onVal func(V, EvictionReason), onEntry func(string, V, EvictionReason)) {

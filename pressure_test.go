@@ -2217,8 +2217,8 @@ func testOverflowAndExternalReclamationResampling(t *testing.T, b backendDef) {
 	})
 
 	t.Run("ExternalReclamationAfterSamplerReentrantCompactClearsExemptionAndForcesResample", func(t *testing.T) {
-		// Arrange: Primary sampler G1 performs a re-entrant Compact() inside PressureFunc, and before G1 returns 0.95,
-		// an external caller creates and compacts new dirty slack. The external reclamation must clear G1's
+		// Arrange: Primary sampler G1 performs a re-entrant reclamation inside PressureFunc, and before G1 returns 0.95,
+		// an external caller reclaims memory and compacts. The external reclamation must clear G1's
 		// re-entrant exemption so G1 is forced to resample (0.10) in lockWithPressure.
 		var pac PressureAwareCache[testData]
 		var cache Cache[testData]
@@ -2237,7 +2237,8 @@ func testOverflowAndExternalReclamationResampling(t *testing.T, b backendDef) {
 					return 0.10
 				}
 				if calls.Add(1) == 1 {
-					pac.Compact() // G1's own re-entrant Compact()
+					_, _ = cache.Delete("tmp1")
+					pac.Compact() // G1's own re-entrant reclamation
 					close(g1AfterReentrantCompact)
 					<-releaseG1
 					return 0.95
@@ -2253,8 +2254,8 @@ func testOverflowAndExternalReclamationResampling(t *testing.T, b backendDef) {
 		require.NoError(t, err)
 		_, err = cache.Put("tmp1", testData{value: 3, dataSize: 10})
 		require.NoError(t, err)
-		_, ok := cache.Delete("tmp1")
-		require.True(t, ok)
+		_, err = cache.Put("tmp2", testData{value: 4, dataSize: 10})
+		require.NoError(t, err)
 		armed.Store(true)
 
 		g1Done := make(chan struct{})
@@ -2264,14 +2265,12 @@ func testOverflowAndExternalReclamationResampling(t *testing.T, b backendDef) {
 		}()
 		<-g1AfterReentrantCompact
 
-		// External caller creates dirty slack and compacts while G1 is still inside PressureFunc.
+		// External caller reclaims tmp2 and compacts while G1 is still inside PressureFunc.
 		armed.Store(false)
-		_, err = cache.Put("tmp2", testData{value: 4, dataSize: 10})
-		require.NoError(t, err)
-		_, ok = cache.Delete("tmp2")
+		_, ok := cache.Delete("tmp2")
 		require.True(t, ok)
-		armed.Store(true)
 		pac.Compact()
+		armed.Store(true)
 
 		// Act: Release G1 to return stale 0.95; lockWithPressure must reject the cleared exemption and resample 0.10.
 		close(releaseG1)
