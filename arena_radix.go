@@ -424,7 +424,7 @@ func (c *arenaRadix[V]) compressPathUpwards(currID uint32) {
 
 		if c.nodes[c.nodes[currID].child].sibling == nilNode {
 			onlyChildID := c.nodes[currID].child
-			c.nodes[onlyChildID].prefix = c.nodes[currID].prefix + c.nodes[onlyChildID].prefix
+			c.nodes[onlyChildID].prefix = concatPrefix(c.nodes[currID].prefix, c.nodes[onlyChildID].prefix)
 			c.nodes[onlyChildID].parent = c.nodes[currID].parent
 
 			parentID := c.nodes[currID].parent

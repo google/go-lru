@@ -566,6 +566,7 @@ func Benchmark_ArenaRadixCache_Compact(b *testing.B) {
 	}
 
 	b.ReportAllocs()
+	b.ResetTimer()
 	var reclaimedBytes uint64
 	for iter := range b.N {
 		b.StopTimer()

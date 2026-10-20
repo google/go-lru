@@ -800,7 +800,7 @@ func TestAdversarial_CacheLineLayoutAndStructAlignment(t *testing.T) {
 	assert.Equal(t, uintptr(0), unsafe.Offsetof(node.prefix))
 	assert.Equal(t, uintptr(16), unsafe.Sizeof(node.prefix))
 	assert.Equal(t, uintptr(56), unsafe.Sizeof(node))
-	nodeType := reflect.TypeOf(node)
+	nodeType := reflect.TypeFor[arenaRadixNode[uint64]]()
 	assert.Equal(t, reflect.String, nodeType.Field(0).Type.Kind())
 }
 
@@ -2095,17 +2095,17 @@ func TestAdv_Bug1_FastEvictTagOwnerGlobalMemoryLeak(t *testing.T) {
 }
 
 //go:noinline
-func createAndDropCacheForGCLeakCheck(t *testing.T, b Backend) weak.Pointer[byte] {
+func createAndDropCacheForGCLeakCheck(t *testing.T, b Backend) weak.Pointer[[32]byte] {
 	t.Helper()
-	c := New[*byte](2,
+	c := New[*[32]byte](2,
 		WithBackend(b),
 		WithPressureFunc(func() float64 { return 0.10 }),
-		WithOnEvictValue(func(_ *byte, _ EvictionReason) {}),
+		WithOnEvictValue(func(_ *[32]byte, _ EvictionReason) {}),
 	)
-	v1 := new(byte)
-	v2 := new(byte)
-	v3 := new(byte)
-	*v2 = 42
+	v1 := new([32]byte)
+	v2 := new([32]byte)
+	v3 := new([32]byte)
+	v2[0] = 42
 	_, err := c.Put("k1", v1)
 	require.NoError(t, err)
 	_, err = c.Put("k2", v2)
@@ -2123,15 +2123,15 @@ func TestAdv_Bug2_PendingChildCallbackPanicLeaksEvictCallbackMuAndDeadlocks(t *t
 	for _, b := range []Backend{BackendMap, BackendRadix, BackendArenaRadix} {
 		t.Run(b.String(), func(t *testing.T) {
 			// Arrange
-			var cache Cache[*int]
+			var cache Cache[*[4]int]
 			var panicOnBatch atomic.Bool
 			var evictedKeys []string
 			var mu sync.Mutex
 
-			cache = New[*int](10,
+			cache = New[*[4]int](10,
 				WithBackend(b),
 				WithInvariantChecking(true),
-				WithOnEvictEntry(func(key string, _ *int, _ EvictionReason) {
+				WithOnEvictEntry(func(key string, _ *[4]int, _ EvictionReason) {
 					mu.Lock()
 					evictedKeys = append(evictedKeys, key)
 					mu.Unlock()
@@ -2139,7 +2139,7 @@ func TestAdv_Bug2_PendingChildCallbackPanicLeaksEvictCallbackMuAndDeadlocks(t *t
 					if key == "k1" {
 						var wg sync.WaitGroup
 						wg.Go(func() {
-							pac := cache.(PressureAwareCache[*int])
+							pac := cache.(PressureAwareCache[*[4]int])
 							pac.DeletePrefix("batch/")
 						})
 						wg.Wait()
@@ -2160,11 +2160,6 @@ func TestAdv_Bug2_PendingChildCallbackPanicLeaksEvictCallbackMuAndDeadlocks(t *t
 			})
 			panicOnBatch.Store(false)
 
-			for range 6 {
-				runtime.GC()
-				runtime.Gosched()
-			}
-
 			done := make(chan struct{})
 			go func() {
 				_, delOk := cache.Delete("k3")
@@ -2179,6 +2174,10 @@ func TestAdv_Bug2_PendingChildCallbackPanicLeaksEvictCallbackMuAndDeadlocks(t *t
 			case <-time.After(2 * time.Second):
 				require.Failf(t, "deadlock", "backend %v permanently deadlocked on evictCallbackMu after pending child callback panic", b)
 			}
+			for range 6 {
+				runtime.GC()
+				runtime.Gosched()
+			}
 			assert.Nil(t, wpBatch2.Value(), "unconsumed event value in panicking pending callback batch must be zeroed")
 			mu.Lock()
 			assert.Contains(t, evictedKeys, "k3")
@@ -2188,9 +2187,9 @@ func TestAdv_Bug2_PendingChildCallbackPanicLeaksEvictCallbackMuAndDeadlocks(t *t
 }
 
 //go:noinline
-func populateBug2Cache(t *testing.T, cache Cache[*int]) weak.Pointer[int] {
+func populateBug2Cache(t *testing.T, cache Cache[*[4]int]) weak.Pointer[[4]int] {
 	t.Helper()
-	v1, vBatch1, vBatch2, v3 := new(int), new(int), new(int), new(int)
+	v1, vBatch1, vBatch2, v3 := new([4]int), new([4]int), new([4]int), new([4]int)
 	wpBatch2 := weak.Make(vBatch2)
 	_, err := cache.Put("k1", v1)
 	require.NoError(t, err)
@@ -2955,11 +2954,11 @@ func TestAdv_Iter2_PanickingPendingCallbackLeavesNestedChildQueueLeaked(t *testi
 	for _, b := range []Backend{BackendMap, BackendRadix, BackendArenaRadix} {
 		t.Run(b.String(), func(t *testing.T) {
 			// Arrange
-			var cache Cache[*int]
-			cache = New[*int](10,
+			var cache Cache[*[4]int]
+			cache = New[*[4]int](10,
 				WithBackend(b),
 				WithInvariantChecking(true),
-				WithOnEvictEntry(func(key string, _ *int, _ EvictionReason) {
+				WithOnEvictEntry(func(key string, _ *[4]int, _ EvictionReason) {
 					switch key {
 					case "k1":
 						var wg sync.WaitGroup
@@ -2986,11 +2985,6 @@ func TestAdv_Iter2_PanickingPendingCallbackLeavesNestedChildQueueLeaked(t *testi
 				_, _ = cache.Delete("k1")
 			})
 
-			for range 6 {
-				runtime.GC()
-				runtime.Gosched()
-			}
-
 			done := make(chan struct{})
 			go func() {
 				_, ok := cache.Delete("k4")
@@ -3004,6 +2998,10 @@ func TestAdv_Iter2_PanickingPendingCallbackLeavesNestedChildQueueLeaked(t *testi
 			case <-time.After(2 * time.Second):
 				require.Failf(t, "deadlock", "backend %v deadlocked on subsequent Delete after panicking pending callback", b)
 			}
+			for range 6 {
+				runtime.GC()
+				runtime.Gosched()
+			}
 			assert.Zero(t, p.evictPendingEnqueues.Load(), "evictPendingEnqueues must be cleared when drainPendingEvictCallbacks unwinds on panic")
 			assert.Nil(t, wpV3.Value(), "nested pending callback closure and its captured value v3 must be cleared on panic")
 		})
@@ -3011,9 +3009,9 @@ func TestAdv_Iter2_PanickingPendingCallbackLeavesNestedChildQueueLeaked(t *testi
 }
 
 //go:noinline
-func populateIter2Bug4Cache(t *testing.T, cache Cache[*int]) weak.Pointer[int] {
+func populateIter2Bug4Cache(t *testing.T, cache Cache[*[4]int]) weak.Pointer[[4]int] {
 	t.Helper()
-	v1, v2, v3, v4 := new(int), new(int), new(int), new(int)
+	v1, v2, v3, v4 := new([4]int), new([4]int), new([4]int), new([4]int)
 	wpV3 := weak.Make(v3)
 	_, err := cache.Put("k1", v1)
 	require.NoError(t, err)
@@ -3177,4 +3175,73 @@ func TestAdv_Iter3_NamedMethodAndOuterWrapperChildGoroutines(t *testing.T) {
 		assert.Equal(t, int32(1), callsAfterFirstPut, "returning outer helper closure using go func() { fn() }() must not bypass PressureFunc re-entrancy guard")
 		assert.Equal(t, int32(2), evictCalls.Load(), "both k1 and k2 eviction callbacks must complete")
 	})
+}
+
+// TestAdv_Iter3_PrimaryEvictCallbackPanicDoesNotDrainPendingChildCallbacks verifies
+// that when the primary OnEvict* callback panics after a spawned child goroutine
+// enqueued a pending callback, unlockEvictCallbackSlow discards the pending queue
+// rather than executing pending callbacks during panic unwind, zeros all queued
+// closures for GC, and releases evictCallbackMu cleanly.
+func TestAdv_Iter3_PrimaryEvictCallbackPanicDoesNotDrainPendingChildCallbacks(t *testing.T) {
+	for _, b := range []Backend{BackendMap, BackendRadix, BackendArenaRadix} {
+		t.Run(b.String(), func(t *testing.T) {
+			// Arrange
+			var cache Cache[*[4]int]
+			var childCallbackRan atomic.Bool
+			cache = New[*[4]int](10,
+				WithBackend(b),
+				WithInvariantChecking(true),
+				WithOnEvictEntry(func(key string, _ *[4]int, _ EvictionReason) {
+					switch key {
+					case "k1":
+						var wg sync.WaitGroup
+						wg.Go(func() {
+							_, _ = cache.Delete("k2")
+						})
+						wg.Wait()
+						panic("simulated primary callback panic after child enqueue")
+					case "k2":
+						childCallbackRan.Store(true)
+					}
+				}),
+			)
+
+			wpV2 := populateIter3Cache(t, cache)
+			p := extractPressureStateForIter2Test(cache)
+
+			// Act
+			require.PanicsWithValue(t, "simulated primary callback panic after child enqueue", func() {
+				_, _ = cache.Delete("k1")
+			})
+
+			// Assert: k2's pending callback was NOT executed during k1's panic unwind,
+			// evictPendingEnqueues is reset, and subsequent evictions succeed.
+			assert.False(t, childCallbackRan.Load(), "pending child callback must not run during primary callback panic unwind")
+			assert.Zero(t, p.evictPendingEnqueues.Load(), "evictPendingEnqueues must be reset to 0 after primary callback panic")
+
+			_, ok := cache.Delete("k4")
+			assert.True(t, ok)
+			for range 6 {
+				runtime.GC()
+				runtime.Gosched()
+			}
+			assert.Nil(t, wpV2.Value(), "discarded pending callback closure must release captured value references")
+		})
+	}
+}
+
+//go:noinline
+func populateIter3Cache(t *testing.T, cache Cache[*[4]int]) weak.Pointer[[4]int] {
+	t.Helper()
+	v1, v2, v3, v4 := new([4]int), new([4]int), new([4]int), new([4]int)
+	wpV2 := weak.Make(v2)
+	_, err := cache.Put("k1", v1)
+	require.NoError(t, err)
+	_, err = cache.Put("k2", v2)
+	require.NoError(t, err)
+	_, err = cache.Put("k3", v3)
+	require.NoError(t, err)
+	_, err = cache.Put("k4", v4)
+	require.NoError(t, err)
+	return wpV2
 }

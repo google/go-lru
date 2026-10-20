@@ -41,7 +41,7 @@ jobs:
 
       - name: Run Performance & Memory Allocation Benchmarks (Head)
         run: |
-          go test -run=^$ -bench=. -benchmem -benchtime=10ms -count=6 ./... | tee benchmark-head.txt
+          go test -run=^$ -bench=^Benchmark_ -benchmem -benchtime=10ms -count=6 ./... | tee benchmark-head.txt
 
       - name: Run Base Branch Benchmarks for Regression Comparison (PR only)
         if: github.event_name == 'pull_request'
@@ -49,7 +49,7 @@ jobs:
           HEAD_SHA=$(git rev-parse HEAD)
           trap 'git checkout "$HEAD_SHA"' EXIT
           git checkout "${{ github.event.pull_request.base.sha }}"
-          go test -run=^$ -bench=. -benchmem -benchtime=10ms -count=6 ./... | tee benchmark-base.txt
+          go test -run=^$ -bench=^Benchmark_ -benchmem -benchtime=10ms -count=6 ./... | tee benchmark-base.txt
           git checkout "$HEAD_SHA"
           trap - EXIT
           sed -i 's|^pkg: .*|pkg: github.com/google/go-lru|' benchmark-base.txt

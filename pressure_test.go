@@ -3530,18 +3530,20 @@ func testGoidBatchInversionAndSiblingWorkerExclusion(t *testing.T) {
 	p.overflowSamplingCount.Store(1)
 
 	// Act
-	invertedGrandchildEvict := canBeDescendantOf(1472, 1483, 1491)
-	invertedGrandchildSampler := p.canBeDescendantOfActiveSampler(1472)
-	directChildSampler := p.canBeDescendantOfActiveSampler(1483)
-	siblingWorkerRejected := p.canBeDescendantOfActiveSampler(1491)
-	mainRootChildRejected := canBeDescendantOf(1, 1483, 1491)
-	zeroParentRejected := canBeDescendantOf(0, 1483, 1491)
+	invertedGrandchildEvict := canBeDescendantOf(1473, 1472, 1483, 1491)
+	invertedGrandchildSampler := p.canBeDescendantOfActiveSampler(1473, 1472)
+	directChildSampler := p.canBeDescendantOfActiveSampler(1472, 1483)
+	siblingWorkerRejected := p.canBeDescendantOfActiveSampler(1486, 1491)
+	ownerParentRejected := canBeDescendantOf(1491, 100, 1483, 1491)
+	mainRootChildRejected := canBeDescendantOf(1500, 1, 1483, 1491)
+	zeroParentRejected := canBeDescendantOf(1501, 0, 1483, 1491)
 
 	// Assert
 	assert.True(t, invertedGrandchildEvict, "2-hop grandchild with lower per-P goid (parentGID 1472 < holder 1483) must be accepted")
 	assert.True(t, invertedGrandchildSampler, "active sampler check must accept 2-hop grandchild with inverted per-P goid")
 	assert.True(t, directChildSampler, "direct child of active sampler (parentGID == samplingGID) must be accepted")
 	assert.False(t, siblingWorkerRejected, "sibling worker sharing parentGID == ownerParentGID (1491) must be rejected in O(1) even with overflow active")
+	assert.False(t, ownerParentRejected, "parent goroutine (gid == ownerParentGID) can never be a descendant of its own child")
 	assert.False(t, mainRootChildRejected, "goroutine spawned directly by main (parentGID == 1) cannot be 2+-hop descendant of non-main owner")
 	assert.False(t, zeroParentRejected, "zero parentGID must be rejected")
 }

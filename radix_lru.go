@@ -500,7 +500,7 @@ func (c *radixCache[V]) compressPathUpwards(curr *radixNode[V]) {
 
 		if curr.child.sibling == nil {
 			onlyChild := curr.child
-			onlyChild.prefix = curr.prefix + onlyChild.prefix
+			onlyChild.prefix = concatPrefix(curr.prefix, onlyChild.prefix)
 			onlyChild.parent = curr.parent
 
 			curr.parent.replaceChild(curr, onlyChild)
