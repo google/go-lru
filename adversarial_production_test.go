@@ -15,6 +15,7 @@
 package lru
 
 import (
+	"bytes"
 	"fmt"
 	"math"
 	"math/rand/v2"
@@ -2202,6 +2203,73 @@ func populateBug2Cache(t *testing.T, cache Cache[*[4]int]) weak.Pointer[[4]int] 
 	return wpBatch2
 }
 
+func currentGoroutineID() uint64 {
+	stack, bufPtr := captureCurrentGoroutineStack()
+	defer releaseCurrentGoroutineStack(bufPtr)
+	gid, _ := parseStackGoroutineAndParentID(stack)
+	return gid
+}
+
+func isGoroutineParkedInLockEvictCallbackSlow() bool {
+	allStacks, bufPtr := captureAllGoroutineStacks()
+	defer releaseAllGoroutineStacks(bufPtr)
+	for rem := allStacks; len(rem) > 0; {
+		var blk []byte
+		blk, rem = nextGoroutineBlock(rem)
+		if bytes.Contains(blk, []byte("lockEvictCallbackSlow(")) &&
+			bytes.Contains(blk, []byte("sync.(*Mutex).Lock(")) &&
+			!bytes.Contains(blk, []byte("isDescendantOfEvictHolder(")) &&
+			!bytes.Contains(blk, []byte("resolveActiveEvictCallbackHolder(")) {
+			return true
+		}
+	}
+	return false
+}
+
+func waitForGoroutineExit(t *testing.T, targetGID uint64) {
+	t.Helper()
+	if targetGID == 0 {
+		return
+	}
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		allStacks, bufPtr := captureAllGoroutineStacks()
+		found := false
+		for rem := allStacks; len(rem) > 0; {
+			var blk []byte
+			blk, rem = nextGoroutineBlock(rem)
+			gid, _ := parseStackGoroutineAndParentID(blk)
+			if gid == targetGID {
+				found = true
+				break
+			}
+		}
+		releaseAllGoroutineStacks(bufPtr)
+		if !found {
+			return
+		}
+		runtime.Gosched()
+	}
+	assert.Failf(t, "timeout", "goroutine %d did not exit within 5s", targetGID)
+}
+
+func waitForEvictContentionOrDone(t *testing.T, p *pressureState, done <-chan struct{}) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		select {
+		case <-done:
+			return
+		default:
+		}
+		if p != nil && (p.evictPendingEnqueues.Load() != 0 || (p.evictCallbackGID.Load() != 0 && isGoroutineParkedInLockEvictCallbackSlow())) {
+			return
+		}
+		runtime.Gosched()
+	}
+	assert.Fail(t, "timed out waiting for worker eviction callback contention")
+}
+
 // TestAdv_Bug3_UnrelatedGoroutineWithExitedParentMisclassifiedAsChild verifies that:
 //  1. An unrelated worker goroutine whose parent goroutine has already exited is not
 //     misclassified as a re-entrant child of an active OnEvict* or PressureFunc holder.
@@ -2213,6 +2281,7 @@ func TestAdv_Bug3_UnrelatedGoroutineWithExitedParentMisclassifiedAsChild(t *test
 		parentExited := make(chan struct{})
 		startWorker := make(chan struct{})
 		workerDone := make(chan struct{})
+		var parentGID atomic.Uint64
 
 		var cache Cache[int]
 		inK1Evict := make(chan struct{})
@@ -2221,6 +2290,7 @@ func TestAdv_Bug3_UnrelatedGoroutineWithExitedParentMisclassifiedAsChild(t *test
 		var k2CompletedBeforeDeleteReturn atomic.Bool
 
 		go func() {
+			parentGID.Store(currentGoroutineID())
 			go func() {
 				<-startWorker
 				_, ok := cache.Delete("k2")
@@ -2231,7 +2301,7 @@ func TestAdv_Bug3_UnrelatedGoroutineWithExitedParentMisclassifiedAsChild(t *test
 			close(parentExited)
 		}()
 		<-parentExited
-		time.Sleep(5 * time.Millisecond)
+		waitForGoroutineExit(t, parentGID.Load())
 
 		var k1Once sync.Once
 		cache = NewMapCache[int](10, WithOnEvictEntry(func(key string, _ int, _ EvictionReason) {
@@ -2242,7 +2312,6 @@ func TestAdv_Bug3_UnrelatedGoroutineWithExitedParentMisclassifiedAsChild(t *test
 					<-releaseK1Evict
 				})
 			case "k2":
-				time.Sleep(15 * time.Millisecond)
 				k2EvictCompleted.Store(true)
 			}
 		}))
@@ -2260,7 +2329,7 @@ func TestAdv_Bug3_UnrelatedGoroutineWithExitedParentMisclassifiedAsChild(t *test
 		}()
 		<-inK1Evict
 		close(startWorker)
-		time.Sleep(10 * time.Millisecond)
+		waitForEvictContentionOrDone(t, extractPressureStateForIter2Test(cache), workerDone)
 		close(releaseK1Evict)
 		<-g1Done
 		<-workerDone
@@ -2291,9 +2360,9 @@ func TestAdv_Bug3_UnrelatedGoroutineWithExitedParentMisclassifiedAsChild(t *test
 				primaryOnce.Do(func() {
 					close(workerTrigger)
 				})
-				deadline := time.Now().Add(200 * time.Millisecond)
-				for calls.Load() < 2 && time.Now().Before(deadline) {
-					runtime.Gosched()
+				select {
+				case <-workerDone:
+				case <-time.After(5 * time.Second):
 				}
 			}
 			return 0.10
@@ -2315,11 +2384,13 @@ func TestAdv_Bug3_UnrelatedGoroutineWithExitedParentMisclassifiedAsChild(t *test
 		parentExited := make(chan struct{})
 		workerTrigger := make(chan struct{})
 		workerDone := make(chan struct{})
+		var parentGID atomic.Uint64
 		var cache *mapCache[int]
 		var calls atomic.Int32
 		var workerErr error
 
 		go func() {
+			parentGID.Store(currentGoroutineID())
 			go func() {
 				<-workerTrigger
 				_, _ = cache.Delete("k_reclaim")
@@ -2329,7 +2400,7 @@ func TestAdv_Bug3_UnrelatedGoroutineWithExitedParentMisclassifiedAsChild(t *test
 			close(parentExited)
 		}()
 		<-parentExited
-		time.Sleep(5 * time.Millisecond)
+		waitForGoroutineExit(t, parentGID.Load())
 
 		var armOnce sync.Once
 		var armed atomic.Bool
@@ -2636,12 +2707,14 @@ func TestAdv_Iter2_WaitGroupGoWrapperHelperDropsCallerFrame(t *testing.T) {
 				if firstPressure.CompareAndSwap(true, false) {
 					g2Exited := make(chan struct{})
 					g3Done := make(chan struct{})
+					var g2GID atomic.Uint64
 					var wg sync.WaitGroup
 					go func() {
+						g2GID.Store(currentGoroutineID())
 						runWithWaitGroupWrapper(&wg, func() {
 							defer close(g3Done)
 							<-g2Exited
-							time.Sleep(5 * time.Millisecond)
+							waitForGoroutineExit(t, g2GID.Load())
 							_, _ = cache.Delete("missing_from_wg_wrapper")
 						})
 						close(g2Exited)
@@ -2656,12 +2729,14 @@ func TestAdv_Iter2_WaitGroupGoWrapperHelperDropsCallerFrame(t *testing.T) {
 				if firstEvict.CompareAndSwap(true, false) {
 					g2Exited := make(chan struct{})
 					g3Done := make(chan struct{})
+					var g2GID atomic.Uint64
 					var wg sync.WaitGroup
 					go func() {
+						g2GID.Store(currentGoroutineID())
 						runWithWaitGroupWrapper(&wg, func() {
 							defer close(g3Done)
 							<-g2Exited
-							time.Sleep(5 * time.Millisecond)
+							waitForGoroutineExit(t, g2GID.Load())
 							_, putErr := cache.Put("k3_from_wg_wrapper", 3)
 							assert.NoError(t, putErr)
 						})
@@ -2721,9 +2796,9 @@ func TestAdv_Iter2_WaitGroupGoWrapperHelperDropsCallerFrame(t *testing.T) {
 					primaryOnce.Do(func() {
 						close(workerTrigger)
 					})
-					deadline := time.Now().Add(200 * time.Millisecond)
-					for calls.Load() < 2 && time.Now().Before(deadline) {
-						runtime.Gosched()
+					select {
+					case <-workerDone:
+					case <-time.After(5 * time.Second):
 					}
 				})
 				innerWG.Wait()
@@ -2778,10 +2853,9 @@ func TestAdv_Iter2_PreExistingWorkerSpawnedViaHelperOrSetupClosureMisclassifiedA
 			case "k1":
 				k1Once.Do(func() {
 					close(startWorker)
-					time.Sleep(10 * time.Millisecond)
+					waitForEvictContentionOrDone(t, extractPressureStateForIter2Test(cache), workerDone)
 				})
 			case "k2":
-				time.Sleep(15 * time.Millisecond)
 				k2EvictCompleted.Store(true)
 			}
 		}))
@@ -2868,9 +2942,9 @@ func TestAdv_Iter2_PreExistingWorkerSpawnedViaHelperOrSetupClosureMisclassifiedA
 				primaryOnce.Do(func() {
 					close(workerTrigger)
 				})
-				deadline := time.Now().Add(200 * time.Millisecond)
-				for calls.Load() < 2 && time.Now().Before(deadline) {
-					runtime.Gosched()
+				select {
+				case <-workerDone:
+				case <-time.After(5 * time.Second):
 				}
 			}
 			return 0.10
@@ -2919,9 +2993,9 @@ func runGenericWaitGroupWorkerScenario[T any](t *testing.T, val T) {
 			primaryOnce.Do(func() {
 				close(workerTrigger)
 			})
-			deadline := time.Now().Add(200 * time.Millisecond)
-			for calls.Load() < 2 && time.Now().Before(deadline) {
-				runtime.Gosched()
+			select {
+			case <-workerDone:
+			case <-time.After(5 * time.Second):
 			}
 		}
 		return 0.10
@@ -3089,7 +3163,7 @@ func TestAdv_Iter3_NamedMethodAndOuterWrapperChildGoroutines(t *testing.T) {
 					go w.putFromChild()
 					select {
 					case <-w.putDone:
-					case <-time.After(500 * time.Millisecond):
+					case <-time.After(5 * time.Second):
 						evictDeadlocked.Store(true)
 					}
 					var wg sync.WaitGroup
@@ -3153,7 +3227,7 @@ func TestAdv_Iter3_NamedMethodAndOuterWrapperChildGoroutines(t *testing.T) {
 					})
 					select {
 					case <-childDone:
-					case <-time.After(500 * time.Millisecond):
+					case <-time.After(5 * time.Second):
 						evictDeadlocked.Store(true)
 					}
 				}
@@ -3747,4 +3821,194 @@ func TestAdv_Iter5_ConcurrentMultiSamplerReentrantReclaimInvalidatesStalePeerSam
 			assert.Equal(t, 10, st.Len, "all 8 base entries + new1 + new2 must remain live on %v", b)
 		})
 	}
+}
+
+type genericCallbackBox[T any] struct {
+	val T
+}
+
+//go:noinline
+func (b *genericCallbackBox[T]) spawnWithExitedIntermediate(t *testing.T, fn func()) {
+	t.Helper()
+	midExited := make(chan struct{})
+	leafDone := make(chan struct{})
+	var midGID atomic.Uint64
+	go func() {
+		midGID.Store(currentGoroutineID())
+		go func() {
+			defer close(leafDone)
+			<-midExited
+			waitForGoroutineExit(t, midGID.Load())
+			fn()
+		}()
+		close(midExited)
+	}()
+	<-leafDone
+}
+
+//go:noinline
+func runGenericSetupAndExitedChildScenario[T any](t *testing.T, val T) {
+	t.Helper()
+
+	workerTrigger := make(chan struct{})
+	workerDone := make(chan struct{})
+	var cache Cache[T]
+	var calls atomic.Int32
+	var evictCalls atomic.Int32
+	var workerErr error
+
+	// Setup closure inside generic function runGenericSetupAndExitedChildScenario[T].
+	startSetup := func() {
+		go func() {
+			<-workerTrigger
+			_, workerErr = cache.Put("worker_key", val)
+			close(workerDone)
+		}()
+	}
+	startSetup()
+
+	box := &genericCallbackBox[T]{val: val}
+	var primaryOnce, evictOnce sync.Once
+	cache = NewMapCache[T](2,
+		WithInvariantChecking(true),
+		WithPressureFunc(func() float64 {
+			c := calls.Add(1)
+			if c == 1 {
+				primaryOnce.Do(func() {
+					box.spawnWithExitedIntermediate(t, func() {
+						_, _ = cache.Delete("missing_generic_box_child")
+					})
+					close(workerTrigger)
+				})
+				select {
+				case <-workerDone:
+				case <-time.After(5 * time.Second):
+				}
+			}
+			return 0.10
+		}),
+		WithOnEvictValue(func(_ T, _ EvictionReason) {
+			evictCalls.Add(1)
+			evictOnce.Do(func() {
+				box.spawnWithExitedIntermediate(t, func() {
+					_, _ = cache.Delete("worker_key")
+				})
+			})
+		}),
+	)
+
+	_, err := cache.Put("parent_key", val)
+	require.NoError(t, err)
+	<-workerDone
+	require.NoError(t, workerErr)
+
+	// Assert 1: Pre-existing setup closure worker in generic function sampled PressureFunc independently,
+	// while the exited-intermediate child inside generic method box.spawnWithExitedIntermediate did not re-sample.
+	assert.Equal(t, int32(2), calls.Load(), "pre-existing setup closure worker in generic function must sample while exited-intermediate generic method child must not")
+
+	// Act 2: Trigger OnEvictValue, which uses generic method box.spawnWithExitedIntermediate to delete worker_key.
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		_, ok := cache.Delete("parent_key")
+		assert.True(t, ok)
+	}()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		require.Fail(t, "deadlock in generic receiver method child inside OnEvictValue")
+	}
+	assert.Equal(t, int32(2), evictCalls.Load())
+}
+
+// TestAdv_Iter6_SiblingClosureWorkerAndGenericClosureOwnerAttribution verifies:
+//  1. PRESSURE-01: When an outer function defines a worker closure (outer.func1) and
+//     OnEvict* / PressureFunc (outer.func2) spawns that sibling closure directly via
+//     `go worker()` or via an inner closure, or calls a sibling helper closure to spawn
+//     a named method, the spawned goroutine is recognized as a descendant rather than
+//     deadlocking on evictCallbackMu or bypassing PressureFunc re-entrancy guards.
+//  2. PRESSURE-02: Closures compiled inside generic functions (`fn[go.shape...].func1`)
+//     and generic receiver methods (`(*Box[go.shape...]).Method.func1`) resolve their
+//     generic owner frames (`fn[...]` and `(*Box[...]).Method`) in runtime stacks.
+func TestAdv_Iter6_SiblingClosureWorkerAndGenericClosureOwnerAttribution(t *testing.T) {
+	t.Run("DirectGoAndInnerClosureSpawningOuterWorkerClosure", func(t *testing.T) {
+		for _, b := range []Backend{BackendMap, BackendRadix, BackendArenaRadix} {
+			t.Run(b.String(), func(t *testing.T) {
+				var cache Cache[int]
+				var pressureCalls, evictCalls atomic.Int32
+				var firstPressure, firstEvict sync.Once
+
+				evictWorkerDone := make(chan struct{})
+				evictWorker := func() {
+					defer close(evictWorkerDone)
+					_, _ = cache.Delete("k2")
+				}
+
+				pressureWorkerDone := make(chan struct{})
+				pressureWorker := func() {
+					defer close(pressureWorkerDone)
+					_, _ = cache.Delete("missing_sibling_worker")
+				}
+
+				spawnSiblingHelper := func(fn func()) {
+					go fn()
+				}
+
+				w := &methodChildWorker{
+					putDone: make(chan struct{}),
+				}
+
+				cache = New[int](10,
+					WithBackend(b),
+					WithInvariantChecking(true),
+					WithPressureFunc(func() float64 {
+						pressureCalls.Add(1)
+						firstPressure.Do(func() {
+							go pressureWorker()
+							<-pressureWorkerDone
+						})
+						return 0.10
+					}),
+					WithOnEvictEntry(func(key string, _ int, _ EvictionReason) {
+						evictCalls.Add(1)
+						if key == "k1" {
+							firstEvict.Do(func() {
+								go evictWorker()
+								<-evictWorkerDone
+								spawnSiblingHelper(w.putFromChild)
+								<-w.putDone
+							})
+						}
+					}),
+				)
+				w.cache = cache
+
+				_, err := cache.Put("k1", 1)
+				require.NoError(t, err)
+				assert.Equal(t, int32(1), pressureCalls.Load(), "sibling closure worker spawned via go pressureWorker() inside PressureFunc must not re-sample")
+
+				_, err = cache.Put("k2", 2)
+				require.NoError(t, err)
+
+				delDone := make(chan struct{})
+				go func() {
+					defer close(delDone)
+					_, ok := cache.Delete("k1")
+					assert.True(t, ok)
+				}()
+
+				select {
+				case <-delDone:
+				case <-time.After(5 * time.Second):
+					require.Failf(t, "deadlock", "backend %v deadlocked when OnEvictEntry spawned outer sibling closure worker", b)
+				}
+				require.NoError(t, w.putErr)
+				assert.Equal(t, int32(2), evictCalls.Load(), "both k1 and k2 eviction callbacks must fire on %v", b)
+			})
+		}
+	})
+
+	t.Run("GenericFunctionAndGenericMethodClosureOwnerResolution", func(t *testing.T) {
+		runGenericSetupAndExitedChildScenario(t, [2]func(int){nil, nil})
+	})
 }

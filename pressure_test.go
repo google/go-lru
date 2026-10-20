@@ -22,6 +22,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
+	"time"
 	"unsafe"
 
 	"github.com/stretchr/testify/assert"
@@ -3234,6 +3235,18 @@ func verifyBackendZeroAllocHotPaths(t *testing.T, name string, cache Cache[int])
 	assert.Zero(t, statsAllocs, "%s Stats() must be 0 allocs/op", name)
 }
 
+func waitForCrossCacheContention(cacheA Cache[int], arenaA *arenaRadix[int]) {
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		if hasKey(cacheA, "from_b") && arenaA.evictCallbackGID.Load() != 0 {
+			if arenaA.evictPendingEnqueues.Load() != 0 || isGoroutineParkedInLockEvictCallbackSlow() {
+				return
+			}
+		}
+		runtime.Gosched()
+	}
+}
+
 func TestPressure_MultiCacheAndCircularReentrancy(t *testing.T) {
 	t.Run("CrossCacheOnEvictReentrancyUnderContention", func(t *testing.T) {
 		// Arrange
@@ -3285,18 +3298,18 @@ func TestPressure_MultiCacheAndCircularReentrancy(t *testing.T) {
 		<-enteredFirstA
 
 		wg.Go(func() {
-			_, putErr := cacheB.Put("b2", 2)
-			assert.NoError(t, putErr)
+			var innerWG sync.WaitGroup
+			innerWG.Go(func() {
+				_, putErr := cacheB.Put("b2", 2)
+				assert.NoError(t, putErr)
+			})
+			innerWG.Wait()
 		})
 
 		<-enteredB
 		arenaA := cacheA.(*arenaRadix[int])
-		for !hasKey(cacheA, "from_b") || arenaA.evictCallbackGID.Load() == 0 {
-			runtime.Gosched()
-		}
-		for range 16 {
-			runtime.Gosched()
-		}
+		waitForCrossCacheContention(cacheA, arenaA)
+		assert.Zero(t, arenaA.evictPendingEnqueues.Load(), "cross-cache caller must block on evictCallbackMu rather than enqueueing as descendant")
 		close(releaseFirstA)
 		wg.Wait()
 

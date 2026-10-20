@@ -137,21 +137,97 @@ func nextGoroutineBlock(rem []byte) (blk, rest []byte) {
 	return nil, nil
 }
 
+func skipBalancedBrackets(b []byte) (int, bool) {
+	if len(b) == 0 || b[0] != '[' {
+		return 0, false
+	}
+	depth := 0
+	for i := range b {
+		switch b[i] {
+		case '\n':
+			return 0, false
+		case '[':
+			depth++
+		case ']':
+			depth--
+			if depth == 0 {
+				return i + 1, true
+			}
+		}
+	}
+	return 0, false
+}
+
+func isCallFrameBoundary(after []byte) bool {
+	if len(after) == 0 {
+		return false
+	}
+	if after[0] == '(' {
+		return true
+	}
+	if after[0] == '[' {
+		adv, ok := skipBalancedBrackets(after)
+		return ok && adv < len(after) && after[adv] == '('
+	}
+	return false
+}
+
+func matchCreatorLine(line, creatorFunc []byte) bool {
+	for len(creatorFunc) > 0 {
+		brackIdx := bytes.IndexByte(creatorFunc, '[')
+		if brackIdx < 0 {
+			if !bytes.HasPrefix(line, creatorFunc) {
+				return false
+			}
+			return isCallFrameBoundary(line[len(creatorFunc):])
+		}
+		if !bytes.HasPrefix(line, creatorFunc[:brackIdx]) {
+			return false
+		}
+		line = line[brackIdx:]
+		creatorFunc = creatorFunc[brackIdx:]
+		cAdv, cOK := skipBalancedBrackets(creatorFunc)
+		lAdv, lOK := skipBalancedBrackets(line)
+		if !cOK || !lOK {
+			return false
+		}
+		creatorFunc = creatorFunc[cAdv:]
+		line = line[lAdv:]
+	}
+	return isCallFrameBoundary(line)
+}
+
 func containsCreatorCallFrame(stackPrefix, creatorFunc []byte) bool {
+	creatorFunc = trimClosureOffset(creatorFunc)
 	if len(creatorFunc) == 0 {
 		return false
 	}
-	if plusIdx := bytes.IndexByte(creatorFunc, '+'); plusIdx > 0 {
-		creatorFunc = creatorFunc[:plusIdx]
+	brackIdx := bytes.IndexByte(creatorFunc, '[')
+	if brackIdx < 0 {
+		search := stackPrefix
+		for len(search) > len(creatorFunc) {
+			idx := bytes.Index(search, creatorFunc)
+			if idx < 0 {
+				return false
+			}
+			afterIdx := idx + len(creatorFunc)
+			if idx > 0 && search[idx-1] == '\n' && isCallFrameBoundary(search[afterIdx:]) {
+				return true
+			}
+			search = search[idx+1:]
+		}
+		return false
+	}
+	if brackIdx == 0 {
+		return false
 	}
 	search := stackPrefix
-	for len(search) > len(creatorFunc) {
-		idx := bytes.Index(search, creatorFunc)
+	for len(search) > brackIdx {
+		idx := bytes.Index(search, creatorFunc[:brackIdx])
 		if idx < 0 {
 			return false
 		}
-		afterIdx := idx + len(creatorFunc)
-		if idx > 0 && search[idx-1] == '\n' && afterIdx < len(search) && (search[afterIdx] == '(' || search[afterIdx] == '[') {
+		if idx > 0 && search[idx-1] == '\n' && matchCreatorLine(search[idx:], creatorFunc) {
 			return true
 		}
 		search = search[idx+1:]
@@ -167,7 +243,7 @@ func hasCallFrameAboveHook(aboveHook []byte) bool {
 
 func isClosureSuffix(suffix []byte) bool {
 	if bytes.HasPrefix(suffix, []byte("func")) {
-		return true
+		suffix = suffix[len("func"):]
 	}
 	if len(suffix) == 0 {
 		return false
@@ -189,7 +265,7 @@ func trimClosureOffset(fn []byte) []byte {
 
 func findClosureOwnerInStack(blk, creatorFunc []byte) []byte {
 	curr := trimClosureOffset(creatorFunc)
-	for {
+	for len(curr) > 0 && curr[len(curr)-1] != ']' {
 		dot := bytes.LastIndexByte(curr, '.')
 		if dot <= 0 || !isClosureSuffix(curr[dot+1:]) {
 			return nil
@@ -199,19 +275,27 @@ func findClosureOwnerInStack(blk, creatorFunc []byte) []byte {
 			return curr
 		}
 	}
+	return nil
 }
 
 func trimFrameFuncName(fnLine []byte) []byte {
 	for i := 0; i < len(fnLine); i++ {
 		if fnLine[i] == '.' && i+2 < len(fnLine) && fnLine[i+1] == '(' && fnLine[i+2] == '*' {
-			if closeIdx := bytes.IndexByte(fnLine[i+3:], ')'); closeIdx >= 0 {
-				i += 3 + closeIdx
-				continue
+			i += 3
+			for i < len(fnLine) && fnLine[i] != ')' {
+				if fnLine[i] == '[' {
+					if adv, ok := skipBalancedBrackets(fnLine[i:]); ok {
+						i += adv
+						continue
+					}
+				}
+				i++
 			}
+			continue
 		}
 		if fnLine[i] == '[' {
-			if closeIdx := bytes.IndexByte(fnLine[i+1:], ']'); closeIdx >= 0 {
-				i += 1 + closeIdx
+			if adv, ok := skipBalancedBrackets(fnLine[i:]); ok {
+				i += adv - 1
 				continue
 			}
 		}
@@ -234,14 +318,29 @@ func popBottomCallFrame(frames []byte) (fnName, rest []byte) {
 	return trimFrameFuncName(frames[fnNL+1 : tabNL]), frames[:fnNL]
 }
 
-func matchChildStackFramesAboveHook(blk, aboveHook, belowHook, childStack []byte) (matched, decided bool) {
+func hasClosureOwnedBy(aboveHook, blk, owner []byte) bool {
+	rest := aboveHook
+	const maxFrames = 16
+	for range maxFrames {
+		var fn []byte
+		fn, rest = popBottomCallFrame(rest)
+		if len(fn) == 0 {
+			return false
+		}
+		if fnOwner := findClosureOwnerInStack(blk, fn); len(fnOwner) > 0 && bytes.Equal(fnOwner, owner) {
+			return true
+		}
+	}
+	return false
+}
+
+func matchChildStackFramesAboveHook(blk, aboveHook, belowHook, childStack []byte) (matchedAbove, sawBelowOwner bool) {
 	const createdBy = "\ncreated by "
 	end := bytes.LastIndex(childStack, []byte(createdBy))
 	if end <= 0 {
 		return false, false
 	}
 	rest := childStack[:end]
-	sawBelowOwner := false
 	const maxBottomFrames = 8
 	for range maxBottomFrames {
 		var fn []byte
@@ -252,22 +351,19 @@ func matchChildStackFramesAboveHook(blk, aboveHook, belowHook, childStack []byte
 		if bytes.Equal(fn, []byte("sync.(*WaitGroup).Go.func1")) {
 			continue
 		}
-		if containsCreatorCallFrame(aboveHook, fn) {
-			return true, true
+		if containsCreatorCallFrame(aboveHook, fn) && !containsCreatorCallFrame(belowHook, fn) {
+			return true, false
 		}
 		if owner := findClosureOwnerInStack(blk, fn); len(owner) > 0 {
-			if containsCreatorCallFrame(aboveHook, owner) {
-				return true, true
+			if containsCreatorCallFrame(aboveHook, owner) && !containsCreatorCallFrame(belowHook, owner) {
+				return true, false
 			}
 			if containsCreatorCallFrame(belowHook, owner) {
 				sawBelowOwner = true
 			}
 		}
 	}
-	if sawBelowOwner {
-		return false, true
-	}
-	return false, false
+	return false, sawBelowOwner
 }
 
 func decideCreatorFromCallbackAboveHook(blk []byte, hookIdx int, currCreator, childStack []byte, requirePositiveMatch bool) (matched, decided bool) {
@@ -276,20 +372,31 @@ func decideCreatorFromCallbackAboveHook(blk []byte, hookIdx int, currCreator, ch
 		return false, true
 	}
 	belowHook := blk[hookIdx:]
-	if matched, decided := matchChildStackFramesAboveHook(blk, aboveHook, belowHook, childStack); decided {
-		return matched, true
+	matchedAbove, sawBelowOwner := matchChildStackFramesAboveHook(blk, aboveHook, belowHook, childStack)
+	if matchedAbove {
+		return true, true
+	}
+	if len(currCreator) > 0 {
+		if containsCreatorCallFrame(aboveHook, currCreator) && !containsCreatorCallFrame(belowHook, currCreator) {
+			return true, true
+		}
+		if owner := findClosureOwnerInStack(blk, currCreator); len(owner) > 0 {
+			if containsCreatorCallFrame(aboveHook, owner) && !containsCreatorCallFrame(belowHook, owner) {
+				return true, true
+			}
+			if containsCreatorCallFrame(belowHook, owner) && !hasClosureOwnedBy(aboveHook, blk, owner) {
+				return false, true
+			}
+		}
+		if containsCreatorCallFrame(belowHook, currCreator) {
+			return false, true
+		}
+	}
+	if sawBelowOwner {
+		return false, true
 	}
 	if len(currCreator) == 0 {
 		return false, false
-	}
-	if containsCreatorCallFrame(aboveHook, currCreator) {
-		return true, true
-	}
-	if containsCreatorCallFrame(belowHook, currCreator) {
-		return false, true
-	}
-	if owner := findClosureOwnerInStack(blk, currCreator); len(owner) > 0 {
-		return containsCreatorCallFrame(aboveHook, owner), true
 	}
 	if !requirePositiveMatch {
 		return true, true
