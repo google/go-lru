@@ -3505,3 +3505,246 @@ func TestAdv_Iter4_DeepDescendantReentrancyChainBeyondEightHops(t *testing.T) {
 		}
 	})
 }
+
+//go:noinline
+func spawnNamedTargetViaReturningHelper(fn func()) {
+	go fn()
+}
+
+// TestAdv_Iter5_CrossCacheFastEvictTagDrainDoesNotPoisonEvictCallbackGID verifies that
+// when cacheA drains a pending re-entrant eviction callback after its fast-path callback,
+// deliverCallbacksFast<tag> is already popped off cacheA's stack before fastEvictTagState[tag]
+// is released. When cacheB claims the same tag on a newer goroutine and spawns a child
+// goroutine inside OnEvict*, resolveEvictCallbackHolderFromAllStacksLocked resolves cacheB's
+// own goroutine rather than matching cacheA's goroutine and deadlocking.
+func TestAdv_Iter5_CrossCacheFastEvictTagDrainDoesNotPoisonEvictCallbackGID(t *testing.T) {
+	for _, b := range []Backend{BackendMap, BackendRadix, BackendArenaRadix} {
+		t.Run(b.String(), func(t *testing.T) {
+			cacheAEnteredPending := make(chan struct{})
+			releaseCacheAPending := make(chan struct{})
+
+			var cacheA, cacheB Cache[int]
+			stepA := 0
+			cacheA = New[int](2,
+				WithBackend(b),
+				WithInvariantChecking(true),
+				WithOnEvictValue(func(_ int, _ EvictionReason) {
+					stepA++
+					if stepA == 1 {
+						_, _ = cacheA.Delete("a2")
+						return
+					}
+					if stepA == 2 {
+						close(cacheAEnteredPending)
+						<-releaseCacheAPending
+					}
+				}),
+			)
+			_, err := cacheA.Put("prime", 1)
+			require.NoError(t, err)
+			_, _ = cacheA.Delete("prime")
+			stepA = 0
+
+			for range numPressureHookTags - 1 {
+				d := New[int](2, WithBackend(b), WithOnEvictValue(func(_ int, _ EvictionReason) {}))
+				_, putErr := d.Put("p", 1)
+				require.NoError(t, putErr)
+				_, _ = d.Delete("p")
+			}
+
+			var bStarted atomic.Bool
+			var bEvicted atomic.Int32
+			cacheB = New[int](2,
+				WithBackend(b),
+				WithInvariantChecking(true),
+				WithOnEvictValue(func(_ int, _ EvictionReason) {
+					bEvicted.Add(1)
+					if !bStarted.CompareAndSwap(false, true) {
+						return
+					}
+					var wg sync.WaitGroup
+					wg.Go(func() {
+						_, _ = cacheB.Delete("b2")
+					})
+					wg.Wait()
+				}),
+			)
+
+			_, err = cacheA.Put("a1", 1)
+			require.NoError(t, err)
+			_, err = cacheA.Put("a2", 2)
+			require.NoError(t, err)
+
+			g1Done := make(chan struct{})
+			go func() {
+				defer close(g1Done)
+				_, _ = cacheA.Delete("a1")
+			}()
+
+			<-cacheAEnteredPending
+
+			_, err = cacheB.Put("b1", 1)
+			require.NoError(t, err)
+			_, err = cacheB.Put("b2", 2)
+			require.NoError(t, err)
+
+			g2Done := make(chan struct{})
+			go func() {
+				defer close(g2Done)
+				_, _ = cacheB.Delete("b1")
+			}()
+
+			select {
+			case <-g2Done:
+			case <-time.After(2 * time.Second):
+				close(releaseCacheAPending)
+				require.Failf(t, "deadlock", "backend %v deadlocked due to cross-cache fast-evict tag poisoning", b)
+			}
+
+			close(releaseCacheAPending)
+			<-g1Done
+			assert.Equal(t, int32(2), bEvicted.Load(), "both b1 and child-deleted b2 eviction callbacks must complete on %v", b)
+		})
+	}
+}
+
+// TestAdv_Iter5_NamedMethodChildViaReturningHelperAndChannelSync verifies that spawning
+// a synchronous child goroutine inside OnEvict* or PressureFunc by passing a named method
+// value to a returning helper function (or wg.Go synchronized via a channel before wg.Wait)
+// recognizes the child goroutine as a descendant of the callback/sampler holder.
+func TestAdv_Iter5_NamedMethodChildViaReturningHelperAndChannelSync(t *testing.T) {
+	for _, b := range []Backend{BackendMap, BackendRadix, BackendArenaRadix} {
+		t.Run(b.String(), func(t *testing.T) {
+			var pressureCalls, evictCalls atomic.Int32
+			var firstPressure, firstEvict sync.Once
+
+			w := &methodChildWorker{
+				putDone: make(chan struct{}),
+			}
+
+			w.cache = New[int](2,
+				WithBackend(b),
+				WithInvariantChecking(true),
+				WithPressureFunc(func() float64 {
+					pressureCalls.Add(1)
+					firstPressure.Do(func() {
+						done := make(chan struct{})
+						wPress := &methodChildWorker{
+							cache:   w.cache,
+							putDone: done,
+						}
+						spawnNamedTargetViaReturningHelper(wPress.putFromChild)
+						<-done
+						require.NoError(t, wPress.putErr)
+					})
+					return 0.10
+				}),
+				WithOnEvictValue(func(_ int, _ EvictionReason) {
+					evictCalls.Add(1)
+					firstEvict.Do(func() {
+						spawnNamedTargetViaReturningHelper(w.putFromChild)
+						<-w.putDone
+					})
+				}),
+			)
+
+			_, err := w.cache.Put("k1", 1)
+			require.NoError(t, err)
+			assert.Equal(t, int32(1), pressureCalls.Load(), "named method child spawned via returning helper inside PressureFunc must not re-sample on %v", b)
+
+			done := make(chan struct{})
+			go func() {
+				defer close(done)
+				_, ok := w.cache.Delete("k1")
+				assert.True(t, ok)
+			}()
+
+			select {
+			case <-done:
+			case <-time.After(2 * time.Second):
+				require.Failf(t, "deadlock", "backend %v deadlocked on named method child spawned via returning helper inside OnEvictValue", b)
+			}
+
+			require.NoError(t, w.putErr)
+			assert.Equal(t, int32(2), evictCalls.Load(), "Delete(k1) and child Put replacement of k3_from_named_method must both fire OnEvictValue on %v", b)
+		})
+	}
+}
+
+// TestAdv_Iter5_ConcurrentMultiSamplerReentrantReclaimInvalidatesStalePeerSample verifies
+// that when Sampler 1 performs an earlier re-entrant reclamation at t1 and samples high
+// pressure (0.95) at t2, and concurrent Sampler 2 performs a later re-entrant reclamation
+// at t3 (after which pressure drops to 0.10), Sampler 1 does not fast-forward its stale
+// 0.95 sample across Sampler 2's reclamation epoch to falsely shed the cache.
+func TestAdv_Iter5_ConcurrentMultiSamplerReentrantReclaimInvalidatesStalePeerSample(t *testing.T) {
+	for _, b := range []Backend{BackendMap, BackendRadix, BackendArenaRadix} {
+		t.Run(b.String(), func(t *testing.T) {
+			var cache PressureAwareCache[int]
+			var enabled atomic.Bool
+			g1Entered := make(chan struct{})
+			g2Entered := make(chan struct{})
+			g1SampledBeforeG2Reclaim := make(chan struct{})
+			g2Reclaimed := make(chan struct{})
+
+			var callNum atomic.Int32
+			cache = New[int](10,
+				WithBackend(b),
+				WithInvariantChecking(true),
+				WithPressureFunc(func() float64 {
+					if !enabled.Load() {
+						return 0.0
+					}
+					switch callNum.Add(1) {
+					case 1:
+						close(g1Entered)
+						<-g2Entered
+						_, _ = cache.Delete("reclaim_g1")
+						val := 0.95
+						close(g1SampledBeforeG2Reclaim)
+						<-g2Reclaimed
+						return val
+					case 2:
+						close(g2Entered)
+						<-g1SampledBeforeG2Reclaim
+						_, _ = cache.Delete("reclaim_g2")
+						close(g2Reclaimed)
+						return 0.10
+					default:
+						return 0.10
+					}
+				}),
+			).(PressureAwareCache[int])
+
+			for i := range 8 {
+				_, err := cache.Put(fmt.Sprintf("k%d", i), i)
+				require.NoError(t, err)
+			}
+			_, err := cache.Put("reclaim_g1", 100)
+			require.NoError(t, err)
+			_, err = cache.Put("reclaim_g2", 200)
+			require.NoError(t, err)
+
+			enabled.Store(true)
+
+			var wg sync.WaitGroup
+			wg.Add(2)
+			go func() {
+				defer wg.Done()
+				_, putErr := cache.Put("new1", 1)
+				assert.NoError(t, putErr)
+			}()
+			<-g1Entered
+			go func() {
+				defer wg.Done()
+				_, putErr := cache.Put("new2", 2)
+				assert.NoError(t, putErr)
+			}()
+			wg.Wait()
+
+			st := cache.Stats()
+			assert.Zero(t, st.PressureShedsInline, "backend %v must not shed on stale pre-peer-reclamation pressure sample", b)
+			assert.Zero(t, st.EvictionsPressure, "backend %v must not evict entries under pressure after peer sampler reclaimed", b)
+			assert.Equal(t, 10, st.Len, "all 8 base entries + new1 + new2 must remain live on %v", b)
+		})
+	}
+}
