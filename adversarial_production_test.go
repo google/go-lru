@@ -3195,9 +3195,11 @@ func TestAdv_Iter3_NamedMethodAndOuterWrapperChildGoroutines(t *testing.T) {
 					case <-time.After(5 * time.Second):
 						evictDeadlocked.Store(true)
 					}
-					var wg sync.WaitGroup
-					wg.Go(w.deleteFromChild)
-					wg.Wait()
+					if !evictDeadlocked.Load() {
+						var wg sync.WaitGroup
+						wg.Go(w.deleteFromChild)
+						wg.Wait()
+					}
 				}
 			}),
 		)
@@ -3209,10 +3211,10 @@ func TestAdv_Iter3_NamedMethodAndOuterWrapperChildGoroutines(t *testing.T) {
 
 		_, err = w.cache.Put("k2", 2)
 		require.NoError(t, err)
-		<-w.putDone
 
 		// Assert
 		require.False(t, evictDeadlocked.Load(), "deadlock: OnEvictValue deadlocked when spawning child via go w.putFromChild()")
+		<-w.putDone
 		require.NoError(t, w.putErr)
 		assert.Equal(t, int32(1), callsAfterFirstPut, "child spawned via wg.Go(w.deleteFromChild) must not bypass PressureFunc re-entrancy guard")
 		assert.Equal(t, int32(2), evictCalls.Load(), "both k1 and k2 eviction callbacks must complete")
@@ -3270,10 +3272,10 @@ func TestAdv_Iter3_NamedMethodAndOuterWrapperChildGoroutines(t *testing.T) {
 
 		_, err = cache.Put("k2", 2)
 		require.NoError(t, err)
-		<-childDone
 
 		// Assert
 		require.False(t, evictDeadlocked.Load(), "deadlock: OnEvictValue deadlocked when spawning child via returning outer helper closure")
+		<-childDone
 		require.NoError(t, childPutErr)
 		assert.Equal(t, int32(1), callsAfterFirstPut, "returning outer helper closure using go func() { fn() }() must not bypass PressureFunc re-entrancy guard")
 		assert.Equal(t, int32(2), evictCalls.Load(), "both k1 and k2 eviction callbacks must complete")
@@ -3415,7 +3417,7 @@ func verifyDeepOnEvictChainForBackendAndDepth(t *testing.T, b Backend, depth int
 	var cache Cache[int]
 	var traceMu sync.Mutex
 	var trace []string
-	var k1ValOnce, k1EntryOnce sync.Once
+	var k1ValRan, k1EntryRan atomic.Bool
 	var leafPutErr error
 	var leafDeletedOK bool
 
@@ -3430,21 +3432,17 @@ func verifyDeepOnEvictChainForBackendAndDepth(t *testing.T, b Backend, depth int
 		WithInvariantChecking(true),
 		WithOnEvictValue(func(v int, r EvictionReason) {
 			recordTrace(fmt.Sprintf("val:%d:%v", v, r))
-			if v == 10 {
-				k1ValOnce.Do(func() {
-					runSyncGoroutineChain(depth, func() {
-						_, leafDeletedOK = cache.Delete("k2")
-					})
+			if v == 10 && k1ValRan.CompareAndSwap(false, true) {
+				runSyncGoroutineChain(depth, func() {
+					_, leafDeletedOK = cache.Delete("k2")
 				})
 			}
 		}),
 		WithOnEvictEntry(func(k string, v int, r EvictionReason) {
 			recordTrace(fmt.Sprintf("entry:%s=%d:%v", k, v, r))
-			if k == "k1" {
-				k1EntryOnce.Do(func() {
-					runSyncGoroutineChain(depth, func() {
-						_, leafPutErr = cache.Put("k3", 40)
-					})
+			if k == "k1" && k1EntryRan.CompareAndSwap(false, true) {
+				runSyncGoroutineChain(depth, func() {
+					_, leafPutErr = cache.Put("k3", 40)
 				})
 			}
 		}),
@@ -3490,7 +3488,6 @@ func verifyDeepPressureFuncChainForBackendAndDepth(t *testing.T, b Backend, dept
 
 	var cache Cache[int]
 	var pressureCalls atomic.Int32
-	var firstSample sync.Once
 	var leafPutErr error
 	var leafDeletedOK bool
 
@@ -3498,13 +3495,12 @@ func verifyDeepPressureFuncChainForBackendAndDepth(t *testing.T, b Backend, dept
 		WithBackend(b),
 		WithInvariantChecking(true),
 		WithPressureFunc(func() float64 {
-			pressureCalls.Add(1)
-			firstSample.Do(func() {
+			if pressureCalls.Add(1) == 1 {
 				runSyncGoroutineChain(depth, func() {
 					_, leafPutErr = cache.Put("leaf_temp", 100)
 					_, leafDeletedOK = cache.Delete("leaf_temp")
 				})
-			})
+			}
 			return 0.10
 		}),
 	)
@@ -3534,28 +3530,25 @@ func verifyDeepExitedMidHopForBackend(t *testing.T, b Backend) {
 
 	var cache Cache[int]
 	var pressureCalls, evictCalls atomic.Int32
-	var firstSample, firstEvict sync.Once
 	var leafPutErr error
 
 	cache = New[int](1,
 		WithBackend(b),
 		WithInvariantChecking(true),
 		WithPressureFunc(func() float64 {
-			pressureCalls.Add(1)
-			firstSample.Do(func() {
+			if pressureCalls.Add(1) == 1 {
 				runSyncGoroutineChainWithExitedMidHop(t, 12, 6, func() {
 					_, _ = cache.Delete("missing_from_depth12_exited_midhop")
 				})
-			})
+			}
 			return 0.10
 		}),
 		WithOnEvictEntry(func(_ string, _ int, _ EvictionReason) {
-			evictCalls.Add(1)
-			firstEvict.Do(func() {
+			if evictCalls.Add(1) == 1 {
 				runSyncGoroutineChainWithExitedMidHop(t, 12, 6, func() {
 					_, leafPutErr = cache.Put("k3_from_depth12_exited_midhop", 3)
 				})
-			})
+			}
 		}),
 	)
 
@@ -3726,7 +3719,6 @@ func TestAdv_Iter5_NamedMethodChildViaReturningHelperAndChannelSync(t *testing.T
 	for _, b := range []Backend{BackendMap, BackendRadix, BackendArenaRadix} {
 		t.Run(b.String(), func(t *testing.T) {
 			var pressureCalls, evictCalls atomic.Int32
-			var firstPressure, firstEvict sync.Once
 
 			w := &methodChildWorker{
 				putDone: make(chan struct{}),
@@ -3736,8 +3728,7 @@ func TestAdv_Iter5_NamedMethodChildViaReturningHelperAndChannelSync(t *testing.T
 				WithBackend(b),
 				WithInvariantChecking(true),
 				WithPressureFunc(func() float64 {
-					pressureCalls.Add(1)
-					firstPressure.Do(func() {
+					if pressureCalls.Add(1) == 1 {
 						done := make(chan struct{})
 						wPress := &methodChildWorker{
 							cache:   w.cache,
@@ -3745,16 +3736,15 @@ func TestAdv_Iter5_NamedMethodChildViaReturningHelperAndChannelSync(t *testing.T
 						}
 						spawnNamedTargetViaReturningHelper(wPress.putFromChild)
 						<-done
-						require.NoError(t, wPress.putErr)
-					})
+						assert.NoError(t, wPress.putErr)
+					}
 					return 0.10
 				}),
 				WithOnEvictValue(func(_ int, _ EvictionReason) {
-					evictCalls.Add(1)
-					firstEvict.Do(func() {
+					if evictCalls.Add(1) == 1 {
 						spawnNamedTargetViaReturningHelper(w.putFromChild)
 						<-w.putDone
-					})
+					}
 				}),
 			)
 
@@ -3923,18 +3913,15 @@ func runGenericSetupAndExitedChildScenario[T any](t *testing.T, val T) {
 	startSetup()
 
 	box := &genericCallbackBox[T]{val: val}
-	var primaryOnce, evictOnce sync.Once
 	cache = NewMapCache[T](2,
 		WithInvariantChecking(true),
 		WithPressureFunc(func() float64 {
 			c := calls.Add(1)
 			if c == 1 {
-				primaryOnce.Do(func() {
-					box.spawnWithExitedIntermediate(t, func() {
-						_, _ = cache.Delete("missing_generic_box_child")
-					})
-					close(workerTrigger)
+				box.spawnWithExitedIntermediate(t, func() {
+					_, _ = cache.Delete("missing_generic_box_child")
 				})
+				close(workerTrigger)
 				select {
 				case <-workerDone:
 				case <-time.After(5 * time.Second):
@@ -3943,12 +3930,11 @@ func runGenericSetupAndExitedChildScenario[T any](t *testing.T, val T) {
 			return 0.10
 		}),
 		WithOnEvictValue(func(_ T, _ EvictionReason) {
-			evictCalls.Add(1)
-			evictOnce.Do(func() {
+			if evictCalls.Add(1) == 1 {
 				box.spawnWithExitedIntermediate(t, func() {
 					_, _ = cache.Delete("worker_key")
 				})
-			})
+			}
 		}),
 	)
 
@@ -3991,7 +3977,7 @@ func TestAdv_Iter6_SiblingClosureWorkerAndGenericClosureOwnerAttribution(t *test
 			t.Run(b.String(), func(t *testing.T) {
 				var cache Cache[int]
 				var pressureCalls, evictCalls atomic.Int32
-				var firstPressure, firstEvict sync.Once
+				var k1EvictRan atomic.Bool
 
 				evictWorkerDone := make(chan struct{})
 				evictWorker := func() {
@@ -4017,22 +4003,19 @@ func TestAdv_Iter6_SiblingClosureWorkerAndGenericClosureOwnerAttribution(t *test
 					WithBackend(b),
 					WithInvariantChecking(true),
 					WithPressureFunc(func() float64 {
-						pressureCalls.Add(1)
-						firstPressure.Do(func() {
+						if pressureCalls.Add(1) == 1 {
 							go pressureWorker()
 							<-pressureWorkerDone
-						})
+						}
 						return 0.10
 					}),
 					WithOnEvictEntry(func(key string, _ int, _ EvictionReason) {
 						evictCalls.Add(1)
-						if key == "k1" {
-							firstEvict.Do(func() {
-								go evictWorker()
-								<-evictWorkerDone
-								spawnSiblingHelper(w.putFromChild)
-								<-w.putDone
-							})
+						if key == "k1" && k1EvictRan.CompareAndSwap(false, true) {
+							go evictWorker()
+							<-evictWorkerDone
+							spawnSiblingHelper(w.putFromChild)
+							<-w.putDone
 						}
 					}),
 				)
