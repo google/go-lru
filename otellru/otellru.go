@@ -119,11 +119,11 @@ func (r *Registration) Unregister() error {
 	return err
 }
 
-func isNilStatsProvider(cache StatsProvider) bool {
-	if cache == nil {
+func isNilInterface(val any) bool {
+	if val == nil {
 		return true
 	}
-	v := reflect.ValueOf(cache)
+	v := reflect.ValueOf(val)
 	switch v.Kind() {
 	case reflect.Pointer, reflect.Interface, reflect.Func, reflect.Map, reflect.Slice, reflect.Chan:
 		return v.IsNil()
@@ -210,11 +210,11 @@ func makeObserveOpts(base []attribute.KeyValue, extra ...attribute.KeyValue) []m
 }
 
 func resolveMeter(cfg *config) metric.Meter {
-	if cfg.meter != nil {
+	if !isNilInterface(cfg.meter) {
 		return cfg.meter
 	}
 	mp := cfg.meterProvider
-	if mp == nil {
+	if isNilInterface(mp) {
 		mp = otel.GetMeterProvider()
 	}
 	return mp.Meter(ScopeName)
@@ -477,7 +477,7 @@ func (inst *cacheInstruments) observe(o metric.Observer, st lru.Stats, opts *obs
 // and gauges backed by a single batch Meter.RegisterCallback that reads cache.Stats() once
 // per collection cycle.
 func Register(cache StatsProvider, opts ...Option) (*Registration, error) {
-	if isNilStatsProvider(cache) {
+	if isNilInterface(cache) {
 		return nil, ErrNilCache
 	}
 

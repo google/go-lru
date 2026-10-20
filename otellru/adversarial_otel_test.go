@@ -538,3 +538,14 @@ func BenchmarkOtelScrape_FullSDKCollect(b *testing.B) {
 		})
 	}
 }
+
+func TestAdversarial_TypedNilMeterAndMeterProviderFallback(t *testing.T) {
+	c := lru.NewMapCache[int](10)
+	var typedNilMP *sdkmetric.MeterProvider
+	var typedNilMeter *callbackCapturingMeter
+
+	reg, err := otellru.Register(c, otellru.WithMeterProvider(typedNilMP), otellru.WithMeter(typedNilMeter))
+	require.NoError(t, err)
+	require.NotNil(t, reg)
+	require.NoError(t, reg.Unregister())
+}

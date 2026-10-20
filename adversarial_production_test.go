@@ -1217,6 +1217,9 @@ func TestDefect_C03_ReentrancyHazards(t *testing.T) {
 						val, ok := cache.Peek("k2")
 						assert.True(t, ok)
 						assert.Equal(t, 2, val)
+						gotVal, gotOK := cache.Get("k2")
+						assert.True(t, gotOK)
+						assert.Equal(t, 2, gotVal)
 						close(callbackDone)
 					}
 				}),
@@ -1237,9 +1240,13 @@ func TestDefect_C03_ReentrancyHazards(t *testing.T) {
 			select {
 			case <-putDone:
 			case <-time.After(2 * time.Second):
-				require.Failf(t, "deadlocked", "backend=%v OnEvictValue calling cache.Stats()/Peek() deadlocked", b)
+				require.Failf(t, "deadlocked", "backend=%v OnEvictValue calling cache.Stats()/Peek()/Get() deadlocked", b)
 			}
-			<-callbackDone
+			select {
+			case <-callbackDone:
+			case <-time.After(2 * time.Second):
+				require.Failf(t, "callback did not complete", "backend=%v OnEvictValue did not fire for EvictionReasonCapacity", b)
+			}
 		}
 	})
 
@@ -2529,9 +2536,12 @@ func TestAdv_Bug5_DetachedChildDrainPendingCallbackNestedEvictionDeadlock(t *tes
 
 				switch key {
 				case "k1":
+					k2Enqueued := make(chan struct{})
 					go func() {
+						defer close(k2Enqueued)
 						_, _ = cache.Delete("k2")
 					}()
+					<-k2Enqueued
 				case "k2":
 					// Trigger both a synchronous nested eviction and a wg.Go child nested eviction
 					// while draining pending callbacks.
@@ -2558,13 +2568,22 @@ func TestAdv_Bug5_DetachedChildDrainPendingCallbackNestedEvictionDeadlock(t *tes
 			}
 
 			// Act: First verify the end-to-end detached child chain (k1 -> detached k2 -> k3 & k4).
-			_, ok := cache.Delete("k1")
-			require.True(t, ok)
+			act1Done := make(chan struct{})
+			go func() {
+				defer close(act1Done)
+				_, ok := cache.Delete("k1")
+				assert.True(t, ok)
+			}()
 
+			select {
+			case <-act1Done:
+			case <-time.After(2 * time.Second):
+				require.Failf(t, "deadlock", "backend %v deadlocked during detached child pending callback nested eviction", b)
+			}
 			select {
 			case <-allDone:
 			case <-time.After(2 * time.Second):
-				require.Failf(t, "deadlock", "backend %v deadlocked during detached child pending callback nested eviction", b)
+				require.Failf(t, "incomplete callbacks", "backend %v did not deliver all 4 eviction callbacks", b)
 			}
 
 			// Also deterministically exercise enqueuePendingCallback's direct TryLock() drain path
@@ -2613,8 +2632,12 @@ func TestAdv_Bug6_TagCollisionForcesIndependentCacheIntoStackDumpAllocations(t *
 	const numCaches = 17
 	inEvict0 := make(chan struct{})
 	releaseEvict0 := make(chan struct{})
+	var releaseEvict0Once sync.Once
+	defer releaseEvict0Once.Do(func() { close(releaseEvict0) })
 	inPressure0 := make(chan struct{})
 	releasePressure0 := make(chan struct{})
+	var releasePressure0Once sync.Once
+	defer releasePressure0Once.Do(func() { close(releasePressure0) })
 	var armEvict0, armPressure0 atomic.Bool
 
 	caches := make([]*mapCache[int], numCaches)
@@ -2659,7 +2682,7 @@ func TestAdv_Bug6_TagCollisionForcesIndependentCacheIntoStackDumpAllocations(t *
 		_ = caches[8].Replace("k2", 20)
 	})
 
-	close(releaseEvict0)
+	releaseEvict0Once.Do(func() { close(releaseEvict0) })
 	wg.Wait()
 
 	armPressure0.Store(true)
@@ -2671,7 +2694,7 @@ func TestAdv_Bug6_TagCollisionForcesIndependentCacheIntoStackDumpAllocations(t *
 	_ = caches[8].Replace("k2", 40)
 	_ = caches[16].Replace("k2", 40)
 
-	close(releasePressure0)
+	releasePressure0Once.Do(func() { close(releasePressure0) })
 	wg.Wait()
 
 	// Assert: Neither caches[8] nor caches[16] was forced onto the slow stack-capture path or marked contended.

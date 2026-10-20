@@ -2091,13 +2091,7 @@ func (p *pressureState) finishFastEvictDelivery() bool {
 }
 
 //go:noinline
-func (q *evictCallbackQueue[V]) deliverCallbacks(p *pressureState, onVal func(V, EvictionReason), onEntry func(string, V, EvictionReason)) bool {
-	panicked := true
-	defer func() {
-		if panicked {
-			p.unlockEvictCallbackSlow(false)
-		}
-	}()
+func (q *evictCallbackQueue[V]) deliverCallbacks(onVal func(V, EvictionReason), onEntry func(string, V, EvictionReason)) {
 	if q.n == 1 {
 		ev := q.buf[0]
 		q.buf[0] = evictEvent[V]{}
@@ -2108,11 +2102,9 @@ func (q *evictCallbackQueue[V]) deliverCallbacks(p *pressureState, onVal func(V,
 		if onEntry != nil {
 			onEntry(ev.key, ev.value, ev.reason)
 		}
-	} else {
-		q.deliverMultiCallbacks(onVal, onEntry)
+		return
 	}
-	panicked = false
-	return p.finishFastEvictDelivery()
+	q.deliverMultiCallbacks(onVal, onEntry)
 }
 
 //go:noinline
@@ -2128,66 +2120,72 @@ func (q *evictCallbackQueue[V]) deliverCallbacksSlow(p *pressureState, onVal fun
 }
 
 //go:noinline
-func (q *evictCallbackQueue[V]) invokeFastEvictCallbacks0(p *pressureState, onVal func(V, EvictionReason), onEntry func(string, V, EvictionReason)) bool {
-	return q.deliverCallbacks(p, onVal, onEntry)
+func (q *evictCallbackQueue[V]) invokeFastEvictCallbacks0(onVal func(V, EvictionReason), onEntry func(string, V, EvictionReason)) {
+	q.deliverCallbacks(onVal, onEntry)
 }
 
 //go:noinline
-func (q *evictCallbackQueue[V]) invokeFastEvictCallbacks1(p *pressureState, onVal func(V, EvictionReason), onEntry func(string, V, EvictionReason)) bool {
-	return q.deliverCallbacks(p, onVal, onEntry)
+func (q *evictCallbackQueue[V]) invokeFastEvictCallbacks1(onVal func(V, EvictionReason), onEntry func(string, V, EvictionReason)) {
+	q.deliverCallbacks(onVal, onEntry)
 }
 
 //go:noinline
-func (q *evictCallbackQueue[V]) invokeFastEvictCallbacks2(p *pressureState, onVal func(V, EvictionReason), onEntry func(string, V, EvictionReason)) bool {
-	return q.deliverCallbacks(p, onVal, onEntry)
+func (q *evictCallbackQueue[V]) invokeFastEvictCallbacks2(onVal func(V, EvictionReason), onEntry func(string, V, EvictionReason)) {
+	q.deliverCallbacks(onVal, onEntry)
 }
 
 //go:noinline
-func (q *evictCallbackQueue[V]) invokeFastEvictCallbacks3(p *pressureState, onVal func(V, EvictionReason), onEntry func(string, V, EvictionReason)) bool {
-	return q.deliverCallbacks(p, onVal, onEntry)
+func (q *evictCallbackQueue[V]) invokeFastEvictCallbacks3(onVal func(V, EvictionReason), onEntry func(string, V, EvictionReason)) {
+	q.deliverCallbacks(onVal, onEntry)
 }
 
 //go:noinline
-func (q *evictCallbackQueue[V]) invokeFastEvictCallbacks4(p *pressureState, onVal func(V, EvictionReason), onEntry func(string, V, EvictionReason)) bool {
-	return q.deliverCallbacks(p, onVal, onEntry)
+func (q *evictCallbackQueue[V]) invokeFastEvictCallbacks4(onVal func(V, EvictionReason), onEntry func(string, V, EvictionReason)) {
+	q.deliverCallbacks(onVal, onEntry)
 }
 
 //go:noinline
-func (q *evictCallbackQueue[V]) invokeFastEvictCallbacks5(p *pressureState, onVal func(V, EvictionReason), onEntry func(string, V, EvictionReason)) bool {
-	return q.deliverCallbacks(p, onVal, onEntry)
+func (q *evictCallbackQueue[V]) invokeFastEvictCallbacks5(onVal func(V, EvictionReason), onEntry func(string, V, EvictionReason)) {
+	q.deliverCallbacks(onVal, onEntry)
 }
 
 //go:noinline
-func (q *evictCallbackQueue[V]) invokeFastEvictCallbacks6(p *pressureState, onVal func(V, EvictionReason), onEntry func(string, V, EvictionReason)) bool {
-	return q.deliverCallbacks(p, onVal, onEntry)
+func (q *evictCallbackQueue[V]) invokeFastEvictCallbacks6(onVal func(V, EvictionReason), onEntry func(string, V, EvictionReason)) {
+	q.deliverCallbacks(onVal, onEntry)
 }
 
 //go:noinline
-func (q *evictCallbackQueue[V]) invokeFastEvictCallbacks7(p *pressureState, onVal func(V, EvictionReason), onEntry func(string, V, EvictionReason)) bool {
-	return q.deliverCallbacks(p, onVal, onEntry)
+func (q *evictCallbackQueue[V]) invokeFastEvictCallbacks7(onVal func(V, EvictionReason), onEntry func(string, V, EvictionReason)) {
+	q.deliverCallbacks(onVal, onEntry)
 }
 
 func (q *evictCallbackQueue[V]) dispatchFastCallbacks(p *pressureState, tag uint32, onVal func(V, EvictionReason), onEntry func(string, V, EvictionReason)) {
-	var drainSlow bool
+	panicked := true
+	defer func() {
+		if panicked {
+			p.unlockEvictCallbackSlow(false)
+		}
+	}()
 	switch tag {
 	case 0:
-		drainSlow = q.invokeFastEvictCallbacks0(p, onVal, onEntry)
+		q.invokeFastEvictCallbacks0(onVal, onEntry)
 	case 1:
-		drainSlow = q.invokeFastEvictCallbacks1(p, onVal, onEntry)
+		q.invokeFastEvictCallbacks1(onVal, onEntry)
 	case 2:
-		drainSlow = q.invokeFastEvictCallbacks2(p, onVal, onEntry)
+		q.invokeFastEvictCallbacks2(onVal, onEntry)
 	case 3:
-		drainSlow = q.invokeFastEvictCallbacks3(p, onVal, onEntry)
+		q.invokeFastEvictCallbacks3(onVal, onEntry)
 	case 4:
-		drainSlow = q.invokeFastEvictCallbacks4(p, onVal, onEntry)
+		q.invokeFastEvictCallbacks4(onVal, onEntry)
 	case 5:
-		drainSlow = q.invokeFastEvictCallbacks5(p, onVal, onEntry)
+		q.invokeFastEvictCallbacks5(onVal, onEntry)
 	case 6:
-		drainSlow = q.invokeFastEvictCallbacks6(p, onVal, onEntry)
+		q.invokeFastEvictCallbacks6(onVal, onEntry)
 	default:
-		drainSlow = q.invokeFastEvictCallbacks7(p, onVal, onEntry)
+		q.invokeFastEvictCallbacks7(onVal, onEntry)
 	}
-	if drainSlow {
+	panicked = false
+	if p.finishFastEvictDelivery() {
 		p.drainPendingEvictCallbacksSlow()
 	}
 }
