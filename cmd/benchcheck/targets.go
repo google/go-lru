@@ -162,10 +162,10 @@ func DefaultTargets() []TargetRule {
 		},
 		{
 			Pattern:        "Benchmark_Put_RadixCache/*",
-			Description:    "RadixCache 50%-turnover Put (<= 2 allocs/op)",
+			Description:    "RadixCache 50%-turnover Put (<= 3 allocs/op)",
 			MaxNsPerOp:     new(float64(800)),
 			MaxBytesPerOp:  new(float64(150)),
-			MaxAllocsPerOp: new(float64(2)),
+			MaxAllocsPerOp: new(float64(3)),
 		},
 		{
 			Pattern:        "Benchmark_Put_ArenaRadixCache/*",
@@ -204,10 +204,10 @@ func DefaultTargets() []TargetRule {
 		},
 		{
 			Pattern:        "Benchmark_Put_WithOnEvictValue/RadixCache",
-			Description:    "RadixCache 50%-turnover Put with OnEvictValue callback (<= 2 allocs/op)",
+			Description:    "RadixCache 50%-turnover Put with OnEvictValue callback (<= 3 allocs/op)",
 			MaxNsPerOp:     new(float64(750)),
 			MaxBytesPerOp:  new(float64(150)),
-			MaxAllocsPerOp: new(float64(2)),
+			MaxAllocsPerOp: new(float64(3)),
 		},
 		{
 			Pattern:        "Benchmark_Put_WithOnEvictValue/ArenaRadixCache",

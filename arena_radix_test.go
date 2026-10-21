@@ -1624,7 +1624,7 @@ func TestArenaRadixCache_FNV1aHashCollisionAndNodeMapHealing(t *testing.T) {
 		idB := c.nodeMap[hColl]
 		require.NotEqual(t, idA, idB)
 
-		// First Replace(collidingKeyA) at low pressure walks the collision fallback (marking nodeMapDirty) and promotes idA to nodeMap[hColl].
+		// First Replace(collidingKeyA) at low pressure walks the collision fallback and promotes idA to nodeMap[hColl].
 		require.NoError(t, c.Replace(collidingKeyA, testData{value: 11, dataSize: 100}))
 		require.Equal(t, idA, c.nodeMap[hColl])
 

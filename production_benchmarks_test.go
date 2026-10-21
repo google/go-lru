@@ -646,6 +646,12 @@ func BenchmarkPressureSamplingAndCallbacks(b *testing.B) {
 
 		for _, depth := range []int{4, 32} {
 			keys := makeKeysAtDepth(depth)
+			branchPins := make([]string, 0, depth-1)
+			var branchSB strings.Builder
+			for d := 1; d < depth; d++ {
+				fmt.Fprintf(&branchSB, "d%02d/", d)
+				branchPins = append(branchPins, branchSB.String()+"branch_pin")
+			}
 			b.Run(fmt.Sprintf("Depth=%d", depth), func(b *testing.B) {
 				for _, cbMode := range []string{"OnEvictValue", "OnEvictEntry"} {
 					b.Run(cbMode, func(b *testing.B) {
@@ -657,12 +663,10 @@ func BenchmarkPressureSamplingAndCallbacks(b *testing.B) {
 								} else {
 									opt = WithOnEvictEntry(func(_ string, _ uint64, _ EvictionReason) {})
 								}
-								c := bf.make(capEntries, opt)
+								c := bf.make(uint64(capEntries+len(branchPins)), opt)
 								// Ensure every level of the prefix has a branching sibling so the radix tree does not collapse it into 1 edge!
-								var branchSB strings.Builder
-								for d := 1; d < depth; d++ {
-									fmt.Fprintf(&branchSB, "d%02d/", d)
-									_, _ = c.Put(branchSB.String()+"branch_pin", 1)
+								for _, pin := range branchPins {
+									_, _ = c.Put(pin, 1)
 								}
 								for i := range capEntries {
 									_, _ = c.Put(keys[i], uint64(i))
@@ -672,12 +676,10 @@ func BenchmarkPressureSamplingAndCallbacks(b *testing.B) {
 								b.ResetTimer()
 								step := capEntries
 								for b.Loop() {
-									// Periodically refresh branch pins so tree depth remains at `depth`
-									if step%capEntries == 0 {
-										var sb strings.Builder
-										for d := 1; d < depth; d++ {
-											fmt.Fprintf(&sb, "d%02d/", d)
-											_, _ = c.Get(sb.String() + "branch_pin")
+									// Periodically refresh branch pins before they reach the LRU tail so tree depth remains at `depth`
+									if step%(capEntries/2) == 0 {
+										for _, pin := range branchPins {
+											_, _ = c.Get(pin)
 										}
 									}
 									_, _ = c.Put(keys[step%poolSize], uint64(step))

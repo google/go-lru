@@ -19,6 +19,7 @@ import (
 	"fmt"
 	"math"
 	"runtime"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -258,22 +259,63 @@ func isClosureSuffix(suffix []byte) bool {
 
 func trimClosureOffset(fn []byte) []byte {
 	if plusIdx := bytes.IndexByte(fn, '+'); plusIdx > 0 {
+		for plusIdx > 0 && (fn[plusIdx-1] == ' ' || fn[plusIdx-1] == '\t') {
+			plusIdx--
+		}
 		return fn[:plusIdx]
 	}
 	return fn
 }
 
+func lastDotOutsideBrackets(s []byte) int {
+	brackDepth := 0
+	parenDepth := 0
+	for i := len(s) - 1; i >= 0; i-- {
+		switch s[i] {
+		case ']':
+			brackDepth++
+		case '[':
+			if brackDepth > 0 {
+				brackDepth--
+			}
+		case ')':
+			parenDepth++
+		case '(':
+			if parenDepth > 0 {
+				parenDepth--
+			}
+		case '.':
+			if brackDepth == 0 && parenDepth == 0 {
+				return i
+			}
+		}
+	}
+	return -1
+}
+
+func hasDotAfterLastSlash(s []byte) bool {
+	slashIdx := bytes.LastIndexByte(s, '/')
+	if slashIdx >= 0 {
+		s = s[slashIdx+1:]
+	}
+	return lastDotOutsideBrackets(s) > 0
+}
+
 func findClosureOwnerInStack(blk, creatorFunc []byte) []byte {
 	curr := trimClosureOffset(creatorFunc)
-	for len(curr) > 0 && curr[len(curr)-1] != ']' {
-		dot := bytes.LastIndexByte(curr, '.')
-		if dot <= 0 || !isClosureSuffix(curr[dot+1:]) {
+	dot := lastDotOutsideBrackets(curr)
+	if dot <= 0 || !isClosureSuffix(curr[dot+1:]) {
+		return nil
+	}
+	for dot > 0 {
+		curr = curr[:dot]
+		if !hasDotAfterLastSlash(curr) {
 			return nil
 		}
-		curr = curr[:dot]
 		if containsCreatorCallFrame(blk, curr) {
 			return curr
 		}
+		dot = lastDotOutsideBrackets(curr)
 	}
 	return nil
 }
@@ -318,6 +360,33 @@ func popBottomCallFrame(frames []byte) (fnName, rest []byte) {
 	return trimFrameFuncName(frames[fnNL+1 : tabNL]), frames[:fnNL]
 }
 
+func sameFuncSymbolIgnoringTypeArgs(a, b []byte) bool {
+	if bytes.Equal(a, b) {
+		return true
+	}
+	for len(a) > 0 && len(b) > 0 {
+		ai := bytes.IndexByte(a, '[')
+		bi := bytes.IndexByte(b, '[')
+		if ai != bi {
+			return false
+		}
+		if ai < 0 {
+			return bytes.Equal(a, b)
+		}
+		if !bytes.Equal(a[:ai], b[:bi]) {
+			return false
+		}
+		aAdv, aOK := skipBalancedBrackets(a[ai:])
+		bAdv, bOK := skipBalancedBrackets(b[bi:])
+		if !aOK || !bOK {
+			return false
+		}
+		a = a[ai+aAdv:]
+		b = b[bi+bAdv:]
+	}
+	return len(a) == 0 && len(b) == 0
+}
+
 func hasClosureOwnedBy(aboveHook, blk, owner []byte) bool {
 	rest := aboveHook
 	const maxFrames = 16
@@ -327,7 +396,7 @@ func hasClosureOwnedBy(aboveHook, blk, owner []byte) bool {
 		if len(fn) == 0 {
 			return false
 		}
-		if fnOwner := findClosureOwnerInStack(blk, fn); len(fnOwner) > 0 && bytes.Equal(fnOwner, owner) {
+		if fnOwner := findClosureOwnerInStack(blk, fn); len(fnOwner) > 0 && sameFuncSymbolIgnoringTypeArgs(fnOwner, owner) {
 			return true
 		}
 	}
@@ -458,6 +527,103 @@ func matchAncestorFallbackInAllStacks(allStacks, currCreator, currChildStack, ca
 	return 0, false
 }
 
+func blockOwnsExitedChild(blk, currCreator, currChildStack []byte) bool {
+	if len(currCreator) > 0 {
+		if containsCreatorCallFrame(blk, currCreator) || len(findClosureOwnerInStack(blk, currCreator)) > 0 {
+			return true
+		}
+	}
+	const createdBy = "\ncreated by "
+	end := bytes.LastIndex(currChildStack, []byte(createdBy))
+	if end <= 0 {
+		return false
+	}
+	rest := currChildStack[:end]
+	for range 2 {
+		var fn []byte
+		fn, rest = popBottomCallFrame(rest)
+		if len(fn) == 0 {
+			return false
+		}
+		if bytes.Equal(fn, []byte("sync.(*WaitGroup).Go.func1")) {
+			continue
+		}
+		return len(findClosureOwnerInStack(blk, fn)) > 0
+	}
+	return false
+}
+
+func findLiveIntermediateAncestorInAllStacks(allStacks, currCreator, currChildStack []byte, callerGID uint64, bridgedGIDs []uint64, matchAncestor func(uint64) bool) (bridgeGID, nextParentGID uint64, nextCreator, bridgeBlk []byte) {
+	for rem := allStacks; len(rem) > 0; {
+		var blk []byte
+		blk, rem = nextGoroutineBlock(rem)
+		gid, parentGID, creator := parseStackGoroutineParentAndCreator(blk)
+		if gid == 0 || gid == callerGID || parentGID == 0 || matchAncestor(gid) {
+			continue
+		}
+		alreadyBridged := slices.Contains(bridgedGIDs, gid)
+		if alreadyBridged {
+			continue
+		}
+		if blockOwnsExitedChild(blk, currCreator, currChildStack) {
+			return gid, parentGID, creator, blk
+		}
+	}
+	return 0, 0, nil, nil
+}
+
+func findGoroutineBlockByID(allStacks []byte, targetGID uint64) (blk []byte, nextParentGID uint64, nextCreator []byte, found bool) {
+	for rem := allStacks; len(rem) > 0; {
+		blk, rem = nextGoroutineBlock(rem)
+		gid, parentGID, creator := parseStackGoroutineParentAndCreator(blk)
+		if gid == targetGID {
+			return blk, parentGID, creator, true
+		}
+	}
+	return nil, 0, nil, false
+}
+
+const maxBridgeHops = 8
+
+type ancestorBridgeState struct {
+	callerGID        uint64
+	exitedCreator    []byte
+	exitedChildStack []byte
+	bridgedGIDs      [maxBridgeHops]uint64
+	bridgeCount      int
+}
+
+func (s *ancestorBridgeState) backtrack(allStacks []byte, matchAncestor func(uint64) bool) (nextParentGID uint64, nextCreator, bridgeBlk []byte, ok bool) {
+	if s.bridgeCount == 0 || s.bridgeCount >= maxBridgeHops {
+		return 0, nil, nil, false
+	}
+	bridgeGID, pGID, creator, blk := findLiveIntermediateAncestorInAllStacks(
+		allStacks, s.exitedCreator, s.exitedChildStack, s.callerGID, s.bridgedGIDs[:s.bridgeCount], matchAncestor,
+	)
+	if bridgeGID == 0 {
+		return 0, nil, nil, false
+	}
+	s.bridgedGIDs[s.bridgeCount] = bridgeGID
+	s.bridgeCount++
+	return pGID, creator, blk, true
+}
+
+func (s *ancestorBridgeState) bridgeExited(allStacks, currCreator, currChildStack []byte, matchAncestor func(uint64) bool) (nextParentGID uint64, nextCreator, bridgeBlk []byte, ok bool) {
+	if s.bridgeCount >= maxBridgeHops {
+		return 0, nil, nil, false
+	}
+	if bridgeGID, pGID, creator, blk := findLiveIntermediateAncestorInAllStacks(
+		allStacks, currCreator, currChildStack, s.callerGID, s.bridgedGIDs[:s.bridgeCount], matchAncestor,
+	); bridgeGID != 0 {
+		s.exitedCreator = currCreator
+		s.exitedChildStack = currChildStack
+		s.bridgedGIDs[s.bridgeCount] = bridgeGID
+		s.bridgeCount++
+		return pGID, creator, blk, true
+	}
+	return s.backtrack(allStacks, matchAncestor)
+}
+
 func findAncestorCreatorAboveHook(allStacks, callerStack []byte, parentGID uint64, creatorFunc, hookName []byte, matchAncestor func(uint64) bool) (uint64, bool) {
 	if parentGID == 0 {
 		return 0, false
@@ -467,37 +633,46 @@ func findAncestorCreatorAboveHook(allStacks, callerStack []byte, parentGID uint6
 		allStacks, bufPtr = captureAllGoroutineStacks()
 		defer releaseAllGoroutineStacks(bufPtr)
 	}
+	callerGID, _ := parseStackGoroutineAndParentID(callerStack)
 	currGID := parentGID
 	currCreator := creatorFunc
 	currChildStack := callerStack
+	bridge := ancestorBridgeState{
+		callerGID:        callerGID,
+		exitedCreator:    creatorFunc,
+		exitedChildStack: callerStack,
+	}
 	const maxAncestorHops = 4096
 	for range maxAncestorHops {
 		if currGID == 0 {
 			return 0, false
 		}
-		foundBlock := false
-		for rem := allStacks; len(rem) > 0; {
-			var blk []byte
-			blk, rem = nextGoroutineBlock(rem)
-			gid, nextParentGID, nextCreator := parseStackGoroutineParentAndCreator(blk)
-			if gid != currGID {
-				continue
+		blk, nextParentGID, nextCreator, foundBlock := findGoroutineBlockByID(allStacks, currGID)
+		if !foundBlock {
+			if gid, ok := matchAncestorFallbackInAllStacks(allStacks, currCreator, currChildStack, creatorFunc, callerStack, hookName, matchAncestor); ok {
+				return gid, true
 			}
-			foundBlock = true
-			if matchAncestor(currGID) {
-				hookIdx := bytes.LastIndex(blk, hookName)
-				if matchAncestorBlockAboveHook(blk, hookIdx, currCreator, currChildStack, creatorFunc, callerStack, false) {
-					return currGID, true
-				}
+			var ok bool
+			currGID, currCreator, currChildStack, ok = bridge.bridgeExited(allStacks, currCreator, currChildStack, matchAncestor)
+			if !ok {
 				return 0, false
 			}
+			continue
+		}
+		if !matchAncestor(currGID) {
 			currGID = nextParentGID
 			currCreator = nextCreator
 			currChildStack = blk
-			break
+			continue
 		}
-		if !foundBlock {
-			return matchAncestorFallbackInAllStacks(allStacks, currCreator, currChildStack, creatorFunc, callerStack, hookName, matchAncestor)
+		hookIdx := bytes.LastIndex(blk, hookName)
+		if matchAncestorBlockAboveHook(blk, hookIdx, currCreator, currChildStack, creatorFunc, callerStack, false) {
+			return currGID, true
+		}
+		var ok bool
+		currGID, currCreator, currChildStack, ok = bridge.backtrack(allStacks, matchAncestor)
+		if !ok {
+			return 0, false
 		}
 	}
 	return matchAncestorFallbackInAllStacks(allStacks, currCreator, currChildStack, creatorFunc, callerStack, hookName, matchAncestor)

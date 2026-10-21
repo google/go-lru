@@ -2367,6 +2367,7 @@ func TestAdv_Bug3_UnrelatedGoroutineWithExitedParentMisclassifiedAsChild(t *test
 		})
 
 		var primaryOnce sync.Once
+		var timedOut atomic.Bool
 		cache = NewMapCache[int](10, WithPressureFunc(func() float64 {
 			c := calls.Add(1)
 			if c == 1 {
@@ -2376,6 +2377,7 @@ func TestAdv_Bug3_UnrelatedGoroutineWithExitedParentMisclassifiedAsChild(t *test
 				select {
 				case <-workerDone:
 				case <-time.After(5 * time.Second):
+					timedOut.Store(true)
 				}
 			}
 			return 0.10
@@ -2384,6 +2386,7 @@ func TestAdv_Bug3_UnrelatedGoroutineWithExitedParentMisclassifiedAsChild(t *test
 		// Act
 		_, err := cache.Put("parent_key", 1)
 		require.NoError(t, err)
+		require.False(t, timedOut.Load(), "timed out waiting for worker goroutine inside PressureFunc")
 		<-workerDone
 		wg.Wait()
 		require.NoError(t, workerErr)
@@ -2817,6 +2820,7 @@ func TestAdv_Iter2_WaitGroupGoWrapperHelperDropsCallerFrame(t *testing.T) {
 		})
 
 		var primaryOnce sync.Once
+		var timedOut atomic.Bool
 		cache = NewMapCache[int](10, WithPressureFunc(func() float64 {
 			c := calls.Add(1)
 			if c == 1 {
@@ -2828,6 +2832,7 @@ func TestAdv_Iter2_WaitGroupGoWrapperHelperDropsCallerFrame(t *testing.T) {
 					select {
 					case <-workerDone:
 					case <-time.After(5 * time.Second):
+						timedOut.Store(true)
 					}
 				})
 				innerWG.Wait()
@@ -2838,6 +2843,7 @@ func TestAdv_Iter2_WaitGroupGoWrapperHelperDropsCallerFrame(t *testing.T) {
 		// Act
 		_, err := cache.Put("parent_key", 1)
 		require.NoError(t, err)
+		require.False(t, timedOut.Load(), "timed out waiting for worker goroutine inside PressureFunc")
 		<-workerDone
 		preWG.Wait()
 		require.NoError(t, workerErr)
@@ -2965,6 +2971,7 @@ func TestAdv_Iter2_PreExistingWorkerSpawnedViaHelperOrSetupClosureMisclassifiedA
 		startSetup()
 
 		var primaryOnce sync.Once
+		var timedOut atomic.Bool
 		cache = NewMapCache[int](10, WithPressureFunc(func() float64 {
 			c := calls.Add(1)
 			if c == 1 {
@@ -2974,6 +2981,7 @@ func TestAdv_Iter2_PreExistingWorkerSpawnedViaHelperOrSetupClosureMisclassifiedA
 				select {
 				case <-workerDone:
 				case <-time.After(5 * time.Second):
+					timedOut.Store(true)
 				}
 			}
 			return 0.10
@@ -2982,6 +2990,7 @@ func TestAdv_Iter2_PreExistingWorkerSpawnedViaHelperOrSetupClosureMisclassifiedA
 		// Act
 		_, err := cache.Put("parent_key", 1)
 		require.NoError(t, err)
+		require.False(t, timedOut.Load(), "timed out waiting for worker goroutine inside PressureFunc")
 		<-workerDone
 		require.NoError(t, workerErr)
 
@@ -3010,6 +3019,7 @@ func runGenericWaitGroupWorkerScenario[T any](t *testing.T, val T) {
 	})
 
 	var primaryOnce sync.Once
+	var timedOut atomic.Bool
 	cache = NewMapCache[T](10, WithPressureFunc(func() float64 {
 		c := calls.Add(1)
 		if c == 1 {
@@ -3025,6 +3035,7 @@ func runGenericWaitGroupWorkerScenario[T any](t *testing.T, val T) {
 			select {
 			case <-workerDone:
 			case <-time.After(5 * time.Second):
+				timedOut.Store(true)
 			}
 		}
 		return 0.10
@@ -3033,6 +3044,7 @@ func runGenericWaitGroupWorkerScenario[T any](t *testing.T, val T) {
 	// Act
 	_, err := cache.Put("parent_key", val)
 	require.NoError(t, err)
+	require.False(t, timedOut.Load(), "timed out waiting for worker goroutine inside PressureFunc")
 	<-workerDone
 	wg.Wait()
 	require.NoError(t, workerErr)
@@ -3940,6 +3952,7 @@ func runGenericSetupAndExitedChildScenario[T any](t *testing.T, val T) {
 	startSetup()
 
 	box := &genericCallbackBox[T]{val: val}
+	var timedOut atomic.Bool
 	cache = NewMapCache[T](2,
 		WithInvariantChecking(true),
 		WithPressureFunc(func() float64 {
@@ -3952,6 +3965,7 @@ func runGenericSetupAndExitedChildScenario[T any](t *testing.T, val T) {
 				select {
 				case <-workerDone:
 				case <-time.After(5 * time.Second):
+					timedOut.Store(true)
 				}
 			}
 			return 0.10
@@ -3967,6 +3981,7 @@ func runGenericSetupAndExitedChildScenario[T any](t *testing.T, val T) {
 
 	_, err := cache.Put("parent_key", val)
 	require.NoError(t, err)
+	require.False(t, timedOut.Load(), "timed out waiting for worker goroutine inside PressureFunc")
 	<-workerDone
 	require.NoError(t, workerErr)
 
@@ -4324,4 +4339,241 @@ func TestAdv_Iter8_ConcurrentHookIDInitDoesNotClobberTagHints(t *testing.T) {
 			}
 		})
 	}
+}
+
+func makeInlinedClosureTask(fn func()) func() {
+	return func() {
+		fn()
+	}
+}
+
+func makeInlinedGenericClosureTask[T any](v T, fn func(T)) func() {
+	return func() {
+		fn(v)
+	}
+}
+
+type inlinedGenericTaskBox[T any] struct {
+	val T
+}
+
+func (b *inlinedGenericTaskBox[T]) makeMethodTask(fn func(T)) func() {
+	return func() {
+		fn(b.val)
+	}
+}
+
+type liveIntermediateStageRunner struct {
+	t     *testing.T
+	cache Cache[int]
+	key   string
+}
+
+//go:noinline
+func (r *liveIntermediateStageRunner) runLiveStageWithExitedMidHop() {
+	g3Done := make(chan struct{})
+	g2Started := make(chan uint64, 1)
+	go func() {
+		g2Started <- currentGoroutineID()
+		go func() {
+			defer close(g3Done)
+			g2ID := <-g2Started
+			waitForGoroutineExit(r.t, g2ID)
+			_, _ = r.cache.Delete(r.key)
+		}()
+	}()
+	<-g3Done
+}
+
+// TestAdv_Iter8_InlinedClosureOwnersAndLiveIntermediateExitedChildBridge verifies:
+//  1. findClosureOwnerInStack resolves closures created inside inlined helper functions,
+//     inlined generic functions, and inlined methods on generic types (e.g.,
+//     pkg.Outer.makeInlinedClosureTask.func1, pkg.Outer.makeInlinedGenericClosureTask[...].func1,
+//     and pkg.Outer.(*inlinedGenericTaskBox[...]).makeMethodTask.func1), as well as
+//     trimClosureOffset with whitespace before "+0x" and hasClosureOwnedBy across generic bracket styles.
+//  2. findAncestorCreatorAboveHook bridges across exited intermediate closure goroutines (G2)
+//     to live intermediate named-function/method ancestor goroutines (G1) on the path up to G0
+//     (G0 -> G1 [live named method] -> G2 [exited closure] -> G3 [closure calling cache]).
+func TestAdv_Iter8_InlinedClosureOwnersAndLiveIntermediateExitedChildBridge(t *testing.T) {
+	t.Run("Unit_InlinedClosureOwnerAndGenericSymbolHelpers", func(t *testing.T) {
+		blk := []byte("goroutine 10 [running]:\ngithub.com/google/go-lru.outerCaller(0x1)\n\t/path/file.go:10 +0x20\ngithub.com/google/go-lru.(*genericCallbackBox[...]).outerMethod(0x1)\n\t/path/file.go:20 +0x30\n")
+
+		assert.Equal(t,
+			[]byte("github.com/google/go-lru.outerCaller"),
+			findClosureOwnerInStack(blk, []byte("github.com/google/go-lru.outerCaller.makeInlinedClosureTask.func1 +0x40")),
+		)
+		assert.Equal(t,
+			[]byte("github.com/google/go-lru.outerCaller"),
+			findClosureOwnerInStack(blk, []byte("github.com/google/go-lru.outerCaller.makeInlinedGenericClosureTask[...].func1")),
+		)
+		assert.Equal(t,
+			[]byte("github.com/google/go-lru.(*genericCallbackBox[...]).outerMethod"),
+			findClosureOwnerInStack(blk, []byte("github.com/google/go-lru.(*genericCallbackBox[...]).outerMethod.(*inlinedGenericTaskBox[...]).makeMethodTask.func1")),
+		)
+		assert.Nil(t, findClosureOwnerInStack(blk, []byte("github.com/google/go-lru.outerCaller.nonClosureHelper")))
+
+		aboveHook := []byte("goroutine 10 [running]:\ngithub.com/google/go-lru.(*genericCallbackBox[...]).outerMethod.func2()\n\t/path/file.go:15 +0x10\n")
+		assert.True(t, hasClosureOwnedBy(
+			aboveHook,
+			blk,
+			[]byte("github.com/google/go-lru.(*genericCallbackBox[int]).outerMethod"),
+		))
+	})
+
+	t.Run("InlinedHelperClosuresInPreExistingWorkerAndCallbackExitedHop", func(t *testing.T) {
+		for _, b := range []Backend{BackendMap, BackendRadix, BackendArenaRadix} {
+			t.Run(b.String(), func(t *testing.T) {
+				var cache Cache[int]
+				var calls atomic.Int32
+				var evictCalls atomic.Int32
+				workerTrigger := make(chan struct{})
+				workerDone := make(chan struct{})
+				var workerErr error
+				var timedOut atomic.Bool
+
+				box := &inlinedGenericTaskBox[int]{val: 7}
+				// Spawn pre-existing worker before Put using an inlined generic method returning a closure.
+				go box.makeMethodTask(func(v int) {
+					<-workerTrigger
+					_, workerErr = cache.Put("worker_key", v)
+					close(workerDone)
+				})()
+
+				spawnExitedViaInlinedHelpers := func(action func()) {
+					g3Done := make(chan struct{})
+					g2Started := make(chan uint64, 1)
+					go makeInlinedClosureTask(func() {
+						g2Started <- currentGoroutineID()
+						go makeInlinedGenericClosureTask(1, func(_ int) {
+							defer close(g3Done)
+							g2ID := <-g2Started
+							waitForGoroutineExit(t, g2ID)
+							action()
+						})()
+					})()
+					<-g3Done
+				}
+
+				cache = New[int](2,
+					WithBackend(b),
+					WithInvariantChecking(true),
+					WithPressureFunc(func() float64 {
+						c := calls.Add(1)
+						if c == 1 {
+							spawnExitedViaInlinedHelpers(func() {
+								_, _ = cache.Delete("missing_inlined_child")
+							})
+							close(workerTrigger)
+							select {
+							case <-workerDone:
+							case <-time.After(5 * time.Second):
+								timedOut.Store(true)
+							}
+						}
+						return 0.10
+					}),
+					WithOnEvictValue(func(_ int, _ EvictionReason) {
+						if evictCalls.Add(1) == 1 {
+							spawnExitedViaInlinedHelpers(func() {
+								_, _ = cache.Delete("worker_key")
+							})
+						}
+					}),
+				)
+
+				_, err := cache.Put("parent_key", 1)
+				require.NoError(t, err)
+				require.False(t, timedOut.Load(), "timed out waiting for pre-existing worker in PressureFunc")
+				<-workerDone
+				require.NoError(t, workerErr)
+				assert.Equal(t, int32(2), calls.Load(), "pre-existing worker from inlined generic method closure must sample independently while callback child must not")
+
+				done := make(chan struct{})
+				go func() {
+					defer close(done)
+					_, _ = cache.Delete("parent_key")
+				}()
+				select {
+				case <-done:
+				case <-time.After(5 * time.Second):
+					require.Failf(t, "deadlock", "backend %v deadlocked in OnEvictValue with inlined closure helpers and exited intermediate hop", b)
+				}
+				assert.Equal(t, int32(2), evictCalls.Load(), "both parent_key and worker_key eviction callbacks must fire on %v", b)
+			})
+		}
+	})
+
+	t.Run("LiveIntermediateNamedMethodAncestorWithExitedClosureChildInHooks", func(t *testing.T) {
+		for _, b := range []Backend{BackendMap, BackendRadix, BackendArenaRadix} {
+			t.Run(b.String(), func(t *testing.T) {
+				var cache Cache[int]
+				var pressureCalls atomic.Int32
+				var callsDuringPressure atomic.Int32
+				var evictCalls atomic.Int32
+				var armed atomic.Bool
+
+				cache = New[int](3,
+					WithBackend(b),
+					WithInvariantChecking(true),
+					WithPressureFunc(func() float64 {
+						if !armed.Load() {
+							return 0.10
+						}
+						if pressureCalls.Add(1) == 1 {
+							runner := &liveIntermediateStageRunner{
+								t:     t,
+								cache: cache,
+								key:   "missing_live_stage_key",
+							}
+							var wg sync.WaitGroup
+							wg.Go(runner.runLiveStageWithExitedMidHop)
+							wg.Wait()
+							callsDuringPressure.Store(pressureCalls.Load())
+						}
+						return 0.10
+					}),
+					WithOnEvictValue(func(_ int, _ EvictionReason) {
+						if !armed.Load() {
+							return
+						}
+						if evictCalls.Add(1) == 1 {
+							runner := &liveIntermediateStageRunner{
+								t:     t,
+								cache: cache,
+								key:   "k2",
+							}
+							var wg sync.WaitGroup
+							wg.Go(runner.runLiveStageWithExitedMidHop)
+							wg.Wait()
+						}
+					}),
+				)
+
+				_, err := cache.Put("k1", 1)
+				require.NoError(t, err)
+				_, err = cache.Put("k2", 2)
+				require.NoError(t, err)
+				_, err = cache.Put("k3", 3)
+				require.NoError(t, err)
+
+				armed.Store(true)
+
+				done := make(chan struct{})
+				go func() {
+					defer close(done)
+					_, putErr := cache.Put("k4", 4) // samples PressureFunc, then evicts k1 -> OnEvictValue deletes k2 via G1 (live) -> G2 (exited) -> G3
+					assert.NoError(t, putErr)
+				}()
+
+				select {
+				case <-done:
+				case <-time.After(5 * time.Second):
+					require.Failf(t, "deadlock", "backend %v deadlocked when G0 spawned live intermediate named method G1 -> exited closure G2 -> G3", b)
+				}
+
+				assert.Equal(t, int32(1), callsDuringPressure.Load(), "G3 Delete under live intermediate named method G1 and exited G2 must not re-sample PressureFunc on %v", b)
+				assert.Equal(t, int32(2), evictCalls.Load(), "both k1 and k2 eviction callbacks must fire on %v", b)
+			})
+		}
+	})
 }

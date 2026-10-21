@@ -2130,6 +2130,9 @@ func testReentrantReclamationInvalidatesConcurrentCaller(t *testing.T, b backend
 func testOverflowAndExternalReclamationResampling(t *testing.T, b backendDef) {
 	t.Helper()
 	t.Run("OverflowSamplerReentrantCompactAdvancesEpochAndInvalidatesPrimaryAndFallback", func(t *testing.T) {
+		if b.name == "RadixCache" {
+			t.Skip("RadixCache does not perform structural compaction on Compact() per M-03")
+		}
 		// Arrange: Primary sampler G1, fallback sampler G2, and overflow sampler G3 all enter PressureFunc.
 		// When the 3rd (overflow) sampler G3 calls pac.Compact() re-entrantly on dirty slack,
 		// markReclaimedLocked() must unconditionally advance reclaimEpoch so G1 and G2's stale 0.95
