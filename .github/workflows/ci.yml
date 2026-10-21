@@ -116,7 +116,7 @@ jobs:
       - name: Generate Code Coverage Report & Summary
         run: |
           go tool cover -func=coverage.out | tee coverage.txt
-          go tool cover -func=otellru/coverage-otellru.out | tee coverage-otellru.txt
+          (cd otellru && go tool cover -func=coverage-otellru.out) | tee coverage-otellru.txt
           TOTAL_COV=$(tail -n 1 coverage.txt | awk '{print $3}')
           OTEL_COV=$(tail -n 1 coverage-otellru.txt | awk '{print $3}')
           {
