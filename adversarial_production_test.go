@@ -4363,24 +4363,38 @@ func (b *inlinedGenericTaskBox[T]) makeMethodTask(fn func(T)) func() {
 	}
 }
 
+//go:noinline
+func spawnViaCustomWrapper(fn func()) {
+	go func() {
+		fn()
+	}()
+}
+
 type liveIntermediateStageRunner struct {
-	t     *testing.T
-	cache Cache[int]
-	key   string
+	t            *testing.T
+	cache        Cache[int]
+	key          string
+	decoyEntered chan struct{}
+	decoyRelease <-chan struct{}
 }
 
 //go:noinline
 func (r *liveIntermediateStageRunner) runLiveStageWithExitedMidHop() {
+	if r.decoyRelease != nil {
+		close(r.decoyEntered)
+		<-r.decoyRelease
+		return
+	}
 	g3Done := make(chan struct{})
 	g2Started := make(chan uint64, 1)
 	go func() {
 		g2Started <- currentGoroutineID()
-		go func() {
+		spawnViaCustomWrapper(func() {
 			defer close(g3Done)
 			g2ID := <-g2Started
 			waitForGoroutineExit(r.t, g2ID)
 			_, _ = r.cache.Delete(r.key)
-		}()
+		})
 	}()
 	<-g3Done
 }
@@ -4511,6 +4525,23 @@ func TestAdv_Iter8_InlinedClosureOwnersAndLiveIntermediateExitedChildBridge(t *t
 				var callsDuringPressure atomic.Int32
 				var evictCalls atomic.Int32
 				var armed atomic.Bool
+
+				// Spawn an earlier decoy goroutine parked inside runLiveStageWithExitedMidHop
+				// whose ancestor chain walks up to main (currGID == 0) without passing through G0.
+				decoyEntered := make(chan struct{})
+				decoyRelease := make(chan struct{})
+				var decoyWG sync.WaitGroup
+				decoyRunner := &liveIntermediateStageRunner{
+					t:            t,
+					decoyEntered: decoyEntered,
+					decoyRelease: decoyRelease,
+				}
+				decoyWG.Go(decoyRunner.runLiveStageWithExitedMidHop)
+				<-decoyEntered
+				defer func() {
+					close(decoyRelease)
+					decoyWG.Wait()
+				}()
 
 				cache = New[int](3,
 					WithBackend(b),

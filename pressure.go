@@ -527,6 +527,27 @@ func matchAncestorFallbackInAllStacks(allStacks, currCreator, currChildStack, ca
 	return 0, false
 }
 
+func isClosureFuncName(fn []byte) bool {
+	curr := trimClosureOffset(fn)
+	dot := lastDotOutsideBrackets(curr)
+	return dot > 0 && isClosureSuffix(curr[dot+1:])
+}
+
+func isWrapperEntryFrame(fn, currCreator []byte) bool {
+	fn = trimClosureOffset(fn)
+	if !isClosureFuncName(fn) {
+		return true
+	}
+	creator := trimClosureOffset(currCreator)
+	if len(creator) == 0 || isClosureFuncName(creator) {
+		return false
+	}
+	if dot := lastDotOutsideBrackets(fn); dot > 0 {
+		return sameFuncSymbolIgnoringTypeArgs(fn[:dot], creator)
+	}
+	return false
+}
+
 func blockOwnsExitedChild(blk, currCreator, currChildStack []byte) bool {
 	if len(currCreator) > 0 {
 		if containsCreatorCallFrame(blk, currCreator) || len(findClosureOwnerInStack(blk, currCreator)) > 0 {
@@ -539,16 +560,19 @@ func blockOwnsExitedChild(blk, currCreator, currChildStack []byte) bool {
 		return false
 	}
 	rest := currChildStack[:end]
-	for range 2 {
+	for i := range 2 {
 		var fn []byte
 		fn, rest = popBottomCallFrame(rest)
 		if len(fn) == 0 {
 			return false
 		}
-		if bytes.Equal(fn, []byte("sync.(*WaitGroup).Go.func1")) {
+		if containsCreatorCallFrame(blk, fn) || len(findClosureOwnerInStack(blk, fn)) > 0 {
+			return true
+		}
+		if i == 0 && isWrapperEntryFrame(fn, currCreator) {
 			continue
 		}
-		return len(findClosureOwnerInStack(blk, fn)) > 0
+		return false
 	}
 	return false
 }
@@ -615,8 +639,10 @@ func (s *ancestorBridgeState) bridgeExited(allStacks, currCreator, currChildStac
 	if bridgeGID, pGID, creator, blk := findLiveIntermediateAncestorInAllStacks(
 		allStacks, currCreator, currChildStack, s.callerGID, s.bridgedGIDs[:s.bridgeCount], matchAncestor,
 	); bridgeGID != 0 {
-		s.exitedCreator = currCreator
-		s.exitedChildStack = currChildStack
+		if s.bridgeCount == 0 {
+			s.exitedCreator = currCreator
+			s.exitedChildStack = currChildStack
+		}
 		s.bridgedGIDs[s.bridgeCount] = bridgeGID
 		s.bridgeCount++
 		return pGID, creator, blk, true
@@ -645,7 +671,11 @@ func findAncestorCreatorAboveHook(allStacks, callerStack []byte, parentGID uint6
 	const maxAncestorHops = 4096
 	for range maxAncestorHops {
 		if currGID == 0 {
-			return 0, false
+			var ok bool
+			currGID, currCreator, currChildStack, ok = bridge.backtrack(allStacks, matchAncestor)
+			if !ok {
+				return 0, false
+			}
 		}
 		blk, nextParentGID, nextCreator, foundBlock := findGoroutineBlockByID(allStacks, currGID)
 		if !foundBlock {
