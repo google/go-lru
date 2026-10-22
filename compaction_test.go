@@ -17,11 +17,13 @@ package lru
 import (
 	"fmt"
 	"math"
+	"reflect"
 	"runtime"
 	"slices"
 	"sync"
 	"sync/atomic"
 	"testing"
+	"unsafe"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -1648,4 +1650,137 @@ func TestObserveEpochAdvance_ArbitraryValueType(t *testing.T) {
 			assertAlreadyCompacted(t, pac, probe)
 		})
 	}
+}
+
+// TestCompaction_MapCompactSkipsReallocationWithoutSlack verifies that in MapCache,
+// a single capacity eviction leaves len(c.index) == peakEntryLen (zero bucket slack),
+// and neither EvaluateMemoryPressure() at Tier 1 nor explicit Compact() reallocates the map
+// when hasSlackLocked() is false.
+func TestCompaction_MapCompactSkipsReallocationWithoutSlack(t *testing.T) {
+	// Arrange
+	pressure := 0.10
+	c := NewMapCache[int](100, WithPressureFunc(func() float64 { return pressure })).(*mapCache[int])
+
+	for i := range 101 {
+		_, err := c.Put(fmt.Sprintf("key_%03d", i), i)
+		require.NoError(t, err)
+	}
+	require.Equal(t, 100, c.Stats().Len)
+	require.Equal(t, 100, c.Stats().PeakEntryLen)
+	require.True(t, c.dirtyIndex)
+	require.False(t, c.hasSlackLocked())
+	indexPtrBefore := reflect.ValueOf(c.index).Pointer()
+
+	// Act
+	pressure = 0.80
+	_ = c.EvaluateMemoryPressure()
+	c.Compact()
+	indexPtrAfter := reflect.ValueOf(c.index).Pointer()
+	compactAllocs := testing.AllocsPerRun(50, func() {
+		c.Compact()
+	})
+
+	// Assert
+	st := c.Stats()
+	assert.Equal(t, indexPtrBefore, indexPtrAfter, "c.index map must not be reallocated when hasSlackLocked() is false")
+	assert.Zero(t, compactAllocs, "Compact() without slack must perform 0 allocations")
+	assert.Equal(t, uint64(0), st.CompactionsPressureTier1)
+	assert.Equal(t, uint64(0), st.CompactionsExplicit)
+}
+
+// TestCompaction_ArenaRadixContiguousCompactRequiresTrueSlack verifies that when
+// ArenaRadixCache is at capacity and a Put triggers 1 LRU eviction that is immediately
+// reused by allocNode() (leaving freeHead == nilNode, len(nodes) == cap(nodes), and
+// len(nodeMap) == peakEntryLen), Compact() and Tier 1 EvaluateMemoryPressure() are
+// zero-allocation no-ops unless true contiguous slack exists.
+func TestCompaction_ArenaRadixContiguousCompactRequiresTrueSlack(t *testing.T) {
+	t.Run("SteadyStateTurnoverWithZeroSlackPerformsZeroAllocCompactAndTier1NoOp", func(t *testing.T) {
+		// Arrange: Fill ArenaRadixCache(100) with 100 entries and trigger 1 capacity eviction
+		// (matching TestCompaction_MapCompactSkipsReallocationWithoutSlack). The evicted node is immediately
+		// reused by allocNode(), leaving freeHead == nilNode, len == peakEntryLen == 100, and deletedSinceCompact == 1.
+		var pressureBits atomic.Uint64
+		pressureBits.Store(math.Float64bits(0.10))
+		c := NewArenaRadixCache[int](100,
+			WithInvariantChecking(true),
+			WithPressureFunc(func() float64 {
+				return math.Float64frombits(pressureBits.Load())
+			}),
+			WithCompactionThreshold(0.75),
+			WithEvictionThreshold(0.90),
+		).(*arenaRadix[int])
+
+		for i := range 100 {
+			_, err := c.Put(fmt.Sprintf("key_%03d", i), i)
+			require.NoError(t, err)
+		}
+		evicted, err := c.Put("key_100", 100)
+		require.NoError(t, err)
+		require.Len(t, evicted, 1)
+
+		require.Equal(t, nilNode, c.freeHead)
+		require.Zero(t, c.freeCount)
+		require.Equal(t, 100, c.len)
+		require.Equal(t, 100, c.peakEntryLen)
+		require.False(t, c.hasContiguousSlackLocked())
+		require.False(t, c.isDirtyLocked())
+		require.False(t, c.shouldAutoCompactLocked(nilNode))
+
+		nodesPtrBefore := unsafe.SliceData(c.nodes)
+		mapPtrBefore := reflect.ValueOf(c.nodeMap).Pointer()
+
+		// Act: Evaluate Tier 1 pressure (0.80) and call explicit Compact().
+		pressureBits.Store(math.Float64bits(0.80))
+		_ = c.EvaluateMemoryPressure()
+		c.Compact()
+		compactAllocs := testing.AllocsPerRun(50, func() {
+			c.Compact()
+		})
+
+		// Assert
+		st := c.Stats()
+		assert.Same(t, nodesPtrBefore, unsafe.SliceData(c.nodes), "c.nodes must not be reallocated when contiguous slack is absent")
+		assert.Equal(t, mapPtrBefore, reflect.ValueOf(c.nodeMap).Pointer(), "c.nodeMap must not be reallocated when map slack is absent")
+		assert.Zero(t, compactAllocs, "Compact() without contiguous slack must perform 0 allocations")
+		assert.Zero(t, st.CompactionsPressureTier1)
+		assert.Zero(t, st.CompactionsExplicit)
+		assert.Zero(t, st.ReclaimEpoch)
+	})
+
+	t.Run("ContiguousUnallocatedSliceSlackAndMapChurnTriggersCompaction", func(t *testing.T) {
+		// Arrange: Insert 9 single-byte keys ("a".."i") into capacity 9 so c.nodes has len 10 in a 16-cap slice,
+		// then perform minChurnCompactDeletes (64) single-byte capacity evictions so freeHead == nilNode
+		// while deletedSinceCompact >= minChurnCompactDeletes and cap(c.nodes) (16) > len(c.nodes) (10).
+		var pressureBits atomic.Uint64
+		pressureBits.Store(math.Float64bits(0.10))
+		c := NewArenaRadixCache[int](9,
+			WithInvariantChecking(true),
+			WithPressureFunc(func() float64 {
+				return math.Float64frombits(pressureBits.Load())
+			}),
+		).(*arenaRadix[int])
+
+		for i := range 9 {
+			_, err := c.Put(string([]byte{byte('a' + i)}), i)
+			require.NoError(t, err)
+		}
+		for i := range minChurnCompactDeletes {
+			_, err := c.Put(string([]byte{byte(128 + i)}), i)
+			require.NoError(t, err)
+		}
+
+		require.Equal(t, nilNode, c.freeHead)
+		require.Greater(t, cap(c.nodes), len(c.nodes))
+		require.True(t, c.hasContiguousSlackLocked())
+		require.True(t, c.isDirtyLocked())
+
+		// Act: Explicit Compact() trims the unallocated tail capacity of c.nodes down to len(c.nodes) and rebuilds nodeMap.
+		c.Compact()
+
+		// Assert
+		st := c.Stats()
+		assert.Equal(t, len(c.nodes), cap(c.nodes), "Compact() must trim unallocated c.nodes capacity")
+		assert.Zero(t, st.ArenaUnallocatedCap)
+		assert.Equal(t, uint64(1), st.CompactionsExplicit)
+		assert.Equal(t, uint64(1), st.ReclaimEpoch)
+	})
 }

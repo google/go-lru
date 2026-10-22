@@ -16,9 +16,12 @@ package lru
 
 import (
 	"fmt"
+	"math"
+	"reflect"
 	"runtime"
 	"slices"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"unsafe"
 
@@ -2201,4 +2204,298 @@ func TestArenaRadixCache_MuCacheLineSeparation(t *testing.T) {
 	assert.Greater(t, muFirstCacheLine, nodesLastCacheLine, "mu must be on a different 64-byte cache line from nodes slice header")
 	assert.GreaterOrEqual(t, muOffset-nodesEnd, cacheLineSize, "mu must be separated from the end of nodes slice header by at least 64 bytes")
 	assert.NotEqual(t, nodesHeapLastLine, muHeapFirstLine, "heap-allocated nodes slice header and mu must not share a 64-byte cache line")
+}
+
+// realFNV1aCollisionKeyA and realFNV1aCollisionKeyB are two distinct 12-byte keys
+// that produce the exact same 64-bit FNV-1a hash (12191099477593943617 / 0xa92d176f78f8c4c1).
+// Because 64-bit FNV-1a is an iterative byte-by-byte state machine, appending any
+// identical suffix S to both keys also produces a 64-bit FNV-1a collision:
+// hashString(realFNV1aCollisionKeyA + S) == hashString(realFNV1aCollisionKeyB + S).
+const (
+	realFNV1aCollisionKeyA = "!!!!!!!!!!!!"
+	realFNV1aCollisionKeyB = "&+!o9)1!=\x1c\xd2\x10"
+)
+
+func TestArenaRadix_DeepTreeHashCollisionsAndCompaction(t *testing.T) {
+	// Arrange: Verify that our two 12-byte keys genuinely collide in 64-bit FNV-1a.
+	require.NotEqual(t, realFNV1aCollisionKeyA, realFNV1aCollisionKeyB)
+	require.Equal(t, hashString(realFNV1aCollisionKeyA), hashString(realFNV1aCollisionKeyB),
+		"realFNV1aCollisionKeyA and realFNV1aCollisionKeyB must have identical 64-bit FNV-1a hashes")
+
+	var pressureBits atomic.Uint64
+	pressureBits.Store(math.Float64bits(0.10))
+
+	var evictedKeys []string
+	c := NewArenaRadixCache[int](500,
+		WithInvariantChecking(true),
+		WithPressureFunc(func() float64 {
+			return math.Float64frombits(pressureBits.Load())
+		}),
+		WithOnEvictEntry(func(k string, _ int, _ EvictionReason) {
+			evictedKeys = append(evictedKeys, k)
+		}),
+	).(*arenaRadix[int])
+
+	// Build a 75-level deep tree under both colliding root prefixes so that:
+	// 1. Tree depth exceeds the 64-entry stack buffer in reconstructKey, hashNodeKey, and freeSubtree.
+	// 2. Every pair (keyA_depth, keyB_depth) at depth d shares the EXACT SAME 64-bit FNV-1a hash!
+	var keysA, keysB []string
+	var sbA, sbB strings.Builder
+	sbA.WriteString(realFNV1aCollisionKeyA)
+	sbB.WriteString(realFNV1aCollisionKeyB)
+
+	// Act
+	for depth := 1; depth <= 75; depth++ {
+		seg := fmt.Sprintf("/%02d", depth)
+		sbA.WriteString(seg)
+		sbB.WriteString(seg)
+		kA := sbA.String()
+		kB := sbB.String()
+		require.Equal(t, hashString(kA), hashString(kB), "64-bit FNV-1a collision must hold at depth %d", depth)
+
+		keysA = append(keysA, kA)
+		keysB = append(keysB, kB)
+
+		_, err := c.Put(kA, depth*10+1)
+		require.NoError(t, err)
+		_, err = c.Put(kB, depth*10+2)
+		require.NoError(t, err)
+	}
+
+	require.Equal(t, 150, c.Stats().Len)
+	// Because every (kA, kB) pair collides on 64-bit FNV-1a, nodeMap has only 75 entries while c.len == 150!
+	require.Len(t, c.nodeMap, 75)
+
+	// Exercise Peek and Get across all 150 colliding deep keys (forcing verifyKey upward walks and trie fallbacks).
+	for i := range 75 {
+		vA, okA := c.Peek(keysA[i])
+		require.True(t, okA)
+		require.Equal(t, (i+1)*10+1, vA)
+
+		vB, okB := c.Get(keysB[i])
+		require.True(t, okB)
+		require.Equal(t, (i+1)*10+2, vB)
+
+		// Replace keysA[i] (which was displaced in nodeMap by keysB[i]).
+		require.NoError(t, c.Replace(keysA[i], (i+1)*100+1))
+	}
+	require.Positive(t, c.Stats().ArenaHashFallbacks)
+
+	// Delete a subtree at depth 66 (exercising freeSubtree stack spill > 64 with colliding hashes).
+	c.DeletePrefix(keysA[65])
+	require.Equal(t, 140, c.Stats().Len)
+	require.NotEmpty(t, evictedKeys)
+
+	// Trigger Tier 1 and Tier 2 EvaluateMemoryPressure and explicit Compact() (exercising hashNodeKey at depth > 64).
+	pressureBits.Store(math.Float64bits(0.80))
+	_ = c.EvaluateMemoryPressure()
+
+	c.Compact()
+
+	// Assert
+	st := c.Stats()
+	assert.Zero(t, st.ArenaFreeNodes, "ArenaFreeNodes must be 0 immediately after Compact()")
+	assert.Zero(t, st.ArenaUnallocatedCap, "ArenaUnallocatedCap must be 0 immediately after Compact()")
+
+	// Verify all remaining 65 keysA and 75 keysB are retrievable and match All() order.
+	for i := range 65 {
+		vA, okA := c.Get(keysA[i])
+		require.True(t, okA)
+		require.Equal(t, (i+1)*100+1, vA)
+	}
+	for i := range 75 {
+		vB, okB := c.Peek(keysB[i])
+		require.True(t, okB)
+		require.Equal(t, (i+1)*10+2, vB)
+	}
+}
+
+func TestArenaRadix_CacheLineLayoutAndStructAlignment(t *testing.T) {
+	// Arrange
+	const cacheLineSize = uintptr(64)
+
+	mc := NewMapCache[uint64](100).(*mapCache[uint64])
+	rc := NewRadixCache[uint64](100).(*radixCache[uint64])
+	ac := NewArenaRadixCache[uint64](100).(*arenaRadix[uint64])
+	require.NotNil(t, mc)
+	require.NotNil(t, rc)
+	require.NotNil(t, ac)
+
+	// Act & Assert 1: Verify ArenaRadixCache separates c.nodes from c.mu across 64-byte cache lines.
+	acNodesEnd := unsafe.Offsetof(ac.nodes) + unsafe.Sizeof(ac.nodes)
+	acMuOffset := unsafe.Offsetof(ac.mu)
+	assert.GreaterOrEqual(t, acMuOffset-acNodesEnd, cacheLineSize,
+		"arenaRadix.mu must be separated from arenaRadix.nodes by at least 64 bytes")
+
+	// Act & Assert 2: Characterize pressureState atomic counter packing:
+	// peekHits, peekMisses, and putRejectedOversized are packed contiguously (8 bytes apart)
+	// in the same 64-byte cache line, and arenaHashFallbacks shares a 64-byte cache line with pressureWriteMu.
+	peekHitsOff := unsafe.Offsetof(mc.peekHits)
+	peekMissesOff := unsafe.Offsetof(mc.peekMisses)
+	rejectedOff := unsafe.Offsetof(mc.putRejectedOversized)
+	fallbacksOff := unsafe.Offsetof(mc.arenaHashFallbacks)
+	pressureMuOff := unsafe.Offsetof(mc.pressureWriteMu)
+	assert.Equal(t, uintptr(8), peekMissesOff-peekHitsOff,
+		"peekHits and peekMisses are adjacent 8-byte fields sharing a cache line")
+	assert.Equal(t, peekHitsOff/cacheLineSize, peekMissesOff/cacheLineSize,
+		"peekHits and peekMisses sit in the same 64-byte cache line")
+	assert.Equal(t, peekHitsOff/cacheLineSize, rejectedOff/cacheLineSize,
+		"peekHits and putRejectedOversized sit in the same 64-byte cache line")
+	assert.Equal(t, fallbacksOff/cacheLineSize, pressureMuOff/cacheLineSize,
+		"arenaHashFallbacks and pressureWriteMu sit in the same 64-byte cache line")
+
+	t.Logf("Layout offsets (bytes): mapCache{index=%d, mu=%d, peekHits=%d, peekMisses=%d, pressureWriteMu=%d} | radixCache{root=%d, mu=%d} | arenaRadix{nodes=%d, mu=%d}",
+		unsafe.Offsetof(mc.index), unsafe.Offsetof(mc.mu), peekHitsOff, peekMissesOff, pressureMuOff,
+		unsafe.Offsetof(rc.root), unsafe.Offsetof(rc.mu),
+		unsafe.Offsetof(ac.nodes), acMuOffset)
+
+	// Act & Assert 3: arenaRadixNode[uint64] embeds `prefix string` at offset 0,
+	// meaning even for pointer-free scalar V = uint64, the node struct contains a Go pointer
+	// (`string` header {*byte, int}) and cannot be placed in a `noscan` span by the Go GC.
+	var node arenaRadixNode[uint64]
+	assert.Equal(t, uintptr(0), unsafe.Offsetof(node.prefix))
+	assert.Equal(t, uintptr(16), unsafe.Sizeof(node.prefix))
+	assert.Equal(t, uintptr(56), unsafe.Sizeof(node))
+	nodeType := reflect.TypeFor[arenaRadixNode[uint64]]()
+	assert.Equal(t, reflect.String, nodeType.Field(0).Type.Kind())
+}
+
+func TestArenaRadix_AllocationCharacterization_PathCompressionAndDeepKeys(t *testing.T) {
+	t.Run("ZeroAllocSteadyStateHotPaths", func(t *testing.T) {
+		for _, b := range []Backend{BackendMap, BackendRadix, BackendArenaRadix} {
+			// Arrange
+			c := New[uint64](100, WithBackend(b))
+			_, _ = c.Put("dir/sub/k1", 1)
+			_, _ = c.Put("dir/sub/k2", 2)
+			valSeq := c.Values()
+
+			// Act & Assert
+			assert.Zero(t, testing.AllocsPerRun(50, func() {
+				_, _ = c.Get("dir/sub/k1")
+			}), "backend %v Get must be 0 allocs/op", b)
+			assert.Zero(t, testing.AllocsPerRun(50, func() {
+				_, _ = c.Peek("dir/sub/k2")
+			}), "backend %v Peek must be 0 allocs/op", b)
+			assert.Zero(t, testing.AllocsPerRun(50, func() {
+				_, _ = c.Put("dir/sub/k1", 3)
+			}), "backend %v in-place Put must be 0 allocs/op", b)
+			assert.Zero(t, testing.AllocsPerRun(50, func() {
+				_ = c.Replace("dir/sub/k2", 4)
+			}), "backend %v Replace must be 0 allocs/op", b)
+			assert.Zero(t, testing.AllocsPerRun(50, func() {
+				_ = c.Stats()
+			}), "backend %v Stats must be 0 allocs/op", b)
+			assert.Zero(t, testing.AllocsPerRun(50, func() {
+				valSeq(func(v uint64) bool { return v > 0 })
+			}), "backend %v Values must be 0 allocs/op", b)
+		}
+	})
+
+	t.Run("RadixSplitAndCompressStringAllocationChurn", func(t *testing.T) {
+		// Arrange: In RadixCache and ArenaRadixCache, inserting a sibling key that splits an edge
+		// into multi-byte segments calls clonePrefix 3 times (3 heap allocs), and deleting
+		// that key calls compressPathUpwards which executes `curr.prefix + onlyChild.prefix` (1 heap alloc).
+		arenaC := NewArenaRadixCache[int](100)
+		_, _ = arenaC.Put("service/users/profile/1001_alpha", 1)
+		k2 := "service/users/profile/1002_beta"
+
+		// Act
+		allocs := testing.AllocsPerRun(100, func() {
+			_, _ = arenaC.Put(k2, 2)
+			_, _ = arenaC.Delete(k2)
+		})
+
+		// Assert
+		assert.GreaterOrEqual(t, allocs, 4.0,
+			"ArenaRadixCache split+compress cycle allocates >= 4 heap strings per Put+Delete")
+	})
+
+	t.Run("DeepTreeStackBufferSpillAboveDepth64", func(t *testing.T) {
+		// Arrange
+		arenaShallow := NewArenaRadixCache[int](200).(*arenaRadix[int])
+		arenaDeep := NewArenaRadixCache[int](200).(*arenaRadix[int])
+
+		_, _ = arenaShallow.Put("a/b/c/d", 1)
+		var deepSB strings.Builder
+		for i := 1; i <= 75; i++ {
+			fmt.Fprintf(&deepSB, "/%02d", i)
+			_, _ = arenaDeep.Put(deepSB.String(), i)
+		}
+		deepLeafKey := deepSB.String()
+		deepLeafID := arenaDeep.nodeMap[hashString(deepLeafKey)]
+
+		// Act
+		shallowHashAllocs := testing.AllocsPerRun(100, func() {
+			_ = arenaShallow.hashNodeKey(arenaShallow.head)
+		})
+		deepHashAllocs := testing.AllocsPerRun(100, func() {
+			_ = arenaDeep.hashNodeKey(deepLeafID)
+		})
+
+		// Assert
+		assert.Zero(t, shallowHashAllocs, "depth <= 64 hashNodeKey uses stackBuf [64]uint32 (0 allocs)")
+		assert.GreaterOrEqual(t, deepHashAllocs, 1.0, "depth > 64 hashNodeKey spills stackBuf [64]uint32 to heap")
+	})
+}
+
+// TestArenaRadix_FNV1aCollisionPreservesFastMissAndHealsOnDisplacedDelete verifies that
+// ArenaRadixCache tracks active hash collisions via collisionCount and collisionPeers, using the trie fallback only while
+// an active collision exists (collisionCount > 0) and immediately restoring the O(1) cache-miss fast-path
+// as soon as the colliding key is deleted or evicted.
+func TestArenaRadix_FNV1aCollisionPreservesFastMissAndHealsOnDisplacedDelete(t *testing.T) {
+	// Arrange: Construct two pairs of distinct keys that produce genuine 64-bit FNV-1a collisions.
+	k1a := realFNV1aCollisionKeyA + "_bucket1"
+	k1b := realFNV1aCollisionKeyB + "_bucket1"
+	k2a := realFNV1aCollisionKeyA + "_bucket2"
+	k2b := realFNV1aCollisionKeyB + "_bucket2"
+	require.Equal(t, hashString(k1a), hashString(k1b))
+	require.Equal(t, hashString(k2a), hashString(k2b))
+
+	c := NewArenaRadixCache[int](100,
+		WithInvariantChecking(true),
+		WithWeigher(func(_ string, v int) uint64 { return uint64(v) }),
+	).(*arenaRadix[int])
+
+	// Act: Insert all 4 colliding keys (2 independent collision buckets), exercise Get/Replace/Put-with-eviction
+	// promotion across peers, then remove the remaining colliding peer.
+	_, err := c.Put(k2b, 20)
+	require.NoError(t, err)
+	_, err = c.Put(k2a, 20)
+	require.NoError(t, err)
+	_, err = c.Put(k1a, 10)
+	require.NoError(t, err)
+	_, err = c.Put(k1b, 20)
+	require.NoError(t, err)
+	require.Equal(t, 2, c.collisionCount)
+	require.Len(t, c.nodeMap, 2)
+
+	// Promote k1a via Get and k1b via Replace, then overwrite k1a with a weight that evicts LRU tail k2b.
+	v1, ok := c.Get(k1a)
+	require.True(t, ok)
+	require.Equal(t, 10, v1)
+	require.NoError(t, c.Replace(k1b, 25))
+	evicted, err := c.Put(k1a, 55) // total 55 + 25 + 20 + 20 = 120 > 100 -> evicts LRU tail k2b (20)
+	require.NoError(t, err)
+	require.Equal(t, []int{20}, evicted)
+	require.Equal(t, 1, c.collisionCount)
+
+	// Delete the remaining colliding peer k1b; collisionCount immediately drops to 0 and len(nodeMap) == c.len == 2.
+	_, deleted := c.Delete(k1b)
+	require.True(t, deleted)
+
+	// Assert
+	require.Equal(t, 0, c.collisionCount)
+	require.Empty(t, c.collisionPeers)
+	require.Equal(t, 2, c.len)
+	require.Len(t, c.nodeMap, 2)
+
+	beforeFallbacks := c.Stats().ArenaHashFallbacks
+	const missProbes = 1000
+	for i := range missProbes {
+		_, ok := c.Peek(fmt.Sprintf("completely_unrelated_missing_key_%d", i))
+		require.False(t, ok)
+	}
+	afterFallbacks := c.Stats().ArenaHashFallbacks
+	delta := afterFallbacks - beforeFallbacks
+	assert.Equal(t, uint64(0), delta, "O(1) cache-miss fast-path must be restored immediately after colliding key removal")
 }

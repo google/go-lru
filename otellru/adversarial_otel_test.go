@@ -433,11 +433,11 @@ func TestAdversarial_NegativeIntAndInvalidPressureClamping(t *testing.T) {
 	assert.InDelta(t, 0.0, recObs.float64Vals[0], 1e-9)
 }
 
-// TestDefect_L01_DuplicateRegistrationWithoutNameCollision characterizes L-01 / F-13 (Bucket 3 OTel SDK behavior):
-// Registering multiple caches of the same backend on the same MeterProvider without
-// unique WithName or WithAttributes emits identical attribute sets (`{"cache.backend": "map"}`),
-// which the OTel SDK deduplicates into a single series.
-func TestDefect_L01_DuplicateRegistrationWithoutNameCollision(t *testing.T) {
+// TestAdversarial_DuplicateRegistrationWithoutNameCollision characterizes OTel SDK behavior when
+// registering multiple caches of the same backend on the same MeterProvider without
+// unique WithName or WithAttributes: identical attribute sets (`{"cache.backend": "map"}`) are
+// emitted, which the OTel SDK deduplicates into a single series.
+func TestAdversarial_DuplicateRegistrationWithoutNameCollision(t *testing.T) {
 	// Arrange
 	reader := sdkmetric.NewManualReader()
 	mp := sdkmetric.NewMeterProvider(sdkmetric.WithReader(reader))
