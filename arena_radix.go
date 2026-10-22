@@ -126,10 +126,7 @@ func hashStringCont(h uint64, s string) uint64 {
 	return h
 }
 
-// hashNodeKey computes the 64-bit FNV-1a hash of the full key for nodeID
-// by walking the ancestor chain. Uses a 64-level stack buffer for common depths
-// and seamlessly handles arbitrary depths > 64.
-func (c *arenaRadix[V]) hashNodeKey(nodeID uint32) uint64 {
+func (c *arenaRadix[V]) hashNodeKeySlow(nodeID uint32) uint64 {
 	var stackBuf [64]uint32
 	path := stackBuf[:0]
 	for curr := nodeID; curr != c.root && curr != nilNode; curr = c.nodes[curr].parent {
@@ -142,19 +139,26 @@ func (c *arenaRadix[V]) hashNodeKey(nodeID uint32) uint64 {
 	return h
 }
 
+// hashNodeKey computes the 64-bit FNV-1a hash of the full key for nodeID
+// by walking the ancestor chain. Uses a 64-level stack buffer for common depths
+// and seamlessly handles arbitrary depths > 64.
+func (c *arenaRadix[V]) hashNodeKey(nodeID uint32) uint64 {
+	if nodeID == nilNode || nodeID == c.root {
+		return offset64
+	}
+	if c.nodes[nodeID].parent == c.root {
+		return hashString(c.nodes[nodeID].prefix)
+	}
+	return c.hashNodeKeySlow(nodeID)
+}
+
 // allocateNode allocates a node index from the free-list or appends to the arena slice.
 func (c *arenaRadix[V]) allocateNode() uint32 {
 	if c.freeHead != nilNode {
 		id := c.freeHead
 		c.freeHead = c.nodes[id].next
 		c.freeCount--
-		c.nodes[id] = arenaRadixNode[V]{
-			parent:  nilNode,
-			child:   nilNode,
-			sibling: nilNode,
-			prev:    nilNode,
-			next:    nilNode,
-		}
+		c.nodes[id].next = nilNode
 		return id
 	}
 	id := uint32(len(c.nodes))
@@ -352,13 +356,6 @@ func (c *arenaRadix[V]) findNodeByTrieWalk(key string) (uint32, bool) {
 	}
 
 	return nilNode, false
-}
-
-// getNodeKey finds a value-bearing node index for key using O(1) FNV-1a hash lookup with zero-alloc verification,
-// falling back to top-down trie traversal only when a hash collision or dirty nodeMap state exists.
-// It does not mutate c.nodeMap, making it safe under RLock.
-func (c *arenaRadix[V]) getNodeKey(key string) (uint32, bool) {
-	return c.lookupNodeKeyWithHash(key, hashString(key))
 }
 
 func (c *arenaRadix[V]) lookupOrWalkNodeKey(key string, keyHash uint64) (nodeID uint32, walked, found bool) {

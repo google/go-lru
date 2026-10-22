@@ -410,7 +410,7 @@ func (inst *cacheInstruments) initArenaInstruments(meter metric.Meter, isArena b
 	return nil
 }
 
-func (inst *cacheInstruments) observe(o metric.Observer, st lru.Stats, opts *observeSets, isArena bool) {
+func (inst *cacheInstruments) observe(o metric.Observer, st *lru.Stats, opts *observeSets, isArena bool) {
 	// 1. lru.cache.requests
 	o.ObserveInt64(inst.requestsCounter, uint64ToCounterInt64(st.GetHits), opts.reqGetHit...)
 	o.ObserveInt64(inst.requestsCounter, uint64ToCounterInt64(st.GetMisses), opts.reqGetMiss...)
@@ -506,7 +506,8 @@ func Register(cache StatsProvider, opts ...Option) (*Registration, error) {
 	}
 
 	reg, err := meter.RegisterCallback(func(_ context.Context, o metric.Observer) error {
-		inst.observe(o, cache.Stats(), &optSets, isArena)
+		st := cache.Stats()
+		inst.observe(o, &st, &optSets, isArena)
 		return nil
 	}, inst.observables...)
 	if err != nil {

@@ -370,18 +370,32 @@ func (c *arenaRadix[V]) checkInvariants() {
 	c.checkTelemetryInvariants(c.len)
 }
 
-func (c *arenaRadix[V]) unlock() {
+//go:noinline
+func (c *arenaRadix[V]) unlockWithInvariants() {
 	defer c.mu.Unlock()
+	c.checkInvariants()
+}
+
+func (c *arenaRadix[V]) unlock() {
 	if c.options.EnableInvariantChecking {
-		c.checkInvariants()
+		c.unlockWithInvariants()
+		return
 	}
+	c.mu.Unlock()
+}
+
+//go:noinline
+func (c *arenaRadix[V]) rUnlockWithInvariants() {
+	defer c.mu.RUnlock()
+	c.checkInvariants()
 }
 
 func (c *arenaRadix[V]) rUnlock() {
-	defer c.mu.RUnlock()
 	if c.options.EnableInvariantChecking {
-		c.checkInvariants()
+		c.rUnlockWithInvariants()
+		return
 	}
+	c.mu.RUnlock()
 }
 
 // Compact performs lossless O(N) compaction of the arena node slice and hash lookup map
@@ -428,6 +442,10 @@ func (c *arenaRadix[V]) finishDeleteReclaimLocked(evictQ *evictCallbackQueue[V],
 }
 
 func (c *arenaRadix[V]) finishMutationReclaimLocked(evictQ *evictCallbackQueue[V], evictedValues []V, protectedID uint32, reclaimedPre, compactedPre bool, sizeBefore, sampledEpoch uint64, pressure float64) []V {
+	if !reclaimedPre && c.currentSize >= sizeBefore && pressure < c.options.CompactionThreshold && pressure < c.options.EvictionThreshold {
+		c.resetZeroWatermarkBelowTier2(pressure)
+		return evictedValues
+	}
 	evictedByPressure := c.maybeReclaimUnderPressureLocked(evictQ, pressure, protectedID)
 	evictedValues = appendEvicted(evictedValues, evictedByPressure)
 	netByteReduced := c.currentSize < sizeBefore
@@ -524,17 +542,14 @@ func (c *arenaRadix[V]) Put(key string, value V) ([]V, error) {
 		return nil, ErrInvalidEntrySize
 	}
 
+	keyHash := hashString(key)
 	var evictQ evictCallbackQueue[V]
-	defer evictQ.invoke(&c.pressureState, c.onEvictValue, c.onEvictEntry)
-
 	sampledEpoch, pressure := c.lockWithPressure(&c.mu, false)
-	defer c.unlock()
 
 	var evictedValues []V
 	sizeBefore := c.currentSize
 	reclaimedPrePut := false
 	compactedPrePut := false
-	keyHash := hashString(key)
 
 	nodeID, exists := c.getNodeKeyWithHash(key, keyHash)
 	if exists {
@@ -544,21 +559,21 @@ func (c *arenaRadix[V]) Put(key string, value V) ([]V, error) {
 	}
 
 	evictedValues = c.finishMutationReclaimLocked(&evictQ, evictedValues, nodeID, reclaimedPrePut, compactedPrePut, sizeBefore, sampledEpoch, pressure)
+	c.unlock()
+	evictQ.invoke(&c.pressureState, c.onEvictValue, c.onEvictEntry)
 	return evictedValues, nil
 }
 
 // Delete removes the entry associated with key from the cache, returning its value and true (or the zero value of V and false if not found).
 func (c *arenaRadix[V]) Delete(key string) (value V, ok bool) {
-	var evictQ evictCallbackQueue[V]
-	defer evictQ.invoke(&c.pressureState, c.onEvictValue, c.onEvictEntry)
-
-	sampledEpoch, pressure := c.lockWithPressure(&c.mu, false)
-	defer c.unlock()
-
 	keyHash := hashString(key)
+	var evictQ evictCallbackQueue[V]
+	sampledEpoch, pressure := c.lockWithPressure(&c.mu, false)
+
 	nodeID, found := c.lookupNodeKeyWithHash(key, keyHash)
 	if !found {
 		c.deleteNotFound++
+		c.unlock()
 		return value, false
 	}
 
@@ -566,45 +581,53 @@ func (c *arenaRadix[V]) Delete(key string) (value V, ok bool) {
 	deleted, erased := c.eraseInternalWithHash(&evictQ, nodeID, keyHash, key, EvictionReasonDeleted)
 	if !erased {
 		c.deleteNotFound++
+		c.unlock()
 		return value, false
 	}
 	c.deleteDeleted++
 	c.finishDeleteReclaimLocked(&evictQ, sizeBefore, sampledEpoch, pressure)
+	c.unlock()
+	evictQ.invoke(&c.pressureState, c.onEvictValue, c.onEvictEntry)
 	return deleted, true
 }
 
 // Get retrieves the value associated with key and promotes it to MRU position.
 // Returns the zero value of V and false if the key is not found in the cache.
 func (c *arenaRadix[V]) Get(key string) (value V, ok bool) {
-	c.mu.Lock()
-	defer c.unlock()
-
 	keyHash := hashString(key)
+	c.mu.Lock()
+
 	nodeID, found := c.getNodeKeyWithHash(key, keyHash)
 	if !found {
 		c.getMisses++
+		c.unlock()
 		return value, false
 	}
 	c.getHits++
 	c.moveToFront(nodeID)
+	val := c.nodes[nodeID].value
+	c.unlock()
 
-	return c.nodes[nodeID].value, true
+	return val, true
 }
 
 // Peek retrieves the value associated with key without altering its LRU position.
 // Returns the zero value of V and false if the key is not found in the cache.
 func (c *arenaRadix[V]) Peek(key string) (value V, ok bool) {
+	keyHash := hashString(key)
 	c.mu.RLock()
-	defer c.rUnlock()
 
-	nodeID, found := c.getNodeKey(key)
+	nodeID, found := c.lookupNodeKeyWithHash(key, keyHash)
 	if !found {
 		c.peekMisses.Add(1)
+		c.rUnlock()
 		return value, false
 	}
 	c.peekHits.Add(1)
+	val := c.nodes[nodeID].value
+	c.rUnlock()
 
-	return c.nodes[nodeID].value, true
+	return val, true
 }
 
 func (c *arenaRadix[V]) canFitGrowthLocked(nodeID uint32, newSize, sizeDelta, avail uint64) bool {
@@ -637,6 +660,34 @@ func (c *arenaRadix[V]) canFitGrowthLocked(nodeID uint32, newSize, sizeDelta, av
 	}
 }
 
+func (c *arenaRadix[V]) replaceResizeOrEvictLocked(evictQ *evictCallbackQueue[V], nodeID uint32, key string, keyHash, oldSize, newSize, sizeBefore, sampledEpoch uint64, pressure float64) (evictedAny, selfEvicted bool) {
+	if newSize > oldSize {
+		sizeDelta := newSize - oldSize
+		if newSize > c.maxSize || !c.canFitGrowthLocked(nodeID, newSize, sizeDelta, c.maxSize-c.currentSize) {
+			c.replaceSelfEvicted++
+			c.eraseInternalWithHash(evictQ, nodeID, keyHash, key, EvictionReasonCapacity)
+			c.finishDeleteReclaimLocked(evictQ, sizeBefore, sampledEpoch, pressure)
+			return false, true
+		}
+
+		for sizeDelta > c.maxSize-c.currentSize && c.tail != nilNode && c.tail != nodeID {
+			c.evictOne(evictQ)
+			evictedAny = true
+		}
+
+		c.onEntrySizeUpdated(oldSize, newSize)
+		c.currentSize += sizeDelta
+		return evictedAny, false
+	}
+	if c.shouldEvictOnZeroWeightShrink(oldSize, newSize, c.maxSize) && c.tail != nodeID {
+		c.evictOne(evictQ)
+		evictedAny = true
+	}
+	c.onEntrySizeUpdated(oldSize, newSize)
+	c.currentSize -= oldSize - newSize
+	return evictedAny, false
+}
+
 // Replace updates the value of an existing key and recomputes its weight
 // without modifying its LRU position.
 // If the entry's updated weight exceeds maxSize (or cannot fit alongside entries more recent than node),
@@ -646,69 +697,47 @@ func (c *arenaRadix[V]) canFitGrowthLocked(nodeID uint32, newSize, sizeDelta, av
 // Returns ErrEntryNotExist if key is not present in the cache.
 func (c *arenaRadix[V]) Replace(key string, value V) error {
 	newSize := c.weigh(key, value)
+	keyHash := hashString(key)
 
 	var evictQ evictCallbackQueue[V]
-	defer evictQ.invoke(&c.pressureState, c.onEvictValue, c.onEvictEntry)
-
 	sampledEpoch, pressure := c.lockWithPressure(&c.mu, false)
-	defer c.unlock()
 
-	keyHash := hashString(key)
-	nodeID, ok := c.lookupNodeKeyWithHash(key, keyHash)
+	nodeID, walked, ok := c.lookupOrWalkNodeKey(key, keyHash)
 	if !ok {
 		c.replaceNotFound++
+		c.unlock()
 		return ErrEntryNotExist
 	}
 
 	oldSize := c.nodes[nodeID].size
 	oldValue := c.nodes[nodeID].value
-
-	if newSize > c.maxSize {
-		c.replaceSelfEvicted++
-		sizeBefore := c.currentSize
-		c.eraseInternalWithHash(&evictQ, nodeID, keyHash, key, EvictionReasonCapacity)
-		c.finishDeleteReclaimLocked(&evictQ, sizeBefore, sampledEpoch, pressure)
-		return nil
-	}
-
 	sizeBefore := c.currentSize
 	evictedAny := false
 
-	switch {
-	case newSize > oldSize:
-		sizeDelta := newSize - oldSize
-		if !c.canFitGrowthLocked(nodeID, newSize, sizeDelta, c.maxSize-c.currentSize) {
-			c.replaceSelfEvicted++
-			c.eraseInternalWithHash(&evictQ, nodeID, keyHash, key, EvictionReasonCapacity)
-			c.finishDeleteReclaimLocked(&evictQ, sizeBefore, sampledEpoch, pressure)
+	if newSize != oldSize {
+		var selfEvicted bool
+		evictedAny, selfEvicted = c.replaceResizeOrEvictLocked(&evictQ, nodeID, key, keyHash, oldSize, newSize, sizeBefore, sampledEpoch, pressure)
+		if selfEvicted {
+			c.unlock()
+			evictQ.invoke(&c.pressureState, c.onEvictValue, c.onEvictEntry)
 			return nil
 		}
-
-		for sizeDelta > c.maxSize-c.currentSize && c.tail != nilNode && c.tail != nodeID {
-			c.evictOne(&evictQ)
-			evictedAny = true
-		}
-
-		c.onEntrySizeUpdated(oldSize, newSize)
-		c.currentSize += sizeDelta
-	case newSize < oldSize:
-		if c.shouldEvictOnZeroWeightShrink(oldSize, newSize, c.maxSize) && c.tail != nodeID {
-			c.evictOne(&evictQ)
-			evictedAny = true
-		}
-		c.onEntrySizeUpdated(oldSize, newSize)
-		c.currentSize -= oldSize - newSize
 	}
+
 	c.nodes[nodeID].value = value
 	c.nodes[nodeID].hasValue = true
 	c.nodes[nodeID].size = newSize
 
-	c.promoteCollisionPeerLocked(keyHash, nodeID)
+	if walked || evictedAny {
+		c.promoteCollisionPeerLocked(keyHash, nodeID)
+	}
 	c.replaceUpdated++
 	c.notifyEvict(&evictQ, key, oldValue, oldSize, EvictionReasonReplaced)
 	reclaimedPreUpdate := c.shouldReclaimSingleSurvivorOnMutation(c.len, c.freeCount > 0 || c.nodeMapDirty, c.freeCount >= minSingleSurvivorFreeNodes, evictedAny, c.currentSize, sizeBefore, pressure)
 
 	c.finishMutationReclaimLocked(&evictQ, nil, nodeID, reclaimedPreUpdate, false, sizeBefore, sampledEpoch, pressure)
+	c.unlock()
+	evictQ.invoke(&c.pressureState, c.onEvictValue, c.onEvictEntry)
 	return nil
 }
 
@@ -937,7 +966,6 @@ func (c *arenaRadix[V]) values(yield func(V) bool) {
 // and contiguous arena node mechanics.
 func (c *arenaRadix[V]) Stats() Stats {
 	c.mu.RLock()
-	defer c.rUnlock()
 
 	st := c.snapshotBaseStats(BackendArenaRadix, c.currentSize, c.maxSize, c.len)
 	freeCount := int(c.freeCount)
@@ -945,5 +973,6 @@ func (c *arenaRadix[V]) Stats() Stats {
 	st.ArenaFreeNodes = freeCount
 	st.ArenaUnallocatedCap = max(cap(c.nodes)-len(c.nodes), 0)
 	st.ArenaHashFallbacks = c.arenaHashFallbacks.Load()
+	c.rUnlock()
 	return st
 }

@@ -790,6 +790,20 @@ func parseThreeASCIIDigits(c0, c1, c2 byte) (int, bool) {
 	return 0, false
 }
 
+func cloneMultiBytePrefix(s string) string {
+	switch len(s) {
+	case 2:
+		if idx, ok := parseTwoASCIIDigits(s[0], s[1]); ok {
+			return twoDigitStrings[idx]
+		}
+	case 3:
+		if idx, ok := parseThreeASCIIDigits(s[0], s[1], s[2]); ok {
+			return threeDigitStrings[idx]
+		}
+	}
+	return strings.Clone(s)
+}
+
 // clonePrefix returns an independent copy of s that never shares s's underlying backing array,
 // using preallocated 1-byte, 2-digit, and 3-digit strings to avoid heap allocations.
 func clonePrefix(s string) string {
@@ -798,18 +812,8 @@ func clonePrefix(s string) string {
 		return ""
 	case 1:
 		return byteStrings[s[0]]
-	case 2:
-		if idx, ok := parseTwoASCIIDigits(s[0], s[1]); ok {
-			return twoDigitStrings[idx]
-		}
-		return strings.Clone(s)
-	case 3:
-		if idx, ok := parseThreeASCIIDigits(s[0], s[1], s[2]); ok {
-			return threeDigitStrings[idx]
-		}
-		return strings.Clone(s)
 	default:
-		return strings.Clone(s)
+		return cloneMultiBytePrefix(s)
 	}
 }
 
@@ -834,11 +838,13 @@ func concatPrefix(a, b string) string {
 
 // longestCommonPrefix finds the length of the longest common prefix of a and b.
 func longestCommonPrefix(a, b string) int {
-	i := 0
-	for i < len(a) && i < len(b) && a[i] == b[i] {
-		i++
+	n := min(len(a), len(b))
+	for i := range n {
+		if a[i] != b[i] {
+			return i
+		}
 	}
-	return i
+	return n
 }
 
 // computeTargetSize safely computes uint64(float64(maxSize) * retention) without
@@ -1177,6 +1183,9 @@ func (p *pressureState) isCachedNonDescendantParent(parentGID, sig uint64) bool 
 }
 
 func (p *pressureState) checkSamplingGoroutineOrChildSlow() (bool, uint64, uint64) {
+	if !p.hasActiveSampler() {
+		return false, 0, 0
+	}
 	gid, parentGID, creatorFunc, callerStack, callerBufPtr, allStacks, allBufPtr := p.inspectCurrentAndResolvePrimary()
 	defer releaseCurrentGoroutineStack(callerBufPtr)
 	defer releaseAllGoroutineStacks(allBufPtr)
@@ -1200,19 +1209,19 @@ func (p *pressureState) checkSamplingGoroutineOrChildSlow() (bool, uint64, uint6
 	return false, gid, parentGID
 }
 
-func (p *pressureState) checkSamplingGoroutineOrChild() (bool, uint64, uint64) {
-	if !p.options.hasCustomPressureFunc || !p.hasActiveSampler() {
-		return false, 0, 0
+func (p *pressureState) checkSamplingGoroutineOrChild() (sampling bool, rootGID, parentGID uint64) {
+	if p.options.hasCustomPressureFunc {
+		return p.checkSamplingGoroutineOrChildSlow()
 	}
-	return p.checkSamplingGoroutineOrChildSlow()
+	return
 }
 
 func (p *pressureState) isSamplingGoroutine() bool {
-	if !p.options.hasCustomPressureFunc || !p.hasActiveSampler() {
-		return false
+	if p.options.hasCustomPressureFunc {
+		sampling, _, _ := p.checkSamplingGoroutineOrChildSlow()
+		return sampling
 	}
-	sampling, _, _ := p.checkSamplingGoroutineOrChildSlow()
-	return sampling
+	return false
 }
 
 func (p *pressureState) recordChildSamplerReclaim() {
@@ -1785,7 +1794,7 @@ func (p *pressureState) shouldReclaimSingleSurvivorSlow(currentLen int, extraChu
 }
 
 func (p *pressureState) shouldReclaimSingleSurvivorOnMutation(currentLen int, isDirty, extraChurn, evictedPre bool, postSize, sizeBefore uint64, pressure float64) bool {
-	if isDirty {
+	if isDirty && (currentLen <= 1 || p.zeroSizeCount > 0) {
 		return p.shouldReclaimSingleSurvivorSlow(currentLen, extraChurn, evictedPre, postSize, sizeBefore, pressure)
 	}
 	return false
@@ -2432,10 +2441,7 @@ func (q *evictCallbackQueue[V]) invokeSlow(p *pressureState, onVal func(V, Evict
 	p.unlockEvictCallbackSlow(true)
 }
 
-func (q *evictCallbackQueue[V]) invoke(p *pressureState, onVal func(V, EvictionReason), onEntry func(string, V, EvictionReason)) {
-	if q.n == 0 {
-		return
-	}
+func (q *evictCallbackQueue[V]) invokeNonEmpty(p *pressureState, onVal func(V, EvictionReason), onEntry func(string, V, EvictionReason)) {
 	if (onVal != nil || onEntry != nil) && p.evictCallbackMu.TryLock() {
 		if slot := p.evictFastSlot; slot != nil && slot.CompareAndSwap(p.evictFastIdle, p.evictFastIdle|1) {
 			q.dispatchFastCallbacks(p, p.evictFastTag, onVal, onEntry)
@@ -2445,6 +2451,13 @@ func (q *evictCallbackQueue[V]) invoke(p *pressureState, onVal func(V, EvictionR
 		return
 	}
 	q.invokeSlow(p, onVal, onEntry)
+}
+
+func (q *evictCallbackQueue[V]) invoke(p *pressureState, onVal func(V, EvictionReason), onEntry func(string, V, EvictionReason)) {
+	if q.n == 0 {
+		return
+	}
+	q.invokeNonEmpty(p, onVal, onEntry)
 }
 
 func appendEvicted[V any](base, extra []V) []V {

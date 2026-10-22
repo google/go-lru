@@ -394,8 +394,6 @@ func (c *mapCache[V]) Put(key string, value V) ([]V, error) {
 
 	sampledEpoch, pressure := c.lockWithPressure(&c.mu, false)
 	var evictQ evictCallbackQueue[V]
-	defer evictQ.invoke(&c.pressureState, c.onEvictValue, c.onEvictEntry)
-	defer c.unlock()
 
 	var evictedValues []V
 	sizeBefore := c.currentSize
@@ -432,6 +430,8 @@ func (c *mapCache[V]) Put(key string, value V) ([]V, error) {
 	}
 
 	evictedValues = c.finishMutationReclaimLocked(&evictQ, evictedValues, e, reclaimedPrePut, compactedPrePut, sizeBefore, sampledEpoch, pressure)
+	c.unlock()
+	evictQ.invoke(&c.pressureState, c.onEvictValue, c.onEvictEntry)
 	return evictedValues, nil
 }
 
@@ -484,17 +484,18 @@ func (c *mapCache[V]) resetEmptyIndexLocked() {
 func (c *mapCache[V]) Delete(key string) (V, bool) {
 	sampledEpoch, pressure := c.lockWithPressure(&c.mu, false)
 	var evictQ evictCallbackQueue[V]
-	defer evictQ.invoke(&c.pressureState, c.onEvictValue, c.onEvictEntry)
-	defer c.unlock()
 
 	sizeBefore := c.currentSize
 	deleted, ok := c.eraseInternal(&evictQ, key, EvictionReasonDeleted)
 	if !ok {
 		c.deleteNotFound++
+		c.unlock()
 		return deleted, false
 	}
 	c.deleteDeleted++
 	c.finishDeleteReclaimLocked(&evictQ, sizeBefore, sampledEpoch, pressure)
+	c.unlock()
+	evictQ.invoke(&c.pressureState, c.onEvictValue, c.onEvictEntry)
 	return deleted, true
 }
 
@@ -502,33 +503,37 @@ func (c *mapCache[V]) Delete(key string) (V, bool) {
 // Returns the zero value of V and false if key is not found in the cache.
 func (c *mapCache[V]) Get(key string) (V, bool) {
 	c.mu.Lock()
-	defer c.unlock()
 
 	e, ok := c.index[key]
 	if !ok {
 		c.getMisses++
+		c.unlock()
 		var zero V
 		return zero, false
 	}
 	c.getHits++
 	c.entries.MoveToFront(e)
-	return e.value, true
+	val := e.value
+	c.unlock()
+	return val, true
 }
 
 // Peek retrieves the value associated with key without altering its LRU position.
 // Returns the zero value of V and false if key is not found in the cache.
 func (c *mapCache[V]) Peek(key string) (V, bool) {
 	c.mu.RLock()
-	defer c.rUnlock()
 
 	e, ok := c.index[key]
 	if !ok {
 		c.peekMisses.Add(1)
+		c.rUnlock()
 		var zero V
 		return zero, false
 	}
 	c.peekHits.Add(1)
-	return e.value, true
+	val := e.value
+	c.rUnlock()
+	return val, true
 }
 
 func (c *mapCache[V]) canFitGrowthLocked(e *entry[V], newSize, sizeDelta, avail uint64) bool {
@@ -632,18 +637,12 @@ func (c *mapCache[V]) Replace(key string, value V) error {
 		evictQ.enqueue(e.key, oldValue, EvictionReasonReplaced)
 	}
 
-	reclaimedPreUpdate := c.dirtyIndex && c.shouldReclaimSingleSurvivorSlow(c.entries.Len(), false, evictedAny, c.currentSize, sizeBefore, pressure)
+	reclaimedPreUpdate := c.shouldReclaimSingleSurvivorOnMutation(c.entries.Len(), c.dirtyIndex, false, evictedAny, c.currentSize, sizeBefore, pressure)
 	if reclaimedPreUpdate || c.currentSize < sizeBefore || pressure >= c.options.CompactionThreshold || pressure >= c.options.EvictionThreshold {
 		c.finishMutationReclaimLocked(&evictQ, nil, e, reclaimedPreUpdate, false, sizeBefore, sampledEpoch, pressure)
 	}
-	if c.options.EnableInvariantChecking {
-		c.unlockWithInvariants()
-	} else {
-		c.mu.Unlock()
-	}
-	if evictQ.n != 0 {
-		evictQ.invoke(&c.pressureState, c.onEvictValue, c.onEvictEntry)
-	}
+	c.unlock()
+	evictQ.invoke(&c.pressureState, c.onEvictValue, c.onEvictEntry)
 
 	return nil
 }
@@ -772,8 +771,9 @@ func (c *mapCache[V]) values(yield func(V) bool) {
 // Stats returns a point-in-time telemetry snapshot of the cache.
 func (c *mapCache[V]) Stats() Stats {
 	c.mu.RLock()
-	defer c.rUnlock()
-	return c.snapshotBaseStats(BackendMap, c.currentSize, c.maxSize, c.entries.Len())
+	st := c.snapshotBaseStats(BackendMap, c.currentSize, c.maxSize, c.entries.Len())
+	c.rUnlock()
+	return st
 }
 
 func (c *mapCache[V]) shouldAutoCompactLocked(isBackground bool) bool {
