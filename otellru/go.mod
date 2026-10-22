@@ -3,7 +3,7 @@ module github.com/google/go-lru/otellru
 go 1.26
 
 require (
-	github.com/google/go-lru v0.0.0
+	github.com/google/go-lru v1.0.0
 	github.com/stretchr/testify v1.12.1
 	go.opentelemetry.io/otel v1.46.0
 	go.opentelemetry.io/otel/metric v1.46.0

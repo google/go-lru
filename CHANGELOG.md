@@ -8,6 +8,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+---
+
+## [1.0.0] - 2026-10-22
+
 ### Added
 - **Zero-Allocation `Stats()` Telemetry Snapshot (`Cache.Stats()`)**:
   - Extended `Cache[V any]` with `Stats() Stats` (and `StatsProvider` interface) across `MapCache`, `RadixCache`, and `ArenaRadixCache`, exposing `Get`/`Peek` hits & misses, eviction counts & weights by `EvictionReason` (`Evictions(reason)` and `EvictedWeight(reason)` helpers), capacity & zero-weight entry gauges, mutation outcomes (`Put`, `Replace`, `Delete`, `DeletePrefix`), two-tier memory pressure & compaction/shed triggers, watermark gauges (`DeletedSinceCompact`, `PeakEntryLen`), and `ArenaRadixCache` node state & FNV-1a hash-fallback counters with `0 allocs/op`.
@@ -18,13 +22,19 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 - **Eviction & Removal Callbacks (`WithOnEvictValue` & `WithOnEvictEntry`)**:
   - Added `EvictionReason` (`EvictionReasonCapacity`, `EvictionReasonPressure`, `EvictionReasonDeleted`, `EvictionReasonReplaced`) with `String()`.
   - Added `WithOnEvictValue[V any](func(value V, reason EvictionReason))` for zero-key-reconstruction value lifecycle notifications (e.g., buffer pool recycling) and `WithOnEvictEntry[V any](func(key string, value V, reason EvictionReason))` for full key+value notifications across `MapCache`, `RadixCache`, and `ArenaRadixCache`.
+- **Automated Benchmark Regression & Target Verification (`cmd/benchcheck`)**:
+  - Added `./cmd/benchcheck` CLI and CI enforcement for absolute performance targets and PR regression checks.
 
 ### Changed
 - **Generic Intrusive Doubly-Linked List in `MapCache`**: Replaced `container/list` in `MapCache` with a strongly typed generic intrusive doubly-linked list (`entry[V]` / `entryList[V]`), eliminating `any` interface boxing, cutting new-entry node allocations in half (`1 alloc/entry`), and reducing `MapCache` 100K-entry live heap footprint by ~29.4% (`115.0 heap-B/entry`).
-- **Go 1.22–1.26 Language & Standard Library Modernization**: Adopted `sync.WaitGroup.Go`, `for range` over integers, `slices.Backward`, `slices.Concat`, `math/rand/v2` across tests and benchmarks, and deduplicated reflection helpers (`isNilFunc`, `isZeroValue`).
+- **Hot-Path Locking, Inlining, Hashing & Reclamation Optimizations**: Placed `sync.RWMutex` after lookup-hot fields in `arenaRadix` to avoid cache-line false sharing; optimized `Peek` locking (`RLock` with atomic hit/miss counters), inlined hot LRU list & pressure reclamation helpers, vectorized FNV-1a hashing, and gated `Delete` / Tier 1 inline pressure checks on compaction slack.
+- **Go 1.22–1.26 Language & Standard Library Modernization**: Adopted `sync.WaitGroup.Go`, `for range` over integers, `slices.Backward`, `slices.Concat`, `math/rand/v2` across tests and benchmarks, deduplicated reflection helpers (`isNilFunc`, `isZeroValue`), unified backend helpers, decomposed invariant checks, and enforced `gocyclo <= 15`.
 - **Generic `Cache[V any]` & `PressureAwareCache[V any]` API**: Parameterized `Cache[V any]`, `PressureAwareCache[V any]`, `New[V any]`, `NewMapCache[V any]`, `NewRadixCache[V any]`, and `NewArenaRadixCache[V any]` by value type `V any`, eliminating wrapper interface boilerplate.
 - **Configurable Entry Weighing (`WithWeigher`)**: Added `WithWeigher[V any](func(key string, value V) uint64)` with a default unit weight of `1` per entry when omitted.
 - **Idiomatic Cache Method Vocabulary**: Standardized `Cache[V any]` operations to `Put`, `Delete`, `Get`, `Peek`, `Replace`, and `DeletePrefix`.
+
+### Fixed
+- **Callback & Pressure Re-Entrancy, Compaction, and Radix/OTel Invariants**: Hardened eviction and pressure callback re-entrancy, synchronized compaction with active iterators, and tightened radix tree and OpenTelemetry registration invariants.
 
 ---
 
@@ -51,7 +61,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## Release & Versioning Workflow
 
-To cut a new semantic version release (e.g. `v0.0.1` and `otellru/v0.0.1`):
+To cut a new semantic version release (e.g. `v1.0.0` and `otellru/v1.0.0`):
 
 ```bash
 # 1. Verify formatting, static analysis, race-enabled test suite, and examples (root and otellru)
@@ -67,9 +77,9 @@ go test -v -run=^Example ./...
 go test -run=^$ -bench=. -benchmem -benchtime=10ms ./...
 (cd otellru && go test -run=^$ -bench=. -benchmem -benchtime=10ms ./...)
 
-# 3. Update otellru/go.mod to require github.com/google/go-lru v0.0.1 (if releasing together),
+# 3. Update otellru/go.mod to require github.com/google/go-lru v1.0.0 (if releasing together),
 #    then create and push annotated semantic version tags
-git tag -a v0.0.1 -m "Release v0.0.1"
-git tag -a otellru/v0.0.1 -m "Release otellru/v0.0.1"
+git tag -a v1.0.0 -m "Release v1.0.0"
+git tag -a otellru/v1.0.0 -m "Release otellru/v1.0.0"
 git push origin --tags
 ```
