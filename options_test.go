@@ -1603,15 +1603,18 @@ func TestCache_OnEvictZeroKeyReconstructionAllocs(t *testing.T) {
 		_, err = c.Put(subKey2, "v2")
 		require.NoError(t, err)
 		assert.Equal(t, "target_key", gotKey)
+		assert.NotSame(t, unsafe.StringData(subKey), unsafe.StringData(gotKey), "MapCache Put must clone initial caller key buffer")
 		assert.NotSame(t, unsafe.StringData(subKey2), unsafe.StringData(gotKey), "MapCache Put overwrite must pass cloned entry.key")
 
 		require.NoError(t, c.Replace(subKey2, "v3"))
 		assert.Equal(t, "target_key", gotKey)
+		assert.NotSame(t, unsafe.StringData(subKey), unsafe.StringData(gotKey), "MapCache Replace must not alias initial caller key buffer")
 		assert.NotSame(t, unsafe.StringData(subKey2), unsafe.StringData(gotKey), "MapCache Replace overwrite must pass cloned entry.key")
 
 		_, ok := c.Delete(subKey2)
 		require.True(t, ok)
 		assert.Equal(t, "target_key", gotKey)
+		assert.NotSame(t, unsafe.StringData(subKey), unsafe.StringData(gotKey), "MapCache Delete must not alias initial caller key buffer")
 		assert.NotSame(t, unsafe.StringData(subKey2), unsafe.StringData(gotKey), "MapCache Delete must pass cloned entry.key")
 	})
 }
