@@ -16,6 +16,7 @@ package lru_test
 
 import (
 	"fmt"
+	"math"
 	"math/rand/v2"
 	"slices"
 	"sync"
@@ -848,6 +849,221 @@ func TestConcurrency_StatsAndPressureUnderRace(t *testing.T) {
 			}
 			assert.Zero(t, st.Evictions(lru.EvictionReason(99)))
 			assert.Zero(t, st.EvictedWeight(lru.EvictionReason(99)))
+		})
+	}
+}
+
+func startHighContentionReadWriteWorkers(wg *sync.WaitGroup, c lru.PressureAwareCache[int], keys []string, iters int) {
+	// 8 Zipfian hot-key writers (Put + Replace)
+	for w := range 8 {
+		wg.Go(func() {
+			r := rand.New(rand.NewPCG(uint64(100+w), 1))
+			zipf := rand.NewZipf(r, 1.15, 1.0, uint64(len(keys)-1))
+			for i := range iters {
+				k := keys[zipf.Uint64()]
+				weight := i % 5 // includes 0-weight when i%5 == 0
+				if i%3 == 0 {
+					_ = c.Replace(k, weight)
+				} else {
+					_, _ = c.Put(k, weight)
+				}
+			}
+		})
+	}
+
+	// 8 Get readers (write-lock path)
+	for rID := range 8 {
+		wg.Go(func() {
+			r := rand.New(rand.NewPCG(uint64(200+rID), 2))
+			for range iters {
+				_, _ = c.Get(keys[r.IntN(len(keys))])
+			}
+		})
+	}
+
+	// 8 Peek + Stats + early-break iterator readers (read-lock path)
+	for pID := range 8 {
+		wg.Go(func() {
+			r := rand.New(rand.NewPCG(uint64(300+pID), 3))
+			for i := range iters {
+				_, _ = c.Peek(keys[r.IntN(len(keys))])
+				if i%15 == 0 {
+					_ = c.Stats()
+				}
+				if i%25 == 0 {
+					sampleFirstThreeEntries(c)
+				}
+				if i%35 == 0 {
+					sampleFirstThreeValues(c)
+				}
+			}
+		})
+	}
+}
+
+func sampleFirstThreeEntries(c lru.Cache[int]) {
+	count := 0
+	for range c.All() {
+		count++
+		if count >= 3 {
+			break
+		}
+	}
+}
+
+func sampleFirstThreeValues(c lru.Cache[int]) {
+	count := 0
+	for range c.Values() {
+		count++
+		if count >= 3 {
+			break
+		}
+	}
+}
+
+func runHighContentionTortureWorkers(c lru.PressureAwareCache[int], keys []string, pressureBits *atomic.Uint64) {
+	const iters = 300
+	var wg sync.WaitGroup
+
+	startHighContentionReadWriteWorkers(&wg, c, keys, iters)
+
+	// 4 Delete + DeletePrefix purgers
+	for dID := range 4 {
+		wg.Go(func() {
+			r := rand.New(rand.NewPCG(uint64(400+dID), 4))
+			for i := range iters {
+				switch {
+				case i%50 == 49:
+					c.DeletePrefix("tenantA/svc1/cold_")
+				case i%120 == 119:
+					c.DeletePrefix("")
+				default:
+					_, _ = c.Delete(keys[r.IntN(len(keys))])
+				}
+			}
+		})
+	}
+
+	// 4 Background pressure & compaction controllers
+	for bgID := range 4 {
+		wg.Go(func() {
+			levels := []float64{0.20, 0.80, 0.95}
+			for i := range iters / 2 {
+				p := levels[(bgID+i)%len(levels)]
+				pressureBits.Store(math.Float64bits(p))
+				if i%5 == 0 {
+					_ = c.EvaluateMemoryPressure()
+				}
+				if i%7 == 0 {
+					c.Compact()
+				}
+			}
+		})
+	}
+
+	wg.Wait()
+}
+
+func recordEvictionReasonCounter(r lru.EvictionReason, capCnt, pressCnt, delCnt, repCnt *atomic.Uint64) {
+	switch r {
+	case lru.EvictionReasonCapacity:
+		capCnt.Add(1)
+	case lru.EvictionReasonPressure:
+		pressCnt.Add(1)
+	case lru.EvictionReasonDeleted:
+		delCnt.Add(1)
+	case lru.EvictionReasonReplaced:
+		repCnt.Add(1)
+	}
+}
+
+func TestConcurrency_HighContentionConservationAndInvariants(t *testing.T) {
+	backends := []struct {
+		name    string
+		backend lru.Backend
+	}{
+		{name: "MapCache", backend: lru.BackendMap},
+		{name: "RadixCache", backend: lru.BackendRadix},
+		{name: "ArenaRadixCache", backend: lru.BackendArenaRadix},
+	}
+
+	for _, b := range backends {
+		t.Run(b.name, func(t *testing.T) {
+			// Arrange
+			var pressureBits atomic.Uint64
+			pressureBits.Store(math.Float64bits(0.20))
+
+			var cbValCap, cbValPress, cbValDel, cbValRep atomic.Uint64
+			var cbEntCap, cbEntPress, cbEntDel, cbEntRep atomic.Uint64
+
+			c := lru.New[int](120,
+				lru.WithBackend(b.backend),
+				lru.WithInvariantChecking(false), // keep lock hold times fast under 32-goroutine race stress; verified post-quiescence
+				lru.WithWeigher(func(_ string, v int) uint64 {
+					if v <= 0 {
+						return 0
+					}
+					return uint64(v)
+				}),
+				lru.WithPressureFunc(func() float64 {
+					return math.Float64frombits(pressureBits.Load())
+				}),
+				lru.WithCompactionThreshold(0.75),
+				lru.WithEvictionThreshold(0.90),
+				lru.WithEvictionRetentionRatio(0.50),
+				lru.WithOnEvictValue(func(_ int, r lru.EvictionReason) {
+					recordEvictionReasonCounter(r, &cbValCap, &cbValPress, &cbValDel, &cbValRep)
+				}),
+				lru.WithOnEvictEntry(func(_ string, _ int, r lru.EvictionReason) {
+					recordEvictionReasonCounter(r, &cbEntCap, &cbEntPress, &cbEntDel, &cbEntRep)
+				}),
+			).(lru.PressureAwareCache[int])
+
+			// Build key pool: 16 hot keys + 128 cold keys under hierarchical prefixes.
+			keys := make([]string, 144)
+			for i := range 16 {
+				keys[i] = fmt.Sprintf("tenantA/svc1/hot_%02d", i)
+			}
+			for i := 16; i < 80; i++ {
+				keys[i] = fmt.Sprintf("tenantA/svc1/cold_%03d", i)
+			}
+			for i := 80; i < 144; i++ {
+				keys[i] = fmt.Sprintf("tenantB/svc2/cold_%03d", i)
+			}
+
+			// Act
+			runHighContentionTortureWorkers(c, keys, &pressureBits)
+
+			// Assert: Post-quiescence Conservation Law Assertions
+			st := c.Stats()
+			totalRemoved := st.EvictionsCapacity + st.EvictionsPressure + st.EvictionsDeleted
+			assert.Equal(t, st.PutInserted, uint64(st.Len)+totalRemoved,
+				"Conservation law violated: PutInserted (%d) != Len (%d) + Evictions[Cap+Press+Del] (%d)",
+				st.PutInserted, st.Len, totalRemoved)
+
+			assert.Equal(t, st.EvictionsCapacity, cbValCap.Load())
+			assert.Equal(t, st.EvictionsPressure, cbValPress.Load())
+			assert.Equal(t, st.EvictionsDeleted, cbValDel.Load())
+			assert.Equal(t, st.EvictionsReplaced, cbValRep.Load())
+
+			assert.Equal(t, st.EvictionsCapacity, cbEntCap.Load())
+			assert.Equal(t, st.EvictionsPressure, cbEntPress.Load())
+			assert.Equal(t, st.EvictionsDeleted, cbEntDel.Load())
+			assert.Equal(t, st.EvictionsReplaced, cbEntRep.Load())
+
+			var liveWeightSum uint64
+			var liveCount, liveZeroCount int
+			for _, v := range c.All() {
+				liveCount++
+				if v <= 0 {
+					liveZeroCount++
+				} else {
+					liveWeightSum += uint64(v)
+				}
+			}
+			assert.Equal(t, st.Len, liveCount)
+			assert.Equal(t, st.ZeroSizeCount, liveZeroCount)
+			assert.Equal(t, st.CurrentSize, liveWeightSum)
 		})
 	}
 }

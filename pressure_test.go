@@ -17,9 +17,12 @@ package lru
 import (
 	"fmt"
 	"math"
+	"runtime"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
+	"time"
 	"unsafe"
 
 	"github.com/stretchr/testify/assert"
@@ -315,7 +318,7 @@ func TestPressure_ForegroundMutations(t *testing.T) {
 				assert.True(t, hasKey(cache, "other/3"))
 			})
 
-			t.Run("ReplaceStrictLRUEvictsOldestTailEntry", func(t *testing.T) {
+			t.Run("ReplaceProtectsUpdatedEntryUnderTier2Shedding", func(t *testing.T) {
 				// Arrange: k1 (20B) at LRU tail, k2 (30B) at MRU head, maxSize = 100, targetSize = 50.
 				pressure := 0.10
 				cache := b.fn(
@@ -335,10 +338,10 @@ func TestPressure_ForegroundMutations(t *testing.T) {
 				pressure = 0.95
 				err = cache.Replace("k1", testData{value: 1, dataSize: 30})
 
-				// Assert: Strict LRU eviction order must evict k1 (oldest at LRU tail) and retain k2 (newest at MRU head).
+				// Assert: Replace protects the updated entry k1 and sheds unprotected k2 to meet targetSize.
 				require.NoError(t, err)
-				assert.False(t, hasKey(cache, "k1"))
-				assert.True(t, hasKey(cache, "k2"))
+				assert.True(t, hasKey(cache, "k1"))
+				assert.False(t, hasKey(cache, "k2"))
 			})
 
 			t.Run("ProtectedMRUEntryAboveTargetSizeDoesNotSpuriouslyAdvanceEpoch", func(t *testing.T) {
@@ -1147,6 +1150,9 @@ func TestPressure_EpochInvalidationAndResamplingSynchronization(t *testing.T) {
 			})
 
 			t.Run("PanicDuringEpochResampleDoesNotDoubleUnlockOrRunCheckInvariantsUnlocked", func(t *testing.T) {
+				if b.name == "RadixCache" {
+					t.Skip("RadixCache does not perform structural compaction on Compact() per M-03")
+				}
 				// Arrange
 				var armed atomic.Bool
 				var sampleCount atomic.Int32
@@ -1243,10 +1249,10 @@ func testChildGoroutineReclaimingInsidePressureFunc(t *testing.T, b backendDef) 
 	_, err := cache.Put("target_key", testData{value: 1, dataSize: 10})
 	_ = cache.(PressureAwareCache[testData]).EvaluateMemoryPressure()
 
-	// Assert: Both Put and EvaluateMemoryPressure terminate in bounded retries (3 parent samples each = 6 total).
+	// Assert: Both Put and EvaluateMemoryPressure attribute child-goroutine reclamations to the parent sampler (1 parent sample each = 2 total).
 	require.NoError(t, err)
 	assert.True(t, hasKey(cache, "target_key"))
-	assert.Equal(t, int32(6), parentSampleCalls.Load())
+	assert.Equal(t, int32(2), parentSampleCalls.Load())
 }
 
 func testExhaustedEpochRetriesUseLatestEpochPressure(t *testing.T, b backendDef) {
@@ -1562,6 +1568,9 @@ func testOverflowAndWatermarkReentrancy(t *testing.T, b backendDef) {
 	})
 
 	t.Run("ForegroundReclaimDuringOverflowSamplingAdvancesReclaimEpoch", func(t *testing.T) {
+		if b.name == "RadixCache" {
+			t.Skip("RadixCache does not perform structural compaction on Compact() per M-03")
+		}
 		// Arrange: Prepare a cache with two 40B live entries and dirty/fragmented state so Compact() reclaims.
 		var pressureBits atomic.Uint64
 		pressureBits.Store(math.Float64bits(0.10))
@@ -1741,6 +1750,9 @@ func TestPressure_ConcurrentReentrantSamplersAndOverflowEpochInvalidation(t *tes
 			})
 
 			t.Run("PrimaryReentrantCompactWhileOverflowActiveInvalidatesStaleSamples", func(t *testing.T) {
+				if b.name == "RadixCache" {
+					t.Skip("RadixCache does not perform structural compaction on Compact() per M-03")
+				}
 				// Arrange: Primary sampler G1, fallback sampler G2, and overflow sampler G3 are all in-flight.
 				// When G1 performs a re-entrant Compact() on real dirty slack while G3 is in overflow,
 				// the reclamation epoch must advance so G2 and G3's stale 0.95 readings from before G1's Compact() are discarded.
@@ -2118,6 +2130,9 @@ func testReentrantReclamationInvalidatesConcurrentCaller(t *testing.T, b backend
 func testOverflowAndExternalReclamationResampling(t *testing.T, b backendDef) {
 	t.Helper()
 	t.Run("OverflowSamplerReentrantCompactAdvancesEpochAndInvalidatesPrimaryAndFallback", func(t *testing.T) {
+		if b.name == "RadixCache" {
+			t.Skip("RadixCache does not perform structural compaction on Compact() per M-03")
+		}
 		// Arrange: Primary sampler G1, fallback sampler G2, and overflow sampler G3 all enter PressureFunc.
 		// When the 3rd (overflow) sampler G3 calls pac.Compact() re-entrantly on dirty slack,
 		// markReclaimedLocked() must unconditionally advance reclaimEpoch so G1 and G2's stale 0.95
@@ -2205,8 +2220,8 @@ func testOverflowAndExternalReclamationResampling(t *testing.T, b backendDef) {
 	})
 
 	t.Run("ExternalReclamationAfterSamplerReentrantCompactClearsExemptionAndForcesResample", func(t *testing.T) {
-		// Arrange: Primary sampler G1 performs a re-entrant Compact() inside PressureFunc, and before G1 returns 0.95,
-		// an external caller creates and compacts new dirty slack. The external reclamation must clear G1's
+		// Arrange: Primary sampler G1 performs a re-entrant reclamation inside PressureFunc, and before G1 returns 0.95,
+		// an external caller reclaims memory and compacts. The external reclamation must clear G1's
 		// re-entrant exemption so G1 is forced to resample (0.10) in lockWithPressure.
 		var pac PressureAwareCache[testData]
 		var cache Cache[testData]
@@ -2225,7 +2240,8 @@ func testOverflowAndExternalReclamationResampling(t *testing.T, b backendDef) {
 					return 0.10
 				}
 				if calls.Add(1) == 1 {
-					pac.Compact() // G1's own re-entrant Compact()
+					_, _ = cache.Delete("tmp1")
+					pac.Compact() // G1's own re-entrant reclamation
 					close(g1AfterReentrantCompact)
 					<-releaseG1
 					return 0.95
@@ -2241,8 +2257,8 @@ func testOverflowAndExternalReclamationResampling(t *testing.T, b backendDef) {
 		require.NoError(t, err)
 		_, err = cache.Put("tmp1", testData{value: 3, dataSize: 10})
 		require.NoError(t, err)
-		_, ok := cache.Delete("tmp1")
-		require.True(t, ok)
+		_, err = cache.Put("tmp2", testData{value: 4, dataSize: 10})
+		require.NoError(t, err)
 		armed.Store(true)
 
 		g1Done := make(chan struct{})
@@ -2252,14 +2268,12 @@ func testOverflowAndExternalReclamationResampling(t *testing.T, b backendDef) {
 		}()
 		<-g1AfterReentrantCompact
 
-		// External caller creates dirty slack and compacts while G1 is still inside PressureFunc.
+		// External caller reclaims tmp2 and compacts while G1 is still inside PressureFunc.
 		armed.Store(false)
-		_, err = cache.Put("tmp2", testData{value: 4, dataSize: 10})
-		require.NoError(t, err)
-		_, ok = cache.Delete("tmp2")
+		_, ok := cache.Delete("tmp2")
 		require.True(t, ok)
-		armed.Store(true)
 		pac.Compact()
+		armed.Store(true)
 
 		// Act: Release G1 to return stale 0.95; lockWithPressure must reject the cleared exemption and resample 0.10.
 		close(releaseG1)
@@ -2792,7 +2806,7 @@ func TestPressure_BelowTier2ResetsZeroWatermarks(t *testing.T) {
 			t.Run("SingleSurvivorDeletionResetsWatermarks", func(t *testing.T) {
 				probe := newPressureProbe(0.10)
 				cache := b.fn(
-					100,
+					200,
 					WithInvariantChecking(true),
 					probe.Option(),
 					WithCompactionThreshold(0.70),
@@ -3003,20 +3017,20 @@ func TestPressure_EvictionCallbacks_Tier2ExplicitAndForeground(t *testing.T) {
 				require.NoError(t, err)
 
 				// 1. Replace LRU tail ("p/k1") while under Tier 2 (1.0 -> retention 0.50 -> targetSize=15B):
-				// "p/k1" is replaced first (EvictionReasonReplaced with old value "0123456789"),
-				// and then Tier 2 pressure sheds the tail ("p/k1" with new value "BBBBBBBBBB" and "p/k2") with EvictionReasonPressure!
+				// "p/k1" is replaced first (EvictionReasonReplaced with old value "0123456789") and protected,
+				// and then Tier 2 pressure sheds unprotected "p/k2" and "p/k3" with EvictionReasonPressure!
 				entryEvents = nil
 				probe.Set(1.0)
 				require.NoError(t, cache.Replace("p/k1", "BBBBBBBBBB"))
 				assert.Equal(t, []recordedEvictEntry{
 					{key: "p/k1", val: "0123456789", reason: EvictionReasonReplaced},
-					{key: "p/k1", val: "BBBBBBBBBB", reason: EvictionReasonPressure},
 					{key: "p/k2", val: "abcdefghij", reason: EvictionReasonPressure},
+					{key: "p/k3", val: "klmnopqrst", reason: EvictionReasonPressure},
 				}, entryEvents)
 
 				// 2. Re-populate at normal pressure (0.10): d1(10B), d2(10B), d3(10B)
 				probe.Set(0.10)
-				_, _ = cache.Delete("p/k3")
+				_, _ = cache.Delete("p/k1")
 				_, err = cache.Put("p/d1", "1111111111")
 				require.NoError(t, err)
 				_, err = cache.Put("p/d2", "2222222222")
@@ -3221,4 +3235,1186 @@ func verifyBackendZeroAllocHotPaths(t *testing.T, name string, cache Cache[int])
 	assert.Zero(t, replaceAllocs, "%s Replace must be 0 allocs/op", name)
 	assert.Zero(t, valuesAllocs, "%s Values() must be 0 allocs/op", name)
 	assert.Zero(t, statsAllocs, "%s Stats() must be 0 allocs/op", name)
+}
+
+func waitForCrossCacheContention(t *testing.T, cacheA Cache[int], arenaA *arenaRadix[int]) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		if hasKey(cacheA, "from_b") && arenaA.evictCallbackGID.Load() != 0 {
+			if arenaA.evictPendingEnqueues.Load() != 0 || isGoroutineParkedInLockEvictCallbackSlow() {
+				return
+			}
+		}
+		runtime.Gosched()
+	}
+	assert.Fail(t, "timed out waiting for cross-cache contention on cacheA")
+}
+
+func TestPressure_MultiCacheAndCircularReentrancy(t *testing.T) {
+	t.Run("CrossCacheOnEvictReentrancyUnderContention", func(t *testing.T) {
+		// Arrange
+		var cacheA, cacheB Cache[int]
+		var activeInA, totalACallbacks atomic.Int32
+		var concurrentOverlap atomic.Bool
+		enteredFirstA := make(chan struct{})
+		enteredB := make(chan struct{})
+		releaseFirstA := make(chan struct{})
+		var firstOnce, bOnce sync.Once
+
+		cacheA = NewArenaRadixCache[int](1,
+			WithInvariantChecking(true),
+			WithOnEvictValue(func(_ int, _ EvictionReason) {
+				if activeInA.Add(1) > 1 {
+					concurrentOverlap.Store(true)
+				}
+				firstOnce.Do(func() {
+					close(enteredFirstA)
+					<-releaseFirstA
+				})
+				totalACallbacks.Add(1)
+				activeInA.Add(-1)
+			}),
+		)
+		cacheB = NewArenaRadixCache[int](1,
+			WithInvariantChecking(true),
+			WithOnEvictValue(func(_ int, _ EvictionReason) {
+				bOnce.Do(func() {
+					close(enteredB)
+				})
+				_, putErr := cacheA.Put("from_b", 20)
+				assert.NoError(t, putErr)
+			}),
+		)
+
+		_, err := cacheA.Put("a1", 1)
+		require.NoError(t, err)
+		_, err = cacheB.Put("b1", 1)
+		require.NoError(t, err)
+
+		// Act
+		var wg sync.WaitGroup
+		wg.Go(func() {
+			_, putErr := cacheA.Put("a2", 2)
+			assert.NoError(t, putErr)
+		})
+
+		<-enteredFirstA
+
+		wg.Go(func() {
+			var innerWG sync.WaitGroup
+			innerWG.Go(func() {
+				_, putErr := cacheB.Put("b2", 2)
+				assert.NoError(t, putErr)
+			})
+			innerWG.Wait()
+		})
+
+		<-enteredB
+		arenaA := cacheA.(*arenaRadix[int])
+		waitForCrossCacheContention(t, cacheA, arenaA)
+		assert.Zero(t, arenaA.evictPendingEnqueues.Load(), "cross-cache caller must block on evictCallbackMu rather than enqueueing as descendant")
+		close(releaseFirstA)
+		wg.Wait()
+
+		// Assert
+		assert.False(t, concurrentOverlap.Load(), "Cache A OnEvict callback must never execute concurrently across goroutines")
+		assert.Equal(t, int32(2), totalACallbacks.Load())
+	})
+
+	t.Run("MultiCacheConcurrentPressureFuncSamplingIsolation", func(t *testing.T) {
+		// Arrange
+		var cacheA, cacheB PressureAwareCache[int]
+		var callsA, callsB, nonPrimaryCallsA atomic.Int32
+		inSamplerA := make(chan struct{})
+		inSamplerB := make(chan struct{})
+		contendDoneA := make(chan struct{})
+		releaseSamplerB := make(chan struct{})
+
+		cacheA = NewArenaRadixCache[int](10, WithPressureFunc(func() float64 {
+			if callsA.Add(1) == 1 {
+				close(inSamplerA)
+				<-inSamplerB
+				<-contendDoneA
+				_, _ = cacheA.Delete("missing_key")
+			} else {
+				nonPrimaryCallsA.Add(1)
+			}
+			return 0.10
+		})).(PressureAwareCache[int])
+
+		cacheB = NewArenaRadixCache[int](10, WithPressureFunc(func() float64 {
+			if callsB.Add(1) == 1 {
+				close(inSamplerB)
+				<-releaseSamplerB
+			}
+			return 0.10
+		})).(PressureAwareCache[int])
+
+		// Act
+		var wg sync.WaitGroup
+		wg.Go(func() {
+			_, putErr := cacheA.Put("ka1", 1)
+			assert.NoError(t, putErr)
+		})
+
+		<-inSamplerA
+
+		wg.Go(func() {
+			_, putErr := cacheB.Put("kb1", 1)
+			assert.NoError(t, putErr)
+		})
+
+		<-inSamplerB
+
+		// Contend on Cache A via public EvaluateMemoryPressure() while both Cache A and Cache B are sampling.
+		_ = cacheA.EvaluateMemoryPressure()
+		close(contendDoneA)
+		close(releaseSamplerB)
+		wg.Wait()
+
+		// Assert: Only the contending EvaluateMemoryPressure() call invoked PressureFunc a second time;
+		// the re-entrant Delete("missing_key") inside Cache A's primary sampler did not re-invoke PressureFunc.
+		assert.Equal(t, int32(1), nonPrimaryCallsA.Load())
+	})
+
+	t.Run("CircularCrossCacheReentrancy_A_To_B_To_A", func(t *testing.T) {
+		// Arrange
+		var cacheA, cacheB Cache[int]
+		var callsA, callsB atomic.Int32
+		var pCallsA, pCallsB atomic.Int32
+
+		cacheA = NewArenaRadixCache[int](1,
+			WithInvariantChecking(true),
+			WithPressureFunc(func() float64 {
+				if pCallsA.Add(1) == 1 {
+					_, _ = cacheB.Delete("missing_in_b")
+				}
+				return 0.10
+			}),
+			WithOnEvictValue(func(_ int, _ EvictionReason) {
+				if callsA.Add(1) == 1 {
+					_, putErr := cacheB.Put("b2", 2)
+					assert.NoError(t, putErr)
+				}
+			}),
+		)
+		cacheB = NewArenaRadixCache[int](1,
+			WithInvariantChecking(true),
+			WithPressureFunc(func() float64 {
+				if pCallsB.Add(1) == 1 {
+					_, _ = cacheA.Delete("missing_in_a")
+				}
+				return 0.10
+			}),
+			WithOnEvictValue(func(_ int, _ EvictionReason) {
+				if callsB.Add(1) == 1 {
+					_, putErr := cacheA.Put("a3", 3)
+					assert.NoError(t, putErr)
+				}
+			}),
+		)
+
+		_, err := cacheB.Put("b1", 1)
+		require.NoError(t, err)
+		_, err = cacheA.Put("a1", 1)
+		require.NoError(t, err)
+
+		// Act
+		_, err = cacheA.Put("a2", 2)
+		require.NoError(t, err)
+
+		// Assert
+		assert.Equal(t, int32(2), callsA.Load(), "Cache A OnEvict should execute for both initial eviction and circular A->B->A eviction")
+		assert.Equal(t, int32(1), callsB.Load(), "Cache B OnEvict should execute once")
+	})
+
+	t.Run("GrandchildGoroutineReentrancyInPressureFuncAndOnEvict", func(t *testing.T) {
+		// Arrange: G1 invokes PressureFunc and OnEvictValue, each spawning child G2 which spawns grandchild G3
+		// while G1 blocks waiting for G2 and G2 blocks waiting for G3 to mutate the same cache.
+		var cache Cache[int]
+		var pressureCalls, evictCalls atomic.Int32
+
+		cache = NewArenaRadixCache[int](1,
+			WithInvariantChecking(true),
+			WithPressureFunc(func() float64 {
+				if pressureCalls.Add(1) == 1 {
+					childDone := make(chan struct{})
+					go func() {
+						defer close(childDone)
+						grandchildDone := make(chan struct{})
+						go func() {
+							defer close(grandchildDone)
+							_, _ = cache.Delete("missing_from_grandchild")
+						}()
+						<-grandchildDone
+					}()
+					<-childDone
+				}
+				return 0.10
+			}),
+			WithOnEvictValue(func(_ int, _ EvictionReason) {
+				if evictCalls.Add(1) == 1 {
+					childDone := make(chan struct{})
+					go func() {
+						defer close(childDone)
+						grandchildDone := make(chan struct{})
+						go func() {
+							defer close(grandchildDone)
+							_, putErr := cache.Put("k3_from_grandchild", 3)
+							assert.NoError(t, putErr)
+						}()
+						<-grandchildDone
+					}()
+					<-childDone
+				}
+			}),
+		)
+
+		_, err := cache.Put("k1", 1)
+		require.NoError(t, err)
+		require.Equal(t, int32(1), pressureCalls.Load())
+
+		// Act: Put("k2", 2) evicts "k1", triggering OnEvictValue -> G2 -> G3 -> Put("k3_from_grandchild", 3).
+		_, err = cache.Put("k2", 2)
+		require.NoError(t, err)
+
+		// Assert: Grandchild G3 bypassed recursive PressureFunc sampling during G1's sample and bypassed
+		// self-deadlock on evictCallbackMu during G1's OnEvictValue callback.
+		assert.Equal(t, int32(2), evictCalls.Load())
+		val, ok := cache.Peek("k3_from_grandchild")
+		require.True(t, ok)
+		assert.Equal(t, 3, val)
+	})
+
+	t.Run("ZeroWatermarkShedResetsLastReclaimedLenWhenOnlyZeroRemain", func(t *testing.T) {
+		// Arrange: maxSize = 60, EvictionRetentionRatio = 0.20 (targetSize = 12B).
+		// Populate p_0 (20B) and p_1 (10B) at LRU tail (currentSize = 30B) + 8 zero-weight entries at MRU head.
+		pressure := 0.10
+		c := NewMapCache[int](60,
+			WithInvariantChecking(true),
+			WithWeigher(func(_ string, v int) uint64 { return uint64(v) }),
+			WithPressureFunc(func() float64 { return pressure }),
+			WithEvictionThreshold(0.90),
+			WithEvictionRetentionRatio(0.20),
+		).(*mapCache[int])
+
+		_, err := c.Put("p_0", 20)
+		require.NoError(t, err)
+		_, err = c.Put("p_1", 10)
+		require.NoError(t, err)
+		for i := range 8 {
+			_, err = c.Put(fmt.Sprintf("z_%d", i), 0)
+			require.NoError(t, err)
+		}
+
+		// Act 1: Tier 2 shed (0.95) sheds p_0 (20B) and 7 zero-weight entries, leaving p_1 (10B) + z_7 (0B).
+		// Because currentLen (2) > zeroSizeCount (1), lastReclaimedLen is set to 2.
+		pressure = 0.95
+		_ = c.EvaluateMemoryPressure()
+		require.Equal(t, 2, c.Stats().Len)
+		require.Equal(t, 1, c.Stats().ZeroSizeCount)
+		require.Equal(t, 2, c.lastReclaimedLen)
+
+		// Act 2: Grow p_1 at the LRU tail to 20B (> targetSize 12B), add 3 zero-weight entries at MRU,
+		// and trigger Tier 2 shed so p_1 is evicted and only zero-weight entries survive.
+		pressure = 0.10
+		require.NoError(t, c.Replace("p_1", 20))
+		for i := range 3 {
+			_, err = c.Put(fmt.Sprintf("z2_%d", i), 0)
+			require.NoError(t, err)
+		}
+		pressure = 0.95
+		_ = c.EvaluateMemoryPressure()
+
+		// Assert: Because only zero-weight entries remain (currentLen == zeroSizeCount), lastReclaimedLen is reset to 0.
+		assert.Equal(t, c.Stats().Len, c.Stats().ZeroSizeCount)
+		assert.Equal(t, 0, c.lastReclaimedLen)
+	})
+
+	t.Run("NestedCrossCacheHookChildGoroutineReentrancy", testNestedCrossCacheHookChildGoroutineReentrancy)
+	t.Run("GoidBatchInversionAndSiblingWorkerExclusion", testGoidBatchInversionAndSiblingWorkerExclusion)
+	t.Run("FindAncestorCreatorAboveHookDeepChainAndCycleFallback", testFindAncestorCreatorAboveHookDeepChainAndCycleFallback)
+}
+
+func testFindAncestorCreatorAboveHookDeepChainAndCycleFallback(t *testing.T) {
+	// Arrange 1: Build a synthetic 20-hop goroutine stack snapshot rooted at goroutine 100
+	// where goroutine 100 is executing inside deliverCallbacks above userCallback.func1.
+	var sb strings.Builder
+	sb.WriteString("goroutine 100 [running]:\n")
+	sb.WriteString("github.com/google/go-lru.userCallback.func1()\n\t/app/cb.go:10 +0x20\n")
+	sb.WriteString("github.com/google/go-lru.(*evictCallbackQueue[...]).deliverCallbacks(0x1, 0x2, 0x3, 0x4)\n\t/app/pressure.go:1900 +0x40\n")
+	sb.WriteString("github.com/google/go-lru.(*mapCache[...]).Delete(0x1, {0x2, 0x3})\n\t/app/map_lru.go:480 +0x80\n\n")
+
+	for hop := 1; hop < 20; hop++ {
+		gid := 100 + hop
+		parentGID := 100 + hop - 1
+		creator := fmt.Sprintf("github.com/google/go-lru.hopFunc%d", hop-1)
+		if hop == 1 {
+			creator = "github.com/google/go-lru.userCallback.func1"
+		}
+		fmt.Fprintf(&sb, "goroutine %d [chan receive]:\n", gid)
+		fmt.Fprintf(&sb, "github.com/google/go-lru.hopFunc%d()\n\t/app/cb.go:%d +0x20\n", hop, 20+hop)
+		fmt.Fprintf(&sb, "created by %s in goroutine %d\n\t/app/cb.go:%d +0x10\n\n", creator, parentGID, 19+hop)
+	}
+
+	leafStack := []byte("goroutine 120 [running]:\ngithub.com/google/go-lru.leafFunc()\n\t/app/cb.go:99 +0x20\ncreated by github.com/google/go-lru.hopFunc19 in goroutine 119\n\t/app/cb.go:50 +0x10\n")
+	allStacks := []byte(sb.String())
+
+	// Act 1: Walk 20-hop synthetic chain.
+	ancGID, ok := findAncestorCreatorAboveHook(allStacks, leafStack, 119, []byte("github.com/google/go-lru.hopFunc19"), []byte("deliverCallbacks"), func(id uint64) bool {
+		return id == 100
+	})
+
+	// Assert 1
+	assert.True(t, ok, "20-hop ancestor chain must resolve root holder goroutine 100")
+	assert.Equal(t, uint64(100), ancGID)
+
+	// Arrange 2: Build a malformed synthetic cycle (goroutine 201 <-> goroutine 202) in allStacks
+	// alongside holder goroutine 200 to verify that exhausting maxAncestorHops falls back to
+	// matchAncestorFallbackInAllStacks without infinite looping or false negatives.
+	cycleStacks := []byte(
+		"goroutine 200 [running]:\n" +
+			"github.com/google/go-lru.cycleCallback.func1()\n\t/app/cb.go:10 +0x20\n" +
+			"github.com/google/go-lru.(*evictCallbackQueue[...]).deliverCallbacks(0x1, 0x2, 0x3, 0x4)\n\t/app/pressure.go:1900 +0x40\n\n" +
+			"goroutine 201 [chan receive]:\n" +
+			"github.com/google/go-lru.cycleCallback.func1.1()\n\t/app/cb.go:12 +0x20\n" +
+			"created by github.com/google/go-lru.cycleCallback.func1.2 in goroutine 202\n\t/app/cb.go:14 +0x10\n\n" +
+			"goroutine 202 [chan receive]:\n" +
+			"github.com/google/go-lru.cycleCallback.func1.2()\n\t/app/cb.go:14 +0x20\n" +
+			"created by github.com/google/go-lru.cycleCallback.func1.1 in goroutine 201\n\t/app/cb.go:12 +0x10\n",
+	)
+	cycleLeaf := []byte(
+		"goroutine 203 [running]:\n" +
+			"github.com/google/go-lru.cycleCallback.func1.3()\n\t/app/cb.go:16 +0x20\n" +
+			"created by github.com/google/go-lru.cycleCallback.func1.2 in goroutine 202\n\t/app/cb.go:14 +0x10\n",
+	)
+
+	// Act 2
+	cycleAncGID, cycleOK := findAncestorCreatorAboveHook(cycleStacks, cycleLeaf, 202, []byte("github.com/google/go-lru.cycleCallback.func1.2"), []byte("deliverCallbacks"), func(id uint64) bool {
+		return id == 200
+	})
+
+	// Assert 2
+	assert.True(t, cycleOK, "exhausting maxAncestorHops on malformed synthetic cycle must fall back to matchAncestorFallbackInAllStacks")
+	assert.Equal(t, uint64(200), cycleAncGID)
+}
+
+func testGoidBatchInversionAndSiblingWorkerExclusion(t *testing.T) {
+	// Arrange: Model multi-P goid batch inversion (1491 -> holder 1483 -> child 1472 -> grandchild 1473)
+	// and a worker pool spawned by G_pool (1491) with primary (1483), fallback (1484), and overflow (1485) samplers.
+	var p pressureState
+	p.samplingParentGID.Store(1491)
+	p.samplingGID.Store(1483)
+	p.fallbackParentGID.Store(1491)
+	p.fallbackGID.Store(1484)
+	p.overflowSamplingGIDs.Store(uint64(1485), uint64(1491))
+	p.overflowSamplingCount.Store(1)
+
+	// Act
+	invertedGrandchildEvict := canBeDescendantOf(1473, 1472, 1483, 1491)
+	invertedGrandchildSampler := p.canBeDescendantOfActiveSampler(1473, 1472)
+	directChildSampler := p.canBeDescendantOfActiveSampler(1472, 1483)
+	siblingWorkerRejected := p.canBeDescendantOfActiveSampler(1486, 1491)
+	ownerParentRejected := canBeDescendantOf(1491, 100, 1483, 1491)
+	mainRootChildRejected := canBeDescendantOf(1500, 1, 1483, 1491)
+	zeroParentRejected := canBeDescendantOf(1501, 0, 1483, 1491)
+
+	// Assert
+	assert.True(t, invertedGrandchildEvict, "2-hop grandchild with lower per-P goid (parentGID 1472 < holder 1483) must be accepted")
+	assert.True(t, invertedGrandchildSampler, "active sampler check must accept 2-hop grandchild with inverted per-P goid")
+	assert.True(t, directChildSampler, "direct child of active sampler (parentGID == samplingGID) must be accepted")
+	assert.False(t, siblingWorkerRejected, "sibling worker sharing parentGID == ownerParentGID (1491) must be rejected in O(1) even with overflow active")
+	assert.False(t, ownerParentRejected, "parent goroutine (gid == ownerParentGID) can never be a descendant of its own child")
+	assert.False(t, mainRootChildRejected, "goroutine spawned directly by main (parentGID == 1) cannot be 2+-hop descendant of non-main owner")
+	assert.False(t, zeroParentRejected, "zero parentGID must be rejected")
+}
+
+func testNestedCrossCacheHookChildGoroutineReentrancy(t *testing.T) {
+	// Arrange: G1 inside cacheA's PressureFunc spawns child G2 and then enters cacheB's PressureFunc
+	// before blocking on G2; next, G1 inside cacheA's OnEvictValue spawns child G2 and then enters
+	// cacheB's OnEvictValue before blocking on G2.
+	var cacheA, cacheB Cache[int]
+	var pressureCallsA, pressureCallsB, pressureCallsDuringNestedSample atomic.Int32
+	var evictCallsA, evictCallsB atomic.Int32
+	inPressureB := make(chan struct{})
+	childPressureDone := make(chan struct{})
+	inEvictB := make(chan struct{})
+	childEvictDone := make(chan struct{})
+
+	cacheA = NewArenaRadixCache[int](1,
+		WithInvariantChecking(true),
+		WithPressureFunc(func() float64 {
+			if pressureCallsA.Add(1) == 1 {
+				go func() {
+					defer close(childPressureDone)
+					<-inPressureB
+					_, putErr := cacheA.Put("a_from_pressure_child", 10)
+					assert.NoError(t, putErr)
+				}()
+				_, putErr := cacheB.Put("b1", 1)
+				require.NoError(t, putErr)
+				pressureCallsDuringNestedSample.Store(pressureCallsA.Load())
+			}
+			return 0.10
+		}),
+		WithOnEvictValue(func(_ int, _ EvictionReason) {
+			if evictCallsA.Add(1) == 1 {
+				go func() {
+					defer close(childEvictDone)
+					<-inEvictB
+					_, deleted := cacheA.Delete("a1")
+					assert.True(t, deleted)
+					_, putErr := cacheA.Put("a2_from_evict_child", 20)
+					assert.NoError(t, putErr)
+				}()
+				_, putErr := cacheB.Put("b2", 2)
+				require.NoError(t, putErr)
+			}
+		}),
+	)
+
+	cacheB = NewArenaRadixCache[int](1,
+		WithInvariantChecking(true),
+		WithPressureFunc(func() float64 {
+			if pressureCallsB.Add(1) == 1 {
+				close(inPressureB)
+				<-childPressureDone
+			}
+			return 0.10
+		}),
+		WithOnEvictValue(func(_ int, _ EvictionReason) {
+			if evictCallsB.Add(1) == 1 {
+				close(inEvictB)
+				<-childEvictDone
+			}
+		}),
+	)
+
+	// Act: Put("a1", 1) on cacheA triggers nested A->B PressureFunc with child G2 mutating cacheA,
+	// then evicts "a_from_pressure_child" and triggers nested A->B OnEvictValue with child G2 mutating cacheA.
+	_, err := cacheA.Put("a1", 1)
+	require.NoError(t, err)
+
+	// Assert: Child G2 was detected as a re-entrant descendant on cacheA during both nested cross-cache hooks.
+	assert.Equal(t, int32(1), pressureCallsDuringNestedSample.Load(),
+		"child G2 spawned in cacheA PressureFunc must be detected as re-entrant even while G1 is nested in cacheB PressureFunc")
+	assert.Equal(t, int32(2), evictCallsA.Load(),
+		"cacheA OnEvictValue must execute for both initial eviction and child G2 deletion without deadlock")
+	assert.Equal(t, int32(1), evictCallsB.Load(),
+		"cacheB OnEvictValue must execute once")
+	valA, okA := cacheA.Peek("a2_from_evict_child")
+	require.True(t, okA)
+	assert.Equal(t, 20, valA)
+}
+
+// TestPressure_ZeroWeightUnboundedGrowthRemediation verifies that when Weigher returns 0,
+// inserting new zero-weight entries into a cache at capacity or when zeroSizeCount >= maxSize
+// evicts at most 1 LRU tail entry per insert so entry count remains bounded by maxSize without
+// wiping out positive-weight tail entries.
+func TestPressure_ZeroWeightUnboundedGrowthRemediation(t *testing.T) {
+	for _, b := range []Backend{BackendMap, BackendRadix, BackendArenaRadix} {
+		t.Run(b.String(), func(t *testing.T) {
+			// Arrange
+			c := New[[]byte](10,
+				WithBackend(b),
+				WithInvariantChecking(true),
+				WithWeigher(func(_ string, v []byte) uint64 { return uint64(len(v)) }),
+				WithPressureFunc(func() float64 { return 0.0 }),
+			)
+
+			// Fill cache to 100% byte capacity (10 / 10 bytes).
+			_, err := c.Put("full_capacity_key", make([]byte, 10))
+			require.NoError(t, err)
+			require.Equal(t, uint64(10), c.Stats().CurrentSize)
+
+			// Act: Insert 5,000 zero-weight entries into a full cache (maxSize = 10).
+			totalEvicted := 0
+			for i := range 5000 {
+				evicted, putErr := c.Put(fmt.Sprintf("zero_weight_key_%d", i), nil)
+				require.NoError(t, putErr)
+				totalEvicted += len(evicted)
+			}
+
+			// Assert
+			st := c.Stats()
+			assert.Equal(t, 10, st.Len)
+			assert.Equal(t, 10, st.ZeroSizeCount)
+			assert.Equal(t, 4991, totalEvicted)
+			assert.Equal(t, uint64(4991), st.EvictionsCapacity)
+		})
+
+		t.Run(b.String()+"_SingleZeroWeightInsertDoesNotWipeWeightedTailEntries", func(t *testing.T) {
+			// Arrange: Populate 3 weighted entries (size 1 each) at the LRU tail followed by
+			// 5 zero-weight entries (zeroSizeCount == maxSize == 5).
+			c := New[int](5,
+				WithBackend(b),
+				WithInvariantChecking(true),
+				WithWeigher(func(_ string, v int) uint64 { return uint64(v) }),
+				WithPressureFunc(func() float64 { return 0.0 }),
+			)
+			for i := range 3 {
+				_, err := c.Put(fmt.Sprintf("weighted_%d", i), 1)
+				require.NoError(t, err)
+			}
+			for i := range 5 {
+				_, err := c.Put(fmt.Sprintf("zero_%d", i), 0)
+				require.NoError(t, err)
+			}
+			require.Equal(t, 8, c.Stats().Len)
+			require.Equal(t, 5, c.Stats().ZeroSizeCount)
+
+			// Act: Insert 1 more zero-weight entry while weighted entries sit at the LRU tail.
+			evicted, err := c.Put("zero_extra", 0)
+
+			// Assert: At most 1 entry is evicted on this single insert, preserving the remaining weighted entries.
+			require.NoError(t, err)
+			assert.Len(t, evicted, 1)
+			assert.Equal(t, 8, c.Stats().Len)
+			assert.Equal(t, uint64(2), c.Stats().CurrentSize)
+		})
+
+		t.Run(b.String()+"_PositiveToZeroUpdateAndPumpingBounded", func(t *testing.T) {
+			// Arrange
+			c := New[int](10,
+				WithBackend(b),
+				WithInvariantChecking(true),
+				WithWeigher(func(_ string, v int) uint64 { return uint64(v) }),
+				WithPressureFunc(func() float64 { return 0.0 }),
+			)
+
+			// Act: Repeatedly insert a positive-weight entry and downgrade it to zero-weight via Put and Replace,
+			// and alternate maxSize weighted inserts with zero-weight inserts.
+			for i := range 500 {
+				key := fmt.Sprintf("pump_%04d", i)
+				_, err := c.Put(key, 1)
+				require.NoError(t, err)
+				if i%2 == 0 {
+					_, err = c.Put(key, 0)
+					require.NoError(t, err)
+				} else {
+					err = c.Replace(key, 0)
+					require.NoError(t, err)
+				}
+			}
+			for i := range 200 {
+				_, err := c.Put(fmt.Sprintf("alt_pos_%04d", i), 10)
+				require.NoError(t, err)
+				for j := range 10 {
+					_, err = c.Put(fmt.Sprintf("alt_zero_%04d_%02d", i, j), 0)
+					require.NoError(t, err)
+				}
+			}
+
+			// Assert: Entry count and zero-size count remain strictly bounded by 2*maxSize (and <= maxSize+1 here).
+			st := c.Stats()
+			assert.LessOrEqual(t, st.Len, 11)
+			assert.LessOrEqual(t, st.ZeroSizeCount, 10)
+		})
+	}
+}
+
+// TestPressure_CallbackAndSamplerReentrancyHazards verifies that:
+//  1. OnEvict* callbacks execute after c.mu.Unlock(), allowing re-entrant read and write calls
+//     on the same cache instance without deadlocking.
+//  2. PressureFunc re-entrancy detection inspects the parent creator GID and creator frame of child goroutines,
+//     preventing recursive PressureFunc execution when a child goroutine touches the cache while allowing
+//     pre-existing sibling worker goroutines spawned before PressureFunc to sample normally.
+func TestPressure_CallbackAndSamplerReentrancyHazards(t *testing.T) {
+	t.Run("OnEvictCallbackCallingCacheMethodsSucceedsWithoutDeadlock", func(t *testing.T) {
+		for _, b := range []Backend{BackendMap, BackendRadix, BackendArenaRadix} {
+			// Arrange
+			var cache Cache[int]
+			callbackDone := make(chan struct{})
+
+			cache = New[int](1,
+				WithBackend(b),
+				WithInvariantChecking(true),
+				WithOnEvictValue(func(_ int, r EvictionReason) {
+					if r == EvictionReasonCapacity {
+						st := cache.Stats()
+						assert.Equal(t, 1, st.Len)
+						val, ok := cache.Peek("k2")
+						assert.True(t, ok)
+						assert.Equal(t, 2, val)
+						gotVal, gotOK := cache.Get("k2")
+						assert.True(t, gotOK)
+						assert.Equal(t, 2, gotVal)
+						close(callbackDone)
+					}
+				}),
+			)
+
+			_, err := cache.Put("k1", 1)
+			require.NoError(t, err)
+
+			// Act
+			putDone := make(chan struct{})
+			go func() {
+				_, putErr := cache.Put("k2", 2)
+				assert.NoError(t, putErr)
+				close(putDone)
+			}()
+
+			// Assert
+			select {
+			case <-putDone:
+			case <-time.After(2 * time.Second):
+				require.Failf(t, "deadlocked", "backend=%v OnEvictValue calling cache.Stats()/Peek()/Get() deadlocked", b)
+			}
+			select {
+			case <-callbackDone:
+			case <-time.After(2 * time.Second):
+				require.Failf(t, "callback did not complete", "backend=%v OnEvictValue did not fire for EvictionReasonCapacity", b)
+			}
+		}
+	})
+
+	t.Run("PressureFuncChildGoroutineDetectedByParentGIDGuard", func(t *testing.T) {
+		// Arrange
+		var cache Cache[int]
+		var depth atomic.Int32
+
+		cache = NewArenaRadixCache[int](10, WithPressureFunc(func() float64 {
+			if depth.Add(1) > 5 {
+				return 0.0
+			}
+			done := make(chan struct{})
+			go func() {
+				defer close(done)
+				_, _ = cache.Delete("missing")
+			}()
+			<-done
+			return 0.10
+		}))
+
+		// Act
+		_, err := cache.Put("k1", 1)
+
+		// Assert
+		require.NoError(t, err)
+		observedDepth := depth.Load()
+		assert.Equal(t, int32(1), observedDepth)
+	})
+
+	t.Run("PreExistingWorkerGoroutineNotMisclassifiedAsChildOfSampler", func(t *testing.T) {
+		// Arrange: Spawn a worker goroutine BEFORE entering cache.Put so its parentGID is the
+		// current test goroutine, but its creator frame lies below invokeAndStorePressure.
+		var cache Cache[int]
+		var calls atomic.Int32
+		inPrimary := make(chan struct{})
+		workerTrigger := make(chan struct{})
+		workerSampled := make(chan struct{})
+		workerDone := make(chan struct{})
+
+		go func() {
+			<-workerTrigger
+			_, err := cache.Put("worker_key", 2)
+			assert.NoError(t, err)
+			close(workerDone)
+		}()
+
+		var primaryOnce, workerSampledOnce sync.Once
+		cache = NewMapCache[int](10, WithPressureFunc(func() float64 {
+			c := calls.Add(1)
+			if c == 1 {
+				primaryOnce.Do(func() {
+					close(inPrimary)
+					close(workerTrigger)
+				})
+				select {
+				case <-workerSampled:
+				case <-workerDone:
+				}
+			} else if c >= 2 {
+				workerSampledOnce.Do(func() {
+					close(workerSampled)
+				})
+			}
+			return 0.10
+		}))
+
+		// Act
+		_, err := cache.Put("parent_key", 1)
+		<-inPrimary
+		<-workerDone
+
+		// Assert: Both the parent goroutine and the pre-existing worker goroutine sampled PressureFunc.
+		require.NoError(t, err)
+		assert.Equal(t, int32(2), calls.Load())
+	})
+}
+
+// TestPressure_CustomPressureFuncAvoidsUncontendedStackDump verifies that custom WithPressureFunc
+// is evaluated on every foreground write without invoking runtime.Stack on the uncontended primary
+// sampler slot (leaving samplingGID == 0 while samplingPressure == true and achieving 0 allocs/op).
+func TestPressure_CustomPressureFuncAvoidsUncontendedStackDump(t *testing.T) {
+	// Arrange
+	var calls atomic.Uint64
+	var mc *mapCache[int]
+	c := NewMapCache[int](1000, WithPressureFunc(func() float64 {
+		calls.Add(1)
+		assert.True(t, mc.samplingPressure.Load(), "primary sampler slot must be active during PressureFunc")
+		assert.Zero(t, mc.samplingGID.Load(), "uncontended primary sampler must leave samplingGID == 0 without calling runtime.Stack")
+		return 0.10
+	}))
+	mc = c.(*mapCache[int])
+
+	// Act
+	const numWrites = 1000
+	for i := range numWrites {
+		_, err := c.Put(fmt.Sprintf("k_%d", i%10), i)
+		require.NoError(t, err)
+	}
+
+	// Assert
+	actualCalls := calls.Load()
+	assert.Equal(t, uint64(numWrites), actualCalls)
+
+	allocs := testing.AllocsPerRun(50, func() {
+		_, _ = c.Put("k_0", 42)
+	})
+	assert.Zero(t, allocs)
+}
+
+// TestPressure_ReplaceEvictsLRUInsteadOfMRUUnderTier2Pressure verifies across all 3 backends
+// that under Tier 2 pressure (>= EvictionThreshold), Replace() protects the replaced entry even
+// when it is not at the MRU head, shedding other unprotected entries instead of evicting the
+// entry it just updated.
+func TestPressure_ReplaceEvictsLRUInsteadOfMRUUnderTier2Pressure(t *testing.T) {
+	for _, b := range []Backend{BackendMap, BackendRadix, BackendArenaRadix} {
+		t.Run(b.String(), func(t *testing.T) {
+			// Arrange
+			pressure := 0.10
+			c := New[string](100,
+				WithBackend(b),
+				WithInvariantChecking(true),
+				WithWeigher(func(_, v string) uint64 { return uint64(len(v)) }),
+				WithPressureFunc(func() float64 { return pressure }),
+				WithEvictionThreshold(0.90),
+				WithEvictionRetentionRatio(0.50),
+			)
+
+			_, _ = c.Put("lru_key", strings.Repeat("a", 20)) // 20B at LRU tail
+			_, _ = c.Put("mru_key", strings.Repeat("b", 40)) // 40B at MRU head (total = 60B > target 50B)
+
+			// Act
+			pressure = 0.95 // Tier 2 critical pressure
+			err := c.Replace("lru_key", strings.Repeat("x", 20))
+			require.NoError(t, err)
+
+			// Assert
+			val, exists := c.Peek("lru_key")
+			_, mruExists := c.Peek("mru_key")
+			st := c.Stats()
+			assert.True(t, exists, "replaced lru_key must be protected during its own Replace() under Tier 2 pressure")
+			assert.Equal(t, strings.Repeat("x", 20), val)
+			assert.False(t, mruExists, "unprotected mru_key must be shed to meet Tier 2 retention target")
+			assert.Equal(t, uint64(1), st.ReplaceUpdated)
+			assert.Equal(t, uint64(0), st.ReplaceSelfEvicted)
+			assert.Equal(t, uint64(1), st.EvictionsPressure)
+		})
+	}
+}
+
+// TestPressure_ThresholdClampingAndEmptyEvaluationEdgeCases verifies:
+// - DeletePrefix("") samples pressure via lockWithPressure and attributes compaction telemetry accurately.
+// - ArenaRadixCache.Compact() on a pure-insert cache is a no-op when !isDirtyLocked().
+// - RadixCache.Compact() resets watermarks without incrementing compaction counters or ReclaimEpoch.
+// - reconcileThresholdWindow clamps derived EvictionThreshold to <= 1.0 and preserves valid explicit pairs.
+func TestPressure_ThresholdClampingAndEmptyEvaluationEdgeCases(t *testing.T) {
+	t.Run("DeletePrefixEmptySamplesPressureAndAttributesTelemetry", func(t *testing.T) {
+		for _, b := range []Backend{BackendMap, BackendRadix, BackendArenaRadix} {
+			// Arrange
+			pressure := 0.10
+			c := New[string](100,
+				WithBackend(b),
+				WithInvariantChecking(true),
+				WithPressureFunc(func() float64 { return pressure }),
+				WithCompactionThreshold(0.75),
+				WithEvictionThreshold(0.90),
+			)
+			for i := range 10 {
+				_, _ = c.Put(fmt.Sprintf("p/%d", i), "val")
+			}
+
+			// Act
+			pressure = 0.95 // Tier 2 critical pressure
+			c.DeletePrefix("")
+			st := c.Stats()
+
+			// Assert
+			assert.InDelta(t, 0.95, st.MemoryPressure, 1e-9)
+			assert.Equal(t, uint64(0), st.CompactionsAutoSlack)
+			assert.Equal(t, uint64(1), st.CompactionsPressureTier2)
+			assert.Equal(t, uint64(1), st.ReclaimEpoch)
+		}
+	})
+
+	t.Run("PureInsertCompactParityAcrossBackends", func(t *testing.T) {
+		// Arrange
+		mapC := NewMapCache[int](100).(PressureAwareCache[int])
+		radixC := NewRadixCache[int](100).(PressureAwareCache[int])
+		arenaC := NewArenaRadixCache[int](100).(PressureAwareCache[int])
+
+		for i := range 10 {
+			k := fmt.Sprintf("key_%d", i)
+			_, _ = mapC.Put(k, i)
+			_, _ = radixC.Put(k, i)
+			_, _ = arenaC.Put(k, i)
+		}
+
+		// Act
+		mapC.Compact()
+		radixC.Compact()
+		arenaC.Compact()
+
+		// Assert
+		assert.Equal(t, uint64(0), mapC.Stats().CompactionsExplicit)
+		assert.Equal(t, uint64(0), radixC.Stats().CompactionsExplicit)
+		assert.Equal(t, uint64(0), arenaC.Stats().CompactionsExplicit)
+		assert.Equal(t, uint64(0), arenaC.Stats().ReclaimEpoch)
+	})
+
+	t.Run("RadixCacheNoOpCompactionDoesNotIncrementTelemetry", func(t *testing.T) {
+		// Arrange
+		c := NewRadixCache[int](100).(PressureAwareCache[int])
+		_, _ = c.Put("k1", 1)
+		_, _ = c.Put("k2", 2)
+		_, _ = c.Delete("k1")
+
+		// Act
+		c.Compact()
+		st := c.Stats()
+
+		// Assert
+		assert.Equal(t, uint64(0), st.CompactionsExplicit)
+		assert.Equal(t, uint64(0), st.ReclaimEpoch)
+		assert.Equal(t, 0, st.DeletedSinceCompact)
+	})
+
+	t.Run("ThresholdReconciliationClampsEvictionThresholdToOne", func(t *testing.T) {
+		// Arrange & Act
+		opts1 := ApplyOptions(WithCompactionThreshold(0.95))
+		opts2 := ApplyOptions(WithCompactionThreshold(0.95), WithEvictionThreshold(0.90))
+		opts3 := ApplyOptions(WithCompactionThreshold(0.60), WithEvictionThreshold(0.85))
+
+		// Assert
+		assert.InDelta(t, 0.95, opts1.CompactionThreshold, 1e-9)
+		assert.InDelta(t, 1.0, opts1.EvictionThreshold, 1e-9)
+
+		assert.InDelta(t, 0.75, opts2.CompactionThreshold, 1e-9)
+		assert.InDelta(t, 0.90, opts2.EvictionThreshold, 1e-9)
+
+		assert.InDelta(t, 0.60, opts3.CompactionThreshold, 1e-9)
+		assert.InDelta(t, 0.85, opts3.EvictionThreshold, 1e-9)
+	})
+}
+
+// TestPressure_ZeroGlobalStackDumpContentionAndZeroAllocReclaim verifies that:
+//  1. Independent cache instances executing OnEvict* or PressureFunc concurrently do not
+//     contend on global singleton slots or allocate 64 KiB runtime.Stack(_, true) buffers.
+//  2. Contended writers on the same cache instance do not repeatedly invoke captureAllGoroutineStacks
+//     once the active primary sampler has been resolved.
+//  3. Steady-state Put under Tier 2 pressure allocates <= 2 objects/op (restoring the PutUnderPressure target).
+func TestPressure_ZeroGlobalStackDumpContentionAndZeroAllocReclaim(t *testing.T) {
+	t.Run("IndependentCachesConcurrentOnEvictAndPressureFuncAllocateZeroStackBuffers", testMultiCacheConcurrentHooksZeroAllocs)
+
+	t.Run("SameCacheContendedWritersResolvePrimarySamplerOnceWithZeroAllocs", func(t *testing.T) {
+		// Arrange: Block primary sampler inside PressureFunc on cacheA, then run a contended writer
+		// from the same parent goroutine (spawned before PressureFunc) in a loop and verify 0 allocs/op.
+		inPrimary := make(chan struct{})
+		releasePrimary := make(chan struct{})
+		var armPrimary atomic.Bool
+
+		c := NewMapCache[int](100, WithPressureFunc(func() float64 {
+			if armPrimary.CompareAndSwap(true, false) {
+				close(inPrimary)
+				<-releasePrimary
+			}
+			return 0.10
+		}))
+		_, err := c.Put("seed", 1)
+		require.NoError(t, err)
+
+		armPrimary.Store(true)
+		var wg sync.WaitGroup
+		wg.Go(func() {
+			_, _ = c.Put("primary_write", 2)
+		})
+		<-inPrimary
+
+		// Act: Repeated contended writes on the same cache resolve the primary sampler once and allocate 0 objects/op.
+		allocs := testing.AllocsPerRun(50, func() {
+			_ = c.Replace("seed", 3)
+		})
+
+		close(releasePrimary)
+		wg.Wait()
+
+		// Assert
+		assert.Zero(t, allocs, "contended writer on same cache must not allocate after primary sampler resolution")
+	})
+
+	t.Run("ArenaRadixPutUnderPressureMeetsTwoAllocsPerOpTarget", func(t *testing.T) {
+		// Arrange
+		c := NewArenaRadixCache[int](512,
+			WithPressureFunc(func() float64 { return 0.95 }),
+			WithCompactionThreshold(0.75),
+			WithEvictionThreshold(0.90),
+			WithEvictionRetentionRatio(0.50),
+		)
+		keys := make([]string, 1024)
+		for i := range keys {
+			keys[i] = fmt.Sprintf("service/instance/item/%06d", i)
+		}
+		for i := range 512 {
+			_, err := c.Put(keys[i], i)
+			require.NoError(t, err)
+		}
+
+		// Act: Measure allocations per Put under continuous Tier 2 pressure (0.95).
+		idx := 512
+		allocs := testing.AllocsPerRun(200, func() {
+			_, _ = c.Put(keys[idx&1023], idx)
+			idx++
+		})
+
+		// Assert: Must be <= 2.0 allocs/op (1 evicted slice + at most 1 prefix string clone, 0 sync.Map Clear allocs).
+		assert.LessOrEqual(t, allocs, 2.0, "ArenaRadixCache PutUnderPressure must allocate <= 2 objects/op")
+	})
+}
+
+func testMultiCacheConcurrentHooksZeroAllocs(t *testing.T) {
+	t.Helper()
+	// Arrange: Hold cachePressureA inside PressureFunc and cacheEvictA inside OnEvictValue concurrently,
+	// while cacheB (with distinct hookTag) executes Replace with PressureFunc and OnEvictValue.
+	inPressureA := make(chan struct{})
+	releasePressureA := make(chan struct{})
+	inEvictA := make(chan struct{})
+	releaseEvictA := make(chan struct{})
+
+	var armPressureA, armEvictA atomic.Bool
+	cachePressureA := NewMapCache[int](2, WithPressureFunc(func() float64 {
+		if armPressureA.CompareAndSwap(true, false) {
+			close(inPressureA)
+			<-releasePressureA
+		}
+		return 0.10
+	}))
+	cacheEvictA := NewMapCache[int](1, WithOnEvictValue(func(_ int, _ EvictionReason) {
+		if armEvictA.CompareAndSwap(true, false) {
+			close(inEvictA)
+			<-releaseEvictA
+		}
+	}))
+	_, err := cacheEvictA.Put("e1", 1)
+	require.NoError(t, err)
+
+	var sinkB int
+	cacheB := NewMapCache[int](2,
+		WithPressureFunc(func() float64 { return 0.10 }),
+		WithOnEvictValue(func(v int, _ EvictionReason) { sinkB = v }),
+	)
+	_, err = cacheB.Put("b1", 1)
+	require.NoError(t, err)
+
+	armPressureA.Store(true)
+	armEvictA.Store(true)
+	var wg sync.WaitGroup
+	wg.Go(func() {
+		_, _ = cachePressureA.Put("p1", 1)
+	})
+	wg.Go(func() {
+		_, _ = cacheEvictA.Put("e2", 2)
+	})
+	<-inPressureA
+	<-inEvictA
+
+	// Act: Measure allocations on cacheB while both cachePressureA and cacheEvictA are blocked in their hooks.
+	allocsB := testing.AllocsPerRun(100, func() {
+		_ = cacheB.Replace("b1", 2)
+	})
+
+	close(releasePressureA)
+	close(releaseEvictA)
+	wg.Wait()
+
+	// Assert
+	assert.Zero(t, allocsB, "independent cacheB must allocate 0 objects while other caches are in PressureFunc and OnEvictValue")
+	assert.Equal(t, 2, sinkB)
+}
+
+func runMultiSamplerReentrantReclaimScenario(t *testing.T, b Backend, staleHasHigherSeq bool) {
+	t.Helper()
+
+	var cache PressureAwareCache[int]
+	var enabled atomic.Bool
+	g1Entered := make(chan struct{})
+	g2Entered := make(chan struct{})
+	staleSampledBeforePeerReclaim := make(chan struct{})
+	peerReclaimed := make(chan struct{})
+
+	var callNum atomic.Int32
+	cache = New[int](10,
+		WithBackend(b),
+		WithInvariantChecking(true),
+		WithPressureFunc(func() float64 {
+			if !enabled.Load() {
+				return 0.0
+			}
+			c := callNum.Add(1)
+			if (!staleHasHigherSeq && c == 1) || (staleHasHigherSeq && c == 2) {
+				if c == 1 {
+					close(g1Entered)
+					<-g2Entered
+				} else {
+					close(g2Entered)
+				}
+				_, _ = cache.Delete("reclaim_stale")
+				val := 0.95
+				close(staleSampledBeforePeerReclaim)
+				<-peerReclaimed
+				return val
+			}
+			if (!staleHasHigherSeq && c == 2) || (staleHasHigherSeq && c == 1) {
+				if c == 1 {
+					close(g1Entered)
+					<-g2Entered
+				} else {
+					close(g2Entered)
+				}
+				<-staleSampledBeforePeerReclaim
+				_, _ = cache.Delete("reclaim_fresh")
+				close(peerReclaimed)
+				return 0.10
+			}
+			return 0.10
+		}),
+	).(PressureAwareCache[int])
+
+	for i := range 8 {
+		_, err := cache.Put(fmt.Sprintf("k%d", i), i)
+		require.NoError(t, err)
+	}
+	_, err := cache.Put("reclaim_stale", 100)
+	require.NoError(t, err)
+	_, err = cache.Put("reclaim_fresh", 200)
+	require.NoError(t, err)
+
+	enabled.Store(true)
+
+	var wg sync.WaitGroup
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		_, putErr := cache.Put("new1", 1)
+		assert.NoError(t, putErr)
+	}()
+	<-g1Entered
+	go func() {
+		defer wg.Done()
+		_, putErr := cache.Put("new2", 2)
+		assert.NoError(t, putErr)
+	}()
+	wg.Wait()
+
+	st := cache.Stats()
+	assert.Zero(t, st.PressureShedsInline, "backend %v must not shed on stale pre-peer-reclamation pressure sample", b)
+	assert.Zero(t, st.EvictionsPressure, "backend %v must not evict entries under pressure after peer sampler reclaimed", b)
+	assert.Equal(t, 10, st.Len, "all 8 base entries + new1 + new2 must remain live on %v", b)
+	assert.InDelta(t, 0.10, st.MemoryPressure, 1e-9, "Stats().MemoryPressure must not be overwritten by rejected stale sample on %v", b)
+}
+
+// TestPressure_ConcurrentMultiSamplerReentrantReclaimInvalidatesStalePeerSample verifies
+// that when one sampler performs an earlier re-entrant reclamation at t1 and samples high
+// pressure (0.95) at t2, and a concurrent sampler performs a later re-entrant reclamation
+// at t3 (after which pressure drops to 0.10), the stale 0.95 sample is invalidated regardless
+// of invokeSeq ordering and never overwrites Stats().MemoryPressure or sheds the cache.
+func TestPressure_ConcurrentMultiSamplerReentrantReclaimInvalidatesStalePeerSample(t *testing.T) {
+	for _, b := range []Backend{BackendMap, BackendRadix, BackendArenaRadix} {
+		t.Run(b.String()+"_StaleLowerSeq", func(t *testing.T) {
+			runMultiSamplerReentrantReclaimScenario(t, b, false)
+		})
+		t.Run(b.String()+"_StaleHigherSeq", func(t *testing.T) {
+			runMultiSamplerReentrantReclaimScenario(t, b, true)
+		})
+	}
+	t.Run("NonReclaimingLowPressureSamplerDoesNotOverwriteElevatedReentrantEpoch", func(t *testing.T) {
+		testNonReclaimingLowPressureDoesNotOverwriteElevatedEpoch(t)
+	})
+}
+
+func testNonReclaimingLowPressureDoesNotOverwriteElevatedEpoch(t *testing.T) {
+	t.Helper()
+	for _, b := range []Backend{BackendMap, BackendRadix, BackendArenaRadix} {
+		t.Run(b.String(), func(t *testing.T) {
+			var cache Cache[int]
+			var pac PressureAwareCache[int]
+			var armed atomic.Bool
+			var sampleSeq atomic.Int32
+			g2Started := make(chan struct{})
+			g1Entered := make(chan struct{})
+			g2Stored := make(chan struct{})
+
+			cache = New[int](100,
+				WithBackend(b),
+				WithInvariantChecking(true),
+				WithCompactionThreshold(0.50),
+				WithEvictionThreshold(0.80),
+				WithEvictionRetentionRatio(0.50),
+				WithPressureFunc(func() float64 {
+					if !armed.Load() {
+						return 0.10
+					}
+					seq := sampleSeq.Add(1)
+					switch seq {
+					case 1:
+						// G2 (invokeSeq 1): wait for G1 (invokeSeq 2) to start at epoch 0, then perform re-entrant Delete and return 0.95.
+						close(g2Started)
+						<-g1Entered
+						_, _ = cache.Delete("tmp")
+						return 0.95
+					case 2:
+						// G1 (invokeSeq 2, non-reentrant): wait until G2 finishes storing 0.95 at epoch 1, then return stale 0.10.
+						close(g1Entered)
+						<-g2Stored
+						return 0.10
+					default:
+						return 0.95
+					}
+				}),
+			)
+			pac = cache.(PressureAwareCache[int])
+
+			for i := range 6 {
+				_, err := cache.Put(fmt.Sprintf("k%d", i), i)
+				require.NoError(t, err)
+			}
+			_, err := cache.Put("tmp", 99)
+			require.NoError(t, err)
+			armed.Store(true)
+
+			g2Done := make(chan struct{})
+			go func() {
+				defer close(g2Done)
+				_ = pac.EvaluateMemoryPressure()
+				close(g2Stored)
+			}()
+			<-g2Started
+
+			g1Done := make(chan struct{})
+			go func() {
+				defer close(g1Done)
+				_, putErr := cache.Put("new_key", 100)
+				assert.NoError(t, putErr)
+			}()
+
+			<-g2Done
+			<-g1Done
+
+			assert.InDelta(t, 0.95, cache.Stats().MemoryPressure, 1e-9, "non-reclaiming stale low-pressure sample must not overwrite elevated post-reclamation pressure")
+			assert.GreaterOrEqual(t, sampleSeq.Load(), int32(3), "G1 must retry sampling after rejecting stale low-pressure reading")
+		})
+	}
 }

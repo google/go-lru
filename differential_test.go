@@ -20,6 +20,7 @@ import (
 	"math/rand/v2"
 	"slices"
 	"strings"
+	"sync/atomic"
 	"testing"
 
 	"github.com/google/go-lru"
@@ -442,11 +443,16 @@ func (h *differentialHarness) VerifyFullCompactionStatsParity(op string) {
 	base := h.instances[0].cache.Stats()
 	for _, inst := range h.instances[1:] {
 		st := inst.cache.Stats()
-		require.Equalf(h.t, base.CompactionsExplicit, st.CompactionsExplicit, "[%s] CompactionsExplicit mismatch with %s (inv=%v)", op, inst.name, inst.invariants)
-		require.Equalf(h.t, base.CompactionsPressureTier1, st.CompactionsPressureTier1, "[%s] CompactionsPressureTier1 mismatch with %s (inv=%v)", op, inst.name, inst.invariants)
-		require.Equalf(h.t, base.CompactionsPressureTier2, st.CompactionsPressureTier2, "[%s] CompactionsPressureTier2 mismatch with %s (inv=%v)", op, inst.name, inst.invariants)
-		require.Equalf(h.t, base.CompactionsAutoSlack, st.CompactionsAutoSlack, "[%s] CompactionsAutoSlack mismatch with %s (inv=%v)", op, inst.name, inst.invariants)
-		require.Equalf(h.t, base.ReclaimEpoch, st.ReclaimEpoch, "[%s] ReclaimEpoch mismatch with %s (inv=%v)", op, inst.name, inst.invariants)
+		if inst.name == "RadixCache" {
+			require.Zerof(h.t, st.CompactionsExplicit, "[%s] RadixCache CompactionsExplicit must be 0 (inv=%v)", op, inst.invariants)
+			require.Zerof(h.t, st.CompactionsPressureTier1, "[%s] RadixCache CompactionsPressureTier1 must be 0 (inv=%v)", op, inst.invariants)
+		} else {
+			require.Equalf(h.t, base.CompactionsExplicit, st.CompactionsExplicit, "[%s] CompactionsExplicit mismatch with %s (inv=%v)", op, inst.name, inst.invariants)
+			require.Equalf(h.t, base.CompactionsPressureTier1, st.CompactionsPressureTier1, "[%s] CompactionsPressureTier1 mismatch with %s (inv=%v)", op, inst.name, inst.invariants)
+			require.Equalf(h.t, base.CompactionsPressureTier2, st.CompactionsPressureTier2, "[%s] CompactionsPressureTier2 mismatch with %s (inv=%v)", op, inst.name, inst.invariants)
+			require.Equalf(h.t, base.CompactionsAutoSlack, st.CompactionsAutoSlack, "[%s] CompactionsAutoSlack mismatch with %s (inv=%v)", op, inst.name, inst.invariants)
+			require.Equalf(h.t, base.ReclaimEpoch, st.ReclaimEpoch, "[%s] ReclaimEpoch mismatch with %s (inv=%v)", op, inst.name, inst.invariants)
+		}
 		require.Equalf(h.t, base.DeletedSinceCompact, st.DeletedSinceCompact, "[%s] DeletedSinceCompact mismatch with %s (inv=%v)", op, inst.name, inst.invariants)
 		require.Equalf(h.t, base.PeakEntryLen, st.PeakEntryLen, "[%s] PeakEntryLen mismatch with %s (inv=%v)", op, inst.name, inst.invariants)
 	}
@@ -1920,4 +1926,390 @@ func testMultiByteUTF8AndHighByteRadixPrefixSplits(t *testing.T) {
 func TestDifferential_NonASCIISingleByteKeysAndUTF8PrefixSplits(t *testing.T) {
 	t.Run("All256SingleByteKeys", testAll256SingleByteKeys)
 	t.Run("MultiByteUTF8AndHighByteRadixPrefixSplits", testMultiByteUTF8AndHighByteRadixPrefixSplits)
+}
+
+func runBinaryKeysDifferentialTest(t *testing.T) {
+	t.Helper()
+	type evictEvent struct {
+		key    string
+		val    int
+		reason lru.EvictionReason
+	}
+
+	var mapEvents, radixEvents, arenaEvents []evictEvent
+	var pressureBits atomic.Uint64
+	setPressure := func(p float64) {
+		pressureBits.Store(math.Float64bits(p))
+	}
+	setPressure(0.10)
+
+	weighFn := func(_ string, v int) uint64 {
+		if v < 0 {
+			return 0
+		}
+		return uint64(v)
+	}
+
+	makeOpts := func(backend lru.Backend, dest *[]evictEvent) []lru.Option {
+		return []lru.Option{
+			lru.WithBackend(backend),
+			lru.WithInvariantChecking(true),
+			lru.WithWeigher(weighFn),
+			lru.WithPressureFunc(func() float64 {
+				return math.Float64frombits(pressureBits.Load())
+			}),
+			lru.WithCompactionThreshold(0.75),
+			lru.WithEvictionThreshold(0.90),
+			lru.WithEvictionRetentionRatio(0.50),
+			lru.WithOnEvictEntry(func(k string, v int, r lru.EvictionReason) {
+				*dest = append(*dest, evictEvent{key: k, val: v, reason: r})
+			}),
+		}
+	}
+
+	const maxCap = uint64(600)
+	mapC := lru.New[int](maxCap, makeOpts(lru.BackendMap, &mapEvents)...).(lru.PressureAwareCache[int])
+	radixC := lru.New[int](maxCap, makeOpts(lru.BackendRadix, &radixEvents)...).(lru.PressureAwareCache[int])
+	arenaC := lru.New[int](maxCap, makeOpts(lru.BackendArenaRadix, &arenaEvents)...).(lru.PressureAwareCache[int])
+
+	assertParity := func(step string) {
+		t.Helper()
+		var mapKV, radixKV, arenaKV []string
+		for k, v := range mapC.All() {
+			mapKV = append(mapKV, fmt.Sprintf("%x=%d", k, v))
+		}
+		for k, v := range radixC.All() {
+			radixKV = append(radixKV, fmt.Sprintf("%x=%d", k, v))
+		}
+		for k, v := range arenaC.All() {
+			arenaKV = append(arenaKV, fmt.Sprintf("%x=%d", k, v))
+		}
+		require.Equal(t, mapKV, radixKV, "Map vs Radix All() mismatch at %s", step)
+		require.Equal(t, mapKV, arenaKV, "Map vs Arena All() mismatch at %s", step)
+
+		ms := mapC.Stats()
+		rs := radixC.Stats()
+		as := arenaC.Stats()
+		require.Equal(t, ms.Len, rs.Len, "Len mismatch at %s", step)
+		require.Equal(t, ms.Len, as.Len, "Len mismatch at %s", step)
+		require.Equal(t, ms.CurrentSize, rs.CurrentSize, "CurrentSize mismatch at %s", step)
+		require.Equal(t, ms.CurrentSize, as.CurrentSize, "CurrentSize mismatch at %s", step)
+		require.Equal(t, ms.ZeroSizeCount, rs.ZeroSizeCount, "ZeroSizeCount mismatch at %s", step)
+		require.Equal(t, ms.ZeroSizeCount, as.ZeroSizeCount, "ZeroSizeCount mismatch at %s", step)
+		require.Equal(t, ms.GetHits, rs.GetHits)
+		require.Equal(t, ms.GetHits, as.GetHits)
+		require.Equal(t, ms.GetMisses, rs.GetMisses)
+		require.Equal(t, ms.GetMisses, as.GetMisses)
+		require.Equal(t, ms.PeekHits, rs.PeekHits)
+		require.Equal(t, ms.PeekHits, as.PeekHits)
+		require.Equal(t, ms.PeekMisses, rs.PeekMisses)
+		require.Equal(t, ms.PeekMisses, as.PeekMisses)
+		require.Equal(t, ms.EvictionsCapacity, rs.EvictionsCapacity)
+		require.Equal(t, ms.EvictionsCapacity, as.EvictionsCapacity)
+		require.Equal(t, ms.EvictionsPressure, rs.EvictionsPressure)
+		require.Equal(t, ms.EvictionsPressure, as.EvictionsPressure)
+		require.Equal(t, ms.EvictionsDeleted, rs.EvictionsDeleted)
+		require.Equal(t, ms.EvictionsDeleted, as.EvictionsDeleted)
+		require.Equal(t, ms.EvictionsReplaced, rs.EvictionsReplaced)
+		require.Equal(t, ms.EvictionsReplaced, as.EvictionsReplaced)
+		require.ElementsMatch(t, mapEvents, radixEvents, "Map vs Radix eviction multiset mismatch at %s", step)
+		require.ElementsMatch(t, mapEvents, arenaEvents, "Map vs Arena eviction multiset mismatch at %s", step)
+	}
+
+	putAll := func(k string, v int) {
+		evM, errM := mapC.Put(k, v)
+		evR, errR := radixC.Put(k, v)
+		evA, errA := arenaC.Put(k, v)
+		require.Equal(t, errM, errR)
+		require.Equal(t, errM, errA)
+		require.Equal(t, evM, evR)
+		require.Equal(t, evM, evA)
+	}
+
+	// 1. Insert empty key, interior null bytes, invalid UTF-8, and all 256 single-byte keys.
+	specialKeys := []string{
+		"",
+		"\x00",
+		"\x00\x00",
+		"a\x00b\xffc",
+		"\xfe\xff\x80\x81",
+		"\xff\x00\xff",
+	}
+	for i, k := range specialKeys {
+		putAll(k, (i%5)+1)
+	}
+	for b := range 256 {
+		putAll(string([]byte{byte(b)}), (b%4)+1)
+	}
+	assertParity("after-256-single-byte-keys")
+
+	// 2. Insert an 80-level deep prefix chain (exceeding the [64] stack buffer in reconstructKey/hashNodeKey/freeSubtree).
+	for depth := 1; depth <= 80; depth++ {
+		k := strings.Repeat("x", depth)
+		val := (depth % 7) + 1
+		if depth%10 == 0 {
+			val = -1 // weight 0
+		}
+		putAll(k, val)
+	}
+	assertParity("after-depth-80-chain")
+
+	// 3. Interleaved Get, Peek, Replace (grow, shrink, zero-weight, !canFit self-evict, >maxSize self-evict).
+	probeKeys := []string{"", "\x00", "a\x00b\xffc", strings.Repeat("x", 65), strings.Repeat("x", 80), "missing_key"}
+	for _, k := range probeKeys {
+		vM, okM := mapC.Get(k)
+		vR, okR := radixC.Get(k)
+		vA, okA := arenaC.Get(k)
+		require.Equal(t, okM, okR)
+		require.Equal(t, okM, okA)
+		require.Equal(t, vM, vR)
+		require.Equal(t, vM, vA)
+
+		pM, pokM := mapC.Peek(k)
+		pR, pokR := radixC.Peek(k)
+		pA, pokA := arenaC.Peek(k)
+		require.Equal(t, pokM, pokR)
+		require.Equal(t, pokM, pokA)
+		require.Equal(t, pM, pR)
+		require.Equal(t, pM, pA)
+	}
+	assertParity("after-get-peek-probes")
+
+	k65 := strings.Repeat("x", 65)
+	putAll(k65, 5)
+	// Replace grow, shrink, zero-weight, and >maxSize self-eviction.
+	for _, newVal := range []int{12, 3, -1, int(maxCap) + 50} {
+		errM := mapC.Replace(k65, newVal)
+		errR := radixC.Replace(k65, newVal)
+		errA := arenaC.Replace(k65, newVal)
+		require.Equal(t, errM, errR)
+		require.Equal(t, errM, errA)
+		assertParity(fmt.Sprintf("after-replace-%d", newVal))
+	}
+
+	// 4. DeletePrefix at depth 65, mid-edge split prefix, and non-matching prefix.
+	for _, pfx := range []string{strings.Repeat("x", 65), "a\x00", "nonexistent_prefix_"} {
+		mapC.DeletePrefix(pfx)
+		radixC.DeletePrefix(pfx)
+		arenaC.DeletePrefix(pfx)
+		assertParity("after-delete-prefix-" + fmt.Sprintf("%x", pfx))
+	}
+
+	// 5. Tier 1 Compaction and Tier 2 Pressure Shedding.
+	setPressure(0.80)
+	require.Empty(t, mapC.EvaluateMemoryPressure())
+	require.Empty(t, radixC.EvaluateMemoryPressure())
+	require.Empty(t, arenaC.EvaluateMemoryPressure())
+	assertParity("after-tier1-pressure")
+
+	setPressure(0.95)
+	evM := mapC.EvaluateMemoryPressure()
+	evR := radixC.EvaluateMemoryPressure()
+	evA := arenaC.EvaluateMemoryPressure()
+	require.Equal(t, evM, evR)
+	require.Equal(t, evM, evA)
+	assertParity("after-tier2-pressure")
+
+	// 6. Explicit Compact and full clear via DeletePrefix("").
+	mapC.Compact()
+	radixC.Compact()
+	arenaC.Compact()
+	assertParity("after-explicit-compact")
+
+	mapC.DeletePrefix("")
+	radixC.DeletePrefix("")
+	arenaC.DeletePrefix("")
+	assertParity("after-delete-prefix-empty")
+}
+
+func TestDifferential_BinaryUTF8AndZeroWeightStorm(t *testing.T) {
+	t.Run("BinaryKeys_HighBit_NullBytes_UTF8_And_SingleByteChain_Depth80", runBinaryKeysDifferentialTest)
+
+	t.Run("ZeroWeightStorm_MixedWithWeightedEntries_And_PressureShedding", func(t *testing.T) {
+		// Arrange
+		var pressureBits atomic.Uint64
+		setPressure := func(p float64) {
+			pressureBits.Store(math.Float64bits(p))
+		}
+		setPressure(0.10)
+
+		weighFn := func(_ string, v int) uint64 {
+			if v <= 0 {
+				return 0
+			}
+			return uint64(v)
+		}
+
+		makeCache := func(b lru.Backend) lru.PressureAwareCache[int] {
+			return lru.New[int](500,
+				lru.WithBackend(b),
+				lru.WithInvariantChecking(true),
+				lru.WithWeigher(weighFn),
+				lru.WithPressureFunc(func() float64 {
+					return math.Float64frombits(pressureBits.Load())
+				}),
+				lru.WithCompactionThreshold(0.75),
+				lru.WithEvictionThreshold(0.90),
+				lru.WithEvictionRetentionRatio(0.50),
+			).(lru.PressureAwareCache[int])
+		}
+
+		mapC := makeCache(lru.BackendMap)
+		radixC := makeCache(lru.BackendRadix)
+		arenaC := makeCache(lru.BackendArenaRadix)
+
+		// Act: Insert 200 zero-weight entries interleaved with 50 weighted entries (weight=10, total=500).
+		for i := range 250 {
+			var k string
+			var v int
+			if i%5 == 0 {
+				k = fmt.Sprintf("weighted/g%02d/k%03d", i%10, i)
+				v = 10
+			} else {
+				k = fmt.Sprintf("zero/g%02d/k%03d", i%10, i)
+				v = 0
+			}
+			_, errM := mapC.Put(k, v)
+			_, errR := radixC.Put(k, v)
+			_, errA := arenaC.Put(k, v)
+			require.NoError(t, errM)
+			require.NoError(t, errR)
+			require.NoError(t, errA)
+		}
+
+		require.Equal(t, 250, mapC.Stats().Len)
+		require.Equal(t, 200, mapC.Stats().ZeroSizeCount)
+		require.Equal(t, uint64(500), mapC.Stats().CurrentSize)
+		require.Equal(t, mapC.Stats().ZeroSizeCount, radixC.Stats().ZeroSizeCount)
+		require.Equal(t, mapC.Stats().ZeroSizeCount, arenaC.Stats().ZeroSizeCount)
+
+		// Transition weights via Replace: 0 -> 10, 10 -> 0, and >maxSize self-eviction.
+		for _, c := range []lru.PressureAwareCache[int]{mapC, radixC, arenaC} {
+			require.NoError(t, c.Replace("weighted/g00/k000", 0))
+			require.NoError(t, c.Replace("zero/g01/k001", 10))
+			require.NoError(t, c.Replace("weighted/g05/k005", 600)) // self-evicts
+		}
+		require.Equal(t, mapC.Stats().ZeroSizeCount, radixC.Stats().ZeroSizeCount)
+		require.Equal(t, mapC.Stats().ZeroSizeCount, arenaC.Stats().ZeroSizeCount)
+		require.Equal(t, mapC.Stats().CurrentSize, radixC.Stats().CurrentSize)
+		require.Equal(t, mapC.Stats().CurrentSize, arenaC.Stats().CurrentSize)
+
+		// Trigger Tier 2 pressure shedding (50% retention).
+		setPressure(0.95)
+		evM := mapC.EvaluateMemoryPressure()
+		evR := radixC.EvaluateMemoryPressure()
+		evA := arenaC.EvaluateMemoryPressure()
+
+		// Assert
+		require.Equal(t, evM, evR)
+		require.Equal(t, evM, evA)
+		require.LessOrEqual(t, mapC.Stats().CurrentSize, uint64(250))
+		require.LessOrEqual(t, mapC.Stats().ZeroSizeCount, 100)
+		require.Equal(t, mapC.Stats().ZeroSizeCount, arenaC.Stats().ZeroSizeCount)
+	})
+
+	t.Run("DeletePrefixEmpty_vs_NonEmpty_PressureSamplingAndCallbackOrderCharacterization", func(t *testing.T) {
+		// Arrange
+		recordOrder := func(b lru.Backend, prefix string) ([]string, lru.Stats) {
+			var evictedKeys []string
+			pressure := 0.10
+			c := lru.New[int](100,
+				lru.WithBackend(b),
+				lru.WithPressureFunc(func() float64 { return pressure }),
+				lru.WithOnEvictEntry(func(k string, _ int, r lru.EvictionReason) {
+					if r == lru.EvictionReasonDeleted {
+						evictedKeys = append(evictedKeys, k)
+					}
+				}),
+			)
+			// Insert in order p/c, p/a, p/b so MRU-to-LRU is [p/b, p/a, p/c]
+			// while lexicographical DFS order is [p/a, p/b, p/c].
+			_, _ = c.Put("p/c", 1)
+			_, _ = c.Put("p/a", 2)
+			_, _ = c.Put("p/b", 3)
+
+			pressure = 0.85
+			c.DeletePrefix(prefix)
+			return evictedKeys, c.Stats()
+		}
+
+		// Act: When prefix == "", all 3 backends iterate head -> tail (MRU-to-LRU: p/b, p/a, p/c).
+		mapEmptyKeys, mapEmptyStats := recordOrder(lru.BackendMap, "")
+		radixEmptyKeys, radixEmptyStats := recordOrder(lru.BackendRadix, "")
+		arenaEmptyKeys, arenaEmptyStats := recordOrder(lru.BackendArenaRadix, "")
+
+		// Assert
+		assert.Equal(t, []string{"p/b", "p/a", "p/c"}, mapEmptyKeys)
+		assert.Equal(t, []string{"p/b", "p/a", "p/c"}, arenaEmptyKeys)
+		assert.Equal(t, []string{"p/b", "p/a", "p/c"}, radixEmptyKeys)
+
+		// DeletePrefix("") samples PressureFunc via lockWithPressure, updating MemoryPressure to 0.85.
+		assert.InDelta(t, 0.85, mapEmptyStats.MemoryPressure, 1e-9)
+		assert.InDelta(t, 0.85, radixEmptyStats.MemoryPressure, 1e-9)
+		assert.InDelta(t, 0.85, arenaEmptyStats.MemoryPressure, 1e-9)
+
+		// When prefix == "p/":
+		// RadixCache and ArenaRadixCache both traverse in lexicographical DFS order (p/a, p/b, p/c),
+		// and all 3 backends sample PressureFunc (updating MemoryPressure to 0.85).
+		_, mapPfxStats := recordOrder(lru.BackendMap, "p/")
+		radixPfxKeys, radixPfxStats := recordOrder(lru.BackendRadix, "p/")
+		arenaPfxKeys, arenaPfxStats := recordOrder(lru.BackendArenaRadix, "p/")
+
+		assert.Equal(t, []string{"p/a", "p/b", "p/c"}, radixPfxKeys)
+		assert.Equal(t, []string{"p/a", "p/b", "p/c"}, arenaPfxKeys)
+		assert.InDelta(t, 0.85, mapPfxStats.MemoryPressure, 1e-9)
+		assert.InDelta(t, 0.85, radixPfxStats.MemoryPressure, 1e-9)
+		assert.InDelta(t, 0.85, arenaPfxStats.MemoryPressure, 1e-9)
+	})
+
+	t.Run("ArenaNodeSlack_vs_EntrySlack_CompactionDivergenceCharacterization", func(t *testing.T) {
+		// Arrange: Construct a workload where intermediate routing nodes are split and freed.
+		// Under Tier 1 pressure (0.80), ArenaRadixCache.shouldAutoCompactLocked checks
+		// node-level free-list slack (freeCount*4 >= len(nodes)), whereas MapCache and
+		// RadixCache check entry-level shrinkage ((peakEntryLen-len)*4 >= peakEntryLen).
+		pressure := 0.10
+		makeOpts := func(b lru.Backend) []lru.Option {
+			return []lru.Option{
+				lru.WithBackend(b),
+				lru.WithPressureFunc(func() float64 { return pressure }),
+				lru.WithCompactionThreshold(0.75),
+				lru.WithEvictionThreshold(0.90),
+			}
+		}
+		mapC := lru.New[int](1000, makeOpts(lru.BackendMap)...)
+		radixC := lru.New[int](1000, makeOpts(lru.BackendRadix)...)
+		arenaC := lru.New[int](1000, makeOpts(lru.BackendArenaRadix)...)
+
+		// Populate 32 entries: 16 pairs of sibling keys under distinct prefixes
+		// (32 leaf nodes + 16 routing nodes + 1 root = 49 arena nodes).
+		for i := range 16 {
+			k1 := fmt.Sprintf("branch_%03d/leaf_a", i)
+			k2 := fmt.Sprintf("branch_%03d/leaf_b", i)
+			for _, c := range []lru.Cache[int]{mapC, radixC, arenaC} {
+				_, _ = c.Put(k1, i)
+				_, _ = c.Put(k2, i)
+			}
+		}
+
+		// Act: Raise pressure to Tier 1 (0.80) and delete 1 leaf from 7 branches.
+		// Entry shrinkage is only 7/32 = 21.875% (< 25%), so MapCache and RadixCache do NOT compact.
+		// However, each deleted leaf in ArenaRadixCache also collapses its single-child routing node
+		// via compressPathUpwards, freeing 2 arena nodes per delete (14 freed nodes / 49 total >= 25%)!
+		pressure = 0.80
+		for i := range 7 {
+			k1 := fmt.Sprintf("branch_%03d/leaf_a", i)
+			for _, c := range []lru.Cache[int]{mapC, radixC, arenaC} {
+				_, _ = c.Delete(k1)
+			}
+		}
+
+		// Assert
+		assert.Equal(t, uint64(0), mapC.Stats().CompactionsPressureTier1)
+		assert.Equal(t, uint64(0), radixC.Stats().CompactionsPressureTier1)
+		assert.Equal(t, uint64(1), arenaC.Stats().CompactionsPressureTier1)
+
+		// Despite compaction counter divergence, key-value and LRU ordering remain 100% identical.
+		require.Equal(t, slices.Collect(mapC.Keys()), slices.Collect(radixC.Keys()))
+		require.Equal(t, slices.Collect(mapC.Keys()), slices.Collect(arenaC.Keys()))
+	})
 }

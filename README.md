@@ -108,7 +108,7 @@ All three backends (`MapCache`, `RadixCache`, and `ArenaRadixCache`) also implem
 | `WithEvictionThreshold(float64)` | `0.90` (`DefaultEvictionThreshold`) | All engines | Tier 2 Critical Pressure threshold triggering proactive LRU tail shedding + compaction |
 | `WithEvictionRetentionRatio(float64)` | `0.50` (`DefaultEvictionRetentionRatio`) | All engines | Target fraction `[0.0, 1.0]` of `maxSize` retained during Tier 2 Critical Pressure shedding |
 
-Eviction callbacks receive an `EvictionReason` (`EvictionReasonCapacity`, `EvictionReasonPressure`, `EvictionReasonDeleted`, or `EvictionReasonReplaced`) and run synchronously inside the mutating operation under the cache's write lock (must not re-enter the same `Cache` instance).
+Eviction callbacks receive an `EvictionReason` (`EvictionReasonCapacity`, `EvictionReasonPressure`, `EvictionReasonDeleted`, or `EvictionReasonReplaced`) and run synchronously inside the mutating operation after the cache's write lock is released (serialized per cache via `evictCallbackMu`, safely supporting re-entrant calls into the same or other `Cache` instances).
 
 ---
 
@@ -162,7 +162,7 @@ go test -v -run=^Example ./...
 cd otellru && go test -race ./... && go test -v -run=^Example ./...
 
 # Run benchmarks and verify absolute performance targets & regression thresholds
-go test -run=^$ -bench=. -benchmem -benchtime=10ms ./... | go run ./cmd/benchcheck -head -
+go test -run=^$ -bench=^Benchmark_ -benchmem -benchtime=10ms ./... | go run ./cmd/benchcheck -head -
 ```
 
 ---

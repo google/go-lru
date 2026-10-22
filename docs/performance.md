@@ -76,24 +76,27 @@ go test -run=^$ -bench="Benchmark_(LargeScale|ArenaRadixCache)" -benchmem ./...
 
 # Run live heap footprint (heap-B/entry) and compaction reclamation (reclaimed-B/op) benchmarks
 go test -run=^$ -bench="Benchmark_(LargeScale_Put_100K|ArenaRadixCache_Compact)" -benchmem ./...
+
+# Run extended production characterization benchmarks (Zipfian/Uniform, payload sizes, concurrency scaling, GC pause)
+go test -run=^$ -bench="Benchmark(KeyDistributions|PayloadSizes|ConcurrencyScaling|CompactionAndPressureShedLatency|GCPauseAndScanOverhead|PressureSamplingAndCallbacks|CustomPressureFuncOverhead)" -benchmem .
 ```
 
 ---
 
 ## 5. Enforcing Performance Targets & Regression Thresholds (`./cmd/benchcheck`)
 
-`./cmd/benchcheck` is a zero-dependency Go command that parses `go test -bench=. -benchmem` output (including multi-sample `-count=N` runs and custom metrics `heap-B/entry` and `reclaimed-B/op`), enforces calibrated absolute performance and zero-allocation targets across all 89 repository benchmarks, and detects relative regressions between a baseline and candidate run.
+`./cmd/benchcheck` is a zero-dependency Go command that parses `go test -bench=^Benchmark_ -benchmem` output (including multi-sample `-count=N` runs and custom metrics `heap-B/entry` and `reclaimed-B/op`), enforces calibrated absolute performance and zero-allocation targets across all 89 target-enforced `Benchmark_*` sub-benchmarks, and detects relative regressions between a baseline and candidate run.
 
 ### Local Target & Regression Verification
 
 ```bash
-# 1. Run benchmarks and enforce absolute performance & zero-allocation targets directly via stdin
-go test -run=^$ -bench=. -benchmem -benchtime=10ms ./... | go run ./cmd/benchcheck -head -
+# 1. Run target-enforced benchmarks and verify absolute performance & zero-allocation targets directly via stdin
+go test -run=^$ -bench=^Benchmark_ -benchmem -benchtime=10ms ./... | go run ./cmd/benchcheck -head -
 
 # 2. Save a baseline benchmark run (e.g., on main) and compare a candidate branch against it
-go test -run=^$ -bench=. -benchmem -benchtime=10ms -count=6 ./... | tee benchmark-base.txt
+go test -run=^$ -bench=^Benchmark_ -benchmem -benchtime=10ms -count=6 ./... | tee benchmark-base.txt
 # ... apply code changes ...
-go test -run=^$ -bench=. -benchmem -benchtime=10ms -count=6 ./... | tee benchmark-head.txt
+go test -run=^$ -bench=^Benchmark_ -benchmem -benchtime=10ms -count=6 ./... | tee benchmark-head.txt
 go run ./cmd/benchcheck -base benchmark-base.txt -head benchmark-head.txt -format text
 ```
 

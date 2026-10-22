@@ -16,6 +16,7 @@ package lru
 
 import (
 	"fmt"
+	"runtime"
 	"slices"
 	"strings"
 	"testing"
@@ -829,13 +830,15 @@ func TestRadixCache_CheckInvariants_PanicScenarios(t *testing.T) {
 // unsafe.StringData(c.root.child.prefix) deterministically verifies zero substring backing-array retention.
 func TestRadixCache_RoutingPrefixDoesNotPinLargeKeyBackingArray(t *testing.T) {
 	// Arrange
-	largeKey := strings.Clone("dir/" + strings.Repeat("X", 1<<16))
-	largeStart := uintptr(unsafe.Pointer(unsafe.StringData(largeKey)))
-	largeEnd := largeStart + uintptr(len(largeKey))
-
 	c := NewRadixCache[string](1<<20, WithInvariantChecking(true)).(*radixCache[string])
+	largeKey := strings.Clone("dir/" + strings.Repeat("X", 1<<16))
+
 	_, err := c.Put(largeKey, "v")
 	require.NoError(t, err)
+	require.NotNil(t, c.root.child)
+	pinnedInitialPrefix := c.root.child.prefix
+	largeStart := uintptr(unsafe.Pointer(unsafe.StringData(pinnedInitialPrefix)))
+	largeEnd := largeStart + uintptr(len(pinnedInitialPrefix))
 
 	// Act: Split "dir/..." at "dir/" and erase the large key.
 	_, err = c.Put("dir/a", "va")
@@ -844,12 +847,13 @@ func TestRadixCache_RoutingPrefixDoesNotPinLargeKeyBackingArray(t *testing.T) {
 	require.NoError(t, err)
 	_, _ = c.Delete(largeKey)
 
-	// Assert: Routing node prefix "dir/" does not alias largeKey's backing array.
+	// Assert: Routing node prefix "dir/" does not alias pinnedInitialPrefix's 64 KiB backing array.
 	routingNode := c.root.child
 	require.NotNil(t, routingNode)
 	assert.Equal(t, "dir/", routingNode.prefix)
 	prefixPtr := uintptr(unsafe.Pointer(unsafe.StringData(routingNode.prefix)))
 	assert.True(t, prefixPtr < largeStart || prefixPtr >= largeEnd, "routing node prefix must not pin largeKey backing array")
+	runtime.KeepAlive(pinnedInitialPrefix)
 }
 
 func TestRadixCache_PrePutEvictionAvoidsRedundantSplitAndMergeAllocations(t *testing.T) {
