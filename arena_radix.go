@@ -81,6 +81,14 @@ func (c *arenaRadix[V]) notifyEvict(evictQ *evictCallbackQueue[V], key string, v
 	}
 }
 
+func (c *arenaRadix[V]) notifyReplaced(evictQ *evictCallbackQueue[V], key string, oldValue V, oldSize uint64) {
+	c.evictionsReplaced++
+	c.evictedWeightReplaced += oldSize
+	if c.onEvictValue != nil || c.onEvictEntry != nil {
+		evictQ.enqueue(key, oldValue, EvictionReasonReplaced)
+	}
+}
+
 // reconstructKey reconstructs the full key for nodeID by walking the ancestor chain up to c.root.
 // It is invoked when onEvictEntry is non-nil (and the caller does not already have the key in hand)
 // or during All() / Keys() iteration.
@@ -313,17 +321,15 @@ func (c *arenaRadix[V]) verifyKey(nodeID uint32, key string) bool {
 	end := len(key)
 
 	for curr != c.root && curr != nilNode {
-		prefix := c.nodes[curr].prefix
+		n := &c.nodes[curr]
+		prefix := n.prefix
 		prefixLen := len(prefix)
 
-		if end < prefixLen {
-			return false
-		}
-		if key[end-prefixLen:end] != prefix {
+		if end < prefixLen || key[end-prefixLen:end] != prefix {
 			return false
 		}
 		end -= prefixLen
-		curr = c.nodes[curr].parent
+		curr = n.parent
 	}
 
 	return end == 0 && curr == c.root
@@ -358,9 +364,18 @@ func (c *arenaRadix[V]) findNodeByTrieWalk(key string) (uint32, bool) {
 	return nilNode, false
 }
 
+//go:noinline
+func (c *arenaRadix[V]) walkNodeKeyFallback(key string, keyHash uint64, heal bool) (uint32, bool) {
+	c.arenaHashFallbacks.Add(1)
+	curr, ok := c.findNodeByTrieWalk(key)
+	if heal && ok {
+		c.promoteCollisionPeerLocked(keyHash, curr)
+	}
+	return curr, ok
+}
+
 func (c *arenaRadix[V]) lookupOrWalkNodeKey(key string, keyHash uint64) (nodeID uint32, walked, found bool) {
-	id, ok := c.nodeMap[keyHash]
-	if ok {
+	if id, ok := c.nodeMap[keyHash]; ok {
 		if id < uint32(len(c.nodes)) && c.nodes[id].hasValue && c.verifyKey(id, key) {
 			return id, false, true
 		}
@@ -370,38 +385,34 @@ func (c *arenaRadix[V]) lookupOrWalkNodeKey(key string, keyHash uint64) (nodeID 
 		// so a map miss is a guaranteed cache miss.
 		return nilNode, false, false
 	}
-	c.arenaHashFallbacks.Add(1)
-	curr, ok := c.findNodeByTrieWalk(key)
+	curr, ok := c.walkNodeKeyFallback(key, keyHash, false)
 	return curr, true, ok
 }
 
 // lookupNodeKeyWithHash finds a value-bearing node index for key using a precomputed FNV-1a hash
 // without mutating c.nodeMap.
 func (c *arenaRadix[V]) lookupNodeKeyWithHash(key string, keyHash uint64) (uint32, bool) {
-	nodeID, _, found := c.lookupOrWalkNodeKey(key, keyHash)
-	return nodeID, found
+	if id, ok := c.nodeMap[keyHash]; ok {
+		if id < uint32(len(c.nodes)) && c.nodes[id].hasValue && c.verifyKey(id, key) {
+			return id, true
+		}
+	} else if len(c.nodeMap)+c.collisionCount == c.len {
+		return nilNode, false
+	}
+	return c.walkNodeKeyFallback(key, keyHash, false)
 }
 
 // getNodeKeyWithHash finds a value-bearing node index for key under exclusive write lock,
 // healing c.nodeMap[keyHash] if resolved via the slow-path trie walk.
 func (c *arenaRadix[V]) getNodeKeyWithHash(key string, keyHash uint64) (uint32, bool) {
-	nodeID, walked, found := c.lookupOrWalkNodeKey(key, keyHash)
-	if walked && found {
-		c.promoteCollisionPeerLocked(keyHash, nodeID)
+	if id, ok := c.nodeMap[keyHash]; ok {
+		if id < uint32(len(c.nodes)) && c.nodes[id].hasValue && c.verifyKey(id, key) {
+			return id, true
+		}
+	} else if len(c.nodeMap)+c.collisionCount == c.len {
+		return nilNode, false
 	}
-	return nodeID, found
-}
-
-// deleteNode clears the value at nodeID and compresses the parent path if needed.
-func (c *arenaRadix[V]) deleteNode(nodeID uint32) {
-	if nodeID == nilNode || !c.nodes[nodeID].hasValue {
-		return
-	}
-
-	var zero V
-	c.nodes[nodeID].value = zero
-	c.nodes[nodeID].hasValue = false
-	c.compressPathUpwards(nodeID)
+	return c.walkNodeKeyFallback(key, keyHash, true)
 }
 
 // compressPathUpwards walks up the tree, pruning empty leaf nodes and merging single-child intermediate routing nodes.
@@ -439,20 +450,20 @@ func (c *arenaRadix[V]) moveToFront(nodeID uint32) {
 	if c.head == nodeID {
 		return
 	}
-	prev := c.nodes[nodeID].prev
-	next := c.nodes[nodeID].next
+	n := &c.nodes[nodeID]
+	prev := n.prev
+	next := n.next
 
 	if prev != nilNode {
 		c.nodes[prev].next = next
 	}
 	if next != nilNode {
 		c.nodes[next].prev = prev
-	}
-	if c.tail == nodeID {
+	} else {
 		c.tail = prev
 	}
-	c.nodes[nodeID].prev = nilNode
-	c.nodes[nodeID].next = c.head
+	n.prev = nilNode
+	n.next = c.head
 	if c.head != nilNode {
 		c.nodes[c.head].prev = nodeID
 	}
@@ -475,11 +486,12 @@ func (c *arenaRadix[V]) pushFront(nodeID uint32) {
 
 // remove unlinks nodeID from the intrusive LRU list.
 func (c *arenaRadix[V]) remove(nodeID uint32) {
-	if c.head != nodeID && c.nodes[nodeID].prev == nilNode {
+	n := &c.nodes[nodeID]
+	if c.head != nodeID && n.prev == nilNode {
 		return
 	}
-	prev := c.nodes[nodeID].prev
-	next := c.nodes[nodeID].next
+	prev := n.prev
+	next := n.next
 
 	if prev != nilNode {
 		c.nodes[prev].next = next
@@ -491,8 +503,8 @@ func (c *arenaRadix[V]) remove(nodeID uint32) {
 	} else {
 		c.tail = prev
 	}
-	c.nodes[nodeID].prev = nilNode
-	c.nodes[nodeID].next = nilNode
+	n.prev = nilNode
+	n.next = nilNode
 	c.len--
 }
 
@@ -547,7 +559,10 @@ func (c *arenaRadix[V]) eraseInternalWithHash(evictQ *evictCallbackQueue[V], nod
 	c.removeOrPromoteNodeMapLocked(hash, nodeID)
 
 	c.remove(nodeID)
-	c.deleteNode(nodeID)
+	var zero V
+	c.nodes[nodeID].value = zero
+	c.nodes[nodeID].hasValue = false
+	c.compressPathUpwards(nodeID)
 
 	c.notifyEvict(evictQ, key, deletedEntry, evictedSize, reason)
 	return deletedEntry, true
@@ -806,16 +821,16 @@ func (c *arenaRadix[V]) shedAndCompactLocked(evictQ *evictCallbackQueue[V], targ
 //
 // Caller MUST hold c.mu.Lock().
 func (c *arenaRadix[V]) maybeReclaimUnderPressureLocked(evictQ *evictCallbackQueue[V], pressure float64, protectedNodeID uint32) []V {
-	if c.isSamplingGoroutine() {
-		return nil
-	}
 	if pressure >= c.options.EvictionThreshold {
+		if c.isSamplingGoroutine() {
+			return nil
+		}
 		retention := c.options.EvictionRetentionRatio
 		targetSize := computeTargetSize(c.maxSize, retention)
 		return c.shedAndCompactLocked(evictQ, targetSize, retention, protectedNodeID)
 	}
 	c.resetZeroWatermarkBelowTier2(pressure)
-	if pressure >= c.options.CompactionThreshold && c.shouldAutoCompactLocked(protectedNodeID) && c.compactDataStructuresLocked() {
+	if pressure >= c.options.CompactionThreshold && c.shouldAutoCompactLocked(protectedNodeID) && !c.isSamplingGoroutine() && c.compactDataStructuresLocked() {
 		c.compactionsPressureTier1++
 		c.markReclaimedLocked()
 	}

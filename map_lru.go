@@ -184,6 +184,14 @@ func (c *mapCache[V]) notifyEvict(evictQ *evictCallbackQueue[V], key string, val
 	}
 }
 
+func (c *mapCache[V]) notifyReplaced(evictQ *evictCallbackQueue[V], key string, oldValue V, oldSize uint64) {
+	c.evictionsReplaced++
+	c.evictedWeightReplaced += oldSize
+	if c.onEvictValue != nil || c.onEvictEntry != nil {
+		evictQ.enqueue(key, oldValue, EvictionReasonReplaced)
+	}
+}
+
 func (c *mapCache[V]) hasSlackLocked() bool {
 	return c.dirtyIndex && (len(c.index) < c.peakEntryLen || c.deletedSinceCompact >= minChurnCompactDeletes)
 }
@@ -327,15 +335,16 @@ func (c *mapCache[V]) finishDeleteReclaimLocked(evictQ *evictCallbackQueue[V], s
 		}
 		reclaimedSingleSurvivor = true
 	}
-	c.maybeReclaimUnderPressureLocked(evictQ, pressure, nil, false)
+	if pressure >= c.options.CompactionThreshold || pressure >= c.options.EvictionThreshold {
+		c.maybeReclaimUnderPressureLocked(evictQ, pressure, nil, false)
+	} else {
+		c.resetZeroWatermarkBelowTier2(pressure)
+	}
 	c.maybeMarkReclaimed(reclaimedSingleSurvivor || c.currentSize < sizeBefore, sampledEpoch, pressure)
 }
 
+//go:noinline
 func (c *mapCache[V]) finishMutationReclaimLocked(evictQ *evictCallbackQueue[V], evictedValues []V, protectedElem *entry[V], reclaimedPre, compactedPre bool, sizeBefore, sampledEpoch uint64, pressure float64) []V {
-	if !reclaimedPre && c.currentSize >= sizeBefore && pressure < c.options.CompactionThreshold && pressure < c.options.EvictionThreshold {
-		c.resetZeroWatermarkBelowTier2(pressure)
-		return evictedValues
-	}
 	evictedByPressure := c.maybeReclaimUnderPressureLocked(evictQ, pressure, protectedElem, false)
 	evictedValues = appendEvicted(evictedValues, evictedByPressure)
 	netByteReduced := c.currentSize < sizeBefore
@@ -374,7 +383,7 @@ func (c *mapCache[V]) updateExistingOnPutLocked(
 	e.size = valueSize
 	c.currentSize += valueSize
 	c.putUpdated++
-	c.notifyEvict(evictQ, e.key, oldValue, oldSize, EvictionReasonReplaced)
+	c.notifyReplaced(evictQ, e.key, oldValue, oldSize)
 	reclaimedPrePut = c.shouldReclaimSingleSurvivorOnMutation(c.entries.Len(), c.hasSlackLocked(), false, evictedPrePut, c.currentSize, sizeBefore, pressure)
 	return evictedValues, reclaimedPrePut
 }
@@ -425,12 +434,18 @@ func (c *mapCache[V]) Put(key string, value V) ([]V, error) {
 		e = c.entries.PushFront(&entry[V]{key: clonedKey, value: value, size: valueSize})
 		c.index[clonedKey] = e
 		c.putInserted++
-		c.onEntryPut(len(c.index), valueSize)
+		c.onEntryPut(c.entries.Len(), valueSize)
 		c.currentSize += valueSize
 	}
 
-	evictedValues = c.finishMutationReclaimLocked(&evictQ, evictedValues, e, reclaimedPrePut, compactedPrePut, sizeBefore, sampledEpoch, pressure)
-	c.unlock()
+	if c.needsMutationReclaim(reclaimedPrePut, c.currentSize, sizeBefore, pressure) {
+		evictedValues = c.finishMutationReclaimLocked(&evictQ, evictedValues, e, reclaimedPrePut, compactedPrePut, sizeBefore, sampledEpoch, pressure)
+	}
+	if c.options.EnableInvariantChecking {
+		c.unlockWithInvariants()
+	} else {
+		c.mu.Unlock()
+	}
 	evictQ.invoke(&c.pressureState, c.onEvictValue, c.onEvictEntry)
 	return evictedValues, nil
 }
@@ -501,62 +516,63 @@ func (c *mapCache[V]) Delete(key string) (V, bool) {
 
 // Get retrieves the value associated with key and updates its position to MRU.
 // Returns the zero value of V and false if key is not found in the cache.
-func (c *mapCache[V]) Get(key string) (V, bool) {
+func (c *mapCache[V]) Get(key string) (value V, ok bool) {
 	c.mu.Lock()
 
-	e, ok := c.index[key]
-	if !ok {
+	e, found := c.index[key]
+	if found {
+		c.getHits++
+		c.entries.MoveToFront(e)
+		value = e.value
+	} else {
 		c.getMisses++
-		c.unlock()
-		var zero V
-		return zero, false
 	}
-	c.getHits++
-	c.entries.MoveToFront(e)
-	val := e.value
-	c.unlock()
-	return val, true
+	if c.options.EnableInvariantChecking {
+		c.unlockWithInvariants()
+	} else {
+		c.mu.Unlock()
+	}
+	return value, found
 }
 
 // Peek retrieves the value associated with key without altering its LRU position.
 // Returns the zero value of V and false if key is not found in the cache.
-func (c *mapCache[V]) Peek(key string) (V, bool) {
+func (c *mapCache[V]) Peek(key string) (value V, ok bool) {
 	c.mu.RLock()
 
-	e, ok := c.index[key]
-	if !ok {
+	e, found := c.index[key]
+	if found {
+		c.peekHits.Add(1)
+		value = e.value
+	} else {
 		c.peekMisses.Add(1)
-		c.rUnlock()
-		var zero V
-		return zero, false
 	}
-	c.peekHits.Add(1)
-	val := e.value
-	c.rUnlock()
-	return val, true
+	if c.options.EnableInvariantChecking {
+		c.rUnlockWithInvariants()
+	} else {
+		c.mu.RUnlock()
+	}
+	return value, found
 }
 
-func (c *mapCache[V]) canFitGrowthLocked(e *entry[V], newSize, sizeDelta, avail uint64) bool {
+func (c *mapCache[V]) canFitGrowthLocked(e *entry[V], maxNewer, sizeDelta, avail uint64) bool {
 	if sizeDelta <= avail {
 		return true
 	}
-	maxNewer := c.maxSize - newSize
 	var newerSize uint64
-	headCurr := c.entries.Front()
-	tailCurr := c.entries.Back()
+	headCurr := c.entries.head
+	tailCurr := c.entries.tail
 	for {
 		if headCurr == e {
-			return newerSize <= maxNewer
+			return true
 		}
-		if headCurr != nil {
-			newerSize += headCurr.size
-			if newerSize > maxNewer {
-				return false
-			}
-			headCurr = headCurr.next
+		newerSize += headCurr.size
+		if newerSize > maxNewer {
+			return false
 		}
-		if tailCurr == nil || tailCurr == e {
-			return sizeDelta <= avail
+		headCurr = headCurr.next
+		if tailCurr == e {
+			return false
 		}
 		avail += tailCurr.size
 		if sizeDelta <= avail {
@@ -569,7 +585,7 @@ func (c *mapCache[V]) canFitGrowthLocked(e *entry[V], newSize, sizeDelta, avail 
 func (c *mapCache[V]) replaceResizeOrEvictLocked(evictQ *evictCallbackQueue[V], e *entry[V], key string, oldSize, newSize, sizeBefore, sampledEpoch uint64, pressure float64) (evictedAny, selfEvicted bool) {
 	if newSize > oldSize {
 		sizeDelta := newSize - oldSize
-		if newSize > c.maxSize || !c.canFitGrowthLocked(e, newSize, sizeDelta, c.maxSize-c.currentSize) {
+		if newSize > c.maxSize || !c.canFitGrowthLocked(e, c.maxSize-newSize, sizeDelta, c.maxSize-c.currentSize) {
 			c.replaceSelfEvicted++
 			c.eraseInternal(evictQ, key, EvictionReasonCapacity)
 			c.finishDeleteReclaimLocked(evictQ, sizeBefore, sampledEpoch, pressure)
@@ -630,15 +646,10 @@ func (c *mapCache[V]) Replace(key string, value V) error {
 	e.value = value
 	e.size = newSize
 	c.replaceUpdated++
-	c.evictionsReplaced++
-	c.evictedWeightReplaced += oldSize
-	hasEvictCB := c.onEvictValue != nil || c.onEvictEntry != nil
-	if hasEvictCB {
-		evictQ.enqueue(e.key, oldValue, EvictionReasonReplaced)
-	}
+	c.notifyReplaced(&evictQ, e.key, oldValue, oldSize)
 
 	reclaimedPreUpdate := c.shouldReclaimSingleSurvivorOnMutation(c.entries.Len(), c.dirtyIndex, false, evictedAny, c.currentSize, sizeBefore, pressure)
-	if reclaimedPreUpdate || c.currentSize < sizeBefore || pressure >= c.options.CompactionThreshold || pressure >= c.options.EvictionThreshold {
+	if c.needsMutationReclaim(reclaimedPreUpdate, c.currentSize, sizeBefore, pressure) {
 		c.finishMutationReclaimLocked(&evictQ, nil, e, reclaimedPreUpdate, false, sizeBefore, sampledEpoch, pressure)
 	}
 	c.unlock()
@@ -657,19 +668,22 @@ func (c *mapCache[V]) deleteAllPrefixLocked(evictQ *evictCallbackQueue[V], sampl
 	hadReclaimable := c.currentSize > 0 || hadDirtySlack
 	c.deletedSinceCompact += c.entries.Len()
 	hadCompactionSlack := c.hasEmptyDeleteSlack(false)
+	c.evictionsDeleted += uint64(c.entries.Len())
+	c.evictedWeightDeleted += c.currentSize
+	hasEvictCB := c.onEvictValue != nil || c.onEvictEntry != nil
 	var zero V
 	for e := c.entries.Front(); e != nil; {
 		next := e.next
 		evictedKey := e.key
 		evictedVal := e.value
-		evictedSize := e.size
-		c.currentSize -= evictedSize
 		e.key = ""
 		e.value = zero
 		e.size = 0
 		e.prev = nil
 		e.next = nil
-		c.notifyEvict(evictQ, evictedKey, evictedVal, evictedSize, EvictionReasonDeleted)
+		if hasEvictCB {
+			evictQ.enqueue(evictedKey, evictedVal, EvictionReasonDeleted)
+		}
 		e = next
 	}
 	c.entries.Init()
@@ -692,11 +706,11 @@ func (c *mapCache[V]) DeletePrefix(prefix string) {
 		}
 		c.mu.Unlock()
 
-		sampledEpoch, pressure := c.lockWithPressure(&c.mu, false)
 		var evictQ evictCallbackQueue[V]
-		defer evictQ.invoke(&c.pressureState, c.onEvictValue, c.onEvictEntry)
-		defer c.unlock()
+		sampledEpoch, pressure := c.lockWithPressure(&c.mu, false)
 		c.deleteAllPrefixLocked(&evictQ, sampledEpoch, pressure)
+		c.unlock()
+		evictQ.invoke(&c.pressureState, c.onEvictValue, c.onEvictEntry)
 		return
 	}
 
@@ -772,19 +786,19 @@ func (c *mapCache[V]) values(yield func(V) bool) {
 func (c *mapCache[V]) Stats() Stats {
 	c.mu.RLock()
 	st := c.snapshotBaseStats(BackendMap, c.currentSize, c.maxSize, c.entries.Len())
-	c.rUnlock()
+	if c.options.EnableInvariantChecking {
+		c.rUnlockWithInvariants()
+	} else {
+		c.mu.RUnlock()
+	}
 	return st
-}
-
-func (c *mapCache[V]) shouldAutoCompactLocked(isBackground bool) bool {
-	return c.shouldAutoCompactEntryCounts(c.hasSlackLocked(), isBackground, len(c.index))
 }
 
 // Compact reallocates the internal hash index to reclaim Go map bucket slack while preserving all live entries.
 func (c *mapCache[V]) Compact() {
 	c.mu.Lock()
-	defer c.unlock()
 	c.compactLocked()
+	c.unlock()
 }
 
 func (c *mapCache[V]) compactDataStructuresLocked() bool {
@@ -819,7 +833,7 @@ func (c *mapCache[V]) completeShedAndCompactLocked(evictedCount int, retention f
 		c.updateZeroWatermarkAfterShed(retention, c.entries.Len(), unadjusted, unprotectedZeroTarget, targetLen)
 	}
 	compacted := false
-	if c.shouldAutoCompactLocked(isBackground) {
+	if c.shouldAutoCompactMap(c.dirtyIndex, isBackground, c.entries.Len()) {
 		compacted = c.compactDataStructuresLocked()
 		if compacted {
 			c.compactionsPressureTier2++
@@ -859,20 +873,18 @@ func (c *mapCache[V]) shedAndCompactLocked(evictQ *evictCallbackQueue[V], target
 }
 
 func (c *mapCache[V]) maybeReclaimUnderPressureLocked(evictQ *evictCallbackQueue[V], pressure float64, protectedElem *entry[V], isBackground bool) []V {
-	if c.isSamplingGoroutine() {
-		return nil
-	}
 	if pressure >= c.options.EvictionThreshold {
+		if c.isSamplingGoroutine() {
+			return nil
+		}
 		retention := c.options.EvictionRetentionRatio
 		targetSize := computeTargetSize(c.maxSize, retention)
 		return c.shedAndCompactLocked(evictQ, targetSize, retention, protectedElem, isBackground)
 	}
 	c.resetZeroWatermarkBelowTier2(pressure)
-	if pressure >= c.options.CompactionThreshold && c.shouldAutoCompactLocked(isBackground) {
-		if c.compactDataStructuresLocked() {
-			c.compactionsPressureTier1++
-			c.markReclaimedLocked()
-		}
+	if pressure >= c.options.CompactionThreshold && c.shouldAutoCompactMap(c.dirtyIndex, isBackground, c.entries.Len()) && !c.isSamplingGoroutine() && c.compactDataStructuresLocked() {
+		c.compactionsPressureTier1++
+		c.markReclaimedLocked()
 	}
 	return nil
 }
@@ -880,10 +892,10 @@ func (c *mapCache[V]) maybeReclaimUnderPressureLocked(evictQ *evictCallbackQueue
 // EvaluateMemoryPressure samples the configured memory-pressure probe and executes
 // Tier 2 (LRU shedding + map compaction) or Tier 1 (lossless map compaction) if thresholds are met.
 func (c *mapCache[V]) EvaluateMemoryPressure() []V {
-	_, pressure := c.lockWithPressure(&c.mu, true)
 	var evictQ evictCallbackQueue[V]
-	defer evictQ.invoke(&c.pressureState, c.onEvictValue, c.onEvictEntry)
-	defer c.unlock()
-
-	return c.maybeReclaimUnderPressureLocked(&evictQ, pressure, nil, true)
+	_, pressure := c.lockWithPressure(&c.mu, true)
+	evicted := c.maybeReclaimUnderPressureLocked(&evictQ, pressure, nil, true)
+	c.unlock()
+	evictQ.invoke(&c.pressureState, c.onEvictValue, c.onEvictEntry)
+	return evicted
 }

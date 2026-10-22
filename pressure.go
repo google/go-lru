@@ -1448,8 +1448,9 @@ func (p *pressureState) recordLastSampledTelemetryLocked(invokeSeq uint64, val f
 	if !stored && p.pressureInitialized.Load() && p.cachedPressureEpoch.Load() == p.reclaimEpoch.Load() {
 		return
 	}
-	if stored || invokeSeq == 0 || invokeSeq >= p.lastSampledSeq.Load() {
-		if invokeSeq > p.lastSampledSeq.Load() {
+	lastSeq := p.lastSampledSeq.Load()
+	if stored || invokeSeq >= lastSeq {
+		if invokeSeq > lastSeq {
 			p.lastSampledSeq.Store(invokeSeq)
 		}
 		p.lastSampledPressureBits.Store(math.Float64bits(val))
@@ -1772,6 +1773,14 @@ func (p *pressureState) shouldAutoCompactEntryCounts(isDirty, isBackground bool,
 	return p.deletedSinceCompact >= minChurnCompactDeletes && p.deletedSinceCompact >= currentLen
 }
 
+func (p *pressureState) shouldAutoCompactMap(dirty, isBackground bool, currentLen int) bool {
+	return p.shouldAutoCompactEntryCounts(dirty && (currentLen < p.peakEntryLen || p.deletedSinceCompact >= minChurnCompactDeletes), isBackground, currentLen)
+}
+
+func (p *pressureState) needsMutationReclaim(reclaimedPre bool, currentSize, sizeBefore uint64, pressure float64) bool {
+	return reclaimedPre || currentSize < sizeBefore || pressure >= p.options.CompactionThreshold || pressure >= p.options.EvictionThreshold
+}
+
 func (p *pressureState) hasEmptyDeleteSlack(extraSlack bool) bool {
 	return extraSlack || p.peakEntryLen > minPeakSlackEntries || p.deletedSinceCompact >= minChurnCompactDeletes
 }
@@ -1780,8 +1789,16 @@ func (p *pressureState) shouldReclaimSingleSurvivorOnDelete(currentLen int, isDi
 	return currentLen == 1 && isDirty && (extraChurn || p.peakEntryLen >= minChurnCompactDeletes || p.deletedSinceCompact >= minChurnCompactDeletes)
 }
 
+//go:noinline
+func (p *pressureState) shouldReclaimEmptyPrePutSlow(extraChurn, evictedPre bool, newSize, sizeBefore uint64, pressure float64) bool {
+	return extraChurn || p.peakEntryLen >= minChurnCompactDeletes || p.deletedSinceCompact >= minChurnCompactDeletes || (evictedPre && newSize < sizeBefore && p.hasElevatedPressureToInvalidate(pressure))
+}
+
 func (p *pressureState) shouldReclaimEmptyPrePut(currentLen int, extraChurn, evictedPre bool, newSize, sizeBefore uint64, pressure float64) bool {
-	return currentLen == 0 && (extraChurn || p.peakEntryLen >= minChurnCompactDeletes || p.deletedSinceCompact >= minChurnCompactDeletes || (evictedPre && newSize < sizeBefore && p.hasElevatedPressureToInvalidate(pressure)))
+	if currentLen == 0 {
+		return p.shouldReclaimEmptyPrePutSlow(extraChurn, evictedPre, newSize, sizeBefore, pressure)
+	}
+	return false
 }
 
 //go:noinline
@@ -1805,7 +1822,7 @@ func (p *pressureState) shouldCompactAfterMutation(reclaimedPre, netByteReduced,
 }
 
 func (p *pressureState) shouldMarkReclaimedAfterMutation(reclaimedPre, netByteReduced bool, sampledEpoch uint64, pressure float64) bool {
-	return (reclaimedPre || netByteReduced) && p.reclaimEpoch.Load() == sampledEpoch && p.shouldInvalidatePressureOnReclaim(pressure)
+	return (reclaimedPre || netByteReduced) && p.shouldInvalidatePressureOnReclaim(pressure) && p.reclaimEpoch.Load() == sampledEpoch
 }
 
 func (p *pressureState) computeZeroShedTargets(retention float64, hasProtected bool, protectedSize uint64) (targetZeroCount, unprotectedZeroTarget int) {
@@ -1886,12 +1903,7 @@ func (p *pressureState) shouldEvictZeroWeightOnInsert(valueSize, maxSize, curren
 	if valueSize == 0 {
 		return (currentSize >= maxSize && uint64(currentLen) >= maxSize) || uint64(p.zeroSizeCount) >= maxSize
 	}
-	if uint64(p.zeroSizeCount) <= maxSize {
-		return false
-	}
-	excessZero := uint64(p.zeroSizeCount) - maxSize
-	avail := maxSize - currentSize
-	return excessZero >= avail || valueSize > avail-excessZero
+	return uint64(p.zeroSizeCount) > maxSize && uint64(p.zeroSizeCount)-maxSize > maxSize-currentSize-valueSize
 }
 
 func (p *pressureState) shouldEvictPreInsertOnPut(valueSize, maxSize, currentSize uint64, currentLen int, evictedPrePut bool) bool {
@@ -1909,7 +1921,7 @@ func (p *pressureState) shouldEvictOnZeroWeightShrink(oldSize, newSize, maxSize 
 }
 
 func (p *pressureState) maybeMarkReclaimed(reclaimedOrReduced bool, sampledEpoch uint64, pressure float64) {
-	if reclaimedOrReduced && p.reclaimEpoch.Load() == sampledEpoch && p.shouldInvalidatePressureOnReclaim(pressure) {
+	if reclaimedOrReduced && p.shouldInvalidatePressureOnReclaim(pressure) && p.reclaimEpoch.Load() == sampledEpoch {
 		p.markReclaimedLocked()
 	}
 }

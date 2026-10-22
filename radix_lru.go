@@ -114,6 +114,14 @@ func (c *radixCache[V]) notifyEvict(evictQ *evictCallbackQueue[V], key string, v
 	}
 }
 
+func (c *radixCache[V]) notifyReplaced(evictQ *evictCallbackQueue[V], key string, oldValue V, oldSize uint64) {
+	c.evictionsReplaced++
+	c.evictedWeightReplaced += oldSize
+	if c.onEvictValue != nil || c.onEvictEntry != nil {
+		evictQ.enqueue(key, oldValue, EvictionReasonReplaced)
+	}
+}
+
 // reconstructKey reconstructs the full key for node by walking the ancestor chain up to c.root.
 // It is invoked when onEvictEntry is non-nil (and the caller does not already have the key in hand)
 // or during All() / Keys() iteration.
@@ -471,18 +479,6 @@ func (c *radixCache[V]) getNode(key string) (*radixNode[V], bool) {
 	}
 }
 
-// deleteNode clears a node's value and compresses the path upwards.
-func (c *radixCache[V]) deleteNode(node *radixNode[V]) {
-	if node == nil || !node.hasValue {
-		return
-	}
-
-	var zero V
-	node.value = zero
-	node.hasValue = false
-	c.compressPathUpwards(node)
-}
-
 // compressPathUpwards walks up the tree from curr, pruning empty leaves and compressing single-child routing nodes.
 func (c *radixCache[V]) compressPathUpwards(curr *radixNode[V]) {
 	for curr != nil && curr != c.root {
@@ -599,7 +595,10 @@ func (c *radixCache[V]) eraseInternalWithKey(evictQ *evictCallbackQueue[V], node
 	node.size = 0
 
 	c.remove(node)
-	c.deleteNode(node)
+	var zero V
+	node.value = zero
+	node.hasValue = false
+	c.compressPathUpwards(node)
 
 	c.notifyEvict(evictQ, key, deletedEntry, evictedSize, reason)
 	return deletedEntry, true
@@ -722,15 +721,16 @@ func (c *radixCache[V]) finishDeleteReclaimLocked(evictQ *evictCallbackQueue[V],
 		}
 		reclaimedSingleSurvivor = true
 	}
-	c.maybeReclaimUnderPressureLocked(evictQ, pressure, nil, false)
+	if pressure >= c.options.CompactionThreshold || pressure >= c.options.EvictionThreshold {
+		c.maybeReclaimUnderPressureLocked(evictQ, pressure, nil, false)
+	} else {
+		c.resetZeroWatermarkBelowTier2(pressure)
+	}
 	c.maybeMarkReclaimed(reclaimedSingleSurvivor || c.currentSize < sizeBefore, sampledEpoch, pressure)
 }
 
+//go:noinline
 func (c *radixCache[V]) finishMutationReclaimLocked(evictQ *evictCallbackQueue[V], evictedValues []V, protectedNode *radixNode[V], reclaimedPre, compactedPre bool, sizeBefore, sampledEpoch uint64, pressure float64) []V {
-	if !reclaimedPre && c.currentSize >= sizeBefore && pressure < c.options.CompactionThreshold && pressure < c.options.EvictionThreshold {
-		c.resetZeroWatermarkBelowTier2(pressure)
-		return evictedValues
-	}
 	evictedByPressure := c.maybeReclaimUnderPressureLocked(evictQ, pressure, protectedNode, false)
 	evictedValues = appendEvicted(evictedValues, evictedByPressure)
 	netByteReduced := c.currentSize < sizeBefore
@@ -771,7 +771,7 @@ func (c *radixCache[V]) updateExistingOnPutLocked(
 	node.size = valueSize
 	c.currentSize += valueSize
 	c.putUpdated++
-	c.notifyEvict(evictQ, key, oldValue, oldSize, EvictionReasonReplaced)
+	c.notifyReplaced(evictQ, key, oldValue, oldSize)
 	reclaimedPrePut = c.shouldReclaimSingleSurvivorOnMutation(c.len, c.deletedSinceCompact > 0, false, evictedPrePut, c.currentSize, sizeBefore, pressure)
 	return evictedValues, reclaimedPrePut
 }
@@ -824,8 +824,14 @@ func (c *radixCache[V]) Put(key string, value V) ([]V, error) {
 		c.currentSize += valueSize
 	}
 
-	evictedValues = c.finishMutationReclaimLocked(&evictQ, evictedValues, node, reclaimedPrePut, compactedPrePut, sizeBefore, sampledEpoch, pressure)
-	c.unlock()
+	if c.needsMutationReclaim(reclaimedPrePut, c.currentSize, sizeBefore, pressure) {
+		evictedValues = c.finishMutationReclaimLocked(&evictQ, evictedValues, node, reclaimedPrePut, compactedPrePut, sizeBefore, sampledEpoch, pressure)
+	}
+	if c.options.EnableInvariantChecking {
+		c.unlockWithInvariants()
+	} else {
+		c.mu.Unlock()
+	}
 	evictQ.invoke(&c.pressureState, c.onEvictValue, c.onEvictEntry)
 	return evictedValues, nil
 }
@@ -862,17 +868,19 @@ func (c *radixCache[V]) Get(key string) (value V, ok bool) {
 	c.mu.Lock()
 
 	node, found := c.getNode(key)
-	if !found {
+	if found {
+		c.getHits++
+		c.moveToFront(node)
+		value = node.value
+	} else {
 		c.getMisses++
-		c.unlock()
-		return value, false
 	}
-	c.getHits++
-	c.moveToFront(node)
-	val := node.value
-	c.unlock()
-
-	return val, true
+	if c.options.EnableInvariantChecking {
+		c.unlockWithInvariants()
+	} else {
+		c.mu.Unlock()
+	}
+	return value, found
 }
 
 // Peek retrieves the value for key without modifying its LRU position.
@@ -881,39 +889,38 @@ func (c *radixCache[V]) Peek(key string) (value V, ok bool) {
 	c.mu.RLock()
 
 	node, found := c.getNode(key)
-	if !found {
+	if found {
+		c.peekHits.Add(1)
+		value = node.value
+	} else {
 		c.peekMisses.Add(1)
-		c.rUnlock()
-		return value, false
 	}
-	c.peekHits.Add(1)
-	val := node.value
-	c.rUnlock()
-
-	return val, true
+	if c.options.EnableInvariantChecking {
+		c.rUnlockWithInvariants()
+	} else {
+		c.mu.RUnlock()
+	}
+	return value, found
 }
 
-func (c *radixCache[V]) canFitGrowthLocked(node *radixNode[V], newSize, sizeDelta, avail uint64) bool {
+func (c *radixCache[V]) canFitGrowthLocked(node *radixNode[V], maxNewer, sizeDelta, avail uint64) bool {
 	if sizeDelta <= avail {
 		return true
 	}
-	maxNewer := c.maxSize - newSize
 	var newerSize uint64
 	headCurr := c.head
 	tailCurr := c.tail
 	for {
 		if headCurr == node {
-			return newerSize <= maxNewer
+			return true
 		}
-		if headCurr != nil {
-			newerSize += headCurr.size
-			if newerSize > maxNewer {
-				return false
-			}
-			headCurr = headCurr.next
+		newerSize += headCurr.size
+		if newerSize > maxNewer {
+			return false
 		}
-		if tailCurr == nil || tailCurr == node {
-			return sizeDelta <= avail
+		headCurr = headCurr.next
+		if tailCurr == node {
+			return false
 		}
 		avail += tailCurr.size
 		if sizeDelta <= avail {
@@ -926,7 +933,7 @@ func (c *radixCache[V]) canFitGrowthLocked(node *radixNode[V], newSize, sizeDelt
 func (c *radixCache[V]) replaceResizeOrEvictLocked(evictQ *evictCallbackQueue[V], node *radixNode[V], key string, oldSize, newSize, sizeBefore, sampledEpoch uint64, pressure float64) (evictedAny, selfEvicted bool) {
 	if newSize > oldSize {
 		sizeDelta := newSize - oldSize
-		if newSize > c.maxSize || !c.canFitGrowthLocked(node, newSize, sizeDelta, c.maxSize-c.currentSize) {
+		if newSize > c.maxSize || !c.canFitGrowthLocked(node, c.maxSize-newSize, sizeDelta, c.maxSize-c.currentSize) {
 			c.replaceSelfEvicted++
 			c.eraseInternalWithKey(evictQ, node, key, EvictionReasonCapacity)
 			c.finishDeleteReclaimLocked(evictQ, sizeBefore, sampledEpoch, pressure)
@@ -990,10 +997,12 @@ func (c *radixCache[V]) Replace(key string, value V) error {
 	node.size = newSize
 
 	c.replaceUpdated++
-	c.notifyEvict(&evictQ, key, oldValue, oldSize, EvictionReasonReplaced)
+	c.notifyReplaced(&evictQ, key, oldValue, oldSize)
 
 	reclaimedPreUpdate := c.shouldReclaimSingleSurvivorOnMutation(c.len, c.deletedSinceCompact > 0, false, evictedAny, c.currentSize, sizeBefore, pressure)
-	c.finishMutationReclaimLocked(&evictQ, nil, node, reclaimedPreUpdate, false, sizeBefore, sampledEpoch, pressure)
+	if c.needsMutationReclaim(reclaimedPreUpdate, c.currentSize, sizeBefore, pressure) {
+		c.finishMutationReclaimLocked(&evictQ, nil, node, reclaimedPreUpdate, false, sizeBefore, sampledEpoch, pressure)
+	}
 	c.unlock()
 	evictQ.invoke(&c.pressureState, c.onEvictValue, c.onEvictEntry)
 
@@ -1066,9 +1075,6 @@ func (c *radixCache[V]) deleteAllPrefixLocked(evictQ *evictCallbackQueue[V], sam
 // DeletePrefix deletes all entries whose keys start with prefix.
 // Prunes subtrees in O(prefix_length + subtree_size) time and sweeps detached nodes.
 func (c *radixCache[V]) DeletePrefix(prefix string) {
-	var evictQ evictCallbackQueue[V]
-	defer evictQ.invoke(&c.pressureState, c.onEvictValue, c.onEvictEntry)
-
 	if prefix == "" {
 		c.mu.Lock()
 		hadEntries := c.len > 0 || (c.root != nil && (c.root.hasValue || c.root.child != nil))
@@ -1080,11 +1086,16 @@ func (c *radixCache[V]) DeletePrefix(prefix string) {
 		}
 		c.mu.Unlock()
 
+		var evictQ evictCallbackQueue[V]
 		sampledEpoch, pressure := c.lockWithPressure(&c.mu, false)
-		defer c.unlock()
 		c.deleteAllPrefixLocked(&evictQ, sampledEpoch, pressure)
+		c.unlock()
+		evictQ.invoke(&c.pressureState, c.onEvictValue, c.onEvictEntry)
 		return
 	}
+
+	var evictQ evictCallbackQueue[V]
+	defer evictQ.invoke(&c.pressureState, c.onEvictValue, c.onEvictEntry)
 
 	sampledEpoch, pressure := c.lockWithPressure(&c.mu, false)
 	defer c.unlock()
@@ -1174,15 +1185,19 @@ func (c *radixCache[V]) values(yield func(V) bool) {
 func (c *radixCache[V]) Stats() Stats {
 	c.mu.RLock()
 	st := c.snapshotBaseStats(BackendRadix, c.currentSize, c.maxSize, c.len)
-	c.rUnlock()
+	if c.options.EnableInvariantChecking {
+		c.rUnlockWithInvariants()
+	} else {
+		c.mu.RUnlock()
+	}
 	return st
 }
 
 // Compact satisfies PressureAwareCache on radixCache (pointer-based nodes are reclaimed directly by Go GC upon deletion).
 func (c *radixCache[V]) Compact() {
 	c.mu.Lock()
-	defer c.unlock()
 	c.compactLocked()
+	c.unlock()
 }
 
 func (c *radixCache[V]) compactDataStructuresLocked() bool {
@@ -1258,16 +1273,16 @@ func (c *radixCache[V]) shedAndCompactLocked(evictQ *evictCallbackQueue[V], targ
 }
 
 func (c *radixCache[V]) maybeReclaimUnderPressureLocked(evictQ *evictCallbackQueue[V], pressure float64, protectedNode *radixNode[V], isBackground bool) []V {
-	if c.isSamplingGoroutine() {
-		return nil
-	}
 	if pressure >= c.options.EvictionThreshold {
+		if c.isSamplingGoroutine() {
+			return nil
+		}
 		retention := c.options.EvictionRetentionRatio
 		targetSize := computeTargetSize(c.maxSize, retention)
 		return c.shedAndCompactLocked(evictQ, targetSize, retention, protectedNode, isBackground)
 	}
 	c.resetZeroWatermarkBelowTier2(pressure)
-	if pressure >= c.options.CompactionThreshold && c.shouldAutoCompactLocked(isBackground) && c.compactDataStructuresLocked() {
+	if pressure >= c.options.CompactionThreshold && c.shouldAutoCompactLocked(isBackground) && !c.isSamplingGoroutine() && c.compactDataStructuresLocked() {
 		c.compactionsPressureTier1++
 		c.markReclaimedLocked()
 	}
@@ -1278,10 +1293,9 @@ func (c *radixCache[V]) maybeReclaimUnderPressureLocked(evictQ *evictCallbackQue
 // down to maxSize * EvictionRetentionRatio if critical pressure is reached.
 func (c *radixCache[V]) EvaluateMemoryPressure() []V {
 	var evictQ evictCallbackQueue[V]
-	defer evictQ.invoke(&c.pressureState, c.onEvictValue, c.onEvictEntry)
-
 	_, pressure := c.lockWithPressure(&c.mu, true)
-	defer c.unlock()
-
-	return c.maybeReclaimUnderPressureLocked(&evictQ, pressure, nil, true)
+	evicted := c.maybeReclaimUnderPressureLocked(&evictQ, pressure, nil, true)
+	c.unlock()
+	evictQ.invoke(&c.pressureState, c.onEvictValue, c.onEvictEntry)
+	return evicted
 }
