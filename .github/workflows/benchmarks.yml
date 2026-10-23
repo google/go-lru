@@ -41,11 +41,13 @@ jobs:
 
       - name: Run Performance & Memory Allocation Benchmarks (Head)
         run: |
+          set -o pipefail
           go test -run=^$ -bench=^Benchmark_ -benchmem -benchtime=10ms -count=6 ./... | tee benchmark-head.txt
 
       - name: Run Base Branch Benchmarks for Regression Comparison (PR only)
         if: github.event_name == 'pull_request'
         run: |
+          set -o pipefail
           HEAD_SHA=$(git rev-parse HEAD)
           trap 'git checkout "$HEAD_SHA"' EXIT
           git checkout "${{ github.event.pull_request.base.sha }}"
@@ -87,6 +89,7 @@ jobs:
 
       - name: Enforce Performance Targets & Regression Thresholds
         run: |
+          set -o pipefail
           if [ -f benchmark-base.txt ]; then
             go run ./cmd/benchcheck -base benchmark-base.txt -head benchmark-head.txt -strict-missing -format markdown -summary "$GITHUB_STEP_SUMMARY" | tee benchcheck-report.md
           else

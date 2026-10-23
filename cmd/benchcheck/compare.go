@@ -365,15 +365,16 @@ func effectiveMinDelta(
 		minDelta = max(minDelta, 300.0)
 	}
 
-	// Benchmark_ArenaRadixCache_Compact allocates a 10,000-key slice (20,001 allocs)
-	// before the b.N loop without b.ResetTimer(), so at -benchtime=10ms (b.N ~ 12..18)
-	// allocs/op = 20 + 20001/b.N varies when b.N changes by 1-3 iterations.
-	if isCompactLowIterAllocsJitter(benchName, unit, baseRes, candRes) {
-		minDelta = max(minDelta, 800.0)
+	// Benchmark_ArenaRadixCache_Compact invokes b.StopTimer()/b.StartTimer() around
+	// 10,000 Puts + 5,000 Deletes per iteration and calls runtime.GC() on iter == b.N-1
+	// (b.N ~ 12..25 at -benchtime=10ms), causing ~200-250 us/op of GC/timer jitter.
+	if isCompactLowIterNsJitter(benchName, unit, baseRes, candRes) {
+		minDelta = max(minDelta, 250000.0)
 	}
 
 	// Benchmark_LargeScale_DeletePrefix_100K/MapCache runs b.N=1..2 at -benchtime=10ms
-	// immediately after runtime.GC(), which can record 192 B/op, 2 allocs/op when b.N=1.
+	// immediately after runtime.GC(), which can record 192 B/op, 2 allocs/op, and ~5-6 ms
+	// of concurrent sweep/timer variance when b.N <= 2.
 	if floor := largeScaleDeletePrefixMinDelta(benchName, unit, baseRes, candRes); floor > 0 {
 		minDelta = max(minDelta, floor)
 	}
@@ -402,15 +403,14 @@ func isParallelOrUnitWeightNsJitter(benchName, unit string) bool {
 		strings.HasSuffix(benchName, "/Parallel")
 }
 
-func isCompactLowIterAllocsJitter(
+func isCompactLowIterNsJitter(
 	benchName, unit string,
 	baseRes, candRes *BenchmarkResult,
 ) bool {
-	if benchName != "Benchmark_ArenaRadixCache_Compact" || unit != UnitAllocsPerOp {
+	if benchName != "Benchmark_ArenaRadixCache_Compact" || unit != UnitNsPerOp {
 		return false
 	}
-	return baseRes.Iterations != candRes.Iterations &&
-		(baseRes.Iterations < 100 || candRes.Iterations < 100)
+	return baseRes.Iterations < 100 || candRes.Iterations < 100
 }
 
 func largeScaleDeletePrefixMinDelta(
@@ -424,6 +424,8 @@ func largeScaleDeletePrefixMinDelta(
 		return 0
 	}
 	switch unit {
+	case UnitNsPerOp:
+		return 6500000.0
 	case UnitBytesPerOp:
 		return 256.0
 	case UnitAllocsPerOp:
