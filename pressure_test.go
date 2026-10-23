@@ -1471,7 +1471,7 @@ func testThreePlusConcurrentCallersReentrant(t *testing.T, b backendDef) {
 	wg.Wait()
 
 	// Assert: Every goroutine's PressureFunc recursion depth stayed strictly 1 (no stack overflow)
-	// and none of the re-entrant calls inside G3/G4 bumped the reclamation epoch (enteredCount == 4 with zero retries).
+	// and concurrent re-entrant reclamations inside G3/G4 did not force low-pressure retries (enteredCount == 4).
 	assert.Equal(t, int32(1), maxDepth.Load())
 	assert.Equal(t, int32(numCallers), enteredCount.Load())
 	assert.False(t, hasKey(cache, "reentrant_3"))
@@ -1749,6 +1749,8 @@ func TestPressure_ConcurrentReentrantSamplersAndOverflowEpochInvalidation(t *tes
 				assert.Equal(t, int32(2), calls.Load())
 			})
 
+			testPostSamplePreLockEpochCoordination(t, b)
+
 			t.Run("PrimaryReentrantCompactWhileOverflowActiveInvalidatesStaleSamples", func(t *testing.T) {
 				if b.name == "RadixCache" {
 					t.Skip("RadixCache does not perform structural compaction on Compact() per M-03")
@@ -1911,6 +1913,497 @@ func TestPressure_ConcurrentReentrantSamplersAndOverflowEpochInvalidation(t *tes
 			})
 		})
 	}
+}
+
+func testPostSamplePreLockEpochCoordination(t *testing.T, b backendDef) {
+	t.Helper()
+	t.Run("PostSampleReentrantReclaimBeforeLockDoesNotForceLowPressureResample", func(t *testing.T) {
+		testPostSampleReentrantReclaimBeforeLock(t, b)
+	})
+	t.Run("PostSampleOverflowReentrantReclaimBeforeLockDoesNotForceLowPressureResample", func(t *testing.T) {
+		testPostSampleOverflowReentrantReclaimBeforeLock(t, b)
+	})
+	t.Run("PostSampleExternalReclaimBeforeLockForcesResampleEvenAtLowPressure", func(t *testing.T) {
+		testPostSampleExternalReclaimBeforeLock(t, b)
+	})
+	t.Run("PostSampleElevatedConcurrentSampleBlocksLowPressureFastForward", func(t *testing.T) {
+		testPostSampleElevatedSampleBlocksFastForward(t, b)
+	})
+}
+
+func isGoroutineParkedInFrame(targetGID uint64, frameSubstr string) bool {
+	allStacks, bufPtr := captureAllGoroutineStacks()
+	defer releaseAllGoroutineStacks(bufPtr)
+	for rem := allStacks; len(rem) > 0; {
+		var blk []byte
+		blk, rem = nextGoroutineBlock(rem)
+		gid, _ := parseStackGoroutineAndParentID(blk)
+		if gid != targetGID {
+			continue
+		}
+		blkStr := string(blk)
+		header := blkStr
+		if before, _, ok := strings.Cut(blkStr, "\n"); ok {
+			header = before
+		}
+		if strings.Contains(header, "[running]") || strings.Contains(header, "[runnable]") {
+			return false
+		}
+		return strings.Contains(blkStr, frameSubstr)
+	}
+	return false
+}
+
+func waitForGoroutineParkedInFrame(t *testing.T, targetGID uint64, frameSubstr string) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		if isGoroutineParkedInFrame(targetGID, frameSubstr) {
+			return
+		}
+		runtime.Gosched()
+	}
+	assert.Failf(t, "timeout", "goroutine %d did not park in %s within 5s", targetGID, frameSubstr)
+}
+
+func waitForGoroutineParkedInRWMutexLock(t *testing.T, targetGID uint64) {
+	t.Helper()
+	waitForGoroutineParkedInFrame(t, targetGID, "(*RWMutex).Lock")
+}
+
+func waitForGoroutineParkedInRWMutexRLock(t *testing.T, targetGID uint64) {
+	t.Helper()
+	waitForGoroutineParkedInFrame(t, targetGID, "(*RWMutex).RLock")
+}
+
+func holdCacheRLock(wg *sync.WaitGroup, cache Cache[testData]) func() {
+	rlockHeld := make(chan struct{})
+	releaseRLock := make(chan struct{})
+	wg.Go(func() {
+		for range cache.All() {
+			close(rlockHeld)
+			<-releaseRLock
+			break
+		}
+	})
+	<-rlockHeld
+	return func() {
+		close(releaseRLock)
+	}
+}
+
+func queueBlockedCacheRLock(t *testing.T, wg *sync.WaitGroup, cache Cache[testData]) (<-chan struct{}, func()) {
+	t.Helper()
+	var readerGID atomic.Uint64
+	started := make(chan struct{})
+	rlockHeld := make(chan struct{})
+	releaseRLock := make(chan struct{})
+	wg.Go(func() {
+		readerGID.Store(testGoroutineID())
+		close(started)
+		for range cache.All() {
+			close(rlockHeld)
+			<-releaseRLock
+			break
+		}
+	})
+	<-started
+	waitForGoroutineParkedInRWMutexRLock(t, readerGID.Load())
+	return rlockHeld, func() {
+		close(releaseRLock)
+	}
+}
+
+func testPostSampleReentrantReclaimBeforeLock(t *testing.T, b backendDef) {
+	t.Helper()
+	// Arrange: Deterministically reproduce the window where G1 finishes PressureFunc (0.10) and
+	// storeSampledPressureWithSeq at epoch 1, then concurrent sampler G2 executes a re-entrant Delete
+	// (advancing reclaimEpoch to 2 with externalReclaimEpoch unchanged) BEFORE G1 acquires c.mu.Lock().
+	var pac PressureAwareCache[testData]
+	var cache Cache[testData]
+	var armed atomic.Bool
+	var calls atomic.Int32
+	var g1GID, g2GID atomic.Uint64
+	g1ReadyToReturn := make(chan struct{})
+	releaseG1Return := make(chan struct{})
+	g2ReadyToDelete := make(chan struct{})
+	releaseG2Delete := make(chan struct{})
+
+	cache = b.fn(
+		1000,
+		WithInvariantChecking(true),
+		WithPressureFunc(func() float64 {
+			if !armed.Load() {
+				return 0.10
+			}
+			switch calls.Add(1) {
+			case 1:
+				g1GID.Store(testGoroutineID())
+				_, _ = cache.Put("tmp1", testData{value: 1, dataSize: 10})
+				_, _ = cache.Delete("tmp1") // Advances reclaimEpoch 0 -> 1
+				close(g1ReadyToReturn)
+				<-releaseG1Return
+				return 0.10
+			case 2:
+				g2GID.Store(testGoroutineID())
+				_, _ = cache.Put("tmp2", testData{value: 2, dataSize: 10})
+				close(g2ReadyToDelete)
+				<-releaseG2Delete
+				_, _ = cache.Delete("tmp2") // Advances reclaimEpoch 1 -> 2 ahead of G1's mu.Lock()
+				return 0.10
+			default:
+				return 0.10
+			}
+		}),
+	)
+	pac = cache.(PressureAwareCache[testData])
+
+	_, err := cache.Put("anchor", testData{value: 1, dataSize: 10})
+	require.NoError(t, err)
+	armed.Store(true)
+
+	var wg sync.WaitGroup
+	wg.Go(func() {
+		_ = pac.EvaluateMemoryPressure()
+	})
+	<-g1ReadyToReturn
+
+	wg.Go(func() {
+		_ = pac.EvaluateMemoryPressure()
+	})
+	<-g2ReadyToDelete
+
+	// Hold RLock via All() so G2 queues first on c.mu.Lock() (for Delete("tmp2")), followed by G1 (after returning 0.10).
+	releaseRLock := holdCacheRLock(&wg, cache)
+
+	// Act: Queue G2 on c.mu.Lock() first, then let G1 return 0.10 (storing epoch 1) and queue behind G2, then release RLock.
+	close(releaseG2Delete)
+	waitForGoroutineParkedInRWMutexLock(t, g2GID.Load())
+
+	close(releaseG1Return)
+	waitForGoroutineParkedInRWMutexLock(t, g1GID.Load())
+
+	releaseRLock()
+	wg.Wait()
+
+	// Assert: G1 fast-forwarded its low-pressure sample across G2's re-entrant reclamation under mu.Lock() with zero retries.
+	assert.Equal(t, int32(2), calls.Load())
+	assert.Equal(t, uint64(2), cache.Stats().ReclaimEpoch)
+	assert.True(t, hasKey(cache, "anchor"))
+	assert.False(t, hasKey(cache, "tmp1"))
+	assert.False(t, hasKey(cache, "tmp2"))
+}
+
+func testPostSampleOverflowReentrantReclaimBeforeLock(t *testing.T, b backendDef) {
+	t.Helper()
+	// Arrange: 4 concurrent samplers enter PressureFunc in deterministic slot order:
+	// G1 (primary), G2 (fallback), G3 (overflow), and G4 (overflow).
+	// G3 advances reclaimEpoch 0 -> 1 re-entrantly, then G1, G2, and G3 all finish storeSampledPressureWithSeq (0.10)
+	// and park before mu.Lock() behind G4's re-entrant Delete("tmp4"), which advances reclaimEpoch 1 -> 2.
+	var pac PressureAwareCache[testData]
+	var cache Cache[testData]
+	var armed atomic.Bool
+	var calls atomic.Int32
+	var g1GID, g2GID, g3GID, g4GID atomic.Uint64
+	g1Entered := make(chan struct{})
+	g2Entered := make(chan struct{})
+	g3Entered := make(chan struct{})
+	allOverflowEntered := make(chan struct{})
+	g3Deleted := make(chan struct{})
+	g4ReadyToDelete := make(chan struct{})
+	releaseG4Delete := make(chan struct{})
+	releaseParkCallers := make(chan struct{})
+
+	cache = b.fn(
+		1000,
+		WithInvariantChecking(true),
+		WithPressureFunc(func() float64 {
+			if !armed.Load() {
+				return 0.10
+			}
+			switch calls.Add(1) {
+			case 1:
+				g1GID.Store(testGoroutineID())
+				close(g1Entered)
+				<-releaseParkCallers
+				return 0.10
+			case 2:
+				g2GID.Store(testGoroutineID())
+				close(g2Entered)
+				<-releaseParkCallers
+				return 0.10
+			case 3:
+				g3GID.Store(testGoroutineID())
+				close(g3Entered)
+				<-allOverflowEntered
+				_, _ = cache.Delete("tmp3") // Advances reclaimEpoch 0 -> 1 while overflow active
+				close(g3Deleted)
+				<-releaseParkCallers
+				return 0.10
+			case 4:
+				g4GID.Store(testGoroutineID())
+				close(allOverflowEntered)
+				<-g3Deleted
+				close(g4ReadyToDelete)
+				<-releaseG4Delete
+				_, _ = cache.Delete("tmp4") // Advances reclaimEpoch 1 -> 2 ahead of G1/G2/G3 mu.Lock()
+				return 0.10
+			default:
+				return 0.10
+			}
+		}),
+	)
+	pac = cache.(PressureAwareCache[testData])
+
+	for _, k := range []string{"anchor", "tmp3", "tmp4"} {
+		_, err := cache.Put(k, testData{value: 1, dataSize: 10})
+		require.NoError(t, err)
+	}
+	armed.Store(true)
+
+	var wg sync.WaitGroup
+	wg.Go(func() { _ = pac.EvaluateMemoryPressure() })
+	<-g1Entered
+
+	wg.Go(func() { _ = pac.EvaluateMemoryPressure() })
+	<-g2Entered
+
+	wg.Go(func() { _ = pac.EvaluateMemoryPressure() })
+	<-g3Entered
+
+	wg.Go(func() { _ = pac.EvaluateMemoryPressure() })
+	<-g4ReadyToDelete
+
+	releaseRLock := holdCacheRLock(&wg, cache)
+
+	// Act: Queue overflow sampler G4 on c.mu.Lock() first, then let primary (G1), fallback (G2),
+	// and overflow (G3) complete storeSampledPressureWithSeq at epoch 1 and park behind G4.
+	close(releaseG4Delete)
+	waitForGoroutineParkedInRWMutexLock(t, g4GID.Load())
+
+	close(releaseParkCallers)
+	waitForGoroutineParkedInRWMutexLock(t, g1GID.Load())
+	waitForGoroutineParkedInRWMutexLock(t, g2GID.Load())
+	waitForGoroutineParkedInRWMutexLock(t, g3GID.Load())
+
+	releaseRLock()
+	wg.Wait()
+
+	// Assert: Primary, fallback, and overflow low-pressure callers all fast-forwarded to epoch 2 with zero retries.
+	assert.Equal(t, int32(4), calls.Load())
+	assert.Equal(t, uint64(2), cache.Stats().ReclaimEpoch)
+	assert.True(t, hasKey(cache, "anchor"))
+	assert.False(t, hasKey(cache, "tmp3"))
+	assert.False(t, hasKey(cache, "tmp4"))
+}
+
+func testPostSampleExternalReclaimBeforeLock(t *testing.T, b backendDef) {
+	t.Helper()
+	// Arrange: G1 completes PressureFunc (0.10) and storeSampledPressureWithSeq at (epoch=0, extEpoch=0),
+	// then parks before mu.Lock() behind an EXTERNAL Delete("ext_reclaim") that advances externalReclaimEpoch 0 -> 1.
+	// Even though G1's initial sample was 0.10, tryFastForwardSampledEpochLocked must reject fast-forwarding
+	// and force G1 to resample PressureFunc.
+	var pac PressureAwareCache[testData]
+	var cache Cache[testData]
+	var armed atomic.Bool
+	var entryOrder, g1Calls atomic.Int32
+	var g1GID, gExtGID atomic.Uint64
+	var resamplePressureBits atomic.Uint64
+	resamplePressureBits.Store(math.Float64bits(0.10))
+
+	g1Entered := make(chan struct{})
+	releaseG1Return := make(chan struct{})
+	gHoldEntered := make(chan struct{})
+	releaseGHold := make(chan struct{})
+	gExtSampled := make(chan struct{})
+
+	cache = b.fn(
+		200,
+		WithInvariantChecking(true),
+		WithEvictionThreshold(0.90),
+		WithEvictionRetentionRatio(0.50),
+		WithPressureFunc(func() float64 {
+			if !armed.Load() {
+				return 0.10
+			}
+			gid := testGoroutineID()
+			if target := g1GID.Load(); target != 0 && gid == target {
+				g1Calls.Add(1)
+				return math.Float64frombits(resamplePressureBits.Load())
+			}
+			switch entryOrder.Add(1) {
+			case 1:
+				g1GID.Store(gid)
+				g1Calls.Add(1)
+				close(g1Entered)
+				<-releaseG1Return
+				return 0.10
+			case 2:
+				// Keep an active sampler so external Delete("ext_reclaim") at 0.10 marks reclaimed across all backends.
+				close(gHoldEntered)
+				<-releaseGHold
+				return 0.10
+			case 3:
+				gExtGID.Store(gid)
+				close(gExtSampled)
+				return 0.10
+			default:
+				return 0.10
+			}
+		}),
+	)
+	pac = cache.(PressureAwareCache[testData])
+
+	_, err := cache.Put("victim", testData{value: 1, dataSize: 60})
+	require.NoError(t, err)
+	_, err = cache.Put("keep", testData{value: 2, dataSize: 60})
+	require.NoError(t, err)
+	_, err = cache.Put("ext_reclaim", testData{value: 3, dataSize: 10})
+	require.NoError(t, err)
+	armed.Store(true)
+
+	var wg sync.WaitGroup
+	g1Done := make(chan struct{})
+	wg.Go(func() {
+		defer close(g1Done)
+		_ = pac.EvaluateMemoryPressure()
+	})
+	<-g1Entered
+
+	wg.Go(func() { _ = pac.EvaluateMemoryPressure() })
+	<-gHoldEntered
+
+	releaseRLock := holdCacheRLock(&wg, cache)
+
+	// Queue external caller G_ext on c.mu.Lock() first (after G_ext exits its sampler slot).
+	wg.Go(func() {
+		_, _ = cache.Delete("ext_reclaim")
+	})
+	<-gExtSampled
+	waitForGoroutineParkedInRWMutexLock(t, gExtGID.Load())
+
+	// Let G1 complete storeSampledPressureWithSeq (0.10, epoch=0, extEpoch=0) and park behind G_ext on c.mu.Lock().
+	close(releaseG1Return)
+	waitForGoroutineParkedInRWMutexLock(t, g1GID.Load())
+
+	// Act: Release RLock so G_ext runs markReclaimedLocked() externally ahead of G1's mu.Lock(), forcing G1 to resample 0.95.
+	resamplePressureBits.Store(math.Float64bits(0.95))
+	releaseRLock()
+	<-g1Done
+
+	resamplePressureBits.Store(math.Float64bits(0.10))
+	close(releaseGHold)
+	wg.Wait()
+
+	// Assert: G1 did not fast-forward its 0.10 sample across external reclamation; it resampled 0.95 and shed "victim".
+	assert.Equal(t, int32(2), g1Calls.Load())
+	assert.False(t, hasKey(cache, "ext_reclaim"))
+	assert.False(t, hasKey(cache, "victim"))
+	assert.True(t, hasKey(cache, "keep"))
+}
+
+func testPostSampleElevatedSampleBlocksFastForward(t *testing.T, b backendDef) {
+	t.Helper()
+	// Arrange: G1 completes storeSampledPressureWithSeq (0.10) at (epoch=1, extEpoch=0) and parks before mu.Lock().
+	// Before G1 acquires mu.Lock(), concurrent sampler G2 advances reclaimEpoch 1 -> 2 via re-entrant Delete("tmp2")
+	// (keeping externalReclaimEpoch == 0) AND stores an elevated pressure (0.95 >= CompactionThreshold) in epoch 2.
+	// Using a queued second RLock keeps G1 holding RWMutex.w across G2's storeSampledPressureWithSeq so G1 acquires
+	// mu.Lock() first with externalReclaimEpoch == 0 and hits canFastForwardLowPressureEpochLocked directly.
+	var pac PressureAwareCache[testData]
+	var cache Cache[testData]
+	var armed atomic.Bool
+	var entryOrder, g1Calls atomic.Int32
+	var g1GID, g2GID atomic.Uint64
+
+	g1ReadyToReturn := make(chan struct{})
+	releaseG1Return := make(chan struct{})
+	g2ReadyToDelete := make(chan struct{})
+	releaseG2Delete := make(chan struct{})
+	g2Deleted := make(chan struct{})
+
+	cache = b.fn(
+		200,
+		WithInvariantChecking(true),
+		WithCompactionThreshold(0.80),
+		WithEvictionThreshold(0.90),
+		WithEvictionRetentionRatio(0.50),
+		WithPressureFunc(func() float64 {
+			if !armed.Load() {
+				return 0.10
+			}
+			gid := testGoroutineID()
+			if target := g1GID.Load(); target != 0 && gid == target {
+				g1Calls.Add(1)
+				return 0.95
+			}
+			switch entryOrder.Add(1) {
+			case 1:
+				g1GID.Store(gid)
+				g1Calls.Add(1)
+				_, _ = cache.Delete("tmp1") // Advances reclaimEpoch 0 -> 1 (extEpoch stays 0)
+				close(g1ReadyToReturn)
+				<-releaseG1Return
+				return 0.10
+			case 2:
+				g2GID.Store(gid)
+				close(g2ReadyToDelete)
+				<-releaseG2Delete
+				_, _ = cache.Delete("tmp2") // Advances reclaimEpoch 1 -> 2 (extEpoch stays 0)
+				close(g2Deleted)
+				return 0.95
+			default:
+				return 0.95
+			}
+		}),
+	)
+	pac = cache.(PressureAwareCache[testData])
+
+	_, err := cache.Put("victim", testData{value: 1, dataSize: 60})
+	require.NoError(t, err)
+	_, err = cache.Put("keep", testData{value: 2, dataSize: 60})
+	require.NoError(t, err)
+	_, err = cache.Put("tmp1", testData{value: 3, dataSize: 10})
+	require.NoError(t, err)
+	_, err = cache.Put("tmp2", testData{value: 4, dataSize: 10})
+	require.NoError(t, err)
+	armed.Store(true)
+
+	var wg sync.WaitGroup
+	wg.Go(func() { _ = pac.EvaluateMemoryPressure() })
+	<-g1ReadyToReturn
+
+	wg.Go(func() { _ = pac.EvaluateMemoryPressure() })
+	<-g2ReadyToDelete
+
+	releaseRLock1 := holdCacheRLock(&wg, cache)
+
+	// Queue G2's re-entrant Delete("tmp2") on c.mu.Lock() first, then park G1 (after storing 0.10 at epoch 1) behind G2.
+	close(releaseG2Delete)
+	waitForGoroutineParkedInRWMutexLock(t, g2GID.Load())
+
+	close(releaseG1Return)
+	waitForGoroutineParkedInRWMutexLock(t, g1GID.Load())
+
+	// Queue a second reader behind G2 so when G2 unlocks Delete("tmp2"), G1 acquires RWMutex.w but stays parked on writerSem
+	// while G2 stores 0.95 in epoch 2 and queues behind G1 on c.mu.Lock().
+	rlock2Held, releaseRLock2 := queueBlockedCacheRLock(t, &wg, cache)
+
+	// Act: Hand c.mu from RLock1 -> G2 Delete("tmp2") -> RLock2, let G2 store 0.95 in epoch 2, then release RLock2 to G1.
+	releaseRLock1()
+	<-g2Deleted
+	<-rlock2Held
+	waitForGoroutineParkedInRWMutexLock(t, g2GID.Load())
+	waitForGoroutineParkedInRWMutexLock(t, g1GID.Load())
+
+	releaseRLock2()
+	wg.Wait()
+
+	// Assert: canFastForwardLowPressureEpochLocked blocked G1 from fast-forwarding 0.10 over epoch 2's 0.95 sample.
+	assert.GreaterOrEqual(t, g1Calls.Load(), int32(2))
+	assert.False(t, hasKey(cache, "tmp1"))
+	assert.False(t, hasKey(cache, "tmp2"))
+	assert.False(t, hasKey(cache, "victim"))
+	assert.True(t, hasKey(cache, "keep"))
 }
 
 func TestPressure_PreSampleEpochLoadAndConcurrentSamplerOrdering(t *testing.T) {
