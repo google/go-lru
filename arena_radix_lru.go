@@ -411,15 +411,20 @@ func (c *arenaRadix[V]) Compact() {
 	c.unlock()
 }
 
+func (c *arenaRadix[V]) evaluateShardPressure(evictQ *evictCallbackQueue[V], hasSample bool, pressure float64, validSample bool) ([]V, float64, bool) {
+	_, p, valid := c.lockShardWithSample(&c.mu, true, hasSample, pressure, validSample)
+	evicted := c.maybeReclaimUnderPressureLocked(evictQ, p, nilNode)
+	c.unlock()
+	return evicted, p, valid
+}
+
 // EvaluateMemoryPressure samples the configured memory-pressure probe lock-free,
 // then acquires the exclusive write lock to execute Tier 2 (LRU tail shedding + compaction)
 // or Tier 1 (lossless compaction) if pressure meets or exceeds the configured thresholds.
 // Returns any values evicted during Tier 2 critical-pressure shedding.
 func (c *arenaRadix[V]) EvaluateMemoryPressure() []V {
 	var evictQ evictCallbackQueue[V]
-	_, pressure := c.lockWithPressure(&c.mu, true)
-	evicted := c.maybeReclaimUnderPressureLocked(&evictQ, pressure, nilNode)
-	c.unlock()
+	evicted, _, _ := c.evaluateShardPressure(&evictQ, false, 0, false)
 	evictQ.invoke(&c.pressureState, c.onEvictValue, c.onEvictEntry)
 	return evicted
 }
@@ -783,13 +788,18 @@ func (c *arenaRadix[V]) evictAllForClearLocked(evictQ *evictCallbackQueue[V]) {
 	}
 }
 
-func (c *arenaRadix[V]) deleteAllPrefixLocked(evictQ *evictCallbackQueue[V], sampledEpoch uint64, pressure float64) {
-	c.deletePrefixExecuted++
+func (c *arenaRadix[V]) isCleanEmptyLocked() bool {
 	hadEntries := c.len > 0
 	hadDirtySlack := c.freeCount > 0 || c.nodeMapDirty || c.peakEntryLen > minPeakSlackEntries || c.deletedSinceCompact > 0 || (c.len == 0 && cap(c.nodes) > 1)
-	if !hadEntries && !hadDirtySlack && c.peakEntryLen == 0 && len(c.nodes) <= 1 {
+	return !hadEntries && !hadDirtySlack && c.peakEntryLen == 0 && len(c.nodes) <= 1
+}
+
+func (c *arenaRadix[V]) deleteAllPrefixLocked(evictQ *evictCallbackQueue[V], sampledEpoch uint64, pressure float64) {
+	c.deletePrefixExecuted++
+	if c.isCleanEmptyLocked() {
 		return
 	}
+	hadDirtySlack := c.freeCount > 0 || c.nodeMapDirty || c.peakEntryLen > minPeakSlackEntries || c.deletedSinceCompact > 0 || (c.len == 0 && cap(c.nodes) > 1)
 	hadReclaimable := c.currentSize > 0 || hadDirtySlack
 	c.deletedSinceCompact += c.len
 	hadCompactionSlack := c.hasEmptyDeleteSlack(len(c.nodes)-1 >= minChurnCompactDeletes)
@@ -798,34 +808,7 @@ func (c *arenaRadix[V]) deleteAllPrefixLocked(evictQ *evictCallbackQueue[V], sam
 	c.finishClearAllLocked(hadCompactionSlack, hadReclaimable, sampledEpoch, pressure)
 }
 
-// DeletePrefix deletes all entries whose keys begin with prefix.
-// It severs the matching subtree in O(1) and iteratively reclaims all nodes into the free-list.
-func (c *arenaRadix[V]) DeletePrefix(prefix string) {
-	if prefix == "" {
-		c.mu.Lock()
-		hadEntries := c.len > 0
-		hadDirtySlack := c.freeCount > 0 || c.nodeMapDirty || c.peakEntryLen > minPeakSlackEntries || c.deletedSinceCompact > 0 || (c.len == 0 && cap(c.nodes) > 1)
-		if !hadEntries && !hadDirtySlack && c.peakEntryLen == 0 && len(c.nodes) <= 1 {
-			c.deletePrefixExecuted++
-			c.unlock()
-			return
-		}
-		c.mu.Unlock()
-
-		var evictQ evictCallbackQueue[V]
-		sampledEpoch, pressure := c.lockWithPressure(&c.mu, false)
-		c.deleteAllPrefixLocked(&evictQ, sampledEpoch, pressure)
-		c.unlock()
-		evictQ.invoke(&c.pressureState, c.onEvictValue, c.onEvictEntry)
-		return
-	}
-
-	var evictQ evictCallbackQueue[V]
-	defer evictQ.invoke(&c.pressureState, c.onEvictValue, c.onEvictEntry)
-
-	sampledEpoch, pressure := c.lockWithPressure(&c.mu, false)
-	defer c.unlock()
-
+func (c *arenaRadix[V]) deleteNonEmptyPrefixLocked(evictQ *evictCallbackQueue[V], prefix string, sampledEpoch uint64, pressure float64) {
 	c.deletePrefixExecuted++
 	nodeID := c.root
 	search := prefix
@@ -848,9 +831,9 @@ func (c *arenaRadix[V]) DeletePrefix(prefix string) {
 			c.nodes[childID].parent = nodeID
 
 			// Now sweep the detached subtree to fix LRU, nodeMap, and currentSize
-			c.freeSubtree(&evictQ, childID)
+			c.freeSubtree(evictQ, childID)
 			c.compressPathUpwards(nodeID)
-			c.finishDeleteReclaimLocked(&evictQ, sizeBefore, sampledEpoch, pressure)
+			c.finishDeleteReclaimLocked(evictQ, sizeBefore, sampledEpoch, pressure)
 			return
 		}
 
@@ -862,6 +845,42 @@ func (c *arenaRadix[V]) DeletePrefix(prefix string) {
 
 		return
 	}
+}
+
+func (c *arenaRadix[V]) deletePrefixShard(evictQ *evictCallbackQueue[V], prefix string, hasSample bool, pressure float64, validSample bool) (bool, float64, bool) {
+	if prefix == "" {
+		c.mu.Lock()
+		if c.isCleanEmptyLocked() {
+			c.deletePrefixExecuted++
+			c.unlock()
+			return hasSample, pressure, validSample
+		}
+		if hasSample {
+			c.hasValidSample = validSample
+			c.resetZeroWatermarkBelowTier2(pressure)
+			c.deleteAllPrefixLocked(evictQ, c.reclaimEpoch.Load(), pressure)
+			c.unlock()
+			return true, pressure, validSample
+		}
+		c.mu.Unlock()
+		sampledEpoch, p, valid := c.lockShardWithSample(&c.mu, false, false, 0, false)
+		c.deleteAllPrefixLocked(evictQ, sampledEpoch, p)
+		c.unlock()
+		return true, p, valid
+	}
+
+	sampledEpoch, p, valid := c.lockShardWithSample(&c.mu, false, hasSample, pressure, validSample)
+	c.deleteNonEmptyPrefixLocked(evictQ, prefix, sampledEpoch, p)
+	c.unlock()
+	return true, p, valid
+}
+
+// DeletePrefix deletes all entries whose keys begin with prefix.
+// It severs the matching subtree in O(1) and iteratively reclaims all nodes into the free-list.
+func (c *arenaRadix[V]) DeletePrefix(prefix string) {
+	var evictQ evictCallbackQueue[V]
+	c.deletePrefixShard(&evictQ, prefix, false, 0, false)
+	evictQ.invoke(&c.pressureState, c.onEvictValue, c.onEvictEntry)
 }
 
 func (c *arenaRadix[V]) evictSubtreeValueNodeLocked(evictQ *evictCallbackQueue[V], currID uint32, currHash uint64) {
@@ -996,14 +1015,8 @@ func (c *arenaRadix[V]) iterateValues(yield func(V) bool) bool {
 // occupancy, lookup performance, mutations, evictions, compactions, memory pressure,
 // and contiguous arena node mechanics.
 func (c *arenaRadix[V]) Stats() Stats {
-	st, _ := c.statsWithSampleOrder()
-	return st
-}
-
-func (c *arenaRadix[V]) statsWithSampleOrder() (Stats, uint64) {
 	c.mu.RLock()
 
-	order := c.lastSampleOrder.Load()
 	st := c.snapshotBaseStats(BackendArenaRadix, c.currentSize, c.maxSize, c.len)
 	freeCount := int(c.freeCount)
 	st.ArenaLiveNodes = max(len(c.nodes)-1-freeCount, 0)
@@ -1015,5 +1028,5 @@ func (c *arenaRadix[V]) statsWithSampleOrder() (Stats, uint64) {
 	} else {
 		c.mu.RUnlock()
 	}
-	return st, order
+	return st
 }

@@ -100,7 +100,7 @@ For high-contention multi-core workloads, any backend can be partitioned across 
 | Option | Default | Applies To | Description |
 | :--- | :--- | :--- | :--- |
 | `WithBackend(backend)` | `BackendMap` | `lru.New`, `lru.NewShardedCache` | Selects underlying cache engine (`BackendMap`, `BackendRadix`, `BackendArenaRadix`) |
-| `WithShards(shards)` | unsharded | All constructors | Partitions `maxSize` across `shards` (`1 <= shards <= maxSize`) independent LRU instances |
+| `WithShards(shards)` | unsharded | `lru.New`, `lru.NewMapCache`, `lru.NewRadixCache`, `lru.NewArenaRadixCache` | Partitions `maxSize` across `shards` (`1 <= shards <= maxSize`) independent LRU instances (`NewShardedCache` uses its explicit `shards` parameter) |
 | `WithShardFunc(fn)` | `DefaultShardFunc` | Sharded caches | Custom key-to-shard router `func(key string, numShards int) int` returning `[0, numShards)` |
 | `WithWeigher(fn)` | `1` per entry | All engines | Custom entry-weight callback `func(key string, value V) uint64` for byte/resource-bounded eviction |
 | `WithOnEvictValue(fn)` | `nil` | All engines | Value-only eviction/removal callback `func(value V, reason EvictionReason)` (zero key-reconstruction overhead on radix backends) |

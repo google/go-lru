@@ -29,7 +29,8 @@ type shardEngine[V any] interface {
 	iterateAll(yield func(string, V) bool) bool
 	iterateKeys(yield func(string) bool) bool
 	iterateValues(yield func(V) bool) bool
-	statsWithSampleOrder() (Stats, uint64)
+	deletePrefixShard(evictQ *evictCallbackQueue[V], prefix string, hasSample bool, pressure float64, validSample bool) (bool, float64, bool)
+	evaluateShardPressure(evictQ *evictCallbackQueue[V], hasSample bool, pressure float64, validSample bool) ([]V, float64, bool)
 }
 
 // DefaultShardFunc computes a zero-allocation 64-bit FNV-1a hash of key and maps it
@@ -54,25 +55,30 @@ func DefaultShardFunc(key string, numShards int) int {
 // LRU cache shards to eliminate lock contention under high-concurrency workloads.
 //
 // Each shard maintains its own independent capacity quota, recency order, mutex,
-// eviction callback serialization, and two-tier memory-pressure reclamation state.
+// and compaction watermarks, while c.coord coordinates cache-wide memory-pressure
+// sampling, reclamation epochs, and serialized eviction callback delivery.
 type shardedCache[V any] struct {
 	shards                  []shardEngine[V]
 	shardFn                 ShardFunc
+	onEvictValue            func(value V, reason EvictionReason)
+	onEvictEntry            func(key string, value V, reason EvictionReason)
 	maxSize                 uint64
 	backend                 Backend
 	enableInvariantChecking bool
 
 	// Cache-line padding isolates read-only hot-path routing fields (shards, shardFn)
-	// from atomic counters mutated during DeletePrefix or pressure sampling.
+	// from atomic counters and coordinator state mutated during DeletePrefix, eviction
+	// callbacks, or memory-pressure sampling.
 	_                    [64]byte
 	deletePrefixExecuted atomic.Uint64
 	_                    [64]byte
-	sampleClock          atomic.Uint64
+	coord                pressureState
 }
 
 // NewShardedCache creates and returns a sharded LRU Cache[V] that partitions maxSize
 // across shards independent instances of the configured Backend (BackendMap by default,
-// or BackendRadix / BackendArenaRadix via WithBackend).
+// or BackendRadix / BackendArenaRadix via WithBackend). The explicit shards parameter
+// overrides any WithShards option supplied in opts.
 //
 // Total capacity maxSize is distributed evenly across shards: each shard receives
 // maxSize / uint64(shards), with the first maxSize % uint64(shards) shards receiving +1
@@ -83,7 +89,9 @@ type shardedCache[V any] struct {
 // WithShardFunc is used, or DefaultShardFunc if neither is provided.
 //
 // All returned instances also implement PressureAwareCache[V]. Eviction callbacks are
-// serialized per shard (callbacks for distinct shards may execute concurrently).
+// serialized per cache across all shards (supporting safe cross-shard re-entrant calls),
+// and multi-shard operations (DeletePrefix, EvaluateMemoryPressure) invoke eviction
+// callbacks after all shard mutations have completed.
 // Iteration methods (All, Keys, Values) visit shards sequentially from shard 0 to shards-1,
 // yielding each shard's entries in MRU-to-LRU order while holding at most one shard's RLock
 // at a time.
@@ -132,18 +140,31 @@ func newShardedCacheWithOptions[V any](maxSize uint64, shards int, options Optio
 		shardFn = DefaultShardFunc
 	}
 
+	coordOpts := options
+	coordOpts.Shards = 0
+	coordOpts.hasCustomShards = false
+	coordOpts.sharedPressure = nil
+	coordOpts.hasShardTier2Target = false
+	coordOpts.shardTier2Target = 0
+
 	c := &shardedCache[V]{
 		shards:                  make([]shardEngine[V], shards),
 		shardFn:                 shardFn,
+		onEvictValue:            resolveOnEvictValue[V](options),
+		onEvictEntry:            resolveOnEvictEntry[V](options),
 		maxSize:                 maxSize,
 		backend:                 options.Backend,
 		enableInvariantChecking: options.EnableInvariantChecking,
+		coord:                   pressureState{options: coordOpts},
 	}
 
-	shardOpts := options
-	shardOpts.Shards = 0
-	shardOpts.hasCustomShards = false
-	shardOpts.sharedSampleClock = &c.sampleClock
+	shardOpts := coordOpts
+	shardOpts.sharedPressure = &c.coord
+	shardOpts.hasShardTier2Target = true
+
+	globalTarget := computeTargetSize(maxSize, options.EvictionRetentionRatio)
+	baseTarget := globalTarget / uint64(shards)
+	targetRem := globalTarget % uint64(shards)
 
 	baseCap := maxSize / uint64(shards)
 	rem := maxSize % uint64(shards)
@@ -152,6 +173,11 @@ func newShardedCacheWithOptions[V any](maxSize uint64, shards int, options Optio
 		if uint64(i) < rem {
 			shardMax++
 		}
+		shardTarget := baseTarget
+		if uint64(i) < targetRem {
+			shardTarget++
+		}
+		shardOpts.shardTier2Target = shardTarget
 		c.shards[i] = newSingleShardEngine[V](shardMax, shardOpts)
 	}
 
@@ -194,12 +220,17 @@ func (c *shardedCache[V]) Replace(key string, value V) error {
 	return c.shardFor(key).Replace(key, value)
 }
 
-// DeletePrefix deletes all entries whose keys begin with prefix across all shards.
+// DeletePrefix deletes all entries whose keys begin with prefix across all shards,
+// invoking any configured eviction callbacks after all shard mutations have completed.
 func (c *shardedCache[V]) DeletePrefix(prefix string) {
 	c.deletePrefixExecuted.Add(1)
+	var evictQ evictCallbackQueue[V]
+	var hasSample, validSample bool
+	var pressure float64
 	for _, s := range c.shards {
-		s.DeletePrefix(prefix)
+		hasSample, pressure, validSample = s.deletePrefixShard(&evictQ, prefix, hasSample, pressure, validSample)
 	}
+	evictQ.invoke(&c.coord, c.onEvictValue, c.onEvictEntry)
 }
 
 // All returns an iterator over all live key-value pairs across all shards, visiting shards
@@ -251,13 +282,21 @@ func (c *shardedCache[V]) Compact() {
 	}
 }
 
-// EvaluateMemoryPressure evaluates memory pressure and executes Tier 1 or Tier 2 reclamation
-// across all shards sequentially, returning all values evicted during Tier 2 shedding.
+// EvaluateMemoryPressure evaluates memory pressure once and executes Tier 1 or Tier 2 reclamation
+// across all shards sequentially, invoking eviction callbacks after all shard mutations complete
+// and returning all values evicted during Tier 2 shedding.
 func (c *shardedCache[V]) EvaluateMemoryPressure() []V {
 	var evicted []V
+	var evictQ evictCallbackQueue[V]
+	var hasSample, validSample bool
+	var pressure float64
 	for _, s := range c.shards {
-		evicted = appendEvicted(evicted, s.EvaluateMemoryPressure())
+		var shardEvicted []V
+		shardEvicted, pressure, validSample = s.evaluateShardPressure(&evictQ, hasSample, pressure, validSample)
+		hasSample = true
+		evicted = appendEvicted(evicted, shardEvicted)
 	}
+	evictQ.invoke(&c.coord, c.onEvictValue, c.onEvictEntry)
 	return evicted
 }
 
@@ -267,15 +306,12 @@ func (c *shardedCache[V]) Stats() Stats {
 		Backend:              c.backend,
 		DeletePrefixExecuted: c.deletePrefixExecuted.Load(),
 	}
-	var latestOrder uint64
 	for _, s := range c.shards {
-		shardStats, order := s.statsWithSampleOrder()
+		shardStats := s.Stats()
 		addShardStats(&st, &shardStats)
-		if order > latestOrder {
-			latestOrder = order
-			st.MemoryPressure = shardStats.MemoryPressure
-		}
 	}
+	st.MemoryPressure = math.Float64frombits(c.coord.lastSampledPressureBits.Load())
+	st.ReclaimEpoch = c.coord.reclaimEpoch.Load()
 	if c.enableInvariantChecking {
 		c.checkAggregateStatsInvariants(&st)
 	}
@@ -317,7 +353,6 @@ func addShardStats(dst, src *Stats) {
 	dst.CompactionsAutoSlack += src.CompactionsAutoSlack
 	dst.PressureShedsInline += src.PressureShedsInline
 	dst.PressureShedsExplicit += src.PressureShedsExplicit
-	dst.ReclaimEpoch += src.ReclaimEpoch
 
 	dst.DeletedSinceCompact += src.DeletedSinceCompact
 	dst.PeakEntryLen += src.PeakEntryLen

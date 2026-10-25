@@ -826,7 +826,7 @@ func (c *arenaRadix[V]) maybeReclaimUnderPressureLocked(evictQ *evictCallbackQue
 			return nil
 		}
 		retention := c.options.EvictionRetentionRatio
-		targetSize := computeTargetSize(c.maxSize, retention)
+		targetSize := c.tier2TargetSize(c.maxSize)
 		return c.shedAndCompactLocked(evictQ, targetSize, retention, protectedNodeID)
 	}
 	c.resetZeroWatermarkBelowTier2(pressure)

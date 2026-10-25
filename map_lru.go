@@ -663,13 +663,18 @@ func (c *mapCache[V]) Replace(key string, value V) error {
 	return nil
 }
 
-func (c *mapCache[V]) deleteAllPrefixLocked(evictQ *evictCallbackQueue[V], sampledEpoch uint64, pressure float64) {
-	c.deletePrefixExecuted++
+func (c *mapCache[V]) isCleanEmptyLocked() bool {
 	hadEntries := c.entries.Len() > 0
 	hadDirtySlack := c.dirtyIndex || c.peakEntryLen > minPeakSlackEntries || c.deletedSinceCompact > 0
-	if !hadEntries && !hadDirtySlack && c.peakEntryLen == 0 {
+	return !hadEntries && !hadDirtySlack && c.peakEntryLen == 0
+}
+
+func (c *mapCache[V]) deleteAllPrefixLocked(evictQ *evictCallbackQueue[V], sampledEpoch uint64, pressure float64) {
+	c.deletePrefixExecuted++
+	if c.isCleanEmptyLocked() {
 		return
 	}
+	hadDirtySlack := c.dirtyIndex || c.peakEntryLen > minPeakSlackEntries || c.deletedSinceCompact > 0
 	hadReclaimable := c.currentSize > 0 || hadDirtySlack
 	c.deletedSinceCompact += c.entries.Len()
 	hadCompactionSlack := c.hasEmptyDeleteSlack(false)
@@ -697,46 +702,56 @@ func (c *mapCache[V]) deleteAllPrefixLocked(evictQ *evictCallbackQueue[V], sampl
 	c.finishClearAllLocked(hadCompactionSlack, hadReclaimable, sampledEpoch, pressure)
 }
 
-// DeletePrefix removes all entries from the cache whose keys start with prefix.
-// If prefix is empty (""), all entries in the cache are deleted.
-func (c *mapCache[V]) DeletePrefix(prefix string) {
-	if prefix == "" {
-		c.mu.Lock()
-		hadEntries := c.entries.Len() > 0
-		hadDirtySlack := c.dirtyIndex || c.peakEntryLen > minPeakSlackEntries || c.deletedSinceCompact > 0
-		if !hadEntries && !hadDirtySlack && c.peakEntryLen == 0 {
-			c.deletePrefixExecuted++
-			c.unlock()
-			return
-		}
-		c.mu.Unlock()
-
-		var evictQ evictCallbackQueue[V]
-		sampledEpoch, pressure := c.lockWithPressure(&c.mu, false)
-		c.deleteAllPrefixLocked(&evictQ, sampledEpoch, pressure)
-		c.unlock()
-		evictQ.invoke(&c.pressureState, c.onEvictValue, c.onEvictEntry)
-		return
-	}
-
-	sampledEpoch, pressure := c.lockWithPressure(&c.mu, false)
-	var evictQ evictCallbackQueue[V]
-	defer evictQ.invoke(&c.pressureState, c.onEvictValue, c.onEvictEntry)
-	defer c.unlock()
-
+func (c *mapCache[V]) deleteNonEmptyPrefixLocked(evictQ *evictCallbackQueue[V], prefix string, sampledEpoch uint64, pressure float64) {
 	c.deletePrefixExecuted++
 	sizeBefore := c.currentSize
 	erasedAny := false
 	for key := range c.index {
 		if strings.HasPrefix(key, prefix) {
-			c.eraseInternal(&evictQ, key, EvictionReasonDeleted)
+			c.eraseInternal(evictQ, key, EvictionReasonDeleted)
 			erasedAny = true
 		}
 	}
 	if !erasedAny {
 		return
 	}
-	c.finishDeleteReclaimLocked(&evictQ, sizeBefore, sampledEpoch, pressure)
+	c.finishDeleteReclaimLocked(evictQ, sizeBefore, sampledEpoch, pressure)
+}
+
+func (c *mapCache[V]) deletePrefixShard(evictQ *evictCallbackQueue[V], prefix string, hasSample bool, pressure float64, validSample bool) (bool, float64, bool) {
+	if prefix == "" {
+		c.mu.Lock()
+		if c.isCleanEmptyLocked() {
+			c.deletePrefixExecuted++
+			c.unlock()
+			return hasSample, pressure, validSample
+		}
+		if hasSample {
+			c.hasValidSample = validSample
+			c.resetZeroWatermarkBelowTier2(pressure)
+			c.deleteAllPrefixLocked(evictQ, c.reclaimEpoch.Load(), pressure)
+			c.unlock()
+			return true, pressure, validSample
+		}
+		c.mu.Unlock()
+		sampledEpoch, p, valid := c.lockShardWithSample(&c.mu, false, false, 0, false)
+		c.deleteAllPrefixLocked(evictQ, sampledEpoch, p)
+		c.unlock()
+		return true, p, valid
+	}
+
+	sampledEpoch, p, valid := c.lockShardWithSample(&c.mu, false, hasSample, pressure, validSample)
+	c.deleteNonEmptyPrefixLocked(evictQ, prefix, sampledEpoch, p)
+	c.unlock()
+	return true, p, valid
+}
+
+// DeletePrefix removes all entries from the cache whose keys start with prefix.
+// If prefix is empty (""), all entries in the cache are deleted.
+func (c *mapCache[V]) DeletePrefix(prefix string) {
+	var evictQ evictCallbackQueue[V]
+	c.deletePrefixShard(&evictQ, prefix, false, 0, false)
+	evictQ.invoke(&c.pressureState, c.onEvictValue, c.onEvictEntry)
 }
 
 // All returns an iterator over all key-value pairs in MRU-to-LRU order without modifying recency.
@@ -804,20 +819,14 @@ func (c *mapCache[V]) iterateValues(yield func(V) bool) bool {
 
 // Stats returns a point-in-time telemetry snapshot of the cache.
 func (c *mapCache[V]) Stats() Stats {
-	st, _ := c.statsWithSampleOrder()
-	return st
-}
-
-func (c *mapCache[V]) statsWithSampleOrder() (Stats, uint64) {
 	c.mu.RLock()
-	order := c.lastSampleOrder.Load()
 	st := c.snapshotBaseStats(BackendMap, c.currentSize, c.maxSize, c.entries.Len())
 	if c.options.EnableInvariantChecking {
 		c.rUnlockWithInvariants()
 	} else {
 		c.mu.RUnlock()
 	}
-	return st, order
+	return st
 }
 
 // Compact reallocates the internal hash index to reclaim Go map bucket slack while preserving all live entries.
@@ -904,7 +913,7 @@ func (c *mapCache[V]) maybeReclaimUnderPressureLocked(evictQ *evictCallbackQueue
 			return nil
 		}
 		retention := c.options.EvictionRetentionRatio
-		targetSize := computeTargetSize(c.maxSize, retention)
+		targetSize := c.tier2TargetSize(c.maxSize)
 		return c.shedAndCompactLocked(evictQ, targetSize, retention, protectedElem, isBackground)
 	}
 	c.resetZeroWatermarkBelowTier2(pressure)
@@ -915,13 +924,18 @@ func (c *mapCache[V]) maybeReclaimUnderPressureLocked(evictQ *evictCallbackQueue
 	return nil
 }
 
+func (c *mapCache[V]) evaluateShardPressure(evictQ *evictCallbackQueue[V], hasSample bool, pressure float64, validSample bool) ([]V, float64, bool) {
+	_, p, valid := c.lockShardWithSample(&c.mu, true, hasSample, pressure, validSample)
+	evicted := c.maybeReclaimUnderPressureLocked(evictQ, p, nil, true)
+	c.unlock()
+	return evicted, p, valid
+}
+
 // EvaluateMemoryPressure samples the configured memory-pressure probe and executes
 // Tier 2 (LRU shedding + map compaction) or Tier 1 (lossless map compaction) if thresholds are met.
 func (c *mapCache[V]) EvaluateMemoryPressure() []V {
 	var evictQ evictCallbackQueue[V]
-	_, pressure := c.lockWithPressure(&c.mu, true)
-	evicted := c.maybeReclaimUnderPressureLocked(&evictQ, pressure, nil, true)
-	c.unlock()
+	evicted, _, _ := c.evaluateShardPressure(&evictQ, false, 0, false)
 	evictQ.invoke(&c.pressureState, c.onEvictValue, c.onEvictEntry)
 	return evicted
 }

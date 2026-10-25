@@ -20,7 +20,6 @@ import (
 	"reflect"
 	"runtime/metrics"
 	"sync"
-	"sync/atomic"
 )
 
 // Weigher calculates the logical or byte weight of a cache entry.
@@ -164,7 +163,8 @@ var metricsSamplePool = sync.Pool{
 // reclamation (on Put, Delete, Replace, and DeletePrefix) and explicit
 // EvaluateMemoryPressure() / Compact() calls across ArenaRadixCache, MapCache, and RadixCache.
 type Options struct {
-	// Backend selects the underlying cache engine when calling New.
+	// Backend selects the underlying cache engine when calling New or NewShardedCache
+	// (explicit backend constructors NewMapCache, NewRadixCache, and NewArenaRadixCache override Backend).
 	// Defaults to BackendMap.
 	Backend Backend
 
@@ -222,19 +222,27 @@ type Options struct {
 	// Defaults to DefaultEvictionRetentionRatio (0.50) if unset, negative, or NaN.
 	EvictionRetentionRatio float64
 
-	// Shards specifies the number of independent LRU shards when sharding is enabled via WithShards.
+	// Shards specifies the number of independent LRU shards when sharding is enabled via WithShards
+	// on New, NewMapCache, NewRadixCache, or NewArenaRadixCache (NewShardedCache always uses its
+	// explicit shards parameter and ignores WithShards).
 	// When unset (0 and !hasCustomShards), New constructs a single unsharded cache instance.
-	// When explicitly configured via WithShards, Shards must satisfy 1 <= Shards <= maxSize;
-	// otherwise cache construction panics.
-	Shards          int
-	hasCustomShards bool
+	// When explicitly configured via WithShards on New, NewMapCache, NewRadixCache, or NewArenaRadixCache,
+	// Shards must satisfy 1 <= Shards <= maxSize; otherwise cache construction panics.
+	Shards              int
+	hasCustomShards     bool
+	hasShardTier2Target bool
 
 	// ShardFunc maps a key to a shard index in [0, Shards) when sharding is enabled.
 	// If nil, DefaultShardFunc is used.
 	ShardFunc ShardFunc
 
-	// sharedSampleClock orders pressure telemetry samples across shards of a single shardedCache.
-	sharedSampleClock *atomic.Uint64
+	// sharedPressure coordinates memory-pressure sampling, reclamation epochs, and eviction
+	// callback serialization across all shards of a single shardedCache.
+	sharedPressure *pressureState
+
+	// shardTier2Target holds the pre-partitioned Tier 2 target retention capacity for a shard
+	// when hasShardTier2Target is true.
+	shardTier2Target uint64
 }
 
 func (o Options) shouldShard() bool {
@@ -244,7 +252,8 @@ func (o Options) shouldShard() bool {
 // Option is a functional option for configuring a Cache instance.
 type Option func(*Options)
 
-// WithBackend configures the cache engine backend constructed by New.
+// WithBackend configures the cache engine backend constructed by New or NewShardedCache.
+// Explicit backend constructors (NewMapCache, NewRadixCache, and NewArenaRadixCache) ignore WithBackend.
 // Supported backends: BackendMap (default), BackendRadix, BackendArenaRadix.
 func WithBackend(backend Backend) Option {
 	return func(o *Options) {
@@ -501,11 +510,12 @@ func WithEvictionRetentionRatio(ratio float64) Option {
 	}
 }
 
-// WithShards configures the cache to partition keys and capacity across the specified
-// number of independent LRU shards of the selected Backend.
+// WithShards configures New, NewMapCache, NewRadixCache, or NewArenaRadixCache to partition
+// keys and capacity across the specified number of independent LRU shards of the selected Backend.
+// NewShardedCache always uses its explicit shards parameter and ignores WithShards.
 //
-// shards must be greater than zero and must not exceed maxSize when constructing a cache;
-// otherwise cache construction panics.
+// When applied to New, NewMapCache, NewRadixCache, or NewArenaRadixCache, shards must be greater
+// than zero and must not exceed maxSize; otherwise cache construction panics.
 func WithShards(shards int) Option {
 	return func(o *Options) {
 		o.Shards = shards

@@ -24,6 +24,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -727,6 +728,520 @@ func TestShardedCache_ConcurrentRaceAndTelemetryParity(t *testing.T) {
 				assert.Equal(t, entryCounts[reason].Load(), st.Evictions(r))
 				assert.Equal(t, entryWeights[reason].Load(), st.EvictedWeight(r))
 			}
+		})
+	}
+}
+
+func TestNewShardedCache_ExplicitShardsOverridesWithShardsOption(t *testing.T) {
+	for _, opt := range []Option{WithShards(0), WithShards(-5), WithShards(999)} {
+		c := NewShardedCache[int](16, 4, nil, opt, WithInvariantChecking(true))
+		sc, ok := c.(*shardedCache[int])
+		require.True(t, ok)
+		assert.Len(t, sc.shards, 4)
+		assert.Equal(t, uint64(16), c.Stats().MaxSize)
+	}
+}
+
+func runCrossShardABBACallbackTest(t *testing.T, backend Backend) {
+	t.Helper()
+	var cache Cache[int]
+	var unsyncedCallbackCounter int // Protected solely by per-cache evictCallbackMu serialization (-race verifies no data race).
+	var reentered atomic.Bool
+
+	cache = NewShardedCache[int](
+		4, // 2 shards * capacity 2 each
+		2,
+		explicitTagShardFunc,
+		WithBackend(backend),
+		WithInvariantChecking(true),
+		WithOnEvictValue(func(_ int, _ EvictionReason) {
+			unsyncedCallbackCounter++
+		}),
+		WithOnEvictEntry(func(k string, v int, r EvictionReason) {
+			unsyncedCallbackCounter++
+			if r != EvictionReasonCapacity {
+				return
+			}
+			// Cross-shard mutual re-entrancy + child goroutine cross-shard mutation.
+			if strings.HasPrefix(k, "s0/w-") || strings.HasPrefix(k, "s0/init-") {
+				_, _ = cache.Put(fmt.Sprintf("s1/re-%d", v), v+100)
+			} else if strings.HasPrefix(k, "s1/w-") || strings.HasPrefix(k, "s1/init-") {
+				_, _ = cache.Put(fmt.Sprintf("s0/re-%d", v), v+200)
+			}
+			if reentered.CompareAndSwap(false, true) {
+				var childWG sync.WaitGroup
+				childWG.Go(func() {
+					cache.DeletePrefix("s1/re-")
+				})
+				childWG.Wait()
+			}
+		}),
+	)
+
+	for i := range 2 {
+		_, err := cache.Put(fmt.Sprintf("s0/init-%d", i), i)
+		require.NoError(t, err)
+		_, err = cache.Put(fmt.Sprintf("s1/init-%d", i), i)
+		require.NoError(t, err)
+	}
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		var wg sync.WaitGroup
+		wg.Go(func() {
+			for i := range 40 {
+				_, _ = cache.Put(fmt.Sprintf("s0/w-%d", i), i)
+			}
+		})
+		wg.Go(func() {
+			for i := range 40 {
+				_, _ = cache.Put(fmt.Sprintf("s1/w-%d", i), i)
+			}
+		})
+		wg.Wait()
+	}()
+
+	select {
+	case <-done:
+	case <-time.After(10 * time.Second):
+		require.Failf(t, "deadlock", "cross-shard eviction callbacks deadlocked on %v", backend)
+	}
+	assert.Positive(t, unsyncedCallbackCounter)
+}
+
+func TestShardedCache_CrossShardEvictCallbackSerializationAndABBAReentrancy(t *testing.T) {
+	for _, backend := range []Backend{BackendMap, BackendRadix, BackendArenaRadix} {
+		t.Run(backend.String(), func(t *testing.T) {
+			runCrossShardABBACallbackTest(t, backend)
+		})
+	}
+}
+
+func TestShardedCache_PressureFuncReentrancyAndSingleProbe(t *testing.T) {
+	for _, backend := range []Backend{BackendMap, BackendRadix, BackendArenaRadix} {
+		t.Run(backend.String(), func(t *testing.T) {
+			var cache Cache[int]
+			var sc *shardedCache[int]
+			var pa PressureAwareCache[int]
+			var probeCalls atomic.Int64
+			var extAfterReentrantOps atomic.Uint64
+			var enableReentrancy atomic.Bool
+
+			cache = NewShardedCache[int](
+				64,
+				16,
+				explicitTagShardFunc,
+				WithBackend(backend),
+				WithInvariantChecking(true),
+				WithWeigher(func(k string, _ int) uint64 {
+					if strings.HasPrefix(k, "s2/zero-") {
+						return 0
+					}
+					return 1
+				}),
+				WithCompactionThreshold(0.70),
+				WithEvictionThreshold(0.90),
+				WithEvictionRetentionRatio(0.50),
+				WithPressureFunc(func() float64 {
+					probeCalls.Add(1)
+					if !enableReentrancy.Load() {
+						return 0.10
+					}
+					// Re-entrant multi-shard EvaluateMemoryPressure, DeletePrefix, cross-shard Put, and child goroutine Delete.
+					_ = pa.EvaluateMemoryPressure()
+					cache.DeletePrefix("s1/tmp-")
+					_, _ = cache.Put("s2/reentrant", 42)
+					var childWG sync.WaitGroup
+					childWG.Go(func() {
+						_, _ = cache.Delete("s0/tmp")
+					})
+					childWG.Wait()
+					extAfterReentrantOps.Store(sc.coord.externalReclaimEpoch.Load())
+					return 0.95
+				}),
+			)
+			sc = cache.(*shardedCache[int])
+			pa = cache.(PressureAwareCache[int])
+
+			// Clean empty DeletePrefix("") must invoke PressureFunc 0 times.
+			probeCalls.Store(0)
+			cache.DeletePrefix("")
+			assert.Zero(t, probeCalls.Load(), "clean empty DeletePrefix(\"\") must not sample PressureFunc")
+
+			// Populate entries across shards, including zero-weight entries on shard 2.
+			_, err := cache.Put("s0/tmp", 1)
+			require.NoError(t, err)
+			_, err = cache.Put("s1/tmp-1", 2)
+			require.NoError(t, err)
+			for i := range 4 {
+				_, err = cache.Put(fmt.Sprintf("s0/keep-%d", i), i)
+				require.NoError(t, err)
+				_, err = cache.Put(fmt.Sprintf("s2/zero-%d", i), i)
+				require.NoError(t, err)
+			}
+
+			// Non-reentrant EvaluateMemoryPressure and DeletePrefix must each invoke PressureFunc once (not 16 times).
+			probeCalls.Store(0)
+			_ = pa.EvaluateMemoryPressure()
+			assert.Equal(t, int64(1), probeCalls.Load(), "EvaluateMemoryPressure must sample PressureFunc once across all shards")
+
+			probeCalls.Store(0)
+			cache.DeletePrefix("nonexistent/")
+			assert.Equal(t, int64(1), probeCalls.Load(), "DeletePrefix must sample PressureFunc once across all shards")
+
+			// Re-entrant PressureFunc must complete in O(N) with 1 PressureFunc invocation (no O(N!) livelock or spurious external retry).
+			extBefore := sc.coord.externalReclaimEpoch.Load()
+			probeCalls.Store(0)
+			enableReentrancy.Store(true)
+
+			_ = pa.EvaluateMemoryPressure()
+			assert.Equal(t, int64(1), probeCalls.Load(), "re-entrant PressureFunc must not recurse across shards or trigger external-reclaim retry")
+			assert.Equal(t, extBefore, extAfterReentrantOps.Load(), "cross-shard re-entrant Delete/DeletePrefix inside PressureFunc must not increment externalReclaimEpoch")
+
+			_, ok := cache.Peek("s2/reentrant")
+			assert.True(t, ok, "re-entrant cross-shard Put must survive")
+		})
+	}
+
+	t.Run("LargeShardCountNoStackOverflow", func(t *testing.T) {
+		var pa PressureAwareCache[int]
+		var calls atomic.Int64
+		c := NewShardedCache[int](
+			512,
+			256,
+			nil,
+			WithPressureFunc(func() float64 {
+				calls.Add(1)
+				_ = pa.EvaluateMemoryPressure()
+				return 0.95
+			}),
+		)
+		pa = c.(PressureAwareCache[int])
+		_ = pa.EvaluateMemoryPressure()
+		assert.Equal(t, int64(1), calls.Load())
+	})
+}
+
+func TestShardedCache_Tier2RetentionRatioAcrossShards(t *testing.T) {
+	for _, backend := range []Backend{BackendMap, BackendRadix, BackendArenaRadix} {
+		t.Run(backend.String()+"/UnitShardMax", func(t *testing.T) {
+			var pressureBits atomic.Uint64
+			pressureBits.Store(math.Float64bits(0.10))
+
+			// maxSize == shards == 8 -> shardMax == 1 on every shard; 50% retention must retain 4 entries globally (not 8).
+			c := NewShardedCache[int](
+				8,
+				8,
+				func(key string, numShards int) int {
+					var idx int
+					_, _ = fmt.Sscanf(key, "k%d", &idx)
+					return idx % numShards
+				},
+				WithBackend(backend),
+				WithInvariantChecking(true),
+				WithEvictionThreshold(0.90),
+				WithEvictionRetentionRatio(0.50),
+				WithPressureFunc(func() float64 {
+					return math.Float64frombits(pressureBits.Load())
+				}),
+			)
+			for i := range 8 {
+				_, err := c.Put(fmt.Sprintf("k%d", i), i)
+				require.NoError(t, err)
+			}
+			require.Equal(t, uint64(8), c.Stats().CurrentSize)
+
+			pressureBits.Store(math.Float64bits(0.95))
+			evicted := c.(PressureAwareCache[int]).EvaluateMemoryPressure()
+			assert.Len(t, evicted, 4)
+			assert.Equal(t, uint64(4), c.Stats().CurrentSize)
+
+			// Inline foreground Put onto shard 7 (whose shardTier2Target == 0) must still protect the newly inserted entry.
+			_, err := c.Put("k7", 777)
+			require.NoError(t, err)
+			v, ok := c.Peek("k7")
+			require.True(t, ok)
+			assert.Equal(t, 777, v)
+		})
+
+		t.Run(backend.String()+"/SmallRetentionGlobalFloorOne", func(t *testing.T) {
+			var pressureBits atomic.Uint64
+			pressureBits.Store(math.Float64bits(0.10))
+
+			// maxSize = 8, shards = 8, retention = 0.01 -> globalTarget = 1 (not 8).
+			c := NewShardedCache[int](
+				8,
+				8,
+				func(key string, numShards int) int {
+					var idx int
+					_, _ = fmt.Sscanf(key, "k%d", &idx)
+					return idx % numShards
+				},
+				WithBackend(backend),
+				WithInvariantChecking(true),
+				WithEvictionThreshold(0.90),
+				WithEvictionRetentionRatio(0.01),
+				WithPressureFunc(func() float64 {
+					return math.Float64frombits(pressureBits.Load())
+				}),
+			)
+			for i := range 8 {
+				_, err := c.Put(fmt.Sprintf("k%d", i), i)
+				require.NoError(t, err)
+			}
+
+			pressureBits.Store(math.Float64bits(0.95))
+			evicted := c.(PressureAwareCache[int]).EvaluateMemoryPressure()
+			assert.Len(t, evicted, 7)
+			assert.Equal(t, uint64(1), c.Stats().CurrentSize)
+		})
+
+		t.Run(backend.String()+"/FractionalPerShardQuota", func(t *testing.T) {
+			var pressureBits atomic.Uint64
+			pressureBits.Store(math.Float64bits(0.10))
+
+			// maxSize = 192 across 64 shards (shardMax = 3 each) at 0.50 retention -> must retain 96 (50%), not 64 (33.3%).
+			c := NewShardedCache[int](
+				192,
+				64,
+				func(key string, numShards int) int {
+					var shard int
+					_, _ = fmt.Sscanf(key, "s%d/", &shard)
+					return shard % numShards
+				},
+				WithBackend(backend),
+				WithInvariantChecking(true),
+				WithEvictionThreshold(0.90),
+				WithEvictionRetentionRatio(0.50),
+				WithPressureFunc(func() float64 {
+					return math.Float64frombits(pressureBits.Load())
+				}),
+			)
+			for s := range 64 {
+				for j := range 3 {
+					_, err := c.Put(fmt.Sprintf("s%d/k%d", s, j), j)
+					require.NoError(t, err)
+				}
+			}
+			require.Equal(t, uint64(192), c.Stats().CurrentSize)
+
+			pressureBits.Store(math.Float64bits(0.95))
+			evicted := c.(PressureAwareCache[int]).EvaluateMemoryPressure()
+			assert.Len(t, evicted, 96)
+			assert.Equal(t, uint64(96), c.Stats().CurrentSize)
+		})
+	}
+}
+
+func runMultiShardDeferredCallbackTest(t *testing.T, backend Backend) {
+	t.Helper()
+	var pressureBits atomic.Uint64
+	pressureBits.Store(math.Float64bits(0.10))
+
+	var firstDeleteSawComplete, firstPressureSawComplete atomic.Bool
+	var deleteCBCount, pressureCBCount atomic.Int32
+	var panicOnDelete atomic.Bool
+
+	var cacheBySuffix Cache[int]
+	cacheBySuffix = NewShardedCache[int](
+		12, // 3 shards * capacity 4 each
+		3,
+		func(key string, numShards int) int {
+			switch {
+			case strings.HasSuffix(key, "/s0"):
+				return 0 % numShards
+			case strings.HasSuffix(key, "/s1"):
+				return 1 % numShards
+			default:
+				return 2 % numShards
+			}
+		},
+		WithBackend(backend),
+		WithInvariantChecking(true),
+		WithEvictionThreshold(0.90),
+		WithEvictionRetentionRatio(0.50),
+		WithPressureFunc(func() float64 {
+			return math.Float64frombits(pressureBits.Load())
+		}),
+		WithOnEvictEntry(func(_ string, _ int, r EvictionReason) {
+			if r == EvictionReasonDeleted {
+				if panicOnDelete.Load() {
+					panic("boom in DeletePrefix callback")
+				}
+				if deleteCBCount.Add(1) == 1 {
+					_, ok0 := cacheBySuffix.Peek("batch/s0")
+					_, ok1 := cacheBySuffix.Peek("batch/s1")
+					_, ok2 := cacheBySuffix.Peek("batch/s2")
+					firstDeleteSawComplete.Store(!ok0 && !ok1 && !ok2)
+					_, _ = cacheBySuffix.Put("batch/s2", 999)
+				}
+			}
+			if r == EvictionReasonPressure && pressureCBCount.Add(1) == 1 {
+				firstPressureSawComplete.Store(cacheBySuffix.Stats().CurrentSize <= 6)
+			}
+		}),
+	)
+
+	for _, suf := range []string{"/s0", "/s1", "/s2"} {
+		for _, pfx := range []string{"batch", "k1", "k2", "k3"} {
+			_, err := cacheBySuffix.Put(pfx+suf, 1)
+			require.NoError(t, err)
+		}
+	}
+
+	cacheBySuffix.DeletePrefix("batch/")
+	assert.True(t, firstDeleteSawComplete.Load(), "first DeletePrefix callback must observe all shards already mutated")
+	rebuiltVal, rebuiltOK := cacheBySuffix.Peek("batch/s2")
+	require.True(t, rebuiltOK, "key re-inserted into later shard during DeletePrefix callback must survive")
+	assert.Equal(t, 999, rebuiltVal)
+
+	// Fill shard 0 and shard 1 back to 4 entries each and run EvaluateMemoryPressure at 0.95.
+	_, err := cacheBySuffix.Put("k4/s0", 1)
+	require.NoError(t, err)
+	_, err = cacheBySuffix.Put("k4/s1", 1)
+	require.NoError(t, err)
+	pressureBits.Store(math.Float64bits(0.95))
+	_ = cacheBySuffix.(PressureAwareCache[int]).EvaluateMemoryPressure()
+	assert.True(t, firstPressureSawComplete.Load(), "first EvaluateMemoryPressure callback must observe all shards already shed")
+
+	// Callback panic during DeletePrefix must still leave all shards mutated and evictCallbackMu unlocked.
+	pressureBits.Store(math.Float64bits(0.10))
+	for _, suf := range []string{"/s0", "/s1", "/s2"} {
+		_, err = cacheBySuffix.Put("panicpfx"+suf, 1)
+		require.NoError(t, err)
+	}
+	panicOnDelete.Store(true)
+	assert.PanicsWithValue(t, "boom in DeletePrefix callback", func() {
+		cacheBySuffix.DeletePrefix("panicpfx/")
+	})
+	panicOnDelete.Store(false)
+	for _, suf := range []string{"/s0", "/s1", "/s2"} {
+		_, stillThere := cacheBySuffix.Peek("panicpfx" + suf)
+		assert.False(t, stillThere, "all shards must be mutated before DeletePrefix callback panics")
+	}
+	// Subsequent deletion + callback must not deadlock.
+	_, err = cacheBySuffix.Put("after-panic/s0", 1)
+	require.NoError(t, err)
+	_, deleted := cacheBySuffix.Delete("after-panic/s0")
+	assert.True(t, deleted)
+}
+
+func TestShardedCache_MultiShardDeferredCallbacksAndPanicSafety(t *testing.T) {
+	for _, backend := range []Backend{BackendMap, BackendRadix, BackendArenaRadix} {
+		t.Run(backend.String(), func(t *testing.T) {
+			runMultiShardDeferredCallbackTest(t, backend)
+		})
+	}
+}
+
+func TestShardedCache_MemoryPressureTelemetryCausalOrdering(t *testing.T) {
+	for _, backend := range []Backend{BackendMap, BackendRadix, BackendArenaRadix} {
+		t.Run(backend.String()+"/StalledOlderProbeDoesNotOverwriteNewerCrossShardProbe", func(t *testing.T) {
+			var seq atomic.Int32
+			g1Started := make(chan struct{})
+			allowG1Finish := make(chan struct{})
+
+			c := NewShardedCache[int](
+				16,
+				2,
+				explicitTagShardFunc,
+				WithBackend(backend),
+				WithInvariantChecking(true),
+				WithPressureFunc(func() float64 {
+					switch seq.Add(1) {
+					case 1:
+						close(g1Started)
+						<-allowG1Finish
+						return 0.85 // Older invocation on shard 0 finishes AFTER newer invocation on shard 1
+					default:
+						return 0.20 // Newer invocation on shard 1
+					}
+				}),
+			)
+
+			g1Done := make(chan struct{})
+			go func() {
+				defer close(g1Done)
+				_, err := c.Put("s0/k", 1)
+				assert.NoError(t, err)
+			}()
+			<-g1Started
+
+			_, err := c.Put("s1/k", 2)
+			require.NoError(t, err)
+			assert.InDelta(t, 0.20, c.Stats().MemoryPressure, 1e-9)
+
+			close(allowG1Finish)
+			<-g1Done
+
+			assert.InDelta(t, 0.20, c.Stats().MemoryPressure, 1e-9, "older stalled probe on shard 0 must not overwrite newer probe on shard 1")
+		})
+
+		t.Run(backend.String()+"/RejectedPreReclamationProbeDoesNotOverwriteStats", func(t *testing.T) {
+			if backend == BackendRadix {
+				return // RadixCache.Compact() does not advance reclaimEpoch on pointer-based nodes
+			}
+			var armed atomic.Bool
+			var sampleNum atomic.Int32
+			g1Entered := make(chan struct{})
+			reclaimed := make(chan struct{})
+			retryStarted := make(chan struct{})
+			allowRetryFinish := make(chan struct{})
+
+			c := NewShardedCache[int](
+				32,
+				2,
+				explicitTagShardFunc,
+				WithBackend(backend),
+				WithInvariantChecking(true),
+				WithPressureFunc(func() float64 {
+					if !armed.Load() {
+						return 0.30
+					}
+					switch sampleNum.Add(1) {
+					case 1:
+						close(g1Entered)
+						<-reclaimed
+						return 0.95 // Stale pre-reclamation reading rejected at storeSampledPressureWithSeq
+					default:
+						close(retryStarted)
+						<-allowRetryFinish
+						return 0.15
+					}
+				}),
+			)
+			pa := c.(PressureAwareCache[int])
+
+			for i := range 10 {
+				_, err := c.Put(fmt.Sprintf("s1/k%d", i), i)
+				require.NoError(t, err)
+			}
+			for i := range 8 {
+				_, _ = c.Delete(fmt.Sprintf("s1/k%d", i))
+			}
+			require.InDelta(t, 0.30, c.Stats().MemoryPressure, 1e-9)
+
+			armed.Store(true)
+			g1Done := make(chan struct{})
+			go func() {
+				defer close(g1Done)
+				_, err := c.Put("s0/write", 1)
+				assert.NoError(t, err)
+			}()
+			<-g1Entered
+
+			// Compact shard 1 while G1's pre-reclamation probe (0.95) is in flight.
+			pa.Compact()
+			close(reclaimed)
+
+			// Wait until G1 has finished storeSampledPressureWithSeq(0.95) and entered its retry sample.
+			<-retryStarted
+			assert.InDelta(t, 0.30, c.Stats().MemoryPressure, 1e-9, "rejected pre-reclamation 0.95 sample must not overwrite Stats().MemoryPressure")
+
+			close(allowRetryFinish)
+			<-g1Done
+			assert.InDelta(t, 0.15, c.Stats().MemoryPressure, 1e-9)
 		})
 	}
 }

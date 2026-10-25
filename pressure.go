@@ -911,7 +911,6 @@ type pressureState struct {
 	putRejectedOversized    atomic.Uint64
 	arenaHashFallbacks      atomic.Uint64
 	lastSampledPressureBits atomic.Uint64
-	lastSampleOrder         atomic.Uint64
 
 	pressureWriteMu          sync.Mutex
 	hookIDVal                atomic.Uint64
@@ -971,6 +970,20 @@ const (
 	minSingleSurvivorFreeNodes = 63
 	slackQuarterMultiplier     = 4
 )
+
+func (p *pressureState) coord() *pressureState {
+	if p.options.sharedPressure != nil {
+		return p.options.sharedPressure
+	}
+	return p
+}
+
+func (p *pressureState) tier2TargetSize(maxSize uint64) uint64 {
+	if p.options.hasShardTier2Target {
+		return p.options.shardTier2Target
+	}
+	return computeTargetSize(maxSize, p.options.EvictionRetentionRatio)
+}
 
 func (p *pressureState) hasOverflowSamplingGID(gid uint64) bool {
 	if gid == 0 || p.overflowSamplingCount.Load() <= 0 {
@@ -1211,15 +1224,17 @@ func (p *pressureState) checkSamplingGoroutineOrChildSlow() (bool, uint64, uint6
 }
 
 func (p *pressureState) checkSamplingGoroutineOrChild() (sampling bool, rootGID, parentGID uint64) {
-	if p.options.hasCustomPressureFunc {
-		return p.checkSamplingGoroutineOrChildSlow()
+	coord := p.coord()
+	if coord.options.hasCustomPressureFunc {
+		return coord.checkSamplingGoroutineOrChildSlow()
 	}
 	return
 }
 
 func (p *pressureState) isSamplingGoroutine() bool {
-	if p.options.hasCustomPressureFunc {
-		sampling, _, _ := p.checkSamplingGoroutineOrChildSlow()
+	coord := p.coord()
+	if coord.options.hasCustomPressureFunc {
+		sampling, _, _ := coord.checkSamplingGoroutineOrChildSlow()
 		return sampling
 	}
 	return false
@@ -1278,6 +1293,14 @@ func (p *pressureState) clearReentrantSlot(gid uint64, slot int) bool {
 // markReclaimedLocked invalidates cached pre-reclamation pressure and increments reclaimEpoch.
 // Caller MUST hold the cache's write lock.
 func (p *pressureState) markReclaimedLocked() {
+	coord := p.coord()
+	if p != coord {
+		p.reclaimEpoch.Add(1)
+	}
+	coord.markReclaimedCoord()
+}
+
+func (p *pressureState) markReclaimedCoord() {
 	p.pressureWriteMu.Lock()
 	defer p.pressureWriteMu.Unlock()
 	sampling, gid := p.checkSamplingGoroutine()
@@ -1308,51 +1331,50 @@ func (p *pressureState) markReclaimedLocked() {
 }
 
 func (p *pressureState) hasElevatedPressureToInvalidate(pressure float64) bool {
-	thresh := p.options.CompactionThreshold
+	coord := p.coord()
+	thresh := coord.options.CompactionThreshold
 	if pressure >= thresh ||
-		math.Float64frombits(p.cachedPressureBits.Load()) >= thresh ||
-		p.pressureNeedsRefresh.Load() {
+		math.Float64frombits(coord.cachedPressureBits.Load()) >= thresh ||
+		coord.pressureNeedsRefresh.Load() {
 		return true
 	}
-	if !p.hasActiveSampler() {
+	if !coord.hasActiveSampler() {
 		return false
 	}
-	return !p.isSamplingGoroutine()
+	return !coord.isSamplingGoroutine()
 }
 
 func (p *pressureState) shouldInvalidatePressureOnReclaim(pressure float64) bool {
-	thresh := p.options.CompactionThreshold
+	coord := p.coord()
+	thresh := coord.options.CompactionThreshold
 	return pressure >= thresh ||
-		math.Float64frombits(p.cachedPressureBits.Load()) >= thresh ||
-		p.pressureNeedsRefresh.Load() ||
-		p.hasActiveSampler()
+		math.Float64frombits(coord.cachedPressureBits.Load()) >= thresh ||
+		coord.pressureNeedsRefresh.Load() ||
+		coord.hasActiveSampler()
 }
 
 func (p *pressureState) resolvePostRetryPressureLocked(sampledEpoch uint64, pressure float64, validSample bool) (uint64, float64) {
-	currentEpoch := p.reclaimEpoch.Load()
-	var resolvedEpoch uint64
+	coord := p.coord()
+	currentEpoch := coord.reclaimEpoch.Load()
 	var resolvedPressure float64
 	switch {
 	case sampledEpoch == currentEpoch:
 		p.hasValidSample = validSample
-		resolvedEpoch = sampledEpoch
 		resolvedPressure = pressure
-	case p.pressureInitialized.Load() && !p.pressureNeedsRefresh.Load() && p.cachedPressureEpoch.Load() == currentEpoch:
+	case coord.pressureInitialized.Load() && !coord.pressureNeedsRefresh.Load() && coord.cachedPressureEpoch.Load() == currentEpoch:
 		p.hasValidSample = true
-		resolvedEpoch = currentEpoch
-		resolvedPressure = math.Float64frombits(p.cachedPressureBits.Load())
+		resolvedPressure = math.Float64frombits(coord.cachedPressureBits.Load())
 	default:
 		p.hasValidSample = false
-		resolvedEpoch = currentEpoch
 		resolvedPressure = 0.0
 	}
 	p.resetZeroWatermarkBelowTier2(resolvedPressure)
-	return resolvedEpoch, resolvedPressure
+	return p.reclaimEpoch.Load(), resolvedPressure
 }
 
 func (p *pressureState) sampleForLock(fresh bool) (sampledEpoch, extEpoch uint64, pressure float64, validSample bool) {
 	if fresh {
-		return p.samplePressureFreshWithEpoch()
+		return p.coord().samplePressureFreshWithEpoch()
 	}
 	return p.samplePressureWithEpoch()
 }
@@ -1370,11 +1392,12 @@ func (p *pressureState) tryFastForwardSampledEpochLocked(sampledEpoch, extEpoch 
 }
 
 func (p *pressureState) lockWithPressureSlow(mu *sync.RWMutex, fresh bool) (uint64, float64) {
+	coord := p.coord()
 	sampledEpoch, extEpoch, pressure, validSample := p.sampleForLock(fresh)
 	mu.Lock()
-	for retries := 0; sampledEpoch != p.reclaimEpoch.Load(); retries++ {
-		sampledEpoch = p.tryFastForwardSampledEpochLocked(sampledEpoch, extEpoch, pressure, validSample)
-		if sampledEpoch == p.reclaimEpoch.Load() || retries >= 2 {
+	for retries := 0; sampledEpoch != coord.reclaimEpoch.Load(); retries++ {
+		sampledEpoch = coord.tryFastForwardSampledEpochLocked(sampledEpoch, extEpoch, pressure, validSample)
+		if sampledEpoch == coord.reclaimEpoch.Load() || retries >= 2 {
 			break
 		}
 		mu.Unlock()
@@ -1399,29 +1422,31 @@ func (p *pressureState) isCachedSampleStillValid(epoch uint64) bool {
 }
 
 func (p *pressureState) lockWithPressureFastMiss(mu *sync.RWMutex) (uint64, float64) {
-	epoch, _, pressure, valid := p.samplePressureFreshWithEpoch()
+	coord := p.coord()
+	epoch, _, pressure, valid := coord.samplePressureFreshWithEpoch()
 	mu.Lock()
-	if epoch == p.reclaimEpoch.Load() {
+	if epoch == coord.reclaimEpoch.Load() {
 		p.hasValidSample = valid
 		p.resetZeroWatermarkBelowTier2(pressure)
-		return epoch, pressure
+		return p.reclaimEpoch.Load(), pressure
 	}
 	mu.Unlock()
 	return p.lockWithPressureSlow(mu, false)
 }
 
 func (p *pressureState) lockWithPressure(mu *sync.RWMutex, fresh bool) (uint64, float64) {
-	if !fresh && !p.options.hasCustomPressureFunc {
-		epoch := p.reclaimEpoch.Load()
-		if p.canUseCachedSampleForEpoch(epoch, p.pressureSampleSeq.Add(1)) {
-			bits := p.cachedPressureBits.Load()
-			if p.isCachedSampleStillValid(epoch) {
+	coord := p.coord()
+	if !fresh && !coord.options.hasCustomPressureFunc {
+		epoch := coord.reclaimEpoch.Load()
+		if coord.canUseCachedSampleForEpoch(epoch, p.pressureSampleSeq.Add(1)) {
+			bits := coord.cachedPressureBits.Load()
+			if coord.isCachedSampleStillValid(epoch) {
 				mu.Lock()
-				if epoch == p.reclaimEpoch.Load() {
+				if epoch == coord.reclaimEpoch.Load() {
 					p.hasValidSample = true
 					pressure := math.Float64frombits(bits)
 					p.resetZeroWatermarkBelowTier2(pressure)
-					return epoch, pressure
+					return p.reclaimEpoch.Load(), pressure
 				}
 				mu.Unlock()
 				return p.lockWithPressureSlow(mu, false)
@@ -1430,6 +1455,17 @@ func (p *pressureState) lockWithPressure(mu *sync.RWMutex, fresh bool) (uint64, 
 		return p.lockWithPressureFastMiss(mu)
 	}
 	return p.lockWithPressureSlow(mu, fresh)
+}
+
+func (p *pressureState) lockShardWithSample(mu *sync.RWMutex, fresh, hasSample bool, pressure float64, validSample bool) (uint64, float64, bool) {
+	if !hasSample {
+		sampledEpoch, resolvedPressure := p.lockWithPressure(mu, fresh)
+		return sampledEpoch, resolvedPressure, p.hasValidSample
+	}
+	mu.Lock()
+	p.hasValidSample = validSample
+	p.resetZeroWatermarkBelowTier2(pressure)
+	return p.reclaimEpoch.Load(), pressure, validSample
 }
 
 func (p *pressureState) updateCachedPressureLocked(epoch, invokeSeq uint64, val float64) (float64, bool) {
@@ -1457,7 +1493,10 @@ func (p *pressureState) updateCachedPressureLocked(epoch, invokeSeq uint64, val 
 	return val, true
 }
 
-func (p *pressureState) recordLastSampledTelemetryLocked(invokeSeq uint64, val float64, stored bool) {
+func (p *pressureState) recordLastSampledTelemetryLocked(epoch, invokeSeq uint64, val float64, stored bool) {
+	if !stored && p.reclaimEpoch.Load() != epoch {
+		return
+	}
 	if !stored && p.pressureInitialized.Load() && p.cachedPressureEpoch.Load() == p.reclaimEpoch.Load() {
 		return
 	}
@@ -1467,9 +1506,6 @@ func (p *pressureState) recordLastSampledTelemetryLocked(invokeSeq uint64, val f
 			p.lastSampledSeq.Store(invokeSeq)
 		}
 		p.lastSampledPressureBits.Store(math.Float64bits(val))
-		if p.options.sharedSampleClock != nil {
-			p.lastSampleOrder.Store(p.options.sharedSampleClock.Add(1))
-		}
 	}
 }
 
@@ -1505,7 +1541,7 @@ func (p *pressureState) storeSampledPressureWithSeq(epoch, extEpoch, invokeSeq u
 		}
 	}
 
-	p.recordLastSampledTelemetryLocked(invokeSeq, val, stored)
+	p.recordLastSampledTelemetryLocked(epoch, invokeSeq, val, stored)
 	return epoch, val, stored
 }
 
@@ -1679,6 +1715,9 @@ func (p *pressureState) sampleWithOverflowSlot(gid, parentGID uint64) (uint64, u
 // samplePressureFreshWithEpoch evaluates p.options.PressureFunc lock-free outside the cache lock
 // with a goroutine-aware re-entrancy guard and cold-start fallback.
 func (p *pressureState) samplePressureFreshWithEpoch() (uint64, uint64, float64, bool) {
+	if coord := p.coord(); p != coord {
+		return coord.samplePressureFreshWithEpoch()
+	}
 	if p.options.PressureFunc == nil {
 		extEpoch := p.externalReclaimEpoch.Load()
 		return p.reclaimEpoch.Load(), extEpoch, 0.0, true
@@ -1710,17 +1749,18 @@ func (p *pressureState) samplePressureFreshWithEpoch() (uint64, uint64, float64,
 // Custom PressureFunc callbacks are invoked on every call; the default runtime/metrics probe is amortized
 // across a 256-operation window (and immediately refreshed after any reclamation/compaction cycle).
 func (p *pressureState) samplePressureWithEpoch() (uint64, uint64, float64, bool) {
-	if p.options.hasCustomPressureFunc {
-		return p.samplePressureFreshWithEpoch()
+	coord := p.coord()
+	if coord.options.hasCustomPressureFunc {
+		return coord.samplePressureFreshWithEpoch()
 	}
-	epoch := p.reclaimEpoch.Load()
+	epoch := coord.reclaimEpoch.Load()
 	seq := p.pressureSampleSeq.Add(1)
-	if (seq&pressureSampleWindowMask) == 1 || !p.pressureInitialized.Load() || p.pressureNeedsRefresh.Load() || p.cachedPressureEpoch.Load() != epoch {
-		return p.samplePressureFreshWithEpoch()
+	if (seq&pressureSampleWindowMask) == 1 || !coord.pressureInitialized.Load() || coord.pressureNeedsRefresh.Load() || coord.cachedPressureEpoch.Load() != epoch {
+		return coord.samplePressureFreshWithEpoch()
 	}
-	bits := p.cachedPressureBits.Load()
-	if !p.pressureInitialized.Load() || p.pressureNeedsRefresh.Load() || p.cachedPressureEpoch.Load() != epoch || p.reclaimEpoch.Load() != epoch {
-		return p.samplePressureFreshWithEpoch()
+	bits := coord.cachedPressureBits.Load()
+	if !coord.pressureInitialized.Load() || coord.pressureNeedsRefresh.Load() || coord.cachedPressureEpoch.Load() != epoch || coord.reclaimEpoch.Load() != epoch {
+		return coord.samplePressureFreshWithEpoch()
 	}
 	return epoch, 0, math.Float64frombits(bits), true
 }
@@ -2486,7 +2526,7 @@ func (q *evictCallbackQueue[V]) invoke(p *pressureState, onVal func(V, EvictionR
 	if q.n == 0 {
 		return
 	}
-	q.invokeNonEmpty(p, onVal, onEntry)
+	q.invokeNonEmpty(p.coord(), onVal, onEntry)
 }
 
 func appendEvicted[V any](base, extra []V) []V {
@@ -2541,6 +2581,7 @@ func (p *pressureState) recordCompactionByPressure(pressure float64) {
 }
 
 func (p *pressureState) snapshotBaseStats(backend Backend, currentSize, maxSize uint64, entryLen int) Stats {
+	coord := p.coord()
 	return Stats{
 		Backend:                  backend,
 		GetHits:                  p.getHits,
@@ -2568,14 +2609,14 @@ func (p *pressureState) snapshotBaseStats(backend Backend, currentSize, maxSize 
 		DeleteDeleted:            p.deleteDeleted,
 		DeleteNotFound:           p.deleteNotFound,
 		DeletePrefixExecuted:     p.deletePrefixExecuted,
-		MemoryPressure:           math.Float64frombits(p.lastSampledPressureBits.Load()),
+		MemoryPressure:           math.Float64frombits(coord.lastSampledPressureBits.Load()),
 		CompactionsExplicit:      p.compactionsExplicit,
 		CompactionsPressureTier1: p.compactionsPressureTier1,
 		CompactionsPressureTier2: p.compactionsPressureTier2,
 		CompactionsAutoSlack:     p.compactionsAutoSlack,
 		PressureShedsInline:      p.pressureShedsInline,
 		PressureShedsExplicit:    p.pressureShedsExplicit,
-		ReclaimEpoch:             p.reclaimEpoch.Load(),
+		ReclaimEpoch:             coord.reclaimEpoch.Load(),
 		DeletedSinceCompact:      p.deletedSinceCompact,
 		PeakEntryLen:             p.peakEntryLen,
 	}
@@ -2594,7 +2635,7 @@ func (p *pressureState) checkWatermarkInvariants(currentLen int) {
 	if p.putInserted > 0 && currentLen > p.peakEntryLen {
 		panic(fmt.Sprintf("lru invariant violation: currentLen %d exceeds peakEntryLen %d", currentLen, p.peakEntryLen))
 	}
-	lastPressure := math.Float64frombits(p.lastSampledPressureBits.Load())
+	lastPressure := math.Float64frombits(p.coord().lastSampledPressureBits.Load())
 	if math.IsNaN(lastPressure) || math.IsInf(lastPressure, 0) || lastPressure < 0.0 {
 		panic(fmt.Sprintf("lru invariant violation: invalid lastSampledPressure %v", lastPressure))
 	}
