@@ -403,13 +403,21 @@ func hasClosureOwnedBy(aboveHook, blk, owner []byte) bool {
 	return false
 }
 
-func matchChildStackFramesAboveHook(blk, aboveHook, belowHook, childStack []byte) (matchedAbove, sawBelowOwner bool) {
+func isDirectWaitGroupSiblingClosure(blk, aboveHook, currCreator, owner []byte, nonWGFrames int) bool {
+	return nonWGFrames == 1 &&
+		bytes.Equal(trimClosureOffset(currCreator), []byte("sync.(*WaitGroup).Go")) &&
+		containsCreatorCallFrame(aboveHook, []byte("sync.(*WaitGroup).Wait")) &&
+		hasClosureOwnedBy(aboveHook, blk, owner)
+}
+
+func matchChildStackFramesAboveHook(blk, aboveHook, belowHook, currCreator, childStack []byte) (matchedAbove, sawBelowOwner bool) {
 	const createdBy = "\ncreated by "
 	end := bytes.LastIndex(childStack, []byte(createdBy))
 	if end <= 0 {
 		return false, false
 	}
 	rest := childStack[:end]
+	nonWGFrames := 0
 	const maxBottomFrames = 8
 	for range maxBottomFrames {
 		var fn []byte
@@ -420,14 +428,15 @@ func matchChildStackFramesAboveHook(blk, aboveHook, belowHook, childStack []byte
 		if bytes.Equal(fn, []byte("sync.(*WaitGroup).Go.func1")) {
 			continue
 		}
-		if containsCreatorCallFrame(aboveHook, fn) && !containsCreatorCallFrame(belowHook, fn) {
+		nonWGFrames++
+		if containsCreatorCallFrame(aboveHook, fn) {
 			return true, false
 		}
 		if owner := findClosureOwnerInStack(blk, fn); len(owner) > 0 {
-			if containsCreatorCallFrame(aboveHook, owner) && !containsCreatorCallFrame(belowHook, owner) {
+			if containsCreatorCallFrame(aboveHook, owner) {
 				return true, false
 			}
-			if containsCreatorCallFrame(belowHook, owner) {
+			if containsCreatorCallFrame(belowHook, owner) && !isDirectWaitGroupSiblingClosure(blk, aboveHook, currCreator, owner, nonWGFrames) {
 				sawBelowOwner = true
 			}
 		}
@@ -441,16 +450,16 @@ func decideCreatorFromCallbackAboveHook(blk []byte, hookIdx int, currCreator, ch
 		return false, true
 	}
 	belowHook := blk[hookIdx:]
-	matchedAbove, sawBelowOwner := matchChildStackFramesAboveHook(blk, aboveHook, belowHook, childStack)
+	matchedAbove, sawBelowOwner := matchChildStackFramesAboveHook(blk, aboveHook, belowHook, currCreator, childStack)
 	if matchedAbove {
 		return true, true
 	}
 	if len(currCreator) > 0 {
-		if containsCreatorCallFrame(aboveHook, currCreator) && !containsCreatorCallFrame(belowHook, currCreator) {
+		if containsCreatorCallFrame(aboveHook, currCreator) {
 			return true, true
 		}
 		if owner := findClosureOwnerInStack(blk, currCreator); len(owner) > 0 {
-			if containsCreatorCallFrame(aboveHook, owner) && !containsCreatorCallFrame(belowHook, owner) {
+			if containsCreatorCallFrame(aboveHook, owner) {
 				return true, true
 			}
 			if containsCreatorCallFrame(belowHook, owner) && !hasClosureOwnedBy(aboveHook, blk, owner) {
@@ -492,6 +501,28 @@ func matchAncestorBlockAboveHook(blk []byte, hookIdx int, currCreator, currChild
 	return false
 }
 
+func isOnlyDirectCallbackEntryAboveHook(blk []byte, hookIdx int, currCreator []byte) bool {
+	creator := trimClosureOffset(currCreator)
+	if len(creator) == 0 || hookIdx <= 0 {
+		return false
+	}
+	rest := blk[:hookIdx]
+	var entryFn []byte
+	for range 2 {
+		entryFn, rest = popBottomCallFrame(rest)
+		if len(entryFn) == 0 {
+			return false
+		}
+		if !bytes.Contains(entryFn, []byte("deliverMultiCallbacks")) {
+			break
+		}
+	}
+	if !sameFuncSymbolIgnoringTypeArgs(trimClosureOffset(entryFn), creator) {
+		return false
+	}
+	return !containsCreatorCallFrame(rest, creator)
+}
+
 func matchAncestorInAllStacks(allStacks, currCreator, childStack, hookName []byte, matchAncestor func(uint64) bool) (uint64, bool) {
 	for rem := allStacks; len(rem) > 0; {
 		var blk []byte
@@ -501,7 +532,10 @@ func matchAncestorInAllStacks(allStacks, currCreator, childStack, hookName []byt
 			continue
 		}
 		hookIdx := bytes.LastIndex(blk, hookName)
-		if hookIdx >= 0 && isCreatorFromCallbackAboveHook(blk, hookIdx, currCreator, childStack, true) {
+		if hookIdx < 0 || isOnlyDirectCallbackEntryAboveHook(blk, hookIdx, currCreator) {
+			continue
+		}
+		if isCreatorFromCallbackAboveHook(blk, hookIdx, currCreator, childStack, true) {
 			return gid, true
 		}
 	}
@@ -520,6 +554,9 @@ func matchAncestorFallbackInAllStacks(allStacks, currCreator, currChildStack, ca
 			continue
 		}
 		hookIdx := bytes.LastIndex(blk, hookName)
+		if hookIdx < 0 || isOnlyDirectCallbackEntryAboveHook(blk, hookIdx, currCreator) {
+			continue
+		}
 		if matchAncestorBlockAboveHook(blk, hookIdx, currCreator, currChildStack, callerCreator, callerStack, true) {
 			return gid, true
 		}
@@ -651,6 +688,14 @@ func (s *ancestorBridgeState) bridgeExited(allStacks, currCreator, currChildStac
 }
 
 func findAncestorCreatorAboveHook(allStacks, callerStack []byte, parentGID uint64, creatorFunc, hookName []byte, matchAncestor func(uint64) bool) (uint64, bool) {
+	return findAncestorCreatorAboveHookFiltered(allStacks, callerStack, parentGID, creatorFunc, hookName, matchAncestor, nil)
+}
+
+func isRejectedAncestorGID(currGID uint64, rejectGID func(uint64) bool) bool {
+	return rejectGID != nil && rejectGID(currGID)
+}
+
+func findAncestorCreatorAboveHookFiltered(allStacks, callerStack []byte, parentGID uint64, creatorFunc, hookName []byte, matchAncestor, rejectGID func(uint64) bool) (uint64, bool) {
 	if parentGID == 0 {
 		return 0, false
 	}
@@ -676,6 +721,9 @@ func findAncestorCreatorAboveHook(allStacks, callerStack []byte, parentGID uint6
 			if !ok {
 				return 0, false
 			}
+		}
+		if isRejectedAncestorGID(currGID, rejectGID) {
+			return 0, false
 		}
 		blk, nextParentGID, nextCreator, foundBlock := findGoroutineBlockByID(allStacks, currGID)
 		if !foundBlock {
@@ -957,16 +1005,22 @@ type pressureState struct {
 	evictFastTag             uint32
 	evictNonDescendantParent atomic.Uint64
 	evictNonDescendantHolder atomic.Uint64
+	belowTier1Epoch          atomic.Uint64
 	belowTier2Epoch          atomic.Uint64
+	cachedBelowTier1Epoch    atomic.Uint64
 	cachedBelowTier2Epoch    atomic.Uint64
 	cachedPressureSeq        atomic.Uint64
 	cachedPublishSeq         atomic.Uint64
 	zeroWatermarkTier2Epoch  uint64
 	zeroWatermarkSeq         uint64
+	sampledCoordEpoch        uint64
+	sampledBelowTier1Epoch   uint64
 	sampledBelowTier2Epoch   uint64
 	sampledPressureSeq       uint64
 	lastSampledEpoch         uint64
 	childShards              []*pressureState
+	exitedSamplerSeq         atomic.Uint64
+	exitedSamplerGIDs        [64]atomic.Uint64
 }
 
 func (p *pressureState) pressureStatePtr() *pressureState {
@@ -979,6 +1033,7 @@ type pressureSample struct {
 	shardExtEpoch uint64
 	extEpoch      uint64
 	invokeSeq     uint64
+	belowTier1    uint64
 	belowTier2    uint64
 	val           float64
 	valid         bool
@@ -988,8 +1043,16 @@ type shardSample struct {
 	hasSample  bool
 	valid      bool
 	pressure   float64
+	coordEpoch uint64
+	belowTier1 uint64
 	belowTier2 uint64
 	seq        uint64
+}
+
+func (s *shardSample) advanceSelfReclaim(postShardEpoch, preShardEpoch uint64) {
+	if s.hasSample && s.valid && postShardEpoch > preShardEpoch {
+		s.coordEpoch += postShardEpoch - preShardEpoch
+	}
 }
 
 const (
@@ -1229,6 +1292,26 @@ func (p *pressureState) isCachedNonDescendantParent(parentGID, sig uint64) bool 
 		p.nonDescendantParentGID.Load() == parentGID
 }
 
+func (p *pressureState) recordExitedSamplerGID(gid uint64) {
+	if gid == 0 {
+		return
+	}
+	idx := p.exitedSamplerSeq.Add(1) & uint64(len(p.exitedSamplerGIDs)-1)
+	p.exitedSamplerGIDs[idx].Store(gid)
+}
+
+func (p *pressureState) isExitedSamplerGID(gid uint64) bool {
+	if gid == 0 || p.isCurrentGoroutineSampling(gid) {
+		return false
+	}
+	for i := range len(p.exitedSamplerGIDs) {
+		if p.exitedSamplerGIDs[i].Load() == gid {
+			return !p.isCurrentGoroutineSampling(gid)
+		}
+	}
+	return false
+}
+
 func (p *pressureState) checkSamplingGoroutineOrChildSlow() (bool, uint64, uint64) {
 	if !p.hasActiveSampler() {
 		return false, 0, 0
@@ -1245,7 +1328,7 @@ func (p *pressureState) checkSamplingGoroutineOrChildSlow() (bool, uint64, uint6
 		if !isDirectSamplerParent && p.isCachedNonDescendantParent(parentGID, sig) {
 			return false, gid, parentGID
 		}
-		if ancestorGID, ok := findAncestorCreatorAboveHook(allStacks, callerStack, parentGID, creatorFunc, []byte("invokeAndStorePressure"), p.isCurrentGoroutineSampling); ok {
+		if ancestorGID, ok := findAncestorCreatorAboveHookFiltered(allStacks, callerStack, parentGID, creatorFunc, []byte("invokeAndStorePressure"), p.isCurrentGoroutineSampling, p.isExitedSamplerGID); ok {
 			return true, ancestorGID, parentGID
 		}
 		if !isDirectSamplerParent && parentGID != 0 && sig != 0 && p.activeSamplerSig() == sig {
@@ -1297,18 +1380,25 @@ func (p *pressureState) recordChildSamplerReclaimOn(coord *pressureState) {
 	}
 }
 
-func (p *pressureState) recordReentrantReclaimGIDOn(coord *pressureState, gid uint64) {
+func (p *pressureState) recordReentrantReclaimGIDOn(coord *pressureState, gid uint64) bool {
 	switch {
 	case gid == 0:
+		if !coord.hasActiveSampler() {
+			return false
+		}
 		p.recordChildSamplerReclaimOn(coord)
+		return true
 	case coord.samplingGID.Load() == gid:
 		p.samplingReentrantReclaim.Store(true)
+		return true
 	case coord.fallbackGID.Load() == gid:
 		p.fallbackReentrantReclaim.Store(true)
+		return true
 	case coord.hasOverflowSamplingGID(gid):
 		p.storeReentrantGID(gid)
+		return true
 	default:
-		p.recordChildSamplerReclaimOn(coord)
+		return false
 	}
 }
 
@@ -1369,10 +1459,10 @@ func (p *pressureState) markReclaimedFromShard(shard *pressureState) {
 	p.pressureWriteMu.Lock()
 	defer p.pressureWriteMu.Unlock()
 	sampling, gid := p.checkSamplingGoroutine()
-	if sampling {
+	if sampling && p.recordReentrantReclaimGIDOn(p, gid) {
 		p.lastReentrantGID.Store(gid)
-		p.recordReentrantReclaimGIDOn(p, gid)
 	} else {
+		sampling = false
 		p.clearAllReentrantReclaims()
 	}
 	seq := p.cachedPublishSeq.Load()
@@ -1387,7 +1477,7 @@ func (p *pressureState) markReclaimedFromShard(shard *pressureState) {
 		if sampling {
 			p.anyShardReentrantReclaim.Store(true)
 			shard.lastReentrantGID.Store(gid)
-			shard.recordReentrantReclaimGIDOn(p, gid)
+			_ = shard.recordReentrantReclaimGIDOn(p, gid)
 		} else {
 			shard.clearAllReentrantReclaims()
 			shard.externalReclaimEpoch.Add(1)
@@ -1422,7 +1512,13 @@ func (p *pressureState) shouldInvalidatePressureOnReclaim(pressure float64) bool
 		coord.hasActiveSampler()
 }
 
-func (p *pressureState) publishCachedPressureLocked(epoch, belowTier2, invokeSeq uint64, val float64) {
+const (
+	sampleStoreNormal = iota
+	sampleStoreAdoptedCached
+	sampleStoreAdoptedLast
+)
+
+func (p *pressureState) publishCachedPressureLocked(epoch, belowTier1, belowTier2, invokeSeq uint64, val float64) {
 	seq := p.cachedPublishSeq.Load()
 	if seq&1 == 0 {
 		seq++
@@ -1430,6 +1526,7 @@ func (p *pressureState) publishCachedPressureLocked(epoch, belowTier2, invokeSeq
 	}
 	p.pressureInitialized.Store(false)
 	p.cachedPressureEpoch.Store(epoch)
+	p.cachedBelowTier1Epoch.Store(belowTier1)
 	p.cachedBelowTier2Epoch.Store(belowTier2)
 	p.cachedPressureSeq.Store(invokeSeq)
 	p.cachedPressureBits.Store(math.Float64bits(val))
@@ -1438,8 +1535,10 @@ func (p *pressureState) publishCachedPressureLocked(epoch, belowTier2, invokeSeq
 	p.cachedPublishSeq.Store(seq + 1)
 }
 
-func (p *pressureState) republishCachedBelowTier2Locked(belowTier2 uint64) {
-	if belowTier2 <= p.cachedBelowTier2Epoch.Load() {
+func (p *pressureState) republishCachedRecoveryEpochsLocked(belowTier1, belowTier2 uint64) {
+	oldTier1 := p.cachedBelowTier1Epoch.Load()
+	oldTier2 := p.cachedBelowTier2Epoch.Load()
+	if belowTier1 <= oldTier1 && belowTier2 <= oldTier2 {
 		return
 	}
 	seq := p.cachedPublishSeq.Load()
@@ -1447,28 +1546,46 @@ func (p *pressureState) republishCachedBelowTier2Locked(belowTier2 uint64) {
 		seq++
 		p.cachedPublishSeq.Store(seq)
 	}
-	p.cachedBelowTier2Epoch.Store(belowTier2)
+	if belowTier1 > oldTier1 {
+		p.cachedBelowTier1Epoch.Store(belowTier1)
+	}
+	if belowTier2 > oldTier2 {
+		p.cachedBelowTier2Epoch.Store(belowTier2)
+	}
 	p.cachedPublishSeq.Store(seq + 1)
 }
 
-func (p *pressureState) readValidCachedSampleForEpoch(epoch uint64) (float64, uint64, uint64, bool) {
+func (p *pressureState) readValidCachedSampleForEpoch(epoch uint64) (float64, uint64, uint64, uint64, bool) {
 	seq1 := p.cachedPublishSeq.Load()
 	if seq1 == 0 || seq1&1 != 0 || !p.pressureInitialized.Load() || p.pressureNeedsRefresh.Load() {
-		return 0.0, 0, 0, false
+		return 0.0, 0, 0, 0, false
 	}
 	if p.cachedPressureEpoch.Load() != epoch {
-		return 0.0, 0, 0, false
+		return 0.0, 0, 0, 0, false
 	}
 	bits := p.cachedPressureBits.Load()
+	belowTier1 := p.cachedBelowTier1Epoch.Load()
 	belowTier2 := p.cachedBelowTier2Epoch.Load()
 	sampleSeq := p.cachedPressureSeq.Load()
 	if p.cachedPublishSeq.Load() != seq1 || !p.isCachedSampleStillValid(epoch) {
-		return 0.0, 0, 0, false
+		return 0.0, 0, 0, 0, false
 	}
-	return math.Float64frombits(bits), belowTier2, sampleSeq, true
+	return math.Float64frombits(bits), belowTier1, belowTier2, sampleSeq, true
 }
 
-func (p *pressureState) recordAcceptedFallbackSample(epoch, invokeSeq uint64, val float64) uint64 {
+func (p *pressureState) advanceRecoveryEpochsForValLocked(val float64) (uint64, uint64) {
+	belowTier1 := p.belowTier1Epoch.Load()
+	if val < p.options.CompactionThreshold {
+		belowTier1 = p.belowTier1Epoch.Add(1)
+	}
+	belowTier2 := p.belowTier2Epoch.Load()
+	if val < p.options.EvictionThreshold {
+		belowTier2 = p.belowTier2Epoch.Add(1)
+	}
+	return belowTier1, belowTier2
+}
+
+func (p *pressureState) recordAcceptedFallbackSample(epoch, invokeSeq, preBelowTier1, preBelowTier2 uint64, val float64) (uint64, uint64) {
 	p.pressureWriteMu.Lock()
 	defer p.pressureWriteMu.Unlock()
 	if invokeSeq != 0 {
@@ -1479,36 +1596,38 @@ func (p *pressureState) recordAcceptedFallbackSample(epoch, invokeSeq uint64, va
 			}
 			p.lastSampledEpoch = epoch
 			p.lastSampledPressureBits.Store(math.Float64bits(val))
-			if val < p.options.EvictionThreshold {
-				belowTier2 := p.belowTier2Epoch.Add(1)
-				if p.pressureInitialized.Load() && !p.pressureNeedsRefresh.Load() {
-					p.republishCachedBelowTier2Locked(belowTier2)
-				}
-				return belowTier2
+			belowTier1, belowTier2 := p.advanceRecoveryEpochsForValLocked(val)
+			if p.pressureInitialized.Load() && !p.pressureNeedsRefresh.Load() {
+				p.republishCachedRecoveryEpochsLocked(belowTier1, belowTier2)
 			}
+			return belowTier1, belowTier2
 		}
 	}
-	return p.belowTier2Epoch.Load()
+	return preBelowTier1, preBelowTier2
 }
 
-func (p *pressureState) isSampleCausallyStaleLocked(val float64, belowTier2, sampleSeq uint64) bool {
-	if sampleSeq != 0 && sampleSeq < p.sampledPressureSeq {
-		return true
-	}
-	return val >= p.options.CompactionThreshold && belowTier2 < p.coord().belowTier2Epoch.Load()
-}
-
-func (p *pressureState) isElevatedSampleStaleLocked(val float64, belowTier2, sampleSeq uint64) bool {
-	return val >= p.options.CompactionThreshold && p.isSampleCausallyStaleLocked(val, belowTier2, sampleSeq)
-}
-
-func (p *pressureState) adoptNewerCachedSampleLocked(minSeq uint64) (float64, uint64, uint64, bool) {
+func (p *pressureState) isSampleCausallyStaleLocked(val float64, belowTier1, belowTier2, sampleSeq uint64) bool {
 	coord := p.coord()
-	val, belowTier2, seq, ok := coord.readValidCachedSampleForEpoch(coord.reclaimEpoch.Load())
-	if !ok || seq <= minSeq || seq < p.sampledPressureSeq {
-		return 0, 0, 0, false
+	if val >= p.options.EvictionThreshold {
+		return belowTier2 < coord.belowTier2Epoch.Load()
 	}
-	return val, belowTier2, seq, true
+	if val >= p.options.CompactionThreshold {
+		return belowTier1 < coord.belowTier1Epoch.Load()
+	}
+	return sampleSeq != 0 && sampleSeq < p.sampledPressureSeq
+}
+
+func (p *pressureState) isElevatedSampleStaleLocked(val float64, belowTier1, belowTier2, sampleSeq uint64) bool {
+	return val >= p.options.CompactionThreshold && p.isSampleCausallyStaleLocked(val, belowTier1, belowTier2, sampleSeq)
+}
+
+func (p *pressureState) adoptNewerCachedSampleLocked(minSeq uint64) (float64, uint64, uint64, uint64, bool) {
+	coord := p.coord()
+	val, belowTier1, belowTier2, seq, ok := coord.readValidCachedSampleForEpoch(coord.reclaimEpoch.Load())
+	if !ok || seq <= minSeq || seq < p.sampledPressureSeq {
+		return 0, 0, 0, 0, false
+	}
+	return val, belowTier1, belowTier2, seq, true
 }
 
 func (p *pressureState) resolvePostRetryPressureLocked(s pressureSample) (uint64, float64) {
@@ -1518,6 +1637,7 @@ func (p *pressureState) resolvePostRetryPressureLocked(s pressureSample) (uint64
 	}
 	coord := p.coord()
 	currentEpoch := coord.reclaimEpoch.Load()
+	belowTier1 := s.belowTier1
 	belowTier2 := s.belowTier2
 	sampleSeq := s.invokeSeq
 	var resolvedPressure float64
@@ -1525,24 +1645,26 @@ func (p *pressureState) resolvePostRetryPressureLocked(s pressureSample) (uint64
 	if s.valid && s.epoch == currentEpoch {
 		p.hasValidSample = true
 		resolvedPressure = s.val
-	} else if cachedVal, cachedBelowTier2, cachedSeq, ok := coord.readValidCachedSampleForEpoch(currentEpoch); ok && (!shardUnreclaimed || cachedSeq >= s.invokeSeq) {
+	} else if cachedVal, cachedBelowTier1, cachedBelowTier2, cachedSeq, ok := coord.readValidCachedSampleForEpoch(currentEpoch); ok && (!shardUnreclaimed || cachedSeq >= s.invokeSeq) {
 		p.hasValidSample = true
+		belowTier1 = cachedBelowTier1
 		belowTier2 = cachedBelowTier2
 		sampleSeq = cachedSeq
 		resolvedPressure = cachedVal
-	} else if shardUnreclaimed && !p.isElevatedSampleStaleLocked(s.val, s.belowTier2, s.invokeSeq) {
+	} else if shardUnreclaimed && !p.isElevatedSampleStaleLocked(s.val, s.belowTier1, s.belowTier2, s.invokeSeq) {
 		p.hasValidSample = true
-		belowTier2 = coord.recordAcceptedFallbackSample(currentEpoch, s.invokeSeq, s.val)
+		belowTier1, belowTier2 = coord.recordAcceptedFallbackSample(currentEpoch, s.invokeSeq, s.belowTier1, s.belowTier2, s.val)
 		resolvedPressure = s.val
 	} else {
 		p.hasValidSample = false
 		resolvedPressure = 0.0
 	}
-	if p.hasValidSample && p.isElevatedSampleStaleLocked(resolvedPressure, belowTier2, sampleSeq) {
+	if p.hasValidSample && p.isElevatedSampleStaleLocked(resolvedPressure, belowTier1, belowTier2, sampleSeq) {
 		p.hasValidSample = false
 		resolvedPressure = 0.0
 	}
-	p.syncZeroWatermarkLocked(belowTier2, sampleSeq, resolvedPressure)
+	p.sampledCoordEpoch = currentEpoch
+	p.syncZeroWatermarkLocked(belowTier1, belowTier2, sampleSeq, resolvedPressure)
 	return p.reclaimEpoch.Load(), resolvedPressure
 }
 
@@ -1590,12 +1712,13 @@ func (p *pressureState) resolveLockLoopStepLocked(s pressureSample, fresh bool, 
 		s = coord.tryFastForwardSampledEpochLocked(p, s)
 	}
 	if s.epoch == coord.reclaimEpoch.Load() {
-		if !s.valid || !p.isElevatedSampleStaleLocked(s.val, s.belowTier2, s.invokeSeq) {
+		if !s.valid || !p.isElevatedSampleStaleLocked(s.val, s.belowTier1, s.belowTier2, s.invokeSeq) {
 			return s, false
 		}
 		if !fresh {
-			if val, belowTier2, seq, ok := p.adoptNewerCachedSampleLocked(s.invokeSeq); ok {
+			if val, belowTier1, belowTier2, seq, ok := p.adoptNewerCachedSampleLocked(s.invokeSeq); ok {
 				s.val = val
+				s.belowTier1 = belowTier1
 				s.belowTier2 = belowTier2
 				s.invokeSeq = seq
 				return s, false
@@ -1643,13 +1766,14 @@ func (p *pressureState) lockWithPressureFastMiss(mu *sync.RWMutex) (uint64, floa
 	coord := p.coord()
 	s := coord.samplePressureFreshForShard(p)
 	mu.Lock()
-	if s.epoch == coord.reclaimEpoch.Load() && !(s.valid && p.isElevatedSampleStaleLocked(s.val, s.belowTier2, s.invokeSeq)) {
+	if s.epoch == coord.reclaimEpoch.Load() && !(s.valid && p.isElevatedSampleStaleLocked(s.val, s.belowTier1, s.belowTier2, s.invokeSeq)) {
 		if !s.valid && p.isSamplingGoroutine() {
 			p.hasValidSample = false
 			return p.reclaimEpoch.Load(), 0.0
 		}
 		p.hasValidSample = s.valid
-		p.syncZeroWatermarkLocked(s.belowTier2, s.invokeSeq, s.val)
+		p.sampledCoordEpoch = s.epoch
+		p.syncZeroWatermarkLocked(s.belowTier1, s.belowTier2, s.invokeSeq, s.val)
 		return p.reclaimEpoch.Load(), s.val
 	}
 	mu.Unlock()
@@ -1661,11 +1785,12 @@ func (p *pressureState) lockWithPressure(mu *sync.RWMutex, fresh bool) (uint64, 
 	if !fresh && !coord.options.hasCustomPressureFunc {
 		epoch := coord.reclaimEpoch.Load()
 		if coord.canUseCachedSampleForEpoch(epoch, p.pressureSampleSeq.Add(1)) {
-			if pressure, belowTier2, sampleSeq, ok := coord.readValidCachedSampleForEpoch(epoch); ok {
+			if pressure, belowTier1, belowTier2, sampleSeq, ok := coord.readValidCachedSampleForEpoch(epoch); ok {
 				mu.Lock()
-				if epoch == coord.reclaimEpoch.Load() && !p.isElevatedSampleStaleLocked(pressure, belowTier2, sampleSeq) {
+				if epoch == coord.reclaimEpoch.Load() && !p.isElevatedSampleStaleLocked(pressure, belowTier1, belowTier2, sampleSeq) {
 					p.hasValidSample = true
-					p.syncZeroWatermarkLocked(belowTier2, sampleSeq, pressure)
+					p.sampledCoordEpoch = epoch
+					p.syncZeroWatermarkLocked(belowTier1, belowTier2, sampleSeq, pressure)
 					return p.reclaimEpoch.Load(), pressure
 				}
 				mu.Unlock()
@@ -1681,6 +1806,31 @@ func (p *pressureState) canReuseShardSample(validSample bool) bool {
 	return validSample || p.isSamplingGoroutine()
 }
 
+func (p *pressureState) adoptCachedShardSampleLocked(minSeq uint64, sample *shardSample) bool {
+	coord := p.coord()
+	curCoordEpoch := coord.reclaimEpoch.Load()
+	val, belowTier1, belowTier2, seq, ok := coord.readValidCachedSampleForEpoch(curCoordEpoch)
+	if !ok || seq < minSeq || seq < p.sampledPressureSeq {
+		return false
+	}
+	if p.isElevatedSampleStaleLocked(val, belowTier1, belowTier2, seq) {
+		return false
+	}
+	*sample = shardSample{
+		hasSample:  true,
+		valid:      true,
+		pressure:   val,
+		coordEpoch: curCoordEpoch,
+		belowTier1: belowTier1,
+		belowTier2: belowTier2,
+		seq:        seq,
+	}
+	p.hasValidSample = true
+	p.sampledCoordEpoch = curCoordEpoch
+	p.syncZeroWatermarkLocked(sample.belowTier1, sample.belowTier2, sample.seq, sample.pressure)
+	return true
+}
+
 func (p *pressureState) tryApplyShardSampleLocked(fresh bool, sample *shardSample) bool {
 	if !sample.hasSample {
 		return false
@@ -1692,27 +1842,27 @@ func (p *pressureState) tryApplyShardSampleLocked(fresh bool, sample *shardSampl
 		p.hasValidSample = false
 		return true
 	}
-	if p.isSampleCausallyStaleLocked(sample.pressure, sample.belowTier2, sample.seq) {
+	coord := p.coord()
+	epochMismatch := coord.reclaimEpoch.Load() != sample.coordEpoch
+	causallyStale := p.isSampleCausallyStaleLocked(sample.pressure, sample.belowTier1, sample.belowTier2, sample.seq)
+	newerOnShard := !fresh && sample.seq != 0 && sample.seq < p.sampledPressureSeq
+	if epochMismatch || causallyStale || newerOnShard {
 		if !fresh {
-			if val, belowTier2, seq, ok := p.adoptNewerCachedSampleLocked(sample.seq); ok {
-				*sample = shardSample{
-					hasSample:  true,
-					valid:      true,
-					pressure:   val,
-					belowTier2: belowTier2,
-					seq:        seq,
-				}
-				p.hasValidSample = true
-				p.syncZeroWatermarkLocked(sample.belowTier2, sample.seq, sample.pressure)
+			minSeq := sample.seq
+			if !epochMismatch {
+				minSeq++
+			}
+			if p.adoptCachedShardSampleLocked(minSeq, sample) {
 				return true
 			}
 		}
-		if sample.pressure >= p.options.CompactionThreshold {
+		if epochMismatch || (causallyStale && sample.pressure >= p.options.CompactionThreshold) {
 			return false
 		}
 	}
 	p.hasValidSample = true
-	p.syncZeroWatermarkLocked(sample.belowTier2, sample.seq, sample.pressure)
+	p.sampledCoordEpoch = sample.coordEpoch
+	p.syncZeroWatermarkLocked(sample.belowTier1, sample.belowTier2, sample.seq, sample.pressure)
 	return true
 }
 
@@ -1726,8 +1876,10 @@ func (p *pressureState) lockShardWithSample(mu *sync.RWMutex, fresh bool, sample
 	}
 	sampledEpoch, resolvedPressure := p.lockWithPressure(mu, fresh)
 	valid := p.hasValidSample
-	var belowTier2, seq uint64
+	var coordEpoch, belowTier1, belowTier2, seq uint64
 	if valid {
+		coordEpoch = p.sampledCoordEpoch
+		belowTier1 = p.sampledBelowTier1Epoch
 		belowTier2 = p.sampledBelowTier2Epoch
 		seq = p.sampledPressureSeq
 	}
@@ -1735,6 +1887,8 @@ func (p *pressureState) lockShardWithSample(mu *sync.RWMutex, fresh bool, sample
 		hasSample:  p.canReuseShardSample(valid),
 		valid:      valid,
 		pressure:   resolvedPressure,
+		coordEpoch: coordEpoch,
+		belowTier1: belowTier1,
 		belowTier2: belowTier2,
 		seq:        seq,
 	}
@@ -1817,48 +1971,53 @@ func (p *pressureState) resolveSampleEpochsLocked(targetShard *pressureState, sh
 	return epoch, shardEpoch, allowStore
 }
 
-func (p *pressureState) decideSampleStoreLocked(epoch, curEpoch, invokeSeq uint64, val float64, allowStore bool) (uint64, float64, bool, bool) {
+func (p *pressureState) decideSampleStoreLocked(epoch, curEpoch, invokeSeq uint64, val float64, allowStore bool) (uint64, float64, bool, int) {
 	if !allowStore {
 		if !p.pressureInitialized.Load() || p.cachedPressureEpoch.Load() != curEpoch {
 			p.pressureNeedsRefresh.Store(true)
 		}
-		return invokeSeq, val, false, false
+		return invokeSeq, val, false, sampleStoreNormal
 	}
 	hasCachedAtEpoch := p.pressureInitialized.Load() && !p.pressureNeedsRefresh.Load() && p.cachedPressureEpoch.Load() == epoch
 	if hasCachedAtEpoch && invokeSeq != 0 && invokeSeq < p.cachedPressureSeq.Load() {
-		return p.cachedPressureSeq.Load(), math.Float64frombits(p.cachedPressureBits.Load()), false, true
+		return p.cachedPressureSeq.Load(), math.Float64frombits(p.cachedPressureBits.Load()), false, sampleStoreAdoptedCached
 	}
 	if p.lastSampledEpoch == epoch && invokeSeq != 0 && invokeSeq < p.lastSampledSeq.Load() {
 		if !hasCachedAtEpoch {
 			p.pressureNeedsRefresh.Store(true)
 		}
-		return p.lastSampledSeq.Load(), math.Float64frombits(p.lastSampledPressureBits.Load()), false, false
+		return p.lastSampledSeq.Load(), math.Float64frombits(p.lastSampledPressureBits.Load()), false, sampleStoreAdoptedLast
 	}
-	return invokeSeq, val, true, false
+	return invokeSeq, val, true, sampleStoreNormal
 }
 
-func (p *pressureState) storeSampledPressureWithSeq(targetShard *pressureState, shardEpoch, shardExtEpoch, epoch, extEpoch, invokeSeq uint64, val float64, gid uint64, slot int) (uint64, uint64, uint64, uint64, float64) {
+func (p *pressureState) storeSampledPressureWithSeq(targetShard *pressureState, shardEpoch, shardExtEpoch, epoch, extEpoch, preBelowTier1, preBelowTier2, invokeSeq uint64, val float64, gid uint64, slot int) (uint64, uint64, uint64, uint64, uint64, float64) {
 	p.pressureWriteMu.Lock()
 	defer p.pressureWriteMu.Unlock()
 
 	curEpoch := p.reclaimEpoch.Load()
 	epoch, shardEpoch, allowStore := p.resolveSampleEpochsLocked(targetShard, shardEpoch, shardExtEpoch, epoch, extEpoch, val, gid, slot)
-	invokeSeq, val, willStore, adoptedCached := p.decideSampleStoreLocked(epoch, curEpoch, invokeSeq, val, allowStore)
+	invokeSeq, val, willStore, storeMode := p.decideSampleStoreLocked(epoch, curEpoch, invokeSeq, val, allowStore)
 
-	var belowTier2 uint64
+	var belowTier1, belowTier2 uint64
 	switch {
-	case adoptedCached:
+	case storeMode == sampleStoreAdoptedCached:
+		belowTier1 = p.cachedBelowTier1Epoch.Load()
 		belowTier2 = p.cachedBelowTier2Epoch.Load()
-	case p.recordLastSampledTelemetryLocked(epoch, invokeSeq, val, willStore) && val < p.options.EvictionThreshold:
-		belowTier2 = p.belowTier2Epoch.Add(1)
-	default:
+	case storeMode == sampleStoreAdoptedLast:
+		belowTier1 = p.belowTier1Epoch.Load()
 		belowTier2 = p.belowTier2Epoch.Load()
+	case p.recordLastSampledTelemetryLocked(epoch, invokeSeq, val, willStore):
+		belowTier1, belowTier2 = p.advanceRecoveryEpochsForValLocked(val)
+	default:
+		belowTier1 = preBelowTier1
+		belowTier2 = preBelowTier2
 	}
 
 	if willStore {
-		p.publishCachedPressureLocked(epoch, belowTier2, invokeSeq, val)
+		p.publishCachedPressureLocked(epoch, belowTier1, belowTier2, invokeSeq, val)
 	}
-	return epoch, shardEpoch, belowTier2, invokeSeq, val
+	return epoch, shardEpoch, belowTier1, belowTier2, invokeSeq, val
 }
 
 //go:noinline
@@ -1871,6 +2030,8 @@ func (p *pressureState) invokeAndStorePressure(targetShard *pressureState, gid u
 	shardEpoch := targetShard.reclaimEpoch.Load()
 	extEpoch := p.externalReclaimEpoch.Load()
 	epoch := p.reclaimEpoch.Load()
+	preBelowTier1 := p.belowTier1Epoch.Load()
+	preBelowTier2 := p.belowTier2Epoch.Load()
 	invokeSeq := p.pressureInvokeSeq.Add(1)
 	val := p.options.PressureFunc()
 	if math.IsNaN(val) || val < 0.0 {
@@ -1878,14 +2039,15 @@ func (p *pressureState) invokeAndStorePressure(targetShard *pressureState, gid u
 	} else if math.IsInf(val, 1) {
 		val = max(1.0, p.options.CompactionThreshold, p.options.EvictionThreshold)
 	}
-	var belowTier2 uint64
-	epoch, shardEpoch, belowTier2, invokeSeq, val = p.storeSampledPressureWithSeq(targetShard, shardEpoch, shardExtEpoch, epoch, extEpoch, invokeSeq, val, gid, slot)
+	var belowTier1, belowTier2 uint64
+	epoch, shardEpoch, belowTier1, belowTier2, invokeSeq, val = p.storeSampledPressureWithSeq(targetShard, shardEpoch, shardExtEpoch, epoch, extEpoch, preBelowTier1, preBelowTier2, invokeSeq, val, gid, slot)
 	return pressureSample{
 		epoch:         epoch,
 		shardEpoch:    shardEpoch,
 		shardExtEpoch: shardExtEpoch,
 		extEpoch:      extEpoch,
 		invokeSeq:     invokeSeq,
+		belowTier1:    belowTier1,
 		belowTier2:    belowTier2,
 		val:           val,
 		valid:         true,
@@ -1962,9 +2124,22 @@ func (p *pressureState) ensureSamplingGID(gid, parentGID uint64) (uint64, uint64
 	return gid, parentGID
 }
 
-func (p *pressureState) releasePrimarySamplerSlot(tag uint32, gid uint64, fastPrimary bool) {
-	p.clearReentrantSlot(gid, samplerSlotPrimary)
-	p.clearChildShardsReentrantSlot(nil, gid, samplerSlotPrimary)
+func (p *pressureState) resolveExitingPrimaryGID(gid uint64, completed bool) uint64 {
+	if gid == 0 {
+		gid = p.samplingGID.Load()
+	}
+	if gid == 0 && (!completed || p.fallbackSampling.Load() || p.overflowSamplingCount.Load() > 0) {
+		gid, _ = p.ensureSamplingGID(0, 0)
+	}
+	return gid
+}
+
+func (p *pressureState) releasePrimarySamplerSlot(tag uint32, gid uint64, fastPrimary, completed bool) {
+	p.pressureWriteMu.Lock()
+	exitingGID := p.resolveExitingPrimaryGID(gid, completed)
+	p.recordExitedSamplerGID(exitingGID)
+	p.clearReentrantSlot(exitingGID, samplerSlotPrimary)
+	p.clearChildShardsReentrantSlot(nil, exitingGID, samplerSlotPrimary)
 	p.samplingActive.Store(false)
 	if fastPrimary {
 		fastPrimaryTagOwner[tag].Store(0)
@@ -1978,6 +2153,7 @@ func (p *pressureState) releasePrimarySamplerSlot(tag uint32, gid uint64, fastPr
 		p.samplingResolveMu.Unlock()
 	}
 	p.samplingPressure.Store(false)
+	p.pressureWriteMu.Unlock()
 }
 
 //go:noinline
@@ -2001,11 +2177,18 @@ func (p *pressureState) sampleWithSlot(targetShard *pressureState, gid, parentGI
 		p.samplingActive.Store(true)
 		p.samplingResolveMu.Unlock()
 	}
-	defer p.releasePrimarySamplerSlot(tag, gid, fastPrimary)
+	completed := false
+	defer func() {
+		p.releasePrimarySamplerSlot(tag, gid, fastPrimary, completed)
+	}()
+	var s pressureSample
 	if fastPrimary {
-		return p.dispatchFastPrimaryPressure(targetShard, tag)
+		s = p.dispatchFastPrimaryPressure(targetShard, tag)
+	} else {
+		s = p.invokeAndStorePressure(targetShard, gid, samplerSlotPrimary)
 	}
-	return p.invokeAndStorePressure(targetShard, gid, samplerSlotPrimary)
+	completed = true
+	return s
 }
 
 //go:noinline
@@ -2015,11 +2198,14 @@ func (p *pressureState) sampleWithFallbackSlot(targetShard *pressureState, gid, 
 		p.fallbackParentGID.Store(parentGID)
 		p.fallbackGID.Store(gid)
 		defer func() {
+			p.pressureWriteMu.Lock()
+			p.recordExitedSamplerGID(gid)
 			p.clearReentrantSlot(gid, samplerSlotFallback)
 			p.clearChildShardsReentrantSlot(nil, gid, samplerSlotFallback)
 			p.fallbackGID.Store(0)
 			p.fallbackParentGID.Store(0)
 			p.fallbackSampling.Store(false)
+			p.pressureWriteMu.Unlock()
 		}()
 	} else {
 		defer p.fallbackSampling.Store(false)
@@ -2035,9 +2221,10 @@ func (p *pressureState) sampleWithOverflowSlot(targetShard *pressureState, gid, 
 	p.overflowSamplingCount.Add(1)
 	defer func() {
 		if p.options.hasCustomPressureFunc {
+			p.pressureWriteMu.Lock()
+			p.recordExitedSamplerGID(gid)
 			p.overflowSamplingGIDs.Delete(gid)
 			p.overflowSamplingCount.Add(-1)
-			p.pressureWriteMu.Lock()
 			p.clearReentrantSlot(gid, samplerSlotOverflow)
 			p.clearChildShardsReentrantSlot(nil, gid, samplerSlotOverflow)
 			p.pressureWriteMu.Unlock()
@@ -2061,6 +2248,7 @@ func (p *pressureState) samplePressureFreshForShard(targetShard *pressureState) 
 			epoch:      p.reclaimEpoch.Load(),
 			shardEpoch: shardEpoch,
 			extEpoch:   extEpoch,
+			belowTier1: p.belowTier1Epoch.Load(),
 			belowTier2: p.belowTier2Epoch.Load(),
 			valid:      true,
 		}
@@ -2072,6 +2260,7 @@ func (p *pressureState) samplePressureFreshForShard(targetShard *pressureState) 
 		return pressureSample{
 			epoch:      p.reclaimEpoch.Load(),
 			shardEpoch: shardEpoch,
+			belowTier1: p.belowTier1Epoch.Load(),
 			belowTier2: p.belowTier2Epoch.Load(),
 		}
 	}
@@ -2086,6 +2275,7 @@ func (p *pressureState) samplePressureFreshForShard(targetShard *pressureState) 
 				return pressureSample{
 					epoch:      p.reclaimEpoch.Load(),
 					shardEpoch: shardEpoch,
+					belowTier1: p.belowTier1Epoch.Load(),
 					belowTier2: p.belowTier2Epoch.Load(),
 				}
 			}
@@ -2111,7 +2301,7 @@ func (p *pressureState) samplePressureWithEpoch() pressureSample {
 		return coord.samplePressureFreshForShard(p)
 	}
 	shardEpoch := p.reclaimEpoch.Load()
-	val, belowTier2, sampleSeq, ok := coord.readValidCachedSampleForEpoch(epoch)
+	val, belowTier1, belowTier2, sampleSeq, ok := coord.readValidCachedSampleForEpoch(epoch)
 	if !ok {
 		return coord.samplePressureFreshForShard(p)
 	}
@@ -2119,6 +2309,7 @@ func (p *pressureState) samplePressureWithEpoch() pressureSample {
 		epoch:      epoch,
 		shardEpoch: shardEpoch,
 		invokeSeq:  sampleSeq,
+		belowTier1: belowTier1,
 		belowTier2: belowTier2,
 		val:        val,
 		valid:      true,
@@ -2918,7 +3109,7 @@ func (p *pressureState) resetZeroWatermarkBelowTier2(pressure float64) {
 	}
 }
 
-func (p *pressureState) syncZeroWatermarkLocked(belowTier2, sampleSeq uint64, pressure float64) {
+func (p *pressureState) syncZeroWatermarkLocked(belowTier1, belowTier2, sampleSeq uint64, pressure float64) {
 	if !p.hasValidSample || p.isSamplingGoroutine() {
 		return
 	}
@@ -2926,6 +3117,7 @@ func (p *pressureState) syncZeroWatermarkLocked(belowTier2, sampleSeq uint64, pr
 		p.hasValidSample = false
 		return
 	}
+	p.sampledBelowTier1Epoch = max(p.sampledBelowTier1Epoch, belowTier1)
 	p.sampledBelowTier2Epoch = max(p.sampledBelowTier2Epoch, belowTier2)
 	p.sampledPressureSeq = sampleSeq
 	if (p.lastReclaimedZeroCount != 0 || p.lastReclaimedLen != 0) && belowTier2 > p.zeroWatermarkTier2Epoch {

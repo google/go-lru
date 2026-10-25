@@ -222,14 +222,16 @@ type Options struct {
 	// Defaults to DefaultEvictionRetentionRatio (0.50) if unset, negative, or NaN.
 	EvictionRetentionRatio float64
 
-	// Shards specifies the number of independent LRU shards when sharding is enabled via WithShards
+	// Shards specifies the number of independent LRU shards when sharding is enabled
 	// on New, NewMapCache, NewRadixCache, or NewArenaRadixCache (NewShardedCache always uses its
 	// explicit shards parameter and ignores WithShards).
-	// When unset (0 and !hasCustomShards), New constructs a single unsharded cache instance.
-	// When explicitly configured via WithShards on New, NewMapCache, NewRadixCache, or NewArenaRadixCache,
-	// Shards must satisfy 1 <= Shards <= maxSize; otherwise cache construction panics.
+	// When left at 0 (unless WithShards(0) is explicitly passed, which panics), constructors build
+	// a single unsharded cache instance; resetting Shards to 0 in a subsequent Option restores
+	// unsharded mode. When sharding is enabled, Shards must satisfy 1 <= Shards <= maxSize;
+	// otherwise cache construction panics.
 	Shards              int
 	hasCustomShards     bool
+	customShardsZero    bool
 	hasShardTier2Target bool
 
 	// ShardFunc maps a key to a shard index in [0, Shards) when sharding is enabled.
@@ -520,6 +522,7 @@ func WithShards(shards int) Option {
 	return func(o *Options) {
 		o.Shards = shards
 		o.hasCustomShards = true
+		o.customShardsZero = shards == 0
 	}
 }
 
@@ -666,6 +669,12 @@ func normalizeCallbacks(options *Options) {
 	}
 }
 
+func reconcileShards(options *Options) {
+	if options.hasCustomShards && options.Shards == 0 && !options.customShardsZero {
+		options.hasCustomShards = false
+	}
+}
+
 // ApplyOptions parses and applies the provided slice of Option functions onto a default Options configuration.
 func ApplyOptions(opts ...Option) Options {
 	options := Options{
@@ -683,6 +692,7 @@ func ApplyOptions(opts ...Option) Options {
 	if options.Backend != BackendMap && options.Backend != BackendRadix && options.Backend != BackendArenaRadix {
 		options.Backend = BackendMap
 	}
+	reconcileShards(&options)
 	sanitizeThresholds(&options)
 	reconcileThresholdWindow(&options)
 	options.EvictionRetentionRatio = normalizeRetentionRatio(options.EvictionRetentionRatio)

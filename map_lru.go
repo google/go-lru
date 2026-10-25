@@ -727,19 +727,23 @@ func (c *mapCache[V]) deletePrefixShard(evictQ *evictCallbackQueue[V], prefix st
 			return sample, sample.hasSample
 		}
 		if sample.hasSample && c.tryApplyShardSampleLocked(false, &sample) {
-			c.deleteAllPrefixLocked(evictQ, c.reclaimEpoch.Load(), sample.pressure)
+			preEpoch := c.reclaimEpoch.Load()
+			c.deleteAllPrefixLocked(evictQ, preEpoch, sample.pressure)
+			sample.advanceSelfReclaim(c.reclaimEpoch.Load(), preEpoch)
 			c.unlock()
 			return sample, true
 		}
 		c.mu.Unlock()
 		sampledEpoch, out := c.lockShardWithSample(&c.mu, false, sample)
 		c.deleteAllPrefixLocked(evictQ, sampledEpoch, out.pressure)
+		out.advanceSelfReclaim(c.reclaimEpoch.Load(), sampledEpoch)
 		c.unlock()
 		return out, true
 	}
 
 	sampledEpoch, out := c.lockShardWithSample(&c.mu, false, sample)
 	c.deleteNonEmptyPrefixLocked(evictQ, prefix, sampledEpoch, out.pressure)
+	out.advanceSelfReclaim(c.reclaimEpoch.Load(), sampledEpoch)
 	c.unlock()
 	return out, true
 }
@@ -923,8 +927,9 @@ func (c *mapCache[V]) maybeReclaimUnderPressureLocked(evictQ *evictCallbackQueue
 }
 
 func (c *mapCache[V]) evaluateShardPressure(evictQ *evictCallbackQueue[V], sample shardSample) ([]V, shardSample) {
-	_, out := c.lockShardWithSample(&c.mu, true, sample)
+	sampledEpoch, out := c.lockShardWithSample(&c.mu, true, sample)
 	evicted := c.maybeReclaimUnderPressureLocked(evictQ, out.pressure, nil, true)
+	out.advanceSelfReclaim(c.reclaimEpoch.Load(), sampledEpoch)
 	c.unlock()
 	return evicted, out
 }
