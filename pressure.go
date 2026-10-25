@@ -348,16 +348,112 @@ func trimFrameFuncName(fnLine []byte) []byte {
 	return fnLine
 }
 
-func popBottomCallFrame(frames []byte) (fnName, rest []byte) {
+func parseFrameFileAndLine(locLine []byte) (file []byte, line uint64, ok bool) {
+	if len(locLine) > 0 && locLine[0] == '\t' {
+		locLine = locLine[1:]
+	}
+	if spIdx := bytes.LastIndex(locLine, []byte(" +0x")); spIdx > 0 {
+		locLine = locLine[:spIdx]
+	}
+	colonIdx := bytes.LastIndexByte(locLine, ':')
+	if colonIdx <= 0 || colonIdx+1 >= len(locLine) {
+		return nil, 0, false
+	}
+	line, consumed := parseDecimalUint64(locLine[colonIdx+1:])
+	if consumed == 0 || line == 0 {
+		return nil, 0, false
+	}
+	return locLine[:colonIdx], line, true
+}
+
+func popBottomCallFrameWithLoc(frames []byte) (fnName, file []byte, line uint64, rest []byte) {
 	tabNL := bytes.LastIndex(frames, []byte("\n\t"))
 	if tabNL <= 0 {
-		return nil, nil
+		return nil, nil, 0, nil
+	}
+	locEnd := len(frames)
+	if relNL := bytes.IndexByte(frames[tabNL+2:], '\n'); relNL >= 0 {
+		locEnd = tabNL + 2 + relNL
 	}
 	fnNL := bytes.LastIndexByte(frames[:tabNL], '\n')
 	if fnNL < 0 {
-		return nil, nil
+		return nil, nil, 0, nil
 	}
-	return trimFrameFuncName(frames[fnNL+1 : tabNL]), frames[:fnNL]
+	file, line, _ = parseFrameFileAndLine(frames[tabNL+2 : locEnd])
+	return trimFrameFuncName(frames[fnNL+1 : tabNL]), file, line, frames[:fnNL]
+}
+
+func popBottomCallFrame(frames []byte) (fnName, rest []byte) {
+	fnName, _, _, rest = popBottomCallFrameWithLoc(frames)
+	return fnName, rest
+}
+
+func parseCreatedByLoc(childStack []byte) (file []byte, line uint64, ok bool) {
+	const createdBy = "\ncreated by "
+	cIdx := bytes.LastIndex(childStack, []byte(createdBy))
+	if cIdx < 0 {
+		return nil, 0, false
+	}
+	tail := childStack[cIdx+len(createdBy):]
+	_, after, ok0 := bytes.Cut(tail, []byte("\n\t"))
+	if !ok0 {
+		return nil, 0, false
+	}
+	loc := after
+	if nlIdx := bytes.IndexByte(loc, '\n'); nlIdx >= 0 {
+		loc = loc[:nlIdx]
+	}
+	return parseFrameFileAndLine(loc)
+}
+
+func nextTopCallFrame(rem []byte) (fnName, file []byte, line uint64, rest []byte) {
+	for len(rem) > 0 {
+		nlIdx := bytes.IndexByte(rem, '\n')
+		if nlIdx < 0 {
+			return nil, nil, 0, nil
+		}
+		fnLine := rem[:nlIdx]
+		rem = rem[nlIdx+1:]
+		if len(rem) == 0 || rem[0] != '\t' {
+			continue
+		}
+		locEnd := len(rem)
+		if locNL := bytes.IndexByte(rem, '\n'); locNL >= 0 {
+			locEnd = locNL
+			rest = rem[locNL+1:]
+		} else {
+			rest = nil
+		}
+		file, line, _ = parseFrameFileAndLine(rem[:locEnd])
+		return trimFrameFuncName(fnLine), file, line, rest
+	}
+	return nil, nil, 0, nil
+}
+
+func isRuntimeOrSyncFrame(fn []byte) bool {
+	return bytes.HasPrefix(fn, []byte("runtime.")) ||
+		bytes.HasPrefix(fn, []byte("runtime/")) ||
+		bytes.HasPrefix(fn, []byte("sync.")) ||
+		bytes.HasPrefix(fn, []byte("sync/")) ||
+		bytes.HasPrefix(fn, []byte("internal/"))
+}
+
+func topUserFrameInAboveHook(aboveHook []byte) (fn, file []byte, line uint64, hadWGWait bool) {
+	for rem := aboveHook; len(rem) > 0; {
+		var fName, fFile []byte
+		var fLine uint64
+		fName, fFile, fLine, rem = nextTopCallFrame(rem)
+		if len(fName) == 0 {
+			return nil, nil, 0, hadWGWait
+		}
+		if bytes.Equal(fName, []byte("sync.(*WaitGroup).Wait")) {
+			hadWGWait = true
+		}
+		if !isRuntimeOrSyncFrame(fName) {
+			return fName, fFile, fLine, hadWGWait
+		}
+	}
+	return nil, nil, 0, hadWGWait
 }
 
 func sameFuncSymbolIgnoringTypeArgs(a, b []byte) bool {
@@ -403,25 +499,234 @@ func hasClosureOwnedBy(aboveHook, blk, owner []byte) bool {
 	return false
 }
 
-func isDirectWaitGroupSiblingClosure(blk, aboveHook, currCreator, owner []byte, nonWGFrames int) bool {
-	return nonWGFrames == 1 &&
-		bytes.Equal(trimClosureOffset(currCreator), []byte("sync.(*WaitGroup).Go")) &&
-		containsCreatorCallFrame(aboveHook, []byte("sync.(*WaitGroup).Wait")) &&
-		hasClosureOwnedBy(aboveHook, blk, owner)
+type hookLineageCtx struct {
+	allStacks []byte
+	ancGID    uint64
+	callerGID uint64
 }
 
-func matchChildStackFramesAboveHook(blk, aboveHook, belowHook, currCreator, childStack []byte) (matchedAbove, sawBelowOwner bool) {
+func strictFrameClassification(blk, aboveHook, belowHook, fn []byte) (strictAbove, strictBelow bool) {
+	if containsCreatorCallFrame(belowHook, fn) {
+		return false, true
+	}
+	if containsCreatorCallFrame(aboveHook, fn) {
+		return true, false
+	}
+	owner := findClosureOwnerInStack(blk, fn)
+	if len(owner) == 0 {
+		return false, false
+	}
+	if containsCreatorCallFrame(belowHook, owner) {
+		return false, true
+	}
+	return containsCreatorCallFrame(aboveHook, owner), false
+}
+
+func strictClassifyChildBlock(blk []byte, hookIdx int, childBlk, childCreator []byte) (strictAbove, strictBelow bool) {
+	aboveHook := blk[:hookIdx]
+	belowHook := blk[hookIdx:]
+	if end := bytes.LastIndex(childBlk, []byte("\ncreated by ")); end > 0 {
+		rest := childBlk[:end]
+		for range 8 {
+			var fn []byte
+			fn, rest = popBottomCallFrame(rest)
+			if len(fn) == 0 {
+				break
+			}
+			if bytes.Equal(fn, []byte("sync.(*WaitGroup).Go.func1")) {
+				continue
+			}
+			a, b := strictFrameClassification(blk, aboveHook, belowHook, fn)
+			strictAbove = strictAbove || a
+			strictBelow = strictBelow || b
+		}
+	}
+	if len(childCreator) > 0 {
+		a, b := strictFrameClassification(blk, aboveHook, belowHook, childCreator)
+		strictAbove = strictAbove || a
+		strictBelow = strictBelow || b
+	}
+	return strictAbove, strictBelow
+}
+
+func siblingSpawnLineInSym(blk, sym, childBlk, childCreator, targetFile []byte) uint64 {
+	if sameFuncSymbolIgnoringTypeArgs(trimClosureOffset(childCreator), sym) {
+		if cFile, cLine, ok := parseCreatedByLoc(childBlk); ok && bytes.Equal(cFile, targetFile) {
+			return cLine
+		}
+	}
+	end := bytes.LastIndex(childBlk, []byte("\ncreated by "))
+	if end <= 0 {
+		return 0
+	}
+	rest := childBlk[:end]
+	for range 4 {
+		var fn, fFile []byte
+		var fLine uint64
+		fn, fFile, fLine, rest = popBottomCallFrameWithLoc(rest)
+		if len(fn) == 0 {
+			break
+		}
+		if owner := findClosureOwnerInStack(blk, fn); len(owner) > 0 && sameFuncSymbolIgnoringTypeArgs(owner, sym) && bytes.Equal(fFile, targetFile) {
+			return fLine
+		}
+	}
+	return 0
+}
+
+func hasDisqualifyingReenteredSibling(ctx hookLineageCtx, blk []byte, hookIdx int, childGID uint64, sym, spawnFile []byte, spawnLine, aboveLine uint64) bool {
+	if ctx.ancGID == 0 || len(ctx.allStacks) == 0 {
+		return false
+	}
+	for rem := ctx.allStacks; len(rem) > 0; {
+		var sBlk []byte
+		sBlk, rem = nextGoroutineBlock(rem)
+		gid, pGID, sCreator := parseStackGoroutineParentAndCreator(sBlk)
+		if gid == 0 || pGID != ctx.ancGID || gid == ctx.ancGID || gid == ctx.callerGID || gid == childGID {
+			continue
+		}
+		sAbove, sBelow := strictClassifyChildBlock(blk, hookIdx, sBlk, sCreator)
+		if sAbove && !sBelow {
+			return true
+		}
+		if oLine := siblingSpawnLineInSym(blk, sym, sBlk, sCreator, spawnFile); oLine > spawnLine && oLine <= aboveLine {
+			return true
+		}
+	}
+	return false
+}
+
+func hasDisqualifyingWGSibling(ctx hookLineageCtx, blk []byte, hookIdx int, childGID uint64) bool {
+	if ctx.ancGID == 0 || len(ctx.allStacks) == 0 {
+		return false
+	}
+	for rem := ctx.allStacks; len(rem) > 0; {
+		var sBlk []byte
+		sBlk, rem = nextGoroutineBlock(rem)
+		gid, pGID, sCreator := parseStackGoroutineParentAndCreator(sBlk)
+		if gid == 0 || pGID != ctx.ancGID || gid == ctx.ancGID || gid == ctx.callerGID || gid == childGID {
+			continue
+		}
+		sAbove, sBelow := strictClassifyChildBlock(blk, hookIdx, sBlk, sCreator)
+		if sAbove {
+			return true
+		}
+		if !sBelow && bytes.Equal(trimClosureOffset(sCreator), []byte("sync.(*WaitGroup).Go")) {
+			return true
+		}
+	}
+	return false
+}
+
+func reenteredAbovePrecedesBelowFrames(belowHook, targetSym, spawnFile []byte, spawnLine, aboveLine uint64) bool {
+	if end := bytes.LastIndex(belowHook, []byte("\ncreated by ")); end > 0 {
+		belowHook = belowHook[:end]
+	}
+	found := false
+	for rem := belowHook; len(rem) > 0; {
+		var fn, fFile []byte
+		var fLine uint64
+		fn, fFile, fLine, rem = nextTopCallFrame(rem)
+		if len(fn) == 0 {
+			break
+		}
+		if !sameFuncSymbolIgnoringTypeArgs(fn, targetSym) {
+			continue
+		}
+		if fLine == 0 || !bytes.Equal(fFile, spawnFile) || (fLine >= spawnLine && aboveLine >= fLine) {
+			return false
+		}
+		found = true
+	}
+	return found
+}
+
+func matchesReenteredFrameInAboveHook(ctx hookLineageCtx, blk []byte, hookIdx int, childGID uint64, sym, spawnFile []byte, spawnLine uint64) bool {
+	if spawnLine == 0 || len(spawnFile) == 0 {
+		return false
+	}
+	aboveHook := blk[:hookIdx]
+	topFn, aboveFile, aboveLine, _ := topUserFrameInAboveHook(aboveHook)
+	if aboveLine < spawnLine || !sameFuncSymbolIgnoringTypeArgs(topFn, sym) || !bytes.Equal(aboveFile, spawnFile) {
+		return false
+	}
+	if !reenteredAbovePrecedesBelowFrames(blk[hookIdx:], sym, spawnFile, spawnLine, aboveLine) {
+		return false
+	}
+	return !hasDisqualifyingReenteredSibling(ctx, blk, hookIdx, childGID, sym, spawnFile, spawnLine, aboveLine)
+}
+
+func resolveChildSpawnLocForOwner(owner, currCreator, childStack, fnFile []byte, fnLine uint64) ([]byte, uint64) {
+	if sameFuncSymbolIgnoringTypeArgs(trimClosureOffset(currCreator), owner) {
+		if cFile, cLine, ok := parseCreatedByLoc(childStack); ok {
+			return cFile, cLine
+		}
+	}
+	return fnFile, fnLine
+}
+
+func isDirectWaitGroupSiblingClosure(ctx hookLineageCtx, blk []byte, hookIdx int, childGID uint64, currCreator, owner []byte, nonWGFrames int) bool {
+	aboveHook := blk[:hookIdx]
+	if nonWGFrames != 1 || !bytes.Equal(trimClosureOffset(currCreator), []byte("sync.(*WaitGroup).Go")) {
+		return false
+	}
+	if !hasClosureOwnedBy(aboveHook, blk, owner) {
+		return false
+	}
+	topFn, _, _, hadWGWait := topUserFrameInAboveHook(aboveHook)
+	if !hadWGWait || !sameFuncSymbolIgnoringTypeArgs(findClosureOwnerInStack(blk, topFn), owner) {
+		return false
+	}
+	return !hasDisqualifyingWGSibling(ctx, blk, hookIdx, childGID)
+}
+
+func checkSingleChildFrameAboveHook(ctx hookLineageCtx, blk []byte, hookIdx int, childGID uint64, currCreator, childStack, fn, fnFile []byte, fnLine uint64, nonWGFrames int) (matchedAbove, sawBelow bool) {
+	aboveHook := blk[:hookIdx]
+	belowHook := blk[hookIdx:]
+	if containsCreatorCallFrame(aboveHook, fn) {
+		if !containsCreatorCallFrame(belowHook, fn) {
+			return true, false
+		}
+		sFile, sLine := resolveChildSpawnLocForOwner(fn, currCreator, childStack, fnFile, fnLine)
+		if matchesReenteredFrameInAboveHook(ctx, blk, hookIdx, childGID, fn, sFile, sLine) {
+			return true, false
+		}
+		return false, true
+	}
+	owner := findClosureOwnerInStack(blk, fn)
+	if len(owner) == 0 {
+		return false, false
+	}
+	if containsCreatorCallFrame(aboveHook, owner) {
+		if !containsCreatorCallFrame(belowHook, owner) {
+			return true, false
+		}
+		sFile, sLine := resolveChildSpawnLocForOwner(owner, currCreator, childStack, fnFile, fnLine)
+		if matchesReenteredFrameInAboveHook(ctx, blk, hookIdx, childGID, owner, sFile, sLine) {
+			return true, false
+		}
+		return false, true
+	}
+	if containsCreatorCallFrame(belowHook, owner) && !isDirectWaitGroupSiblingClosure(ctx, blk, hookIdx, childGID, currCreator, owner, nonWGFrames) {
+		return false, true
+	}
+	return false, false
+}
+
+func matchChildStackFramesAboveHook(ctx hookLineageCtx, blk []byte, hookIdx int, currCreator, childStack []byte) (matchedAbove, sawBelowOwner bool) {
 	const createdBy = "\ncreated by "
 	end := bytes.LastIndex(childStack, []byte(createdBy))
 	if end <= 0 {
 		return false, false
 	}
+	childGID, _ := parseStackGoroutineAndParentID(childStack)
 	rest := childStack[:end]
 	nonWGFrames := 0
 	const maxBottomFrames = 8
 	for range maxBottomFrames {
-		var fn []byte
-		fn, rest = popBottomCallFrame(rest)
+		var fn, fnFile []byte
+		var fnLine uint64
+		fn, fnFile, fnLine, rest = popBottomCallFrameWithLoc(rest)
 		if len(fn) == 0 {
 			break
 		}
@@ -429,52 +734,106 @@ func matchChildStackFramesAboveHook(blk, aboveHook, belowHook, currCreator, chil
 			continue
 		}
 		nonWGFrames++
-		if containsCreatorCallFrame(aboveHook, fn) {
+		matched, below := checkSingleChildFrameAboveHook(ctx, blk, hookIdx, childGID, currCreator, childStack, fn, fnFile, fnLine, nonWGFrames)
+		if matched {
 			return true, false
 		}
-		if owner := findClosureOwnerInStack(blk, fn); len(owner) > 0 {
-			if containsCreatorCallFrame(aboveHook, owner) {
-				return true, false
-			}
-			if containsCreatorCallFrame(belowHook, owner) && !isDirectWaitGroupSiblingClosure(blk, aboveHook, currCreator, owner, nonWGFrames) {
-				sawBelowOwner = true
-			}
+		if below {
+			sawBelowOwner = true
 		}
 	}
 	return false, sawBelowOwner
 }
 
-func decideCreatorFromCallbackAboveHook(blk []byte, hookIdx int, currCreator, childStack []byte, requirePositiveMatch bool) (matched, decided bool) {
+func decideCreatorSymAboveHook(ctx hookLineageCtx, blk []byte, hookIdx int, childGID uint64, currCreator, childStack []byte) (matched, decided bool) {
+	aboveHook := blk[:hookIdx]
+	belowHook := blk[hookIdx:]
+	if containsCreatorCallFrame(aboveHook, currCreator) {
+		if !containsCreatorCallFrame(belowHook, currCreator) {
+			return true, true
+		}
+		cFile, cLine, ok := parseCreatedByLoc(childStack)
+		return ok && matchesReenteredFrameInAboveHook(ctx, blk, hookIdx, childGID, trimClosureOffset(currCreator), cFile, cLine), true
+	}
+	if owner := findClosureOwnerInStack(blk, currCreator); len(owner) > 0 {
+		if containsCreatorCallFrame(aboveHook, owner) {
+			if !containsCreatorCallFrame(belowHook, owner) {
+				return true, true
+			}
+			cFile, cLine, ok := parseCreatedByLoc(childStack)
+			return ok && matchesReenteredFrameInAboveHook(ctx, blk, hookIdx, childGID, owner, cFile, cLine), true
+		}
+		if containsCreatorCallFrame(belowHook, owner) {
+			return false, true
+		}
+	}
+	if containsCreatorCallFrame(belowHook, currCreator) {
+		return false, true
+	}
+	return false, false
+}
+
+func callbackEntryFuncInAboveHook(aboveHook []byte) []byte {
+	rest := aboveHook
+	for range 2 {
+		var entryFn []byte
+		entryFn, rest = popBottomCallFrame(rest)
+		if len(entryFn) == 0 {
+			return nil
+		}
+		if !bytes.Contains(entryFn, []byte("deliverMultiCallbacks")) {
+			return entryFn
+		}
+	}
+	return nil
+}
+
+func isClosureOwnedBySym(fn, ownerSym []byte) bool {
+	curr := trimClosureOffset(fn)
+	dot := lastDotOutsideBrackets(curr)
+	if dot <= 0 || !isClosureSuffix(curr[dot+1:]) {
+		return false
+	}
+	for dot > 0 {
+		curr = curr[:dot]
+		if !hasDotAfterLastSlash(curr) {
+			return false
+		}
+		if sameFuncSymbolIgnoringTypeArgs(curr, ownerSym) {
+			return true
+		}
+		dot = lastDotOutsideBrackets(curr)
+	}
+	return false
+}
+
+func isCreatedInsideHookEntry(aboveHook, belowHook, currCreator []byte) bool {
+	creator := trimClosureOffset(currCreator)
+	entryFn := callbackEntryFuncInAboveHook(aboveHook)
+	if len(creator) == 0 || len(entryFn) == 0 || containsCreatorCallFrame(belowHook, entryFn) {
+		return false
+	}
+	return sameFuncSymbolIgnoringTypeArgs(creator, entryFn) || isClosureOwnedBySym(creator, entryFn)
+}
+
+func decideCreatorFromCallbackAboveHook(ctx hookLineageCtx, blk []byte, hookIdx int, currCreator, childStack []byte, requirePositiveMatch bool) (matched, decided bool) {
 	aboveHook := blk[:hookIdx]
 	if !hasCallFrameAboveHook(aboveHook) {
 		return false, true
 	}
-	belowHook := blk[hookIdx:]
-	matchedAbove, sawBelowOwner := matchChildStackFramesAboveHook(blk, aboveHook, belowHook, currCreator, childStack)
+	matchedAbove, sawBelowOwner := matchChildStackFramesAboveHook(ctx, blk, hookIdx, currCreator, childStack)
 	if matchedAbove {
 		return true, true
 	}
-	if len(currCreator) > 0 {
-		if containsCreatorCallFrame(aboveHook, currCreator) {
-			return true, true
-		}
-		if owner := findClosureOwnerInStack(blk, currCreator); len(owner) > 0 {
-			if containsCreatorCallFrame(aboveHook, owner) {
-				return true, true
-			}
-			if containsCreatorCallFrame(belowHook, owner) && !hasClosureOwnedBy(aboveHook, blk, owner) {
-				return false, true
-			}
-		}
-		if containsCreatorCallFrame(belowHook, currCreator) {
-			return false, true
-		}
-	}
-	if sawBelowOwner {
+	if sawBelowOwner && !isCreatedInsideHookEntry(aboveHook, blk[hookIdx:], currCreator) {
 		return false, true
 	}
 	if len(currCreator) == 0 {
 		return false, false
+	}
+	childGID, _ := parseStackGoroutineAndParentID(childStack)
+	if m, d := decideCreatorSymAboveHook(ctx, blk, hookIdx, childGID, currCreator, childStack); d {
+		return m, true
 	}
 	if !requirePositiveMatch {
 		return true, true
@@ -482,20 +841,20 @@ func decideCreatorFromCallbackAboveHook(blk []byte, hookIdx int, currCreator, ch
 	return false, false
 }
 
-func isCreatorFromCallbackAboveHook(blk []byte, hookIdx int, currCreator, childStack []byte, requirePositiveMatch bool) bool {
-	matched, _ := decideCreatorFromCallbackAboveHook(blk, hookIdx, currCreator, childStack, requirePositiveMatch)
+func isCreatorFromCallbackAboveHook(ctx hookLineageCtx, blk []byte, hookIdx int, currCreator, childStack []byte, requirePositiveMatch bool) bool {
+	matched, _ := decideCreatorFromCallbackAboveHook(ctx, blk, hookIdx, currCreator, childStack, requirePositiveMatch)
 	return matched
 }
 
-func matchAncestorBlockAboveHook(blk []byte, hookIdx int, currCreator, currChildStack, callerCreator, callerStack []byte, requirePositiveMatch bool) bool {
+func matchAncestorBlockAboveHook(ctx hookLineageCtx, blk []byte, hookIdx int, currCreator, currChildStack, callerCreator, callerStack []byte, requirePositiveMatch bool) bool {
 	if hookIdx < 0 {
 		return false
 	}
-	if matched, decided := decideCreatorFromCallbackAboveHook(blk, hookIdx, currCreator, currChildStack, requirePositiveMatch); decided {
+	if matched, decided := decideCreatorFromCallbackAboveHook(ctx, blk, hookIdx, currCreator, currChildStack, requirePositiveMatch); decided {
 		return matched
 	}
 	if len(callerStack) > 0 && (len(currChildStack) == 0 || &callerStack[0] != &currChildStack[0]) {
-		matched, _ := decideCreatorFromCallbackAboveHook(blk, hookIdx, callerCreator, callerStack, true)
+		matched, _ := decideCreatorFromCallbackAboveHook(ctx, blk, hookIdx, callerCreator, callerStack, true)
 		return matched
 	}
 	return false
@@ -523,7 +882,7 @@ func isOnlyDirectCallbackEntryAboveHook(blk []byte, hookIdx int, currCreator []b
 	return !containsCreatorCallFrame(rest, creator)
 }
 
-func matchAncestorInAllStacks(allStacks, currCreator, childStack, hookName []byte, matchAncestor func(uint64) bool) (uint64, bool) {
+func matchAncestorInAllStacks(allStacks []byte, callerGID uint64, currCreator, childStack, hookName []byte, matchAncestor func(uint64) bool) (uint64, bool) {
 	for rem := allStacks; len(rem) > 0; {
 		var blk []byte
 		blk, rem = nextGoroutineBlock(rem)
@@ -535,16 +894,17 @@ func matchAncestorInAllStacks(allStacks, currCreator, childStack, hookName []byt
 		if hookIdx < 0 || isOnlyDirectCallbackEntryAboveHook(blk, hookIdx, currCreator) {
 			continue
 		}
-		if isCreatorFromCallbackAboveHook(blk, hookIdx, currCreator, childStack, true) {
+		ctx := hookLineageCtx{allStacks: allStacks, ancGID: gid, callerGID: callerGID}
+		if isCreatorFromCallbackAboveHook(ctx, blk, hookIdx, currCreator, childStack, true) {
 			return gid, true
 		}
 	}
 	return 0, false
 }
 
-func matchAncestorFallbackInAllStacks(allStacks, currCreator, currChildStack, callerCreator, callerStack, hookName []byte, matchAncestor func(uint64) bool) (uint64, bool) {
+func matchAncestorFallbackInAllStacks(allStacks []byte, callerGID uint64, currCreator, currChildStack, callerCreator, callerStack, hookName []byte, matchAncestor func(uint64) bool) (uint64, bool) {
 	if len(callerStack) == 0 || (len(currChildStack) > 0 && &callerStack[0] == &currChildStack[0]) {
-		return matchAncestorInAllStacks(allStacks, currCreator, currChildStack, hookName, matchAncestor)
+		return matchAncestorInAllStacks(allStacks, callerGID, currCreator, currChildStack, hookName, matchAncestor)
 	}
 	for rem := allStacks; len(rem) > 0; {
 		var blk []byte
@@ -557,7 +917,8 @@ func matchAncestorFallbackInAllStacks(allStacks, currCreator, currChildStack, ca
 		if hookIdx < 0 || isOnlyDirectCallbackEntryAboveHook(blk, hookIdx, currCreator) {
 			continue
 		}
-		if matchAncestorBlockAboveHook(blk, hookIdx, currCreator, currChildStack, callerCreator, callerStack, true) {
+		ctx := hookLineageCtx{allStacks: allStacks, ancGID: gid, callerGID: callerGID}
+		if matchAncestorBlockAboveHook(ctx, blk, hookIdx, currCreator, currChildStack, callerCreator, callerStack, true) {
 			return gid, true
 		}
 	}
@@ -688,14 +1049,24 @@ func (s *ancestorBridgeState) bridgeExited(allStacks, currCreator, currChildStac
 }
 
 func findAncestorCreatorAboveHook(allStacks, callerStack []byte, parentGID uint64, creatorFunc, hookName []byte, matchAncestor func(uint64) bool) (uint64, bool) {
-	return findAncestorCreatorAboveHookFiltered(allStacks, callerStack, parentGID, creatorFunc, hookName, matchAncestor, nil)
+	return findAncestorCreatorAboveHookFiltered(allStacks, callerStack, parentGID, creatorFunc, hookName, matchAncestor, nil, nil)
 }
 
 func isRejectedAncestorGID(currGID uint64, rejectGID func(uint64) bool) bool {
 	return rejectGID != nil && rejectGID(currGID)
 }
 
-func findAncestorCreatorAboveHookFiltered(allStacks, callerStack []byte, parentGID uint64, creatorFunc, hookName []byte, matchAncestor, rejectGID func(uint64) bool) (uint64, bool) {
+func handleRejectedAncestorGID(bridge *ancestorBridgeState, allStacks []byte, callerGID uint64, matchAncestor, onDirectReject func(uint64) bool) (uint64, []byte, []byte, bool) {
+	if bridge.bridgeCount == 0 {
+		if onDirectReject != nil && callerGID != 0 {
+			onDirectReject(callerGID)
+		}
+		return 0, nil, nil, false
+	}
+	return bridge.backtrack(allStacks, matchAncestor)
+}
+
+func findAncestorCreatorAboveHookFiltered(allStacks, callerStack []byte, parentGID uint64, creatorFunc, hookName []byte, matchAncestor, rejectGID func(uint64) bool, onDirectReject func(uint64)) (uint64, bool) {
 	if parentGID == 0 {
 		return 0, false
 	}
@@ -713,24 +1084,33 @@ func findAncestorCreatorAboveHookFiltered(allStacks, callerStack []byte, parentG
 		exitedCreator:    creatorFunc,
 		exitedChildStack: callerStack,
 	}
+	directRejectFn := func(gid uint64) bool {
+		if onDirectReject != nil {
+			onDirectReject(gid)
+		}
+		return true
+	}
 	const maxAncestorHops = 4096
 	for range maxAncestorHops {
+		var ok bool
 		if currGID == 0 {
-			var ok bool
 			currGID, currCreator, currChildStack, ok = bridge.backtrack(allStacks, matchAncestor)
 			if !ok {
 				return 0, false
 			}
 		}
 		if isRejectedAncestorGID(currGID, rejectGID) {
-			return 0, false
+			currGID, currCreator, currChildStack, ok = handleRejectedAncestorGID(&bridge, allStacks, callerGID, matchAncestor, directRejectFn)
+			if !ok {
+				return 0, false
+			}
+			continue
 		}
 		blk, nextParentGID, nextCreator, foundBlock := findGoroutineBlockByID(allStacks, currGID)
 		if !foundBlock {
-			if gid, ok := matchAncestorFallbackInAllStacks(allStacks, currCreator, currChildStack, creatorFunc, callerStack, hookName, matchAncestor); ok {
+			if gid, matched := matchAncestorFallbackInAllStacks(allStacks, callerGID, currCreator, currChildStack, creatorFunc, callerStack, hookName, matchAncestor); matched {
 				return gid, true
 			}
-			var ok bool
 			currGID, currCreator, currChildStack, ok = bridge.bridgeExited(allStacks, currCreator, currChildStack, matchAncestor)
 			if !ok {
 				return 0, false
@@ -738,22 +1118,19 @@ func findAncestorCreatorAboveHookFiltered(allStacks, callerStack []byte, parentG
 			continue
 		}
 		if !matchAncestor(currGID) {
-			currGID = nextParentGID
-			currCreator = nextCreator
-			currChildStack = blk
+			currGID, currCreator, currChildStack = nextParentGID, nextCreator, blk
 			continue
 		}
-		hookIdx := bytes.LastIndex(blk, hookName)
-		if matchAncestorBlockAboveHook(blk, hookIdx, currCreator, currChildStack, creatorFunc, callerStack, false) {
+		ctx := hookLineageCtx{allStacks: allStacks, ancGID: currGID, callerGID: callerGID}
+		if matchAncestorBlockAboveHook(ctx, blk, bytes.LastIndex(blk, hookName), currCreator, currChildStack, creatorFunc, callerStack, false) {
 			return currGID, true
 		}
-		var ok bool
 		currGID, currCreator, currChildStack, ok = bridge.backtrack(allStacks, matchAncestor)
 		if !ok {
 			return 0, false
 		}
 	}
-	return matchAncestorFallbackInAllStacks(allStacks, currCreator, currChildStack, creatorFunc, callerStack, hookName, matchAncestor)
+	return matchAncestorFallbackInAllStacks(allStacks, callerGID, currCreator, currChildStack, creatorFunc, callerStack, hookName, matchAncestor)
 }
 
 const numPressureHookTags = 8
@@ -1021,6 +1398,8 @@ type pressureState struct {
 	childShards              []*pressureState
 	exitedSamplerSeq         atomic.Uint64
 	exitedSamplerGIDs        [64]atomic.Uint64
+	panickedSamplerEpoch     atomic.Uint64
+	panickedSamplerGIDs      sync.Map
 }
 
 func (p *pressureState) pressureStatePtr() *pressureState {
@@ -1300,9 +1679,27 @@ func (p *pressureState) recordExitedSamplerGID(gid uint64) {
 	p.exitedSamplerGIDs[idx].Store(gid)
 }
 
+func (p *pressureState) hasPanickedSamplerGIDRaw(gid uint64) bool {
+	if gid == 0 {
+		return false
+	}
+	_, ok := p.panickedSamplerGIDs.Load(gid)
+	return ok
+}
+
+func (p *pressureState) isPanickedSamplerGID(gid uint64) bool {
+	if gid == 0 || p.panickedSamplerEpoch.Load() == 0 || p.isCurrentGoroutineSampling(gid) {
+		return false
+	}
+	return p.hasPanickedSamplerGIDRaw(gid) && !p.isCurrentGoroutineSampling(gid)
+}
+
 func (p *pressureState) isExitedSamplerGID(gid uint64) bool {
 	if gid == 0 || p.isCurrentGoroutineSampling(gid) {
 		return false
+	}
+	if p.isPanickedSamplerGID(gid) {
+		return true
 	}
 	for i := range len(p.exitedSamplerGIDs) {
 		if p.exitedSamplerGIDs[i].Load() == gid {
@@ -1310,6 +1707,82 @@ func (p *pressureState) isExitedSamplerGID(gid uint64) bool {
 		}
 	}
 	return false
+}
+
+func (p *pressureState) propagateRejectedCallerIfPanicked(currGID, callerGID uint64) {
+	if callerGID != 0 && p.isPanickedSamplerGID(currGID) {
+		p.panickedSamplerGIDs.Store(callerGID, struct{}{})
+	}
+}
+
+func (p *pressureState) hasOtherActiveSampler(selfGID uint64) bool {
+	if sGID := p.samplingGID.Load(); p.samplingPressure.Load() && (sGID == 0 || sGID != selfGID) {
+		return true
+	}
+	if fGID := p.fallbackGID.Load(); p.fallbackSampling.Load() && fGID != selfGID {
+		return true
+	}
+	otherOverflow := false
+	if p.overflowSamplingCount.Load() > 0 {
+		p.overflowSamplingGIDs.Range(func(k, _ any) bool {
+			if oGID, _ := k.(uint64); oGID != selfGID {
+				otherOverflow = true
+				return false
+			}
+			return true
+		})
+	}
+	return otherOverflow
+}
+
+func (p *pressureState) expandPanickedDescendantsOnce(allStacks, callerStack []byte, allowDeadParentMatch bool) bool {
+	added := false
+	for rem := allStacks; len(rem) > 0; {
+		var blk []byte
+		blk, rem = nextGoroutineBlock(rem)
+		gID, pGID, gCreator := parseStackGoroutineParentAndCreator(blk)
+		if gID == 0 || p.hasPanickedSamplerGIDRaw(gID) {
+			continue
+		}
+		if pGID != 0 && p.hasPanickedSamplerGIDRaw(pGID) {
+			p.panickedSamplerGIDs.Store(gID, struct{}{})
+			added = true
+			continue
+		}
+		if allowDeadParentMatch && pGID != 0 {
+			if _, _, _, found := findGoroutineBlockByID(allStacks, pGID); !found && blockOwnsExitedChild(callerStack, gCreator, blk) {
+				p.panickedSamplerGIDs.Store(pGID, struct{}{})
+				p.panickedSamplerGIDs.Store(gID, struct{}{})
+				added = true
+			}
+		}
+	}
+	return added
+}
+
+func (p *pressureState) recordAbnormalSamplerExit(gid uint64, slot int) {
+	p.panickedSamplerEpoch.Add(1)
+	callerStack, callerBufPtr := captureCurrentGoroutineStack()
+	defer releaseCurrentGoroutineStack(callerBufPtr)
+	actualGID, _ := parseStackGoroutineAndParentID(callerStack)
+	if actualGID == 0 {
+		actualGID = gid
+	}
+	if actualGID == 0 && slot == samplerSlotPrimary {
+		actualGID = p.samplingGID.Load()
+	}
+	if actualGID == 0 {
+		return
+	}
+	p.panickedSamplerGIDs.Store(actualGID, struct{}{})
+	allStacks, allBufPtr := captureAllGoroutineStacks()
+	defer releaseAllGoroutineStacks(allBufPtr)
+	allowDeadParent := !p.hasOtherActiveSampler(actualGID)
+	for range 16 {
+		if !p.expandPanickedDescendantsOnce(allStacks, callerStack, allowDeadParent) {
+			break
+		}
+	}
 }
 
 func (p *pressureState) checkSamplingGoroutineOrChildSlow() (bool, uint64, uint64) {
@@ -1322,13 +1795,22 @@ func (p *pressureState) checkSamplingGoroutineOrChildSlow() (bool, uint64, uint6
 	if p.isCurrentGoroutineSampling(gid) {
 		return true, gid, parentGID
 	}
+	if p.isPanickedSamplerGID(gid) || p.isPanickedSamplerGID(parentGID) {
+		if gid != 0 {
+			p.panickedSamplerGIDs.Store(gid, struct{}{})
+		}
+		return false, gid, parentGID
+	}
 	if p.canBeDescendantOfActiveSampler(gid, parentGID) {
 		sig := p.activeSamplerSig()
 		isDirectSamplerParent := p.isCurrentGoroutineSampling(parentGID)
 		if !isDirectSamplerParent && p.isCachedNonDescendantParent(parentGID, sig) {
 			return false, gid, parentGID
 		}
-		if ancestorGID, ok := findAncestorCreatorAboveHookFiltered(allStacks, callerStack, parentGID, creatorFunc, []byte("invokeAndStorePressure"), p.isCurrentGoroutineSampling, p.isExitedSamplerGID); ok {
+		onReject := func(cGID uint64) {
+			p.propagateRejectedCallerIfPanicked(parentGID, cGID)
+		}
+		if ancestorGID, ok := findAncestorCreatorAboveHookFiltered(allStacks, callerStack, parentGID, creatorFunc, []byte("invokeAndStorePressure"), p.isCurrentGoroutineSampling, p.isExitedSamplerGID, onReject); ok {
 			return true, ancestorGID, parentGID
 		}
 		if !isDirectSamplerParent && parentGID != 0 && sig != 0 && p.activeSamplerSig() == sig {
@@ -1518,7 +2000,7 @@ const (
 	sampleStoreAdoptedLast
 )
 
-func (p *pressureState) publishCachedPressureLocked(epoch, belowTier1, belowTier2, invokeSeq uint64, val float64) {
+func (p *pressureState) publishCachedPressureLocked(epoch, belowTier1, belowTier2, invokeSeq uint64, val float64, needsRefresh bool) {
 	seq := p.cachedPublishSeq.Load()
 	if seq&1 == 0 {
 		seq++
@@ -1531,7 +2013,17 @@ func (p *pressureState) publishCachedPressureLocked(epoch, belowTier1, belowTier
 	p.cachedPressureSeq.Store(invokeSeq)
 	p.cachedPressureBits.Store(math.Float64bits(val))
 	p.pressureInitialized.Store(true)
-	p.pressureNeedsRefresh.Store(false)
+	p.pressureNeedsRefresh.Store(needsRefresh)
+	p.cachedPublishSeq.Store(seq + 1)
+}
+
+func (p *pressureState) invalidateCachedPressureLocked() {
+	seq := p.cachedPublishSeq.Load()
+	if seq&1 == 0 {
+		seq++
+		p.cachedPublishSeq.Store(seq)
+	}
+	p.pressureNeedsRefresh.Store(true)
 	p.cachedPublishSeq.Store(seq + 1)
 }
 
@@ -1555,6 +2047,19 @@ func (p *pressureState) republishCachedRecoveryEpochsLocked(belowTier1, belowTie
 	p.cachedPublishSeq.Store(seq + 1)
 }
 
+func (p *pressureState) syncCachedRecoveryEpochsLocked(belowTier1, belowTier2 uint64) {
+	if !p.pressureInitialized.Load() || p.pressureNeedsRefresh.Load() {
+		return
+	}
+	cachedVal := math.Float64frombits(p.cachedPressureBits.Load())
+	if (belowTier2 > p.cachedBelowTier2Epoch.Load() && cachedVal >= p.options.EvictionThreshold) ||
+		(belowTier1 > p.cachedBelowTier1Epoch.Load() && cachedVal >= p.options.CompactionThreshold) {
+		p.invalidateCachedPressureLocked()
+		return
+	}
+	p.republishCachedRecoveryEpochsLocked(belowTier1, belowTier2)
+}
+
 func (p *pressureState) readValidCachedSampleForEpoch(epoch uint64) (float64, uint64, uint64, uint64, bool) {
 	seq1 := p.cachedPublishSeq.Load()
 	if seq1 == 0 || seq1&1 != 0 || !p.pressureInitialized.Load() || p.pressureNeedsRefresh.Load() {
@@ -1573,34 +2078,46 @@ func (p *pressureState) readValidCachedSampleForEpoch(epoch uint64) (float64, ui
 	return math.Float64frombits(bits), belowTier1, belowTier2, sampleSeq, true
 }
 
-func (p *pressureState) advanceRecoveryEpochsForValLocked(val float64) (uint64, uint64) {
-	belowTier1 := p.belowTier1Epoch.Load()
+func (p *pressureState) advanceRecoveryEpochsForValLocked(val float64, preBelowTier1, preBelowTier2 uint64) (uint64, uint64) {
+	belowTier1 := preBelowTier1
 	if val < p.options.CompactionThreshold {
 		belowTier1 = p.belowTier1Epoch.Add(1)
 	}
-	belowTier2 := p.belowTier2Epoch.Load()
+	belowTier2 := preBelowTier2
 	if val < p.options.EvictionThreshold {
 		belowTier2 = p.belowTier2Epoch.Add(1)
 	}
 	return belowTier1, belowTier2
 }
 
-func (p *pressureState) recordAcceptedFallbackSample(epoch, invokeSeq, preBelowTier1, preBelowTier2 uint64, val float64) (uint64, uint64) {
+func (p *pressureState) isPreSampleElevatedCausallyStaleLocked(val float64, preBelowTier1, preBelowTier2 uint64) bool {
+	if val >= p.options.EvictionThreshold {
+		return preBelowTier2 < p.belowTier2Epoch.Load()
+	}
+	if val >= p.options.CompactionThreshold {
+		return preBelowTier1 < p.belowTier1Epoch.Load()
+	}
+	return false
+}
+
+func (p *pressureState) recordAcceptedFallbackSample(sampleEpoch, invokeSeq, preBelowTier1, preBelowTier2 uint64, val float64) (uint64, uint64) {
 	p.pressureWriteMu.Lock()
 	defer p.pressureWriteMu.Unlock()
+	if p.isPreSampleElevatedCausallyStaleLocked(val, preBelowTier1, preBelowTier2) {
+		return preBelowTier1, preBelowTier2
+	}
 	if invokeSeq != 0 {
 		lastSeq := p.lastSampledSeq.Load()
-		if invokeSeq >= lastSeq {
-			if invokeSeq > lastSeq {
-				p.lastSampledSeq.Store(invokeSeq)
-			}
-			p.lastSampledEpoch = epoch
+		if invokeSeq > lastSeq {
+			p.lastSampledSeq.Store(invokeSeq)
+			p.lastSampledEpoch = sampleEpoch
 			p.lastSampledPressureBits.Store(math.Float64bits(val))
-			belowTier1, belowTier2 := p.advanceRecoveryEpochsForValLocked(val)
-			if p.pressureInitialized.Load() && !p.pressureNeedsRefresh.Load() {
-				p.republishCachedRecoveryEpochsLocked(belowTier1, belowTier2)
-			}
+			belowTier1, belowTier2 := p.advanceRecoveryEpochsForValLocked(val, preBelowTier1, preBelowTier2)
+			p.syncCachedRecoveryEpochsLocked(belowTier1, belowTier2)
 			return belowTier1, belowTier2
+		}
+		if invokeSeq == lastSeq {
+			p.syncCachedRecoveryEpochsLocked(preBelowTier1, preBelowTier2)
 		}
 	}
 	return preBelowTier1, preBelowTier2
@@ -1637,6 +2154,7 @@ func (p *pressureState) resolvePostRetryPressureLocked(s pressureSample) (uint64
 	}
 	coord := p.coord()
 	currentEpoch := coord.reclaimEpoch.Load()
+	acceptedCoordEpoch := currentEpoch
 	belowTier1 := s.belowTier1
 	belowTier2 := s.belowTier2
 	sampleSeq := s.invokeSeq
@@ -1653,7 +2171,8 @@ func (p *pressureState) resolvePostRetryPressureLocked(s pressureSample) (uint64
 		resolvedPressure = cachedVal
 	} else if shardUnreclaimed && !p.isElevatedSampleStaleLocked(s.val, s.belowTier1, s.belowTier2, s.invokeSeq) {
 		p.hasValidSample = true
-		belowTier1, belowTier2 = coord.recordAcceptedFallbackSample(currentEpoch, s.invokeSeq, s.belowTier1, s.belowTier2, s.val)
+		acceptedCoordEpoch = s.epoch
+		belowTier1, belowTier2 = coord.recordAcceptedFallbackSample(s.epoch, s.invokeSeq, s.belowTier1, s.belowTier2, s.val)
 		resolvedPressure = s.val
 	} else {
 		p.hasValidSample = false
@@ -1663,7 +2182,7 @@ func (p *pressureState) resolvePostRetryPressureLocked(s pressureSample) (uint64
 		p.hasValidSample = false
 		resolvedPressure = 0.0
 	}
-	p.sampledCoordEpoch = currentEpoch
+	p.sampledCoordEpoch = acceptedCoordEpoch
 	p.syncZeroWatermarkLocked(belowTier1, belowTier2, sampleSeq, resolvedPressure)
 	return p.reclaimEpoch.Load(), resolvedPressure
 }
@@ -1894,7 +2413,10 @@ func (p *pressureState) lockShardWithSample(mu *sync.RWMutex, fresh bool, sample
 	}
 }
 
-func (p *pressureState) recordLastSampledTelemetryLocked(epoch, invokeSeq uint64, val float64, willStore bool) bool {
+func (p *pressureState) recordLastSampledTelemetryLocked(originalEpoch, epoch, invokeSeq uint64, val float64, willStore, elevatedStale bool) bool {
+	if elevatedStale {
+		return false
+	}
 	if !willStore && p.reclaimEpoch.Load() != epoch {
 		return false
 	}
@@ -1902,7 +2424,7 @@ func (p *pressureState) recordLastSampledTelemetryLocked(epoch, invokeSeq uint64
 		return false
 	}
 	lastSeq := p.lastSampledSeq.Load()
-	if invokeSeq >= lastSeq || (willStore && epoch > p.lastSampledEpoch) {
+	if invokeSeq >= lastSeq || (willStore && originalEpoch > p.lastSampledEpoch) {
 		if invokeSeq > lastSeq {
 			p.lastSampledSeq.Store(invokeSeq)
 		}
@@ -1923,25 +2445,25 @@ func (p *pressureState) canFastForwardLowPressureEpochLocked(val float64) bool {
 		math.Float64frombits(p.cachedPressureBits.Load()) < p.options.CompactionThreshold
 }
 
-func (p *pressureState) isSoleReentrantReclaimerLocked(reentrant bool, resolvedGID uint64) bool {
-	if !reentrant {
+func (p *pressureState) isSoleReentrantReclaimerLocked(reentrant, noPeerPanic bool, resolvedGID uint64) bool {
+	if !reentrant || !noPeerPanic {
 		return false
 	}
 	lastGID := p.lastReentrantGID.Load()
 	return lastGID == 0 || lastGID == resolvedGID
 }
 
-func (p *pressureState) resolveTargetShardEpochLocked(targetShard *pressureState, shardEpoch, shardExtEpoch uint64, shardReentrant bool, resolvedGID uint64, val float64) uint64 {
+func (p *pressureState) resolveTargetShardEpochLocked(targetShard *pressureState, shardEpoch, shardExtEpoch uint64, shardReentrant, noPeerPanic bool, resolvedGID uint64, val float64) uint64 {
 	if targetShard == p || targetShard.reclaimEpoch.Load() == shardEpoch || targetShard.externalReclaimEpoch.Load() != shardExtEpoch {
 		return shardEpoch
 	}
-	if targetShard.isSoleReentrantReclaimerLocked(shardReentrant, resolvedGID) || p.canFastForwardLowPressureEpochLocked(val) {
+	if targetShard.isSoleReentrantReclaimerLocked(shardReentrant, noPeerPanic, resolvedGID) || p.canFastForwardLowPressureEpochLocked(val) {
 		return targetShard.reclaimEpoch.Load()
 	}
 	return shardEpoch
 }
 
-func (p *pressureState) resolveSampleEpochsLocked(targetShard *pressureState, shardEpoch, shardExtEpoch, epoch, extEpoch uint64, val float64, gid uint64, slot int) (uint64, uint64, bool) {
+func (p *pressureState) resolveSampleEpochsLocked(targetShard *pressureState, shardEpoch, shardExtEpoch, epoch, extEpoch uint64, val float64, gid uint64, slot int, noPeerPanic bool) (uint64, uint64, bool) {
 	curEpoch := p.reclaimEpoch.Load()
 	allowStore := curEpoch == epoch
 	if !p.options.hasCustomPressureFunc {
@@ -1958,7 +2480,7 @@ func (p *pressureState) resolveSampleEpochsLocked(targetShard *pressureState, sh
 
 	if !allowStore && p.externalReclaimEpoch.Load() == extEpoch {
 		switch {
-		case p.isSoleReentrantReclaimerLocked(reentrant, resolvedGID):
+		case p.isSoleReentrantReclaimerLocked(reentrant, noPeerPanic, resolvedGID):
 			epoch = curEpoch
 			shardEpoch = targetShard.reclaimEpoch.Load()
 			allowStore = true
@@ -1967,11 +2489,27 @@ func (p *pressureState) resolveSampleEpochsLocked(targetShard *pressureState, sh
 			shardEpoch = targetShard.reclaimEpoch.Load()
 		}
 	}
-	shardEpoch = p.resolveTargetShardEpochLocked(targetShard, shardEpoch, shardExtEpoch, shardReentrant, resolvedGID, val)
+	shardEpoch = p.resolveTargetShardEpochLocked(targetShard, shardEpoch, shardExtEpoch, shardReentrant, noPeerPanic, resolvedGID, val)
 	return epoch, shardEpoch, allowStore
 }
 
-func (p *pressureState) decideSampleStoreLocked(epoch, curEpoch, invokeSeq uint64, val float64, allowStore bool) (uint64, float64, bool, int) {
+func (p *pressureState) decideOlderInvokeSeqLocked(originalEpoch, epoch, invokeSeq uint64, val float64, hasCachedAtEpoch bool) (uint64, float64, bool, int) {
+	if p.lastSampledEpoch == epoch {
+		if !hasCachedAtEpoch {
+			p.pressureNeedsRefresh.Store(true)
+		}
+		return p.lastSampledSeq.Load(), math.Float64frombits(p.lastSampledPressureBits.Load()), false, sampleStoreAdoptedLast
+	}
+	if originalEpoch <= p.lastSampledEpoch {
+		if !hasCachedAtEpoch {
+			p.pressureNeedsRefresh.Store(true)
+		}
+		return invokeSeq, val, false, sampleStoreNormal
+	}
+	return invokeSeq, val, true, sampleStoreNormal
+}
+
+func (p *pressureState) decideSampleStoreLocked(originalEpoch, epoch, curEpoch, invokeSeq uint64, val float64, allowStore bool) (uint64, float64, bool, int) {
 	if !allowStore {
 		if !p.pressureInitialized.Load() || p.cachedPressureEpoch.Load() != curEpoch {
 			p.pressureNeedsRefresh.Store(true)
@@ -1982,22 +2520,21 @@ func (p *pressureState) decideSampleStoreLocked(epoch, curEpoch, invokeSeq uint6
 	if hasCachedAtEpoch && invokeSeq != 0 && invokeSeq < p.cachedPressureSeq.Load() {
 		return p.cachedPressureSeq.Load(), math.Float64frombits(p.cachedPressureBits.Load()), false, sampleStoreAdoptedCached
 	}
-	if p.lastSampledEpoch == epoch && invokeSeq != 0 && invokeSeq < p.lastSampledSeq.Load() {
-		if !hasCachedAtEpoch {
-			p.pressureNeedsRefresh.Store(true)
-		}
-		return p.lastSampledSeq.Load(), math.Float64frombits(p.lastSampledPressureBits.Load()), false, sampleStoreAdoptedLast
+	if invokeSeq != 0 && invokeSeq < p.lastSampledSeq.Load() {
+		return p.decideOlderInvokeSeqLocked(originalEpoch, epoch, invokeSeq, val, hasCachedAtEpoch)
 	}
 	return invokeSeq, val, true, sampleStoreNormal
 }
 
-func (p *pressureState) storeSampledPressureWithSeq(targetShard *pressureState, shardEpoch, shardExtEpoch, epoch, extEpoch, preBelowTier1, preBelowTier2, invokeSeq uint64, val float64, gid uint64, slot int) (uint64, uint64, uint64, uint64, uint64, float64) {
+func (p *pressureState) storeSampledPressureWithSeq(targetShard *pressureState, shardEpoch, shardExtEpoch, epoch, extEpoch, preBelowTier1, preBelowTier2, invokeSeq uint64, val float64, gid uint64, slot int, noPeerPanic bool) (uint64, uint64, uint64, uint64, uint64, float64) {
 	p.pressureWriteMu.Lock()
 	defer p.pressureWriteMu.Unlock()
 
+	originalEpoch := epoch
 	curEpoch := p.reclaimEpoch.Load()
-	epoch, shardEpoch, allowStore := p.resolveSampleEpochsLocked(targetShard, shardEpoch, shardExtEpoch, epoch, extEpoch, val, gid, slot)
-	invokeSeq, val, willStore, storeMode := p.decideSampleStoreLocked(epoch, curEpoch, invokeSeq, val, allowStore)
+	elevatedStale := p.isPreSampleElevatedCausallyStaleLocked(val, preBelowTier1, preBelowTier2)
+	epoch, shardEpoch, allowStore := p.resolveSampleEpochsLocked(targetShard, shardEpoch, shardExtEpoch, epoch, extEpoch, val, gid, slot, noPeerPanic)
+	invokeSeq, val, willStore, storeMode := p.decideSampleStoreLocked(originalEpoch, epoch, curEpoch, invokeSeq, val, allowStore)
 
 	var belowTier1, belowTier2 uint64
 	switch {
@@ -2007,24 +2544,31 @@ func (p *pressureState) storeSampledPressureWithSeq(targetShard *pressureState, 
 	case storeMode == sampleStoreAdoptedLast:
 		belowTier1 = p.belowTier1Epoch.Load()
 		belowTier2 = p.belowTier2Epoch.Load()
-	case p.recordLastSampledTelemetryLocked(epoch, invokeSeq, val, willStore):
-		belowTier1, belowTier2 = p.advanceRecoveryEpochsForValLocked(val)
+	case p.recordLastSampledTelemetryLocked(originalEpoch, epoch, invokeSeq, val, willStore, elevatedStale):
+		belowTier1, belowTier2 = p.advanceRecoveryEpochsForValLocked(val, preBelowTier1, preBelowTier2)
 	default:
 		belowTier1 = preBelowTier1
 		belowTier2 = preBelowTier2
 	}
 
 	if willStore {
-		p.publishCachedPressureLocked(epoch, belowTier1, belowTier2, invokeSeq, val)
+		p.publishCachedPressureLocked(epoch, belowTier1, belowTier2, invokeSeq, val, elevatedStale)
 	}
 	return epoch, shardEpoch, belowTier1, belowTier2, invokeSeq, val
 }
 
 //go:noinline
 func (p *pressureState) invokeAndStorePressure(targetShard *pressureState, gid uint64, slot int) pressureSample {
+	completed := false
+	prePanicEpoch := p.panickedSamplerEpoch.Load()
 	if p.options.hasCustomPressureFunc {
 		p.clearReentrantSlot(gid, slot)
 		p.clearChildShardsReentrantSlot(nil, gid, slot)
+		defer func() {
+			if !completed {
+				p.recordAbnormalSamplerExit(gid, slot)
+			}
+		}()
 	}
 	shardExtEpoch := targetShard.externalReclaimEpoch.Load()
 	shardEpoch := targetShard.reclaimEpoch.Load()
@@ -2034,13 +2578,15 @@ func (p *pressureState) invokeAndStorePressure(targetShard *pressureState, gid u
 	preBelowTier2 := p.belowTier2Epoch.Load()
 	invokeSeq := p.pressureInvokeSeq.Add(1)
 	val := p.options.PressureFunc()
+	completed = true
 	if math.IsNaN(val) || val < 0.0 {
 		val = 0.0
 	} else if math.IsInf(val, 1) {
 		val = max(1.0, p.options.CompactionThreshold, p.options.EvictionThreshold)
 	}
+	noPeerPanic := p.panickedSamplerEpoch.Load() == prePanicEpoch
 	var belowTier1, belowTier2 uint64
-	epoch, shardEpoch, belowTier1, belowTier2, invokeSeq, val = p.storeSampledPressureWithSeq(targetShard, shardEpoch, shardExtEpoch, epoch, extEpoch, preBelowTier1, preBelowTier2, invokeSeq, val, gid, slot)
+	epoch, shardEpoch, belowTier1, belowTier2, invokeSeq, val = p.storeSampledPressureWithSeq(targetShard, shardEpoch, shardExtEpoch, epoch, extEpoch, preBelowTier1, preBelowTier2, invokeSeq, val, gid, slot, noPeerPanic)
 	return pressureSample{
 		epoch:         epoch,
 		shardEpoch:    shardEpoch,

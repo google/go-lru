@@ -3391,6 +3391,1008 @@ func TestOptions_DirectShardsZeroOverrideRestoresUnshardedMode(t *testing.T) {
 	assert.PanicsWithValue(t, "shards must be greater than zero", func() {
 		_ = New[int](100, WithShards(0))
 	})
+	assert.PanicsWithValue(t, "shards must be greater than zero", func() {
+		_ = New[int](100, WithShards(0), WithBackend(BackendRadix))
+	})
+	assert.PanicsWithValue(t, "shards must be greater than zero", func() {
+		_ = New[int](100, WithShards(0), func(o *Options) {
+			o.EnableInvariantChecking = true
+		})
+	})
+
+	resetAfterZero := []Option{
+		WithShards(0),
+		func(o *Options) { o.Shards = 0 },
+	}
+	resetAfterZeroAndPositive := []Option{
+		WithShards(0),
+		func(o *Options) { o.Shards = 4 },
+		func(o *Options) { o.Shards = 0 },
+	}
+	for _, seqOpts := range [][]Option{resetAfterZero, resetAfterZeroAndPositive} {
+		appliedZero := ApplyOptions(seqOpts...)
+		assert.Zero(t, appliedZero.Shards)
+		assert.False(t, appliedZero.shouldShard())
+		for _, fn := range []func(...Option) Cache[int]{
+			func(opts ...Option) Cache[int] { return New[int](100, opts...) },
+			func(opts ...Option) Cache[int] { return NewMapCache[int](100, opts...) },
+			func(opts ...Option) Cache[int] { return NewRadixCache[int](100, opts...) },
+			func(opts ...Option) Cache[int] { return NewArenaRadixCache[int](100, opts...) },
+		} {
+			var c Cache[int]
+			require.NotPanics(t, func() {
+				c = fn(seqOpts...)
+			})
+			_, isSharded := c.(*shardedCache[int])
+			assert.False(t, isSharded, "custom Option resetting Options.Shards = 0 after WithShards(0) must restore unsharded mode")
+		}
+	}
+}
+
+func runCrossShardFallbackEpochIsolationCase(t *testing.T, backend Backend, useDeletePrefix bool) {
+	t.Helper()
+	var armed atomic.Bool
+	var healthy atomic.Bool
+	probeEntered := make(chan struct{})
+	probeRelease := make(chan struct{})
+	var g1GID atomic.Uint64
+
+	c := NewShardedCache[int](
+		300,
+		3,
+		explicitTagShardFunc,
+		WithBackend(backend),
+		WithInvariantChecking(true),
+		WithWeigher(func(_ string, v int) uint64 { return uint64(v) }),
+		WithCompactionThreshold(0.80),
+		WithEvictionThreshold(0.90),
+		WithEvictionRetentionRatio(0.50),
+		WithPressureFunc(func() float64 {
+			if !armed.Load() || healthy.Load() {
+				return 0.10
+			}
+			if g1GID.Load() != 0 && currentGoroutineID() == g1GID.Load() {
+				probeEntered <- struct{}{}
+				<-probeRelease
+				return 0.95
+			}
+			return 0.95
+		}),
+	)
+	pa := c.(PressureAwareCache[int])
+
+	_, err := c.Put("s2/live", 80)
+	require.NoError(t, err)
+	for i := range 5 {
+		_, err = c.Put(fmt.Sprintf("s1/victim%d", i), 2)
+		require.NoError(t, err)
+	}
+	if useDeletePrefix {
+		_, err = c.Put("s2/drop/target", 2)
+		require.NoError(t, err)
+	}
+
+	armed.Store(true)
+	opDone := make(chan struct{})
+	go func() {
+		defer close(opDone)
+		g1GID.Store(currentGoroutineID())
+		if useDeletePrefix {
+			c.DeletePrefix("s2/drop/")
+		} else {
+			_ = pa.EvaluateMemoryPressure()
+		}
+	}()
+
+	for i := range 5 {
+		<-probeEntered
+		_, ok := c.Delete(fmt.Sprintf("s1/victim%d", i))
+		require.True(t, ok)
+		if i == 4 {
+			healthy.Store(true)
+		}
+		probeRelease <- struct{}{}
+	}
+
+	<-opDone
+	_, present := c.Peek("s2/live")
+	assert.True(t, present, "subsequent shard must resample 0.10 instead of adopting shard 0's pre-reclamation 0.95 fallback")
+	stats := c.Stats()
+	assert.Zero(t, stats.EvictionsPressure)
+	assert.Zero(t, stats.CompactionsPressureTier2)
+	assert.InDelta(t, 0.10, stats.MemoryPressure, 1e-9)
+}
+
+func TestShardedCache_CrossShardRetryExhaustionFallbackDoesNotPropagateStaleEpoch(t *testing.T) {
+	for _, backend := range []Backend{BackendMap, BackendRadix, BackendArenaRadix} {
+		t.Run(backend.String()+"/EvaluateMemoryPressure", func(t *testing.T) {
+			runCrossShardFallbackEpochIsolationCase(t, backend, false)
+		})
+		t.Run(backend.String()+"/DeletePrefix", func(t *testing.T) {
+			runCrossShardFallbackEpochIsolationCase(t, backend, true)
+		})
+	}
+}
+
+type decoyLineageStage struct {
+	park <-chan struct{}
+}
+
+func (s *decoyLineageStage) run(fn func()) {
+	if s.park != nil {
+		<-s.park
+		return
+	}
+	fn()
+}
+
+func TestShardedCache_BacktrackOnRejectedDecoyAncestorPreservesMultiHopLineage(t *testing.T) {
+	decoyReady := make(chan struct{})
+	decoyRelease := make(chan struct{})
+	setupReady := make(chan struct{})
+
+	var armed atomic.Bool
+	var setupMode atomic.Bool
+	var probeCalls atomic.Int32
+	var cache Cache[int]
+
+	cache = NewShardedCache[int](
+		64,
+		2,
+		explicitTagShardFunc,
+		WithInvariantChecking(true),
+		WithPressureFunc(func() float64 {
+			if setupMode.Load() {
+				done := make(chan struct{})
+				go func() {
+					defer close(done)
+					_, _ = cache.Put("s1/setup_child", 1)
+				}()
+				<-done
+				return 0.10
+			}
+			if !armed.Load() {
+				return 0.10
+			}
+			if probeCalls.Add(1) > 1 {
+				return 0.10
+			}
+			leafDone := make(chan struct{})
+			stage := &decoyLineageStage{}
+			go stage.run(func() {
+				midExited := make(chan struct{})
+				go func() {
+					go func() {
+						<-midExited
+						defer close(leafDone)
+						_, _ = cache.Put("s1/reentrant", 1)
+					}()
+					close(midExited)
+				}()
+				<-leafDone
+			})
+			<-leafDone
+			return 0.10
+		}),
+	)
+
+	setupDone := make(chan struct{})
+	go func() {
+		defer close(setupDone)
+		decoy := &decoyLineageStage{park: decoyRelease}
+		go func() {
+			close(decoyReady)
+			decoy.run(func() {})
+		}()
+		<-decoyReady
+		setupMode.Store(true)
+		_, _ = cache.Put("s0/setup", 1)
+		setupMode.Store(false)
+		close(setupReady)
+		<-decoyRelease
+	}()
+	<-setupReady
+
+	armed.Store(true)
+	_, err := cache.Put("s0/trigger", 2)
+	require.NoError(t, err)
+	assert.Equal(t, int32(1), probeCalls.Load(),
+		"multi-hop PressureFunc descendant must backtrack past decoy goroutine and preserve re-entrancy guard")
+	close(decoyRelease)
+	<-setupDone
+}
+
+func runPanickingSamplerOrphanIsolationCase(t *testing.T, ringChurn bool) {
+	t.Helper()
+	var armed atomic.Bool
+	var healthy atomic.Bool
+	var g1GID, g2GID atomic.Uint64
+	g1Ready := make(chan struct{})
+	g2ReadHigh := make(chan struct{})
+	releaseG1Panic := make(chan struct{})
+	releaseOrphan := make(chan struct{})
+	orphanDone := make(chan struct{})
+	releaseG2Return := make(chan struct{})
+
+	var cache Cache[int]
+	spawnOrphanHelper := func() {
+		if ringChurn {
+			go func() {
+				<-releaseOrphan
+				healthy.Store(true)
+				_, _ = cache.Delete("s1/victim")
+				close(orphanDone)
+			}()
+			return
+		}
+		midDone := make(chan struct{})
+		go func() {
+			go func() {
+				<-midDone
+				<-releaseOrphan
+				healthy.Store(true)
+				_, _ = cache.Delete("s1/victim")
+				close(orphanDone)
+			}()
+			close(midDone)
+		}()
+		<-midDone
+	}
+
+	cache = NewShardedCache[int](
+		300,
+		3,
+		explicitTagShardFunc,
+		WithInvariantChecking(true),
+		WithWeigher(func(_ string, v int) uint64 { return uint64(v) }),
+		WithCompactionThreshold(0.80),
+		WithEvictionThreshold(0.90),
+		WithEvictionRetentionRatio(0.50),
+		WithPressureFunc(func() float64 {
+			if !armed.Load() || healthy.Load() {
+				return 0.10
+			}
+			gid := currentGoroutineID()
+			if g1GID.Load() != 0 && gid == g1GID.Load() {
+				spawnOrphanHelper()
+				close(g1Ready)
+				<-releaseG1Panic
+				panic("boom from G1 sampler")
+			}
+			if g2GID.Load() != 0 && gid == g2GID.Load() {
+				close(g2ReadHigh)
+				<-releaseG2Return
+				return 0.95
+			}
+			childDone := make(chan struct{})
+			go func() {
+				defer close(childDone)
+				_, _ = cache.Peek("s0/noop")
+			}()
+			<-childDone
+			return 0.95
+		}),
+	)
+
+	_, err := cache.Put("s1/victim", 20)
+	require.NoError(t, err)
+	_, err = cache.Put("s2/live", 80)
+	require.NoError(t, err)
+
+	armed.Store(true)
+	g1Done := make(chan struct{})
+	go func() {
+		defer close(g1Done)
+		g1GID.Store(currentGoroutineID())
+		assert.PanicsWithValue(t, "boom from G1 sampler", func() {
+			_, _ = cache.Put("s0/g1", 10)
+		})
+	}()
+	<-g1Ready
+
+	if ringChurn {
+		close(releaseG1Panic)
+		<-g1Done
+		for range 70 {
+			_, putErr := cache.Put("s0/churn", 1)
+			require.NoError(t, putErr)
+		}
+	}
+
+	g2Done := make(chan struct{})
+	go func() {
+		defer close(g2Done)
+		g2GID.Store(currentGoroutineID())
+		_, putErr := cache.Put("s2/trigger", 10)
+		assert.NoError(t, putErr)
+	}()
+	<-g2ReadHigh
+
+	if !ringChurn {
+		close(releaseG1Panic)
+		<-g1Done
+	}
+
+	close(releaseOrphan)
+	<-orphanDone
+	close(releaseG2Return)
+	<-g2Done
+
+	_, present := cache.Peek("s2/live")
+	assert.True(t, present, "orphan descendant of panicked sampler must not fast-forward G2's stale 0.95 sample")
+	assert.Zero(t, cache.Stats().EvictionsPressure)
+	assert.InDelta(t, 0.10, cache.Stats().MemoryPressure, 1e-9)
+}
+
+func TestShardedCache_PanickingSamplerGrandchildAndPost64RingOrphanIsolation(t *testing.T) {
+	t.Run("GrandchildViaExitedIntermediate", func(t *testing.T) {
+		runPanickingSamplerOrphanIsolationCase(t, false)
+	})
+	t.Run("Post64SampleRingEviction", func(t *testing.T) {
+		runPanickingSamplerOrphanIsolationCase(t, true)
+	})
+}
+
+func TestShardedCache_ConcurrentInvertedInvokeSeqPreservesPreSampleRecoveryEpochs(t *testing.T) {
+	for _, backend := range []Backend{BackendMap, BackendRadix, BackendArenaRadix} {
+		t.Run(backend.String(), func(t *testing.T) {
+			var armed atomic.Bool
+			var healthy atomic.Bool
+			var probeSeq atomic.Int32
+			gRecoverEntered := make(chan struct{})
+			releaseGRecover := make(chan struct{})
+			gSpikeReadHigh := make(chan struct{})
+			releaseGSpike := make(chan struct{})
+
+			c := NewShardedCache[int](
+				80,
+				4,
+				explicitTagShardFunc,
+				WithBackend(backend),
+				WithInvariantChecking(true),
+				WithWeigher(func(_ string, v int) uint64 { return uint64(v) }),
+				WithCompactionThreshold(0.80),
+				WithEvictionThreshold(0.90),
+				WithEvictionRetentionRatio(0.50),
+				WithPressureFunc(func() float64 {
+					if !armed.Load() {
+						return 0.10
+					}
+					switch probeSeq.Add(1) {
+					case 1:
+						close(gRecoverEntered)
+						<-releaseGRecover
+						if healthy.Load() {
+							return 0.10
+						}
+						return 0.95
+					case 2:
+						val := 0.95
+						if healthy.Load() {
+							val = 0.10
+						}
+						close(gSpikeReadHigh)
+						<-releaseGSpike
+						return val
+					default:
+						if healthy.Load() {
+							return 0.10
+						}
+						return 0.95
+					}
+				}),
+			)
+
+			_, err := c.Put("s0/live", 16)
+			require.NoError(t, err)
+
+			armed.Store(true)
+			gRecoverDone := make(chan struct{})
+			go func() {
+				defer close(gRecoverDone)
+				_, putErr := c.Put("s3/recover", 2)
+				assert.NoError(t, putErr)
+			}()
+			<-gRecoverEntered
+
+			gSpikeDone := make(chan struct{})
+			go func() {
+				defer close(gSpikeDone)
+				_, putErr := c.Put("s0/spike", 2)
+				assert.NoError(t, putErr)
+			}()
+			<-gSpikeReadHigh
+
+			healthy.Store(true)
+			close(releaseGRecover)
+			<-gRecoverDone
+			require.InDelta(t, 0.10, c.Stats().MemoryPressure, 1e-9)
+
+			close(releaseGSpike)
+			<-gSpikeDone
+
+			_, present := c.Peek("s0/live")
+			assert.True(t, present, "stale pre-recovery 0.95 spike must not shed s0/live after recovery")
+			assert.Zero(t, c.Stats().EvictionsPressure)
+			assert.InDelta(t, 0.10, c.Stats().MemoryPressure, 1e-9)
+		})
+	}
+}
+
+func TestShardedCache_ReentrantFastForwardEnforcesInvokeSeqAndRecoveryCausality(t *testing.T) {
+	for _, backend := range []Backend{BackendMap, BackendRadix, BackendArenaRadix} {
+		t.Run(backend.String(), func(t *testing.T) {
+			var armed atomic.Bool
+			var healthy atomic.Bool
+			var probeSeq atomic.Int32
+			g1ReadHigh := make(chan struct{})
+			releaseG1Delete := make(chan struct{})
+			var cache Cache[int]
+
+			cache = NewShardedCache[int](
+				80,
+				4,
+				explicitTagShardFunc,
+				WithBackend(backend),
+				WithInvariantChecking(true),
+				WithWeigher(func(_ string, v int) uint64 { return uint64(v) }),
+				WithCompactionThreshold(0.80),
+				WithEvictionThreshold(0.90),
+				WithEvictionRetentionRatio(0.50),
+				WithPressureFunc(func() float64 {
+					if !armed.Load() {
+						return 0.10
+					}
+					if probeSeq.Add(1) == 1 {
+						val := 0.95
+						close(g1ReadHigh)
+						<-releaseG1Delete
+						_, _ = cache.Delete("s1/scratch")
+						return val
+					}
+					if healthy.Load() {
+						return 0.10
+					}
+					return 0.95
+				}),
+			)
+
+			_, err := cache.Put("s0/live", 16)
+			require.NoError(t, err)
+			_, err = cache.Put("s1/scratch", 2)
+			require.NoError(t, err)
+
+			armed.Store(true)
+			g1Done := make(chan struct{})
+			go func() {
+				defer close(g1Done)
+				_, putErr := cache.Put("s0/trigger", 2)
+				assert.NoError(t, putErr)
+			}()
+			<-g1ReadHigh
+
+			healthy.Store(true)
+			_, err = cache.Put("s3/healthy", 2)
+			require.NoError(t, err)
+			require.InDelta(t, 0.10, cache.Stats().MemoryPressure, 1e-9)
+
+			close(releaseG1Delete)
+			<-g1Done
+
+			_, present := cache.Peek("s0/live")
+			assert.True(t, present, "re-entrant fast-forwarded pre-recovery 0.95 sample must not shed s0/live")
+			assert.Zero(t, cache.Stats().EvictionsPressure)
+			assert.InDelta(t, 0.10, cache.Stats().MemoryPressure, 1e-9)
+		})
+	}
+}
+
+func runAcceptedHealthyFallbackInvalidatesCachedSpikeCase(t *testing.T, backend Backend) {
+	t.Helper()
+	var armed atomic.Bool
+	var healthy atomic.Bool
+	var gRecoverGID, gSpikeGID, delPrefGID atomic.Uint64
+	var gRecoverSamples atomic.Int32
+	stepReq := make(chan struct{}, 1)
+	stepAck := make(chan struct{}, 1)
+	fifthReady := make(chan struct{})
+	releaseFifth := make(chan struct{})
+	spikeEntered := make(chan struct{})
+	releaseSpike := make(chan struct{})
+
+	var cache Cache[string]
+	cache = NewShardedCache[string](
+		80,
+		4,
+		explicitTagShardFunc,
+		WithBackend(backend),
+		WithInvariantChecking(true),
+		WithWeigher(func(_, v string) uint64 { return uint64(len(v)) }),
+		WithCompactionThreshold(0.80),
+		WithEvictionThreshold(0.90),
+		WithEvictionRetentionRatio(0.50),
+		WithPressureFunc(func() float64 {
+			if !armed.Load() {
+				return 0.10
+			}
+			gid := currentGoroutineID()
+			if gRecoverGID.Load() != 0 && gid == gRecoverGID.Load() {
+				n := gRecoverSamples.Add(1)
+				if n <= 4 {
+					stepReq <- struct{}{}
+					<-stepAck
+					return 0.95
+				}
+				if n == 5 {
+					close(fifthReady)
+					<-releaseFifth
+					return 0.10
+				}
+			}
+			if gSpikeGID.Load() != 0 && gid == gSpikeGID.Load() {
+				close(spikeEntered)
+				<-releaseSpike
+				_, _ = cache.Delete("s2/reentrant_del")
+				return 0.95
+			}
+			if healthy.Load() {
+				return 0.10
+			}
+			return 0.95
+		}),
+	)
+
+	_, err := cache.Put("s3/live", "0123456789abcdef") // 16B > tier2Target 10B
+	require.NoError(t, err)
+	_, err = cache.Put("s3/del/target", "ab")
+	require.NoError(t, err)
+	_, err = cache.Put("s1/anchor", "a")
+	require.NoError(t, err)
+	_, err = cache.Put("s2/reentrant_del", "ab")
+	require.NoError(t, err)
+	for i := range 4 {
+		_, err = cache.Put(fmt.Sprintf("s2/v%d", i), "a")
+		require.NoError(t, err)
+	}
+
+	releaseS3 := holdShardRLockViaKeys(t, cache, "s3/")
+	delPrefReady := make(chan struct{})
+	delPrefDone := make(chan struct{})
+	go func() {
+		defer close(delPrefDone)
+		delPrefGID.Store(currentGoroutineID())
+		close(delPrefReady)
+		cache.DeletePrefix("s3/del/")
+	}()
+	<-delPrefReady
+	waitForGoroutineParkedInRWMutexLock(t, delPrefGID.Load())
+
+	spikeDone := make(chan struct{})
+	stopWorker := make(chan struct{})
+	workerDone := make(chan struct{})
+	go func() {
+		defer close(workerDone)
+		for idx := 0; ; {
+			select {
+			case <-stopWorker:
+				return
+			case <-stepReq:
+				if idx < 4 {
+					_, _ = cache.Delete(fmt.Sprintf("s2/v%d", idx))
+					idx++
+					if idx == 4 {
+						// Start G_spike at epoch 4 so its invokeSeq (M) precedes G_recover's 5th sample (M+1).
+						go func() {
+							defer close(spikeDone)
+							gSpikeGID.Store(currentGoroutineID())
+							_, putErr := cache.Put("s0/spike_empty", "x")
+							assert.NoError(t, putErr)
+						}()
+						<-spikeEntered
+					}
+				}
+				stepAck <- struct{}{}
+			}
+		}
+	}()
+
+	armed.Store(true)
+	gRecoverDone := make(chan struct{})
+	go func() {
+		defer close(gRecoverDone)
+		gRecoverGID.Store(currentGoroutineID())
+		_, putErr := cache.Put("s1/recover_put", "v")
+		assert.NoError(t, putErr)
+	}()
+	<-fifthReady
+
+	close(releaseSpike)
+	<-spikeDone
+
+	healthy.Store(true)
+	close(releaseFifth)
+	<-gRecoverDone
+	close(stopWorker)
+	<-workerDone
+
+	releaseS3()
+	<-delPrefDone
+
+	_, present := cache.Peek("s3/live")
+	assert.True(t, present, "DeletePrefix on shard 3 must not adopt stale cached 0.95 after healthy fallback recovery")
+	assert.Zero(t, cache.Stats().EvictionsPressure)
+	assert.InDelta(t, 0.10, cache.Stats().MemoryPressure, 1e-9)
+}
+
+func TestShardedCache_AcceptedHealthyFallbackInvalidatesStaleCachedElevatedPressure(t *testing.T) {
+	for _, backend := range []Backend{BackendMap, BackendRadix, BackendArenaRadix} {
+		t.Run(backend.String(), func(t *testing.T) {
+			runAcceptedHealthyFallbackInvalidatesCachedSpikeCase(t, backend)
+		})
+	}
+}
+
+func TestShardedCache_PreExistingWaitGroupWorkerNotMisclassifiedDuringCallbackWait(t *testing.T) {
+	t.Run("OnEvictSynchronousDeliveryAndPanicIsolation", func(t *testing.T) {
+		bgReady := make(chan struct{})
+		triggerBg := make(chan struct{})
+		bgFinished := make(chan struct{})
+		var bgGID atomic.Uint64
+		var bgCallbackDone atomic.Bool
+		var bgCallbackRan atomic.Bool
+		var asyncViolation atomic.Bool
+
+		var c Cache[int]
+		var bgWG sync.WaitGroup
+		bgWG.Go(func() {
+			bgGID.Store(currentGoroutineID())
+			close(bgReady)
+			<-triggerBg
+			_, ok := c.Delete("s1/bg_key")
+			assert.True(t, ok)
+			if !bgCallbackDone.Load() {
+				asyncViolation.Store(true)
+			}
+			close(bgFinished)
+		})
+		<-bgReady
+
+		c = NewShardedCache[int](
+			16,
+			2,
+			explicitTagShardFunc,
+			WithInvariantChecking(true),
+			WithOnEvictEntry(func(key string, _ int, _ EvictionReason) {
+				if key == "s1/bg_key" {
+					bgCallbackRan.Store(true)
+					bgCallbackDone.Store(true)
+					return
+				}
+				if key == "s0/k1" {
+					var innerWG sync.WaitGroup
+					innerWG.Go(func() {
+						close(triggerBg)
+						waitForGoroutineParkedInFrame(t, bgGID.Load(), "lockEvictCallbackSlow")
+					})
+					innerWG.Wait()
+					panic("boom in s0/k1 callback")
+				}
+			}),
+		)
+
+		_, err := c.Put("s0/k1", 1)
+		require.NoError(t, err)
+		_, err = c.Put("s1/bg_key", 2)
+		require.NoError(t, err)
+
+		assert.PanicsWithValue(t, "boom in s0/k1 callback", func() {
+			_, _ = c.Delete("s0/k1")
+		})
+		bgWG.Wait()
+		<-bgFinished
+
+		assert.True(t, bgCallbackRan.Load(), "pre-existing WaitGroup.Go worker callback must not be lost on G0 panic")
+		assert.False(t, asyncViolation.Load(), "pre-existing WaitGroup.Go worker Delete must not return before its OnEvictEntry finishes")
+	})
+
+	t.Run("PressureFuncNotBypassedUnderCriticalPressure", func(t *testing.T) {
+		triggerBg := make(chan struct{})
+		bgEvalDone := make(chan struct{})
+		var armed atomic.Bool
+		var g0Sampling atomic.Bool
+
+		var c Cache[int]
+		var pa PressureAwareCache[int]
+		var bgWG sync.WaitGroup
+		bgWG.Go(func() {
+			<-triggerBg
+			_ = pa.EvaluateMemoryPressure()
+			close(bgEvalDone)
+		})
+
+		c = NewShardedCache[int](
+			200,
+			2,
+			explicitTagShardFunc,
+			WithInvariantChecking(true),
+			WithWeigher(func(_ string, v int) uint64 { return uint64(v) }),
+			WithCompactionThreshold(0.80),
+			WithEvictionThreshold(0.90),
+			WithEvictionRetentionRatio(0.50),
+			WithPressureFunc(func() float64 {
+				if !armed.Load() {
+					return 0.10
+				}
+				if g0Sampling.CompareAndSwap(true, false) {
+					var innerWG sync.WaitGroup
+					innerWG.Go(func() {
+						close(triggerBg)
+						<-bgEvalDone
+					})
+					innerWG.Wait()
+					return 0.95
+				}
+				return 0.95
+			}),
+		)
+		pa = c.(PressureAwareCache[int])
+
+		_, err := c.Put("s1/live", 80)
+		require.NoError(t, err)
+
+		armed.Store(true)
+		g0Sampling.Store(true)
+		_, err = c.Put("s0/trigger", 5)
+		require.NoError(t, err)
+		bgWG.Wait()
+
+		_, s1Present := c.Peek("s1/live")
+		assert.False(t, s1Present, "pre-existing WaitGroup.Go worker must not bypass PressureFunc under 0.95 pressure")
+	})
+
+	t.Run("ExternalCompactAdvancesEpochAndInvalidatesStaleSample", func(t *testing.T) {
+		triggerBg := make(chan struct{})
+		bgCompactDone := make(chan struct{})
+		var armed atomic.Bool
+		var healthy atomic.Bool
+		var g0Sampling atomic.Bool
+
+		var c Cache[int]
+		var pa PressureAwareCache[int]
+		var bgWG sync.WaitGroup
+		bgWG.Go(func() {
+			<-triggerBg
+			healthy.Store(true)
+			pa.Compact()
+			close(bgCompactDone)
+		})
+
+		c = NewShardedCache[int](
+			200,
+			2,
+			explicitTagShardFunc,
+			WithBackend(BackendArenaRadix),
+			WithInvariantChecking(true),
+			WithWeigher(func(_ string, v int) uint64 { return uint64(v) }),
+			WithCompactionThreshold(0.80),
+			WithEvictionThreshold(0.90),
+			WithEvictionRetentionRatio(0.50),
+			WithPressureFunc(func() float64 {
+				if !armed.Load() || healthy.Load() {
+					return 0.10
+				}
+				if g0Sampling.CompareAndSwap(true, false) {
+					_, _ = c.Delete("s0/reentrant_del")
+					var innerWG sync.WaitGroup
+					innerWG.Go(func() {
+						close(triggerBg)
+						<-bgCompactDone
+					})
+					innerWG.Wait()
+					return 0.95
+				}
+				return 0.95
+			}),
+		)
+		pa = c.(PressureAwareCache[int])
+
+		_, err := c.Put("s0/reentrant_del", 2)
+		require.NoError(t, err)
+		for i := range 10 {
+			_, err = c.Put(fmt.Sprintf("s0/tmp_%d", i), 2)
+			require.NoError(t, err)
+		}
+		for i := range 9 {
+			_, _ = c.Delete(fmt.Sprintf("s0/tmp_%d", i))
+		}
+		_, err = c.Put("s1/keep_after_compact", 80)
+		require.NoError(t, err)
+
+		armed.Store(true)
+		g0Sampling.Store(true)
+		_, err = c.Put("s1/trigger", 5)
+		require.NoError(t, err)
+		bgWG.Wait()
+
+		_, s1Present := c.Peek("s1/keep_after_compact")
+		assert.True(t, s1Present, "external Compact on pre-existing WaitGroup.Go worker must advance externalReclaimEpoch and invalidate G0's 0.95 sample")
+		assert.InDelta(t, 0.10, c.Stats().MemoryPressure, 1e-9)
+	})
+}
+
+type reenteredOpService struct {
+	t              *testing.T
+	cache          Cache[int]
+	bgGID          atomic.Uint64
+	bgReady        chan struct{}
+	triggerBg      chan struct{}
+	bgFinished     chan struct{}
+	bgCallbackDone *atomic.Bool
+	asyncViolation *atomic.Bool
+	cbFirst        bool
+}
+
+func (s *reenteredOpService) runOp(isCallback bool) {
+	if s.cbFirst {
+		if isCallback {
+			close(s.triggerBg)
+			waitForGoroutineParkedInFrame(s.t, s.bgGID.Load(), "lockEvictCallbackSlow")
+			return
+		}
+		go func() {
+			s.bgGID.Store(currentGoroutineID())
+			close(s.bgReady)
+			<-s.triggerBg
+			_, _ = s.cache.Delete("s1/bg_key")
+			if !s.bgCallbackDone.Load() {
+				s.asyncViolation.Store(true)
+			}
+			close(s.bgFinished)
+		}()
+		<-s.bgReady
+		_, _ = s.cache.Delete("s0/k1")
+		return
+	}
+	if !isCallback {
+		go func() {
+			s.bgGID.Store(currentGoroutineID())
+			close(s.bgReady)
+			<-s.triggerBg
+			_, _ = s.cache.Delete("s1/bg_key")
+			if !s.bgCallbackDone.Load() {
+				s.asyncViolation.Store(true)
+			}
+			close(s.bgFinished)
+		}()
+		<-s.bgReady
+		_, _ = s.cache.Delete("s0/k1")
+		return
+	}
+	close(s.triggerBg)
+	waitForGoroutineParkedInFrame(s.t, s.bgGID.Load(), "lockEvictCallbackSlow")
+}
+
+func spawnOrParkInSharedHelper(t *testing.T, fn func(), triggerBg chan struct{}, bgGID *atomic.Uint64) {
+	t.Helper()
+	if fn != nil {
+		go fn()
+		return
+	}
+	close(triggerBg)
+	waitForGoroutineParkedInFrame(t, bgGID.Load(), "lockEvictCallbackSlow")
+}
+
+func TestShardedCache_PreExistingGoroutineNotMisclassifiedAcrossReenteredMethodAndSpawnHelper(t *testing.T) {
+	for _, cbFirst := range []bool{true, false} {
+		name := "ReEnteredServiceMethodNonCallbackFirst"
+		if cbFirst {
+			name = "ReEnteredServiceMethodCallbackFirst"
+		}
+		t.Run(name, func(t *testing.T) {
+			var bgCallbackDone atomic.Bool
+			var bgCallbackRan atomic.Bool
+			var asyncViolation atomic.Bool
+
+			svc := &reenteredOpService{
+				t:              t,
+				bgReady:        make(chan struct{}),
+				triggerBg:      make(chan struct{}),
+				bgFinished:     make(chan struct{}),
+				bgCallbackDone: &bgCallbackDone,
+				asyncViolation: &asyncViolation,
+				cbFirst:        cbFirst,
+			}
+			svc.cache = NewShardedCache[int](
+				16,
+				2,
+				explicitTagShardFunc,
+				WithInvariantChecking(true),
+				WithOnEvictEntry(func(key string, _ int, _ EvictionReason) {
+					if key == "s1/bg_key" {
+						bgCallbackRan.Store(true)
+						bgCallbackDone.Store(true)
+						return
+					}
+					if key == "s0/k1" {
+						svc.runOp(true)
+						panic("boom in reentered runOp callback")
+					}
+				}),
+			)
+
+			_, err := svc.cache.Put("s0/k1", 1)
+			require.NoError(t, err)
+			_, err = svc.cache.Put("s1/bg_key", 2)
+			require.NoError(t, err)
+
+			assert.PanicsWithValue(t, "boom in reentered runOp callback", func() {
+				svc.runOp(false)
+			})
+			<-svc.bgFinished
+			assert.True(t, bgCallbackRan.Load(), "pre-existing goroutine callback must not be lost when active callback panics")
+			assert.False(t, asyncViolation.Load(), "pre-existing goroutine Delete must wait synchronously for OnEvictEntry")
+		})
+	}
+
+	for _, sharded := range []bool{false, true} {
+		mode := "UnshardedMapCache"
+		if sharded {
+			mode = "ShardedCache"
+		}
+		t.Run("SharedSpawnHelper/"+mode, func(t *testing.T) {
+			bgReady := make(chan struct{})
+			triggerBg := make(chan struct{})
+			bgFinished := make(chan struct{})
+			var bgGID atomic.Uint64
+			var bgCallbackDone atomic.Bool
+			var bgCallbackRan atomic.Bool
+			var asyncViolation atomic.Bool
+
+			var c Cache[int]
+			spawnOrParkInSharedHelper(t, func() {
+				bgGID.Store(currentGoroutineID())
+				close(bgReady)
+				<-triggerBg
+				_, ok := c.Delete("s1/bg_key")
+				assert.True(t, ok)
+				if !bgCallbackDone.Load() {
+					asyncViolation.Store(true)
+				}
+				close(bgFinished)
+			}, nil, nil)
+			<-bgReady
+
+			evictOpt := WithOnEvictEntry(func(key string, _ int, _ EvictionReason) {
+				if key == "s1/bg_key" {
+					bgCallbackRan.Store(true)
+					bgCallbackDone.Store(true)
+					return
+				}
+				if key == "s0/k1" {
+					spawnOrParkInSharedHelper(t, nil, triggerBg, &bgGID)
+					panic("boom in shared helper callback")
+				}
+			})
+			if sharded {
+				c = NewShardedCache[int](16, 2, explicitTagShardFunc, WithInvariantChecking(true), evictOpt)
+			} else {
+				c = NewMapCache[int](16, WithInvariantChecking(true), evictOpt)
+			}
+
+			_, err := c.Put("s0/k1", 1)
+			require.NoError(t, err)
+			_, err = c.Put("s1/bg_key", 2)
+			require.NoError(t, err)
+
+			assert.PanicsWithValue(t, "boom in shared helper callback", func() {
+				_, _ = c.Delete("s0/k1")
+			})
+			<-bgFinished
+
+			assert.True(t, bgCallbackRan.Load(), "pre-existing goroutine spawned via shared helper must not lose OnEvictEntry")
+			assert.False(t, asyncViolation.Load(), "pre-existing goroutine Delete must wait synchronously for OnEvictEntry")
+		})
+	}
 }
 
 func BenchmarkShardedParallelThroughput(b *testing.B) {
