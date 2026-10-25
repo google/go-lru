@@ -1578,6 +1578,514 @@ func TestShardedCache_ZeroWeightWatermarkResetsAcrossPressureEpisodes(t *testing
 	}
 }
 
+func holdShardRLockViaKeys[V any](t *testing.T, c Cache[V], shardPrefix string) func() {
+	t.Helper()
+	locked := make(chan struct{})
+	release := make(chan struct{})
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		for k := range c.Keys() {
+			if strings.HasPrefix(k, shardPrefix) {
+				close(locked)
+				<-release
+				return
+			}
+		}
+	}()
+	<-locked
+	return func() {
+		close(release)
+		<-done
+	}
+}
+
+func runConcurrentHealthyAndCriticalEpisodeTest(t *testing.T, backend Backend, sharded bool) {
+	t.Helper()
+	var mode atomic.Int32
+	g1Entered := make(chan struct{})
+	releaseG1 := make(chan struct{})
+	g2Entered := make(chan struct{})
+	releaseG2 := make(chan struct{})
+
+	opts := []Option{
+		WithBackend(backend),
+		WithInvariantChecking(true),
+		WithWeigher(func(_, v string) uint64 { return uint64(len(v)) }),
+		WithCompactionThreshold(0.70),
+		WithEvictionThreshold(0.90),
+		WithEvictionRetentionRatio(0.50),
+		WithPressureFunc(func() float64 {
+			switch mode.Load() {
+			case 0:
+				return 0.10
+			case 1:
+				return 0.95
+			case 2, 3:
+				if mode.CompareAndSwap(2, 3) {
+					close(g1Entered)
+					<-releaseG1
+					return 0.10
+				}
+				if mode.CompareAndSwap(3, 4) {
+					close(g2Entered)
+					<-releaseG2
+					return 0.95
+				}
+				return 0.95
+			default:
+				return 0.95
+			}
+		}),
+	}
+
+	var c Cache[string]
+	if sharded {
+		c = NewShardedCache[string](100, 2, explicitTagShardFunc, opts...)
+	} else {
+		c = New[string](100, opts...)
+	}
+	pa := c.(PressureAwareCache[string])
+
+	for i := range 4 {
+		_, err := c.Put(fmt.Sprintf("s1/z%d", i), "")
+		require.NoError(t, err)
+	}
+
+	if sharded {
+		// Episode 1 sheds 4 -> 2 on shard 1.
+		mode.Store(1)
+		require.Len(t, pa.EvaluateMemoryPressure(), 2)
+		require.Equal(t, 2, c.Stats().ZeroSizeCount)
+	}
+
+	// Coordinate G1 (healthy 0.10) and G2 (critical 0.95) so both enter PressureFunc concurrently,
+	// G1 commits 0.10 first, and G2 commits 0.95 second.
+	mode.Store(2)
+	g1Done := make(chan struct{})
+	go func() {
+		defer close(g1Done)
+		_, _ = c.Put("s0/healthy", "x")
+	}()
+	<-g1Entered
+
+	g2Done := make(chan []string, 1)
+	go func() {
+		g2Done <- pa.EvaluateMemoryPressure()
+	}()
+	<-g2Entered
+
+	close(releaseG1)
+	<-g1Done
+	require.InDelta(t, 0.10, c.Stats().MemoryPressure, 1e-9)
+
+	close(releaseG2)
+	evictedG2 := <-g2Done
+	require.InDelta(t, 0.95, c.Stats().MemoryPressure, 1e-9)
+
+	if sharded {
+		assert.Len(t, evictedG2, 1, "Episode 2 must shed shard 1 (2 -> 1) after G1 committed healthy recovery")
+		assert.Equal(t, 1, c.Stats().ZeroSizeCount)
+	} else {
+		assert.Len(t, evictedG2, 2, "Episode 1 must shed 4 -> 2 zero-weight entries")
+		assert.Equal(t, 2, c.Stats().ZeroSizeCount)
+	}
+	assert.Empty(t, pa.EvaluateMemoryPressure(), "subsequent evaluation in the same uninterrupted 0.95 episode must not over-shed")
+}
+
+func TestShardedCache_ConcurrentHealthyAndCriticalProbesPreserveEpisodeEpochs(t *testing.T) {
+	for _, backend := range []Backend{BackendMap, BackendRadix, BackendArenaRadix} {
+		t.Run(backend.String()+"/ShardedCrossEpisodeNotSuppressed", func(t *testing.T) {
+			runConcurrentHealthyAndCriticalEpisodeTest(t, backend, true)
+		})
+		t.Run(backend.String()+"/UnshardedSingleEpisodeNoOverShed", func(t *testing.T) {
+			runConcurrentHealthyAndCriticalEpisodeTest(t, backend, false)
+		})
+	}
+}
+
+func TestShardedCache_ConcurrentCrossShardInvalidationDoesNotProduceTornZeroSample(t *testing.T) {
+	for _, backend := range []Backend{BackendMap, BackendRadix, BackendArenaRadix} {
+		t.Run(backend.String(), func(t *testing.T) {
+			var armed atomic.Bool
+			c := NewShardedCache[string](
+				800,
+				8,
+				explicitTagShardFunc,
+				WithBackend(backend),
+				WithInvariantChecking(true),
+				WithWeigher(func(_, v string) uint64 { return uint64(len(v)) }),
+				WithCompactionThreshold(0.70),
+				WithEvictionThreshold(0.90),
+				WithEvictionRetentionRatio(0.50),
+				WithPressureFunc(func() float64 {
+					if !armed.Load() {
+						return 0.10
+					}
+					return 0.95
+				}),
+			)
+			pa := c.(PressureAwareCache[string])
+			sc := c.(*shardedCache[string])
+
+			for i := range 4 {
+				_, err := c.Put(fmt.Sprintf("s7/z%d", i), "")
+				require.NoError(t, err)
+			}
+
+			// Enter sustained 0.95 Episode 1 and shed shard 7 from 4 -> 2 zero-weight entries.
+			armed.Store(true)
+			require.Len(t, pa.EvaluateMemoryPressure(), 2)
+			require.Equal(t, 2, sc.shards[7].Stats().ZeroSizeCount)
+
+			stop := make(chan struct{})
+			var wg sync.WaitGroup
+			for s := 1; s <= 5; s++ {
+				shardID := s
+				wg.Go(func() {
+					val := strings.Repeat("x", 10)
+					for i := 0; ; i++ {
+						select {
+						case <-stop:
+							return
+						default:
+							k := fmt.Sprintf("s%d/churn-%d", shardID, i&7)
+							_, _ = c.Put(k, val)
+							_, _ = c.Delete(k)
+						}
+					}
+				})
+			}
+			wg.Go(func() {
+				for {
+					select {
+					case <-stop:
+						return
+					default:
+						_, _ = c.Delete("s6/nonexistent")
+					}
+				}
+			})
+
+			for range 150 {
+				_ = pa.EvaluateMemoryPressure()
+				require.Equal(t, 2, sc.shards[7].Stats().ZeroSizeCount,
+					"concurrent cross-shard invalidation must never produce a torn 0.0 sample that wipes shard 7 watermarks mid-episode")
+			}
+
+			close(stop)
+			wg.Wait()
+		})
+	}
+}
+
+func TestShardedCache_ReentrantShardReclaimInPressureFuncPreservesCrossShardFallback(t *testing.T) {
+	for _, backend := range []Backend{BackendMap, BackendRadix, BackendArenaRadix} {
+		t.Run(backend.String(), func(t *testing.T) {
+			var armed atomic.Bool
+			var inWorker atomic.Bool
+			stepReq := make(chan struct{}, 1)
+			stepAck := make(chan struct{}, 1)
+
+			var c Cache[int]
+			c = NewShardedCache[int](
+				40, // 4 shards * capacity 10 each, shardTier2Target = 5
+				4,
+				explicitTagShardFunc,
+				WithBackend(backend),
+				WithInvariantChecking(true),
+				WithCompactionThreshold(0.70),
+				WithEvictionThreshold(0.90),
+				WithEvictionRetentionRatio(0.50),
+				WithPressureFunc(func() float64 {
+					if !armed.Load() {
+						return 0.10
+					}
+					if inWorker.Load() {
+						return 0.95
+					}
+					// Perform a supported re-entrant Put + Delete on target shard 0 before measuring 0.95.
+					_, _ = c.Put("s0/reentrant-scratch", 1)
+					_, _ = c.Delete("s0/reentrant-scratch")
+					select {
+					case stepReq <- struct{}{}:
+						<-stepAck
+					default:
+					}
+					return 0.95
+				}),
+			)
+
+			for j := range 9 {
+				_, err := c.Put(fmt.Sprintf("s0/k%d", j), j)
+				require.NoError(t, err)
+			}
+			for s := 1; s <= 3; s++ {
+				for j := range 3 {
+					_, err := c.Put(fmt.Sprintf("s%d/k%d", s, j), j)
+					require.NoError(t, err)
+				}
+			}
+
+			stopWorker := make(chan struct{})
+			workerDone := make(chan struct{})
+			go func() {
+				defer close(workerDone)
+				step := 0
+				for {
+					select {
+					case <-stopWorker:
+						return
+					case <-stepReq:
+						if step < 6 {
+							shardIdx := (step % 3) + 1
+							keyIdx := step / 3
+							inWorker.Store(true)
+							_, _ = c.Delete(fmt.Sprintf("s%d/k%d", shardIdx, keyIdx))
+							inWorker.Store(false)
+							step++
+						}
+						stepAck <- struct{}{}
+					}
+				}
+			}()
+
+			armed.Store(true)
+			evicted, err := c.Put("s0/hot", 999)
+			close(stopWorker)
+			<-workerDone
+
+			require.NoError(t, err)
+			assert.Len(t, evicted, 5, "re-entrant PressureFunc reclaim on shard 0 must not cause cross-shard deletes to drop 0.95 fallback")
+			sc := c.(*shardedCache[int])
+			assert.Equal(t, uint64(5), sc.shards[0].Stats().CurrentSize)
+		})
+	}
+}
+
+func TestShardedCache_StaleFallbackAfterReclaimDoesNotClobberTelemetryOrOverShed(t *testing.T) {
+	for _, backend := range []Backend{BackendMap, BackendRadix, BackendArenaRadix} {
+		t.Run(backend.String(), func(t *testing.T) {
+			var g1Armed atomic.Bool
+			var inWorker atomic.Bool
+			var spikeCritical atomic.Bool
+			var g1SampleCount atomic.Int32
+			stepReq := make(chan struct{}, 1)
+			stepAck := make(chan struct{}, 1)
+			fifthSampleReady := make(chan struct{})
+			releaseFifthSample := make(chan struct{})
+
+			c := NewShardedCache[string](
+				80,
+				8,
+				explicitTagShardFunc,
+				WithBackend(backend),
+				WithInvariantChecking(true),
+				WithWeigher(func(_, v string) uint64 { return uint64(len(v)) }),
+				WithCompactionThreshold(0.70),
+				WithEvictionThreshold(0.90),
+				WithEvictionRetentionRatio(0.50),
+				WithPressureFunc(func() float64 {
+					if spikeCritical.Load() {
+						return 0.95
+					}
+					if !g1Armed.Load() {
+						return 0.10
+					}
+					if inWorker.Load() {
+						return 0.95
+					}
+					n := g1SampleCount.Add(1)
+					if n <= 4 {
+						stepReq <- struct{}{}
+						<-stepAck
+						return 0.10
+					}
+					if n == 5 {
+						close(fifthSampleReady)
+						<-releaseFifthSample
+						return 0.10
+					}
+					return 0.10
+				}),
+			)
+			pa := c.(PressureAwareCache[string])
+			sc := c.(*shardedCache[string])
+
+			_, err := c.Put("s1/anchor", "a")
+			require.NoError(t, err)
+			for s := 2; s <= 5; s++ {
+				_, err = c.Put(fmt.Sprintf("s%d/del", s), "x")
+				require.NoError(t, err)
+			}
+			for i := range 4 {
+				_, err = c.Put(fmt.Sprintf("s7/z%d", i), "")
+				require.NoError(t, err)
+			}
+
+			stopWorker := make(chan struct{})
+			workerDone := make(chan struct{})
+			go func() {
+				defer close(workerDone)
+				shardIdx := 2
+				for {
+					select {
+					case <-stopWorker:
+						return
+					case <-stepReq:
+						if shardIdx <= 5 {
+							inWorker.Store(true)
+							_, _ = c.Delete(fmt.Sprintf("s%d/del", shardIdx))
+							inWorker.Store(false)
+							shardIdx++
+						}
+						stepAck <- struct{}{}
+					}
+				}
+			}()
+
+			g1Armed.Store(true)
+			g1Done := make(chan struct{})
+			go func() {
+				defer close(g1Done)
+				_, _ = c.Put("s1/item", "v")
+			}()
+			<-fifthSampleReady
+
+			// Hold RLock on shard 1 so G1 finishes its 5th (0.10) sample and parks on s1.mu.Lock().
+			releaseS1 := holdShardRLockViaKeys(t, c, "s1/")
+			close(releaseFifthSample)
+
+			// Wait until G1's 0.10 sample has committed to telemetry (query shard 0 to avoid blocking behind G1 on s1.mu.Lock()).
+			require.Eventually(t, func() bool {
+				return math.Abs(sc.shards[0].Stats().MemoryPressure-0.10) < 1e-9
+			}, time.Second, time.Millisecond)
+
+			// Spike pressure permanently to 0.95 and shed shard 7 (5 -> 2 zero-weight entries), advancing reclaimEpoch.
+			spikeCritical.Store(true)
+			evictedS7, err := c.Put("s7/z4", "")
+			require.NoError(t, err)
+			require.Len(t, evictedS7, 3)
+			require.Equal(t, 2, sc.shards[7].Stats().ZeroSizeCount)
+			require.InDelta(t, 0.95, sc.shards[0].Stats().MemoryPressure, 1e-9)
+
+			// Release shard 1 so G1 enters resolvePostRetryPressureLocked -> recordAcceptedFallbackSample with its older 0.10 sample.
+			releaseS1()
+			<-g1Done
+			close(stopWorker)
+			<-workerDone
+
+			assert.InDelta(t, 0.95, c.Stats().MemoryPressure, 1e-9,
+				"stale pre-spike fallback sample must not overwrite Stats().MemoryPressure backwards from 0.95 to 0.10")
+			assert.Empty(t, pa.EvaluateMemoryPressure(),
+				"stale pre-spike fallback sample must not advance belowTier2Epoch or cause repeated zero-weight shedding in the same 0.95 crisis")
+			assert.Equal(t, 2, sc.shards[7].Stats().ZeroSizeCount)
+		})
+	}
+}
+
+func runStragglerMultiShardWatermarkTest(t *testing.T, backend Backend, healthyDipStraggler bool) {
+	t.Helper()
+	var pressureBits atomic.Uint64
+	pressureBits.Store(math.Float64bits(0.10))
+
+	c := NewShardedCache[string](
+		90,
+		3,
+		explicitTagShardFunc,
+		WithBackend(backend),
+		WithInvariantChecking(true),
+		WithWeigher(func(_, v string) uint64 { return uint64(len(v)) }),
+		WithCompactionThreshold(0.70),
+		WithEvictionThreshold(0.90),
+		WithEvictionRetentionRatio(0.50),
+		WithPressureFunc(func() float64 {
+			return math.Float64frombits(pressureBits.Load())
+		}),
+	)
+	pa := c.(PressureAwareCache[string])
+	sc := c.(*shardedCache[string])
+
+	_, err := c.Put("s0/anchor", "a")
+	require.NoError(t, err)
+	_, err = c.Put("s1/hold", "b")
+	require.NoError(t, err)
+	for i := range 4 {
+		_, err = c.Put(fmt.Sprintf("s2/z%d", i), "")
+		require.NoError(t, err)
+	}
+
+	// Episode 1: spike to 0.95.
+	pressureBits.Store(math.Float64bits(0.95))
+	if healthyDipStraggler {
+		// Shed shard 2 in Episode 1 (4 -> 2), then replenish to 4 during the dip before straggler starts.
+		require.Len(t, pa.EvaluateMemoryPressure(), 2)
+		pressureBits.Store(math.Float64bits(0.10))
+		_, err = c.Put("s2/z4", "")
+		require.NoError(t, err)
+		_, err = c.Put("s2/z5", "")
+		require.NoError(t, err)
+		require.Equal(t, 4, sc.shards[2].Stats().ZeroSizeCount)
+	}
+
+	// Hold RLock on shard 1 so a multi-shard operation completes shard 0 and parks waiting for shard 1.
+	releaseS1 := holdShardRLockViaKeys(t, c, "s1/")
+	epochBeforeStraggler := sc.shards[0].Stats().DeletePrefixExecuted
+	stragglerDone := make(chan struct{})
+	go func() {
+		defer close(stragglerDone)
+		if healthyDipStraggler {
+			c.DeletePrefix("nomatch/")
+		} else {
+			_ = pa.EvaluateMemoryPressure()
+		}
+	}()
+
+	if healthyDipStraggler {
+		require.Eventually(t, func() bool {
+			return sc.shards[0].Stats().DeletePrefixExecuted > epochBeforeStraggler
+		}, time.Second, time.Millisecond)
+		_, _ = c.Peek("s0/anchor")
+	} else {
+		require.Eventually(t, func() bool {
+			return math.Abs(sc.shards[0].Stats().MemoryPressure-0.95) < 1e-9
+		}, time.Second, time.Millisecond)
+		_, _ = c.Peek("s0/anchor")
+		// Recover briefly to 0.10 on shard 0 to advance belowTier2Epoch before Episode 2.
+		pressureBits.Store(math.Float64bits(0.10))
+		_, err = c.Put("s0/dip", "d")
+		require.NoError(t, err)
+	}
+
+	// Enter Episode 2 (0.95) and shed shard 2 via foreground Put("s2/ep2", "") from 5 -> 2 zero-weight entries.
+	pressureBits.Store(math.Float64bits(0.95))
+	evictedEp2, err := c.Put("s2/ep2", "")
+	require.NoError(t, err)
+	require.Len(t, evictedEp2, 3)
+	require.Equal(t, 2, sc.shards[2].Stats().ZeroSizeCount)
+
+	// Release shard 1 so the older multi-shard straggler reaches shard 2.
+	releaseS1()
+	<-stragglerDone
+
+	assert.Equal(t, 2, sc.shards[2].Stats().ZeroSizeCount,
+		"older multi-shard straggler must not shed shard 2 a second time in Episode 2")
+	assert.Empty(t, pa.EvaluateMemoryPressure(),
+		"older multi-shard straggler must not rewind or clear shard 2 watermark for subsequent Episode 2 evaluations")
+	assert.Equal(t, 2, sc.shards[2].Stats().ZeroSizeCount)
+}
+
+func TestShardedCache_StragglerMultiShardSampleDoesNotRewindOrWipeEpisodeWatermarks(t *testing.T) {
+	for _, backend := range []Backend{BackendMap, BackendRadix, BackendArenaRadix} {
+		t.Run(backend.String()+"/CriticalEpisode1Straggler", func(t *testing.T) {
+			runStragglerMultiShardWatermarkTest(t, backend, false)
+		})
+		t.Run(backend.String()+"/HealthyDipStraggler", func(t *testing.T) {
+			runStragglerMultiShardWatermarkTest(t, backend, true)
+		})
+	}
+}
+
 func BenchmarkShardedParallelThroughput(b *testing.B) {
 	const capTotal = 16384
 	keys := make([]string, capTotal*2)

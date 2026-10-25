@@ -1125,7 +1125,7 @@ func (c *radixCache[V]) deletePrefixShard(evictQ *evictCallbackQueue[V], prefix 
 		}
 		if sample.hasSample {
 			c.hasValidSample = sample.valid
-			c.syncZeroWatermarkLocked(sample.belowTier2, sample.pressure)
+			c.syncZeroWatermarkLocked(sample.belowTier2, sample.seq, sample.pressure)
 			c.deleteAllPrefixLocked(evictQ, c.reclaimEpoch.Load(), sample.pressure)
 			c.unlock()
 			return sample
