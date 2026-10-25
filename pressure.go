@@ -911,6 +911,7 @@ type pressureState struct {
 	putRejectedOversized    atomic.Uint64
 	arenaHashFallbacks      atomic.Uint64
 	lastSampledPressureBits atomic.Uint64
+	lastSampleOrder         atomic.Uint64
 
 	pressureWriteMu          sync.Mutex
 	hookIDVal                atomic.Uint64
@@ -1466,6 +1467,9 @@ func (p *pressureState) recordLastSampledTelemetryLocked(invokeSeq uint64, val f
 			p.lastSampledSeq.Store(invokeSeq)
 		}
 		p.lastSampledPressureBits.Store(math.Float64bits(val))
+		if p.options.sharedSampleClock != nil {
+			p.lastSampleOrder.Store(p.options.sharedSampleClock.Add(1))
+		}
 	}
 }
 

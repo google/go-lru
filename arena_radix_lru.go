@@ -22,17 +22,22 @@ import (
 )
 
 // NewArenaRadixCache returns a new arena-backed radix LRU Cache[V] bounded by maxSize.
-// Optional configuration parameters can be passed via opts (e.g. WithWeigher, WithInvariantChecking).
+// Optional configuration parameters can be passed via opts (e.g. WithWeigher, WithShards, WithInvariantChecking).
 //
 // maxSize must be greater than zero; otherwise NewArenaRadixCache panics.
 func NewArenaRadixCache[V any](maxSize uint64, opts ...Option) Cache[V] {
 	if maxSize == 0 {
 		panic("maxSize must be greater than zero")
 	}
-	return newArenaRadixCacheWithOptions[V](maxSize, ApplyOptions(opts...))
+	options := ApplyOptions(opts...)
+	options.Backend = BackendArenaRadix
+	if options.shouldShard() {
+		return newShardedCacheWithOptions[V](maxSize, options.Shards, options)
+	}
+	return newArenaRadixCacheWithOptions[V](maxSize, options)
 }
 
-func newArenaRadixCacheWithOptions[V any](maxSize uint64, options Options) Cache[V] {
+func newArenaRadixCacheWithOptions[V any](maxSize uint64, options Options) *arenaRadix[V] {
 	c := &arenaRadix[V]{
 		maxSize:       maxSize,
 		weigher:       resolveWeigher[V](options),
@@ -929,14 +934,19 @@ func (c *arenaRadix[V]) All() iter.Seq2[string, V] {
 }
 
 func (c *arenaRadix[V]) all(yield func(string, V) bool) {
+	c.iterateAll(yield)
+}
+
+func (c *arenaRadix[V]) iterateAll(yield func(string, V) bool) bool {
 	c.mu.RLock()
 	defer c.rUnlock()
 
 	for currID := c.head; currID != nilNode; currID = c.nodes[currID].next {
 		if !yield(c.reconstructKey(currID), c.nodes[currID].value) {
-			return
+			return false
 		}
 	}
+	return true
 }
 
 // Keys returns an iterator over all keys in MRU-to-LRU order without modifying recency.
@@ -945,14 +955,19 @@ func (c *arenaRadix[V]) Keys() iter.Seq[string] {
 }
 
 func (c *arenaRadix[V]) keys(yield func(string) bool) {
+	c.iterateKeys(yield)
+}
+
+func (c *arenaRadix[V]) iterateKeys(yield func(string) bool) bool {
 	c.mu.RLock()
 	defer c.rUnlock()
 
 	for currID := c.head; currID != nilNode; currID = c.nodes[currID].next {
 		if !yield(c.reconstructKey(currID)) {
-			return
+			return false
 		}
 	}
+	return true
 }
 
 // Values returns an iterator over all values in MRU-to-LRU order without modifying recency.
@@ -962,22 +977,33 @@ func (c *arenaRadix[V]) Values() iter.Seq[V] {
 }
 
 func (c *arenaRadix[V]) values(yield func(V) bool) {
+	c.iterateValues(yield)
+}
+
+func (c *arenaRadix[V]) iterateValues(yield func(V) bool) bool {
 	c.mu.RLock()
 	defer c.rUnlock()
 
 	for currID := c.head; currID != nilNode; currID = c.nodes[currID].next {
 		if !yield(c.nodes[currID].value) {
-			return
+			return false
 		}
 	}
+	return true
 }
 
 // Stats returns a point-in-time, zero-allocation telemetry snapshot of the cache's
 // occupancy, lookup performance, mutations, evictions, compactions, memory pressure,
 // and contiguous arena node mechanics.
 func (c *arenaRadix[V]) Stats() Stats {
+	st, _ := c.statsWithSampleOrder()
+	return st
+}
+
+func (c *arenaRadix[V]) statsWithSampleOrder() (Stats, uint64) {
 	c.mu.RLock()
 
+	order := c.lastSampleOrder.Load()
 	st := c.snapshotBaseStats(BackendArenaRadix, c.currentSize, c.maxSize, c.len)
 	freeCount := int(c.freeCount)
 	st.ArenaLiveNodes = max(len(c.nodes)-1-freeCount, 0)
@@ -989,5 +1015,5 @@ func (c *arenaRadix[V]) Stats() Stats {
 	} else {
 		c.mu.RUnlock()
 	}
-	return st
+	return st, order
 }

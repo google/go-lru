@@ -48,6 +48,12 @@ This document details the internal data structures, concurrency models, and memo
   - `verifyKey(nodeID, key)` walks `parent` indices from `nodeID` up to `root`, verifying byte-for-byte suffix equality against `key` in zero allocations.
   - If two distinct keys collide on the same 64-bit FNV-1a hash, `ArenaRadixCache` preserves full correctness and `O(1)` cache-miss fast-path guarantees (`len(nodeMap)+collisionCount == len`) by tracking displaced same-hash peers in `collisionPeers` (`collisionCount`), falling back to `O(K)` trie descent (`getNodeKeyWithHash`) on hash collisions, and immediately promoting surviving peers into `nodeMap` when a colliding key is deleted or evicted.
 
+### 2.4 Sharded Cache Composition (`sharded_lru.go`)
+`NewShardedCache[V]` (and `WithShards(n)` / `WithShardFunc(fn)`) composes `n` (`1 <= n <= maxSize`) independent instances of `MapCache`, `RadixCache`, or `ArenaRadixCache` behind `Cache[V]` and `PressureAwareCache[V]`:
+- **Capacity Partitioning**: Total `maxSize` is split evenly (`maxSize / n`, with `+1` assigned to the first `maxSize % n` shards so `Stats().MaxSize == maxSize`).
+- **Custom & Default Routing (`ShardFunc`)**: Keys route via `ShardFunc(key, numShards) int` (defaulting to `DefaultShardFunc`, a zero-allocation 64-bit FNV-1a hash with bitmask fast-path on power-of-two shard counts, or custom tenant/prefix routers that preserve subtree locality on `RadixCache` / `ArenaRadixCache`). Out-of-bounds indices panic via a single unsigned check (`uint(idx) >= uint(len(shards))`).
+- **Lock-Free Cross-Shard Isolation**: Point operations (`Get`, `Peek`, `Put`, `Replace`, `Delete`) touch only one shard; multi-shard operations (`DeletePrefix`, `Compact`, `EvaluateMemoryPressure`, `All`/`Keys`/`Values`, `Stats`) visit shards sequentially holding at most one shard's lock at a time, with cache-line padding separating read-only routing fields from atomic telemetry counters and zero-allocation internal `shardEngine[V]` dispatch.
+
 ---
 
 ## 3. Two-Tier Memory-Pressure Reclamation (`PressureAwareCache[V]`, `pressure.go`)

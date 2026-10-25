@@ -14,7 +14,8 @@
 
 // Package lru provides high-performance, concurrent, zero-dependency LRU cache implementations.
 //
-// The package defines a unified Cache interface satisfied by three specialized engines:
+// The package defines a unified Cache interface satisfied by three specialized engines
+// (and optionally partitioned across N independent shards via NewShardedCache or WithShards):
 //   - MapCache: A standard doubly-linked list + map implementation with O(1) operations.
 //   - RadixCache: A Left-Child Right-Sibling (LCRS) radix tree with intrusive LRU pointers.
 //   - ArenaRadixCache: A flat-slice arena-allocated radix tree with 32-bit node indices that
@@ -213,8 +214,9 @@ type PressureAwareCache[V any] interface {
 // New creates and returns a new generic LRU Cache[V] bounded by maxSize.
 // By default, New constructs a MapCache (BackendMap) and assigns each entry a default weight of 1
 // unless a custom weigher is provided via WithWeigher. Callers can select an alternative
-// engine via WithBackend(BackendRadix) or WithBackend(BackendArenaRadix), or invoke
-// NewMapCache, NewRadixCache, or NewArenaRadixCache directly.
+// engine via WithBackend(BackendRadix) or WithBackend(BackendArenaRadix), partition the cache
+// across multiple shards via WithShards / WithShardFunc, or invoke NewMapCache, NewRadixCache,
+// NewArenaRadixCache, or NewShardedCache directly.
 //
 // All returned Cache[V] instances also implement PressureAwareCache[V].
 //
@@ -224,6 +226,9 @@ func New[V any](maxSize uint64, opts ...Option) Cache[V] {
 		panic("maxSize must be greater than zero")
 	}
 	options := ApplyOptions(opts...)
+	if options.shouldShard() {
+		return newShardedCacheWithOptions[V](maxSize, options.Shards, options)
+	}
 	switch options.Backend {
 	case BackendRadix:
 		return newRadixCacheWithOptions[V](maxSize, options)

@@ -1258,3 +1258,47 @@ func TestRegister_TypedNilMeterAndMeterProviderFallback(t *testing.T) {
 	require.NotNil(t, reg)
 	require.NoError(t, reg.Unregister())
 }
+
+func TestRegister_ShardedCacheTelemetryAndZeroAllocScrape(t *testing.T) {
+	reader := sdkmetric.NewManualReader()
+	mp := sdkmetric.NewMeterProvider(sdkmetric.WithReader(reader))
+	t.Cleanup(func() {
+		_ = mp.Shutdown(context.Background())
+	})
+
+	cache := lru.NewShardedCache[int](64, 4, nil, lru.WithBackend(lru.BackendArenaRadix))
+	for i := range 12 {
+		_, err := cache.Put(fmt.Sprintf("shard-key-%d", i), i)
+		require.NoError(t, err)
+	}
+	_, _ = cache.Get("shard-key-0")
+	cache.DeletePrefix("shard-key-1")
+
+	reg, err := otellru.Register(cache, otellru.WithMeterProvider(mp), otellru.WithName("sharded-arena"))
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = reg.Unregister() })
+
+	metricsByName := collectMetricsByName(t, reader, otellru.ScopeName)
+	require.Len(t, metricsByName, 16)
+
+	st := cache.Stats()
+	maxSizePts := requireInt64GaugePoints(t, metricsByName["lru.cache.max_size"], "{weight}")
+	for _, v := range maxSizePts {
+		assert.Equal(t, int64(64), v)
+	}
+	entriesPts := requireInt64GaugePoints(t, metricsByName["lru.cache.entries"], "{entry}")
+	for _, v := range entriesPts {
+		assert.Equal(t, int64(st.Len), v)
+	}
+
+	capturingMeter := &callbackCapturingMeter{}
+	regZero, err := otellru.Register(cache, otellru.WithMeter(capturingMeter))
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = regZero.Unregister() })
+
+	obs := &zeroAllocObserver{}
+	allocs := testing.AllocsPerRun(100, func() {
+		_ = capturingMeter.cb(context.Background(), obs)
+	})
+	assert.Zero(t, allocs, "scraping a sharded cache via otellru must allocate 0 B/op")
+}

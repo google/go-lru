@@ -80,10 +80,15 @@ func NewRadixCache[V any](maxSize uint64, opts ...Option) Cache[V] {
 	if maxSize == 0 {
 		panic("maxSize must be greater than zero")
 	}
-	return newRadixCacheWithOptions[V](maxSize, ApplyOptions(opts...))
+	options := ApplyOptions(opts...)
+	options.Backend = BackendRadix
+	if options.shouldShard() {
+		return newShardedCacheWithOptions[V](maxSize, options.Shards, options)
+	}
+	return newRadixCacheWithOptions[V](maxSize, options)
 }
 
-func newRadixCacheWithOptions[V any](maxSize uint64, options Options) Cache[V] {
+func newRadixCacheWithOptions[V any](maxSize uint64, options Options) *radixCache[V] {
 	c := &radixCache[V]{
 		maxSize:       maxSize,
 		root:          &radixNode[V]{},
@@ -1138,14 +1143,19 @@ func (c *radixCache[V]) All() iter.Seq2[string, V] {
 }
 
 func (c *radixCache[V]) all(yield func(string, V) bool) {
+	c.iterateAll(yield)
+}
+
+func (c *radixCache[V]) iterateAll(yield func(string, V) bool) bool {
 	c.mu.RLock()
 	defer c.rUnlock()
 
 	for curr := c.head; curr != nil; curr = curr.next {
 		if !yield(c.reconstructKey(curr), curr.value) {
-			return
+			return false
 		}
 	}
+	return true
 }
 
 // Keys returns an iterator over all keys in MRU-to-LRU order without modifying recency.
@@ -1154,14 +1164,19 @@ func (c *radixCache[V]) Keys() iter.Seq[string] {
 }
 
 func (c *radixCache[V]) keys(yield func(string) bool) {
+	c.iterateKeys(yield)
+}
+
+func (c *radixCache[V]) iterateKeys(yield func(string) bool) bool {
 	c.mu.RLock()
 	defer c.rUnlock()
 
 	for curr := c.head; curr != nil; curr = curr.next {
 		if !yield(c.reconstructKey(curr)) {
-			return
+			return false
 		}
 	}
+	return true
 }
 
 // Values returns an iterator over all values in MRU-to-LRU order without modifying recency.
@@ -1171,26 +1186,37 @@ func (c *radixCache[V]) Values() iter.Seq[V] {
 }
 
 func (c *radixCache[V]) values(yield func(V) bool) {
+	c.iterateValues(yield)
+}
+
+func (c *radixCache[V]) iterateValues(yield func(V) bool) bool {
 	c.mu.RLock()
 	defer c.rUnlock()
 
 	for curr := c.head; curr != nil; curr = curr.next {
 		if !yield(curr.value) {
-			return
+			return false
 		}
 	}
+	return true
 }
 
 // Stats returns a point-in-time telemetry snapshot of the cache.
 func (c *radixCache[V]) Stats() Stats {
+	st, _ := c.statsWithSampleOrder()
+	return st
+}
+
+func (c *radixCache[V]) statsWithSampleOrder() (Stats, uint64) {
 	c.mu.RLock()
+	order := c.lastSampleOrder.Load()
 	st := c.snapshotBaseStats(BackendRadix, c.currentSize, c.maxSize, c.len)
 	if c.options.EnableInvariantChecking {
 		c.rUnlockWithInvariants()
 	} else {
 		c.mu.RUnlock()
 	}
-	return st
+	return st, order
 }
 
 // Compact satisfies PressureAwareCache on radixCache (pointer-based nodes are reclaimed directly by Go GC upon deletion).

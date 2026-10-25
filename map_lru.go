@@ -145,17 +145,22 @@ type mapCache[V any] struct {
 }
 
 // NewMapCache returns a new map-based LRU Cache[V] initialized with the supplied maxSize.
-// Optional configuration parameters can be passed via opts (e.g. WithWeigher, WithInvariantChecking).
+// Optional configuration parameters can be passed via opts (e.g. WithWeigher, WithShards, WithInvariantChecking).
 //
 // maxSize must be greater than zero; otherwise NewMapCache panics.
 func NewMapCache[V any](maxSize uint64, opts ...Option) Cache[V] {
 	if maxSize == 0 {
 		panic("maxSize must be greater than zero")
 	}
-	return newMapCacheWithOptions[V](maxSize, ApplyOptions(opts...))
+	options := ApplyOptions(opts...)
+	options.Backend = BackendMap
+	if options.shouldShard() {
+		return newShardedCacheWithOptions[V](maxSize, options.Shards, options)
+	}
+	return newMapCacheWithOptions[V](maxSize, options)
 }
 
-func newMapCacheWithOptions[V any](maxSize uint64, options Options) Cache[V] {
+func newMapCacheWithOptions[V any](maxSize uint64, options Options) *mapCache[V] {
 	c := &mapCache[V]{
 		maxSize:       maxSize,
 		index:         make(map[string]*entry[V]),
@@ -740,14 +745,19 @@ func (c *mapCache[V]) All() iter.Seq2[string, V] {
 }
 
 func (c *mapCache[V]) all(yield func(string, V) bool) {
+	c.iterateAll(yield)
+}
+
+func (c *mapCache[V]) iterateAll(yield func(string, V) bool) bool {
 	c.mu.RLock()
 	defer c.rUnlock()
 
 	for e := c.entries.Front(); e != nil; e = e.next {
 		if !yield(e.key, e.value) {
-			return
+			return false
 		}
 	}
+	return true
 }
 
 // Keys returns an iterator over all keys in MRU-to-LRU order without modifying recency.
@@ -756,14 +766,19 @@ func (c *mapCache[V]) Keys() iter.Seq[string] {
 }
 
 func (c *mapCache[V]) keys(yield func(string) bool) {
+	c.iterateKeys(yield)
+}
+
+func (c *mapCache[V]) iterateKeys(yield func(string) bool) bool {
 	c.mu.RLock()
 	defer c.rUnlock()
 
 	for e := c.entries.Front(); e != nil; e = e.next {
 		if !yield(e.key) {
-			return
+			return false
 		}
 	}
+	return true
 }
 
 // Values returns an iterator over all values in MRU-to-LRU order without modifying recency.
@@ -772,26 +787,37 @@ func (c *mapCache[V]) Values() iter.Seq[V] {
 }
 
 func (c *mapCache[V]) values(yield func(V) bool) {
+	c.iterateValues(yield)
+}
+
+func (c *mapCache[V]) iterateValues(yield func(V) bool) bool {
 	c.mu.RLock()
 	defer c.rUnlock()
 
 	for e := c.entries.Front(); e != nil; e = e.next {
 		if !yield(e.value) {
-			return
+			return false
 		}
 	}
+	return true
 }
 
 // Stats returns a point-in-time telemetry snapshot of the cache.
 func (c *mapCache[V]) Stats() Stats {
+	st, _ := c.statsWithSampleOrder()
+	return st
+}
+
+func (c *mapCache[V]) statsWithSampleOrder() (Stats, uint64) {
 	c.mu.RLock()
+	order := c.lastSampleOrder.Load()
 	st := c.snapshotBaseStats(BackendMap, c.currentSize, c.maxSize, c.entries.Len())
 	if c.options.EnableInvariantChecking {
 		c.rUnlockWithInvariants()
 	} else {
 		c.mu.RUnlock()
 	}
-	return st
+	return st, order
 }
 
 // Compact reallocates the internal hash index to reclaim Go map bucket slack while preserving all live entries.

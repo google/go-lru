@@ -20,6 +20,7 @@ import (
 	"reflect"
 	"runtime/metrics"
 	"sync"
+	"sync/atomic"
 )
 
 // Weigher calculates the logical or byte weight of a cache entry.
@@ -127,6 +128,12 @@ const (
 // indicate moderate pressure, and values >= EvictionThreshold indicate critical pressure.
 type PressureFunc func() float64
 
+// ShardFunc maps a cache key to a shard index in [0, numShards).
+// Implementations must be safe for concurrent invocation by multiple goroutines
+// and deterministic for a given key and numShards. Returning an index outside
+// [0, numShards) causes the cache operation to panic.
+type ShardFunc func(key string, numShards int) int
+
 // gomemlimitSamplePool pools 1-element runtime/metrics sample arrays so DefaultRuntimePressureFunc(0)
 // can check /gc/gomemlimit:bytes without acquiring runtime.metricsLock or sweeping per-P heap stats
 // when GOMEMLIMIT is unbounded.
@@ -214,6 +221,24 @@ type Options struct {
 	// when Critical Pressure (EvictionThreshold) is reached.
 	// Defaults to DefaultEvictionRetentionRatio (0.50) if unset, negative, or NaN.
 	EvictionRetentionRatio float64
+
+	// Shards specifies the number of independent LRU shards when sharding is enabled via WithShards.
+	// When unset (0 and !hasCustomShards), New constructs a single unsharded cache instance.
+	// When explicitly configured via WithShards, Shards must satisfy 1 <= Shards <= maxSize;
+	// otherwise cache construction panics.
+	Shards          int
+	hasCustomShards bool
+
+	// ShardFunc maps a key to a shard index in [0, Shards) when sharding is enabled.
+	// If nil, DefaultShardFunc is used.
+	ShardFunc ShardFunc
+
+	// sharedSampleClock orders pressure telemetry samples across shards of a single shardedCache.
+	sharedSampleClock *atomic.Uint64
+}
+
+func (o Options) shouldShard() bool {
+	return o.hasCustomShards || o.Shards != 0
 }
 
 // Option is a functional option for configuring a Cache instance.
@@ -476,6 +501,27 @@ func WithEvictionRetentionRatio(ratio float64) Option {
 	}
 }
 
+// WithShards configures the cache to partition keys and capacity across the specified
+// number of independent LRU shards of the selected Backend.
+//
+// shards must be greater than zero and must not exceed maxSize when constructing a cache;
+// otherwise cache construction panics.
+func WithShards(shards int) Option {
+	return func(o *Options) {
+		o.Shards = shards
+		o.hasCustomShards = true
+	}
+}
+
+// WithShardFunc configures a custom key-to-shard routing function used when sharding is enabled
+// via WithShards or NewShardedCache (when NewShardedCache's shardFn parameter is nil).
+// Passing nil resets ShardFunc to DefaultShardFunc.
+func WithShardFunc(fn ShardFunc) Option {
+	return func(o *Options) {
+		o.ShardFunc = fn
+	}
+}
+
 // DefaultRuntimePressureFunc returns a lock-free, zero-allocation, STW-free PressureFunc backed by runtime/metrics.
 // It compares active Go runtime memory (/memory/classes/total:bytes - (/memory/classes/heap/released:bytes + /memory/classes/heap/free:bytes))
 // against memoryBudget (if > 0) or /gc/gomemlimit:bytes (if configured < math.MaxInt64).
@@ -604,6 +650,9 @@ func normalizeCallbacks(options *Options) {
 		options.hasCustomPressureFunc = false
 	} else {
 		options.hasCustomPressureFunc = true
+	}
+	if options.ShardFunc == nil {
+		options.ShardFunc = DefaultShardFunc
 	}
 }
 
