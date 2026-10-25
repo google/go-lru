@@ -29,8 +29,8 @@ type shardEngine[V any] interface {
 	iterateAll(yield func(string, V) bool) bool
 	iterateKeys(yield func(string) bool) bool
 	iterateValues(yield func(V) bool) bool
-	deletePrefixShard(evictQ *evictCallbackQueue[V], prefix string, hasSample bool, pressure float64, validSample bool) (bool, float64, bool)
-	evaluateShardPressure(evictQ *evictCallbackQueue[V], hasSample bool, pressure float64, validSample bool) ([]V, float64, bool)
+	deletePrefixShard(evictQ *evictCallbackQueue[V], prefix string, sample shardSample) shardSample
+	evaluateShardPressure(evictQ *evictCallbackQueue[V], sample shardSample) ([]V, shardSample)
 }
 
 // DefaultShardFunc computes a zero-allocation 64-bit FNV-1a hash of key and maps it
@@ -225,10 +225,9 @@ func (c *shardedCache[V]) Replace(key string, value V) error {
 func (c *shardedCache[V]) DeletePrefix(prefix string) {
 	c.deletePrefixExecuted.Add(1)
 	var evictQ evictCallbackQueue[V]
-	var hasSample, validSample bool
-	var pressure float64
+	var sample shardSample
 	for _, s := range c.shards {
-		hasSample, pressure, validSample = s.deletePrefixShard(&evictQ, prefix, hasSample, pressure, validSample)
+		sample = s.deletePrefixShard(&evictQ, prefix, sample)
 	}
 	evictQ.invoke(&c.coord, c.onEvictValue, c.onEvictEntry)
 }
@@ -288,12 +287,10 @@ func (c *shardedCache[V]) Compact() {
 func (c *shardedCache[V]) EvaluateMemoryPressure() []V {
 	var evicted []V
 	var evictQ evictCallbackQueue[V]
-	var hasSample, validSample bool
-	var pressure float64
+	var sample shardSample
 	for _, s := range c.shards {
 		var shardEvicted []V
-		shardEvicted, pressure, validSample = s.evaluateShardPressure(&evictQ, hasSample, pressure, validSample)
-		hasSample = true
+		shardEvicted, sample = s.evaluateShardPressure(&evictQ, sample)
 		evicted = appendEvicted(evicted, shardEvicted)
 	}
 	evictQ.invoke(&c.coord, c.onEvictValue, c.onEvictEntry)

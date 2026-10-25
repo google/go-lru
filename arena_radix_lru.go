@@ -411,11 +411,11 @@ func (c *arenaRadix[V]) Compact() {
 	c.unlock()
 }
 
-func (c *arenaRadix[V]) evaluateShardPressure(evictQ *evictCallbackQueue[V], hasSample bool, pressure float64, validSample bool) ([]V, float64, bool) {
-	_, p, valid := c.lockShardWithSample(&c.mu, true, hasSample, pressure, validSample)
-	evicted := c.maybeReclaimUnderPressureLocked(evictQ, p, nilNode)
+func (c *arenaRadix[V]) evaluateShardPressure(evictQ *evictCallbackQueue[V], sample shardSample) ([]V, shardSample) {
+	_, out := c.lockShardWithSample(&c.mu, true, sample)
+	evicted := c.maybeReclaimUnderPressureLocked(evictQ, out.pressure, nilNode)
 	c.unlock()
-	return evicted, p, valid
+	return evicted, out
 }
 
 // EvaluateMemoryPressure samples the configured memory-pressure probe lock-free,
@@ -424,7 +424,7 @@ func (c *arenaRadix[V]) evaluateShardPressure(evictQ *evictCallbackQueue[V], has
 // Returns any values evicted during Tier 2 critical-pressure shedding.
 func (c *arenaRadix[V]) EvaluateMemoryPressure() []V {
 	var evictQ evictCallbackQueue[V]
-	evicted, _, _ := c.evaluateShardPressure(&evictQ, false, 0, false)
+	evicted, _ := c.evaluateShardPressure(&evictQ, shardSample{})
 	evictQ.invoke(&c.pressureState, c.onEvictValue, c.onEvictEntry)
 	return evicted
 }
@@ -847,39 +847,39 @@ func (c *arenaRadix[V]) deleteNonEmptyPrefixLocked(evictQ *evictCallbackQueue[V]
 	}
 }
 
-func (c *arenaRadix[V]) deletePrefixShard(evictQ *evictCallbackQueue[V], prefix string, hasSample bool, pressure float64, validSample bool) (bool, float64, bool) {
+func (c *arenaRadix[V]) deletePrefixShard(evictQ *evictCallbackQueue[V], prefix string, sample shardSample) shardSample {
 	if prefix == "" {
 		c.mu.Lock()
 		if c.isCleanEmptyLocked() {
 			c.deletePrefixExecuted++
 			c.unlock()
-			return hasSample, pressure, validSample
+			return sample
 		}
-		if hasSample {
-			c.hasValidSample = validSample
-			c.resetZeroWatermarkBelowTier2(pressure)
-			c.deleteAllPrefixLocked(evictQ, c.reclaimEpoch.Load(), pressure)
+		if sample.hasSample {
+			c.hasValidSample = sample.valid
+			c.syncZeroWatermarkLocked(sample.belowTier2, sample.pressure)
+			c.deleteAllPrefixLocked(evictQ, c.reclaimEpoch.Load(), sample.pressure)
 			c.unlock()
-			return true, pressure, validSample
+			return sample
 		}
 		c.mu.Unlock()
-		sampledEpoch, p, valid := c.lockShardWithSample(&c.mu, false, false, 0, false)
-		c.deleteAllPrefixLocked(evictQ, sampledEpoch, p)
+		sampledEpoch, out := c.lockShardWithSample(&c.mu, false, sample)
+		c.deleteAllPrefixLocked(evictQ, sampledEpoch, out.pressure)
 		c.unlock()
-		return true, p, valid
+		return out
 	}
 
-	sampledEpoch, p, valid := c.lockShardWithSample(&c.mu, false, hasSample, pressure, validSample)
-	c.deleteNonEmptyPrefixLocked(evictQ, prefix, sampledEpoch, p)
+	sampledEpoch, out := c.lockShardWithSample(&c.mu, false, sample)
+	c.deleteNonEmptyPrefixLocked(evictQ, prefix, sampledEpoch, out.pressure)
 	c.unlock()
-	return true, p, valid
+	return out
 }
 
 // DeletePrefix deletes all entries whose keys begin with prefix.
 // It severs the matching subtree in O(1) and iteratively reclaims all nodes into the free-list.
 func (c *arenaRadix[V]) DeletePrefix(prefix string) {
 	var evictQ evictCallbackQueue[V]
-	c.deletePrefixShard(&evictQ, prefix, false, 0, false)
+	c.deletePrefixShard(&evictQ, prefix, shardSample{})
 	evictQ.invoke(&c.pressureState, c.onEvictValue, c.onEvictEntry)
 }
 

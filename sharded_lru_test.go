@@ -45,16 +45,24 @@ func prefixShardFunc(key string, numShards int) int {
 }
 
 func explicitTagShardFunc(key string, numShards int) int {
-	switch {
-	case strings.HasPrefix(key, "s0/"):
-		return 0 % numShards
-	case strings.HasPrefix(key, "s1/"):
-		return 1 % numShards
-	case strings.HasPrefix(key, "s2/"):
-		return 2 % numShards
-	default:
-		return DefaultShardFunc(key, numShards)
+	if len(key) >= 3 && key[0] == 's' {
+		if slash := strings.IndexByte(key, '/'); slash > 1 {
+			n := 0
+			valid := true
+			for i := 1; i < slash; i++ {
+				ch := key[i]
+				if ch < '0' || ch > '9' {
+					valid = false
+					break
+				}
+				n = n*10 + int(ch-'0')
+			}
+			if valid {
+				return n % numShards
+			}
+		}
 	}
+	return DefaultShardFunc(key, numShards)
 }
 
 func TestDefaultShardFunc(t *testing.T) {
@@ -1242,6 +1250,330 @@ func TestShardedCache_MemoryPressureTelemetryCausalOrdering(t *testing.T) {
 			close(allowRetryFinish)
 			<-g1Done
 			assert.InDelta(t, 0.15, c.Stats().MemoryPressure, 1e-9)
+		})
+	}
+}
+
+func runCrossShardDeleteContentionTest(t *testing.T, backend Backend) {
+	t.Helper()
+	var armed atomic.Bool
+	var inWorker atomic.Bool
+	stepReq := make(chan int, 1)
+	stepAck := make(chan struct{}, 1)
+
+	c := NewShardedCache[int](
+		80, // 8 shards * capacity 10 each, Tier 2 target = 5 each
+		8,
+		explicitTagShardFunc,
+		WithBackend(backend),
+		WithInvariantChecking(true),
+		WithCompactionThreshold(0.70),
+		WithEvictionThreshold(0.85),
+		WithEvictionRetentionRatio(0.50),
+		WithPressureFunc(func() float64 {
+			if !armed.Load() {
+				return 0.10
+			}
+			if inWorker.Load() {
+				return 0.95
+			}
+			select {
+			case stepReq <- 1:
+				<-stepAck
+			default:
+			}
+			return 0.95
+		}),
+	)
+
+	for s := range 8 {
+		for j := range 9 {
+			_, err := c.Put(fmt.Sprintf("s%d/k%d", s, j), j)
+			require.NoError(t, err)
+		}
+	}
+
+	stopWorker := make(chan struct{})
+	workerDone := make(chan struct{})
+	go func() {
+		defer close(workerDone)
+		shardIdx := 1
+		for {
+			select {
+			case <-stopWorker:
+				return
+			case <-stepReq:
+				if shardIdx <= 6 {
+					inWorker.Store(true)
+					_, _ = c.Delete(fmt.Sprintf("s%d/k0", shardIdx))
+					inWorker.Store(false)
+					shardIdx++
+				}
+				stepAck <- struct{}{}
+			}
+		}
+	}()
+
+	armed.Store(true)
+	evicted, err := c.Put("s0/hot", 999)
+	close(stopWorker)
+	<-workerDone
+	require.NoError(t, err)
+	assert.Len(t, evicted, 5, "shard 0 must still shed from 10 down to shardTier2Target=5 despite cross-shard epoch contention")
+	sc := c.(*shardedCache[int])
+	assert.Equal(t, uint64(5), sc.shards[0].Stats().CurrentSize)
+}
+
+func runCrossShardCompactContentionTest(t *testing.T, backend Backend) {
+	t.Helper()
+	if backend == BackendRadix {
+		return // Pointer-based RadixCache.Compact() does not advance reclaimEpoch.
+	}
+	var armed atomic.Bool
+	stepReq := make(chan struct{}, 1)
+	stepAck := make(chan struct{}, 1)
+
+	c := NewShardedCache[int](
+		80,
+		8,
+		explicitTagShardFunc,
+		WithBackend(backend),
+		WithInvariantChecking(true),
+		WithCompactionThreshold(0.70),
+		WithEvictionThreshold(0.85),
+		WithEvictionRetentionRatio(0.50),
+		WithPressureFunc(func() float64 {
+			if !armed.Load() {
+				return 0.10
+			}
+			select {
+			case stepReq <- struct{}{}:
+				<-stepAck
+			default:
+			}
+			return 0.95
+		}),
+	)
+
+	// Create slack on shards 1..6 and populate shard 0 with 9 entries at healthy 0.10 pressure.
+	for s := 1; s <= 6; s++ {
+		for j := range 10 {
+			_, err := c.Put(fmt.Sprintf("s%d/tmp%d", s, j), j)
+			require.NoError(t, err)
+		}
+		for j := range 8 {
+			_, _ = c.Delete(fmt.Sprintf("s%d/tmp%d", s, j))
+		}
+	}
+	for j := range 9 {
+		_, err := c.Put(fmt.Sprintf("s0/k%d", j), j)
+		require.NoError(t, err)
+	}
+	require.InDelta(t, 0.10, c.Stats().MemoryPressure, 1e-9)
+
+	sc := c.(*shardedCache[int])
+	stopWorker := make(chan struct{})
+	workerDone := make(chan struct{})
+	go func() {
+		defer close(workerDone)
+		shardIdx := 1
+		for {
+			select {
+			case <-stopWorker:
+				return
+			case <-stepReq:
+				if shardIdx <= 6 {
+					sc.shards[shardIdx].Compact()
+					shardIdx++
+				}
+				stepAck <- struct{}{}
+			}
+		}
+	}()
+
+	armed.Store(true)
+	evicted, err := c.Put("s0/hot", 999)
+	close(stopWorker)
+	<-workerDone
+	require.NoError(t, err)
+	assert.Len(t, evicted, 5, "shard 0 must shed to shardTier2Target=5 despite 6 cross-shard compactions")
+	assert.Equal(t, uint64(5), sc.shards[0].Stats().CurrentSize)
+	assert.InDelta(t, 0.95, c.Stats().MemoryPressure, 1e-9, "Stats().MemoryPressure must reflect accepted 0.95 spike after cross-shard compactions")
+}
+
+func TestShardedCache_CrossShardEpochContentionPreservesSheddingAndTelemetry(t *testing.T) {
+	for _, backend := range []Backend{BackendMap, BackendRadix, BackendArenaRadix} {
+		t.Run(backend.String()+"/ConcurrentCrossShardDeletes", func(t *testing.T) {
+			runCrossShardDeleteContentionTest(t, backend)
+		})
+		t.Run(backend.String()+"/ConcurrentCrossShardCompactions", func(t *testing.T) {
+			runCrossShardCompactContentionTest(t, backend)
+		})
+	}
+}
+
+func runSameShardRetryExhaustionMultiShardOpTest(t *testing.T, backend Backend, mode string) {
+	t.Helper()
+	var armed atomic.Bool
+	var inWorker atomic.Bool
+	stepReq := make(chan struct{}, 1)
+	stepAck := make(chan struct{}, 1)
+
+	c := NewShardedCache[int](
+		120, // 8 shards * capacity 15 each, Tier 2 target = 7..8 (globalTarget = 60 -> 4 shards of 8, 4 shards of 7)
+		8,
+		explicitTagShardFunc,
+		WithBackend(backend),
+		WithInvariantChecking(true),
+		WithCompactionThreshold(0.70),
+		WithEvictionThreshold(0.85),
+		WithEvictionRetentionRatio(0.50),
+		WithPressureFunc(func() float64 {
+			if !armed.Load() {
+				return 0.10
+			}
+			if inWorker.Load() {
+				return 0.95
+			}
+			select {
+			case stepReq <- struct{}{}:
+				<-stepAck
+			default:
+			}
+			return 0.95
+		}),
+	)
+
+	for s := range 8 {
+		_, err := c.Put(fmt.Sprintf("s%d/match", s), 100)
+		require.NoError(t, err)
+		for j := range 13 {
+			_, err = c.Put(fmt.Sprintf("s%d/k%d", s, j), j)
+			require.NoError(t, err)
+		}
+	}
+
+	// Exhaust sameShardRetries on shard 0 alone (3 same-shard reclamations on shard 0).
+	stopWorker := make(chan struct{})
+	workerDone := make(chan struct{})
+	go func() {
+		defer close(workerDone)
+		delIdx := 0
+		for {
+			select {
+			case <-stopWorker:
+				return
+			case <-stepReq:
+				if delIdx < 3 {
+					inWorker.Store(true)
+					_, _ = c.Delete(fmt.Sprintf("s0/k%d", delIdx))
+					inWorker.Store(false)
+					delIdx++
+				}
+				stepAck <- struct{}{}
+			}
+		}
+	}()
+
+	armed.Store(true)
+	pa := c.(PressureAwareCache[int])
+	switch mode {
+	case "evaluate":
+		evicted := pa.EvaluateMemoryPressure()
+		assert.NotEmpty(t, evicted, "EvaluateMemoryPressure must still shed shards 1..7 when shard 0 exhausts same-shard retries")
+		assert.LessOrEqual(t, c.Stats().CurrentSize, uint64(60))
+	case "prefix_nonempty":
+		c.DeletePrefix("s1/match")
+		sc := c.(*shardedCache[int])
+		assert.LessOrEqual(t, sc.shards[1].Stats().CurrentSize, uint64(8), "DeletePrefix must still shed matching later shards")
+	case "prefix_empty":
+		c.DeletePrefix("")
+		st := c.Stats()
+		assert.Zero(t, st.Len)
+		if backend != BackendRadix {
+			assert.GreaterOrEqual(t, st.CompactionsPressureTier2, uint64(7), "DeletePrefix(\"\") on shards 1..7 must attribute slack compactions to Tier 2 pressure")
+		}
+	}
+	close(stopWorker)
+	<-workerDone
+}
+
+func TestShardedCache_SameShardRetryExhaustionDoesNotPoisonRemainingShards(t *testing.T) {
+	for _, backend := range []Backend{BackendMap, BackendRadix, BackendArenaRadix} {
+		for _, mode := range []string{"evaluate", "prefix_nonempty", "prefix_empty"} {
+			t.Run(fmt.Sprintf("%s/%s", backend.String(), mode), func(t *testing.T) {
+				runSameShardRetryExhaustionMultiShardOpTest(t, backend, mode)
+			})
+		}
+	}
+}
+
+func runZeroWeightEpisodeRecoveryTest(t *testing.T, backend Backend, includeWeighted bool) {
+	t.Helper()
+	var pressureBits atomic.Uint64
+	pressureBits.Store(math.Float64bits(0.10))
+
+	c := NewShardedCache[string](
+		100,
+		2,
+		explicitTagShardFunc,
+		WithBackend(backend),
+		WithInvariantChecking(true),
+		WithWeigher(func(_, v string) uint64 {
+			return uint64(len(v))
+		}),
+		WithCompactionThreshold(0.70),
+		WithEvictionThreshold(0.90),
+		WithEvictionRetentionRatio(0.50),
+		WithPressureFunc(func() float64 {
+			return math.Float64frombits(pressureBits.Load())
+		}),
+	)
+	pa := c.(PressureAwareCache[string])
+
+	if includeWeighted {
+		for i := range 2 {
+			_, err := c.Put(fmt.Sprintf("s1/w%d", i), "x")
+			require.NoError(t, err)
+		}
+	}
+	for i := range 4 {
+		_, err := c.Put(fmt.Sprintf("s1/z%d", i), "")
+		require.NoError(t, err)
+	}
+	require.Equal(t, 4, c.Stats().ZeroSizeCount)
+
+	// Episode 1: critical pressure (0.95) sheds 4 -> 2 zero-weight entries on shard 1, and repeat is idempotent.
+	pressureBits.Store(math.Float64bits(0.95))
+	_ = pa.EvaluateMemoryPressure()
+	require.Equal(t, 2, c.Stats().ZeroSizeCount)
+	assert.Empty(t, pa.EvaluateMemoryPressure(), "repeated evaluation in Episode 1 must remain idempotent")
+	require.Equal(t, 2, c.Stats().ZeroSizeCount)
+
+	// Healthy window (0.10): foreground writes/deletes hit shard 0 only; shard 1 only serves Get/Peek reads.
+	pressureBits.Store(math.Float64bits(0.10))
+	_, err := c.Put("s0/healthy", "ok")
+	require.NoError(t, err)
+	_, _ = c.Delete("s0/missing")
+	_, _ = c.Get("s1/z2")
+	_, _ = c.Peek("s1/z3")
+	require.InDelta(t, 0.10, c.Stats().MemoryPressure, 1e-9)
+
+	// Episode 2: critical pressure (0.95) must shed 2 -> 1 zero-weight entry on shard 1 despite no healthy-window writes on shard 1.
+	pressureBits.Store(math.Float64bits(0.95))
+	evictedEp2 := pa.EvaluateMemoryPressure()
+	assert.NotEmpty(t, evictedEp2, "Episode 2 must shed zero-weight entries on shard 1 after cache-wide healthy recovery")
+	assert.Equal(t, 1, c.Stats().ZeroSizeCount)
+	assert.Empty(t, pa.EvaluateMemoryPressure(), "repeated evaluation in Episode 2 must remain idempotent")
+}
+
+func TestShardedCache_ZeroWeightWatermarkResetsAcrossPressureEpisodes(t *testing.T) {
+	for _, backend := range []Backend{BackendMap, BackendRadix, BackendArenaRadix} {
+		t.Run(backend.String()+"/PureZeroWeight", func(t *testing.T) {
+			runZeroWeightEpisodeRecoveryTest(t, backend, false)
+		})
+		t.Run(backend.String()+"/MixedWeightedAndZeroWeight", func(t *testing.T) {
+			runZeroWeightEpisodeRecoveryTest(t, backend, true)
 		})
 	}
 }
