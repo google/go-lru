@@ -1594,10 +1594,12 @@ func holdShardRLockViaKeys[V any](t *testing.T, c Cache[V], shardPrefix string) 
 		}
 	}()
 	<-locked
-	return func() {
+	releaseFn := sync.OnceFunc(func() {
 		close(release)
 		<-done
-	}
+	})
+	t.Cleanup(releaseFn)
+	return releaseFn
 }
 
 func runConcurrentHealthyAndCriticalEpisodeTest(t *testing.T, backend Backend, sharded bool) {
@@ -3039,6 +3041,7 @@ func runContendedTier1CompactionTest(t *testing.T, backend Backend, sharded bool
 	require.Zero(t, coord.reclaimEpoch.Load())
 
 	releaseRLock := holdShardRLockViaKeys(t, c, "s0/")
+	defer releaseRLock()
 	baseBelowTier2 := coord.belowTier2Epoch.Load()
 
 	evalDone := make(chan struct{})
@@ -3058,15 +3061,19 @@ func runContendedTier1CompactionTest(t *testing.T, backend Backend, sharded bool
 		}
 	} else {
 		for i := range 6 {
+			var putGID atomic.Uint64
+			putStarted := make(chan struct{})
 			putWG.Add(1)
 			go func(idx int) {
 				defer putWG.Done()
+				putGID.Store(currentGoroutineID())
+				close(putStarted)
 				_, _ = c.Put(fmt.Sprintf("s3/p_%d", idx), idx)
 			}(i)
+			<-putStarted
+			waitForGoroutineParkedInRWMutexLock(t, putGID.Load())
 		}
-		require.Eventually(t, func() bool {
-			return coord.belowTier2Epoch.Load() >= baseBelowTier2+7
-		}, time.Second, time.Millisecond)
+		require.Equal(t, baseBelowTier2+7, coord.belowTier2Epoch.Load())
 	}
 
 	releaseRLock()
@@ -3400,16 +3407,73 @@ func TestOptions_DirectShardsZeroOverrideRestoresUnshardedMode(t *testing.T) {
 		})
 	})
 
-	resetAfterZero := []Option{
-		WithShards(0),
-		func(o *Options) { o.Shards = 0 },
+	// Custom Option after WithShards(0) must observe Shards == 0 (never an internal sentinel)
+	// and must not have explicit Shards overrides clobbered in composite Option closures.
+	observedShards := -1
+	sentinelCheck := ApplyOptions(WithShards(0), func(o *Options) {
+		observedShards = o.Shards
+	})
+	assert.Zero(t, observedShards, "custom Option inspecting Options.Shards after WithShards(0) must observe 0")
+	assert.Zero(t, sentinelCheck.Shards)
+	assert.True(t, sentinelCheck.shouldShard())
+
+	compositePositiveOpts := [][]Option{
+		{
+			WithShards(0),
+			func(o *Options) {
+				WithBackend(BackendRadix)(o)
+				o.Shards = 4
+			},
+		},
+		{
+			WithShards(0),
+			func(o *Options) {
+				if o.Shards == 0 {
+					o.Shards = 4
+				}
+			},
+		},
+		{
+			func(o *Options) {
+				WithShards(0)(o)
+				o.Shards = 4
+			},
+		},
 	}
-	resetAfterZeroAndPositive := []Option{
-		WithShards(0),
-		func(o *Options) { o.Shards = 4 },
-		func(o *Options) { o.Shards = 0 },
+	for _, seqOpts := range compositePositiveOpts {
+		appliedPos := ApplyOptions(seqOpts...)
+		assert.Equal(t, 4, appliedPos.Shards)
+		assert.True(t, appliedPos.shouldShard())
+		scPos, isSharded := New[int](100, seqOpts...).(*shardedCache[int])
+		require.True(t, isSharded)
+		assert.Len(t, scPos.shards, 4)
 	}
-	for _, seqOpts := range [][]Option{resetAfterZero, resetAfterZeroAndPositive} {
+
+	resetAfterZeroAndPositive := [][]Option{
+		{
+			WithShards(0),
+			func(o *Options) { o.Shards = 4 },
+			func(o *Options) { o.Shards = 0 },
+		},
+		{
+			WithShards(0),
+			func(o *Options) {
+				WithBackend(BackendRadix)(o)
+				o.Shards = 4
+			},
+			func(o *Options) {
+				WithInvariantChecking(true)(o)
+				o.Shards = 0
+			},
+		},
+		{
+			func(o *Options) {
+				WithShards(4)(o)
+				o.Shards = 0
+			},
+		},
+	}
+	for _, seqOpts := range resetAfterZeroAndPositive {
 		appliedZero := ApplyOptions(seqOpts...)
 		assert.Zero(t, appliedZero.Shards)
 		assert.False(t, appliedZero.shouldShard())
@@ -3424,7 +3488,7 @@ func TestOptions_DirectShardsZeroOverrideRestoresUnshardedMode(t *testing.T) {
 				c = fn(seqOpts...)
 			})
 			_, isSharded := c.(*shardedCache[int])
-			assert.False(t, isSharded, "custom Option resetting Options.Shards = 0 after WithShards(0) must restore unsharded mode")
+			assert.False(t, isSharded, "resetting Options.Shards from a non-zero value back to 0 must restore unsharded mode")
 		}
 	}
 }
@@ -4272,14 +4336,11 @@ func (s *reenteredOpService) runOp(isCallback bool) {
 	waitForGoroutineParkedInFrame(s.t, s.bgGID.Load(), "lockEvictCallbackSlow")
 }
 
-func spawnOrParkInSharedHelper(t *testing.T, fn func(), triggerBg chan struct{}, bgGID *atomic.Uint64) {
-	t.Helper()
-	if fn != nil {
-		go fn()
-		return
+func spawnInSharedHelper(fn func(), wait <-chan struct{}) {
+	go fn()
+	if wait != nil {
+		<-wait
 	}
-	close(triggerBg)
-	waitForGoroutineParkedInFrame(t, bgGID.Load(), "lockEvictCallbackSlow")
 }
 
 func TestShardedCache_PreExistingGoroutineNotMisclassifiedAcrossReenteredMethodAndSpawnHelper(t *testing.T) {
@@ -4349,7 +4410,7 @@ func TestShardedCache_PreExistingGoroutineNotMisclassifiedAcrossReenteredMethodA
 			var asyncViolation atomic.Bool
 
 			var c Cache[int]
-			spawnOrParkInSharedHelper(t, func() {
+			spawnInSharedHelper(func() {
 				bgGID.Store(currentGoroutineID())
 				close(bgReady)
 				<-triggerBg
@@ -4359,7 +4420,7 @@ func TestShardedCache_PreExistingGoroutineNotMisclassifiedAcrossReenteredMethodA
 					asyncViolation.Store(true)
 				}
 				close(bgFinished)
-			}, nil, nil)
+			}, nil)
 			<-bgReady
 
 			evictOpt := WithOnEvictEntry(func(key string, _ int, _ EvictionReason) {
@@ -4369,7 +4430,12 @@ func TestShardedCache_PreExistingGoroutineNotMisclassifiedAcrossReenteredMethodA
 					return
 				}
 				if key == "s0/k1" {
-					spawnOrParkInSharedHelper(t, nil, triggerBg, &bgGID)
+					innerDone := make(chan struct{})
+					spawnInSharedHelper(func() {
+						defer close(innerDone)
+						close(triggerBg)
+						waitForGoroutineParkedInFrame(t, bgGID.Load(), "lockEvictCallbackSlow")
+					}, innerDone)
 					panic("boom in shared helper callback")
 				}
 			})
@@ -4392,6 +4458,416 @@ func TestShardedCache_PreExistingGoroutineNotMisclassifiedAcrossReenteredMethodA
 			assert.True(t, bgCallbackRan.Load(), "pre-existing goroutine spawned via shared helper must not lose OnEvictEntry")
 			assert.False(t, asyncViolation.Load(), "pre-existing goroutine Delete must wait synchronously for OnEvictEntry")
 		})
+	}
+}
+
+func runDirectCallbackHelper(done <-chan struct{}, fn func()) {
+	go fn()
+	<-done
+}
+
+func waitChanHelper(done <-chan struct{}) {
+	<-done
+}
+
+type reenteredWaitHelperService struct {
+	c       Cache[int]
+	cbFirst bool
+}
+
+func (s *reenteredWaitHelperService) runOp(inCallback bool, evictKey string) {
+	if s.cbFirst {
+		if inCallback {
+			done := make(chan struct{})
+			go func() {
+				defer close(done)
+				_, _ = s.c.Delete(evictKey)
+			}()
+			waitChanHelper(done)
+			return
+		}
+		_, _ = s.c.Put("s0/k3", 3)
+		return
+	}
+	if !inCallback {
+		_, _ = s.c.Put("s0/k3", 3)
+		return
+	}
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		_, _ = s.c.Delete(evictKey)
+	}()
+	waitChanHelper(done)
+}
+
+func TestShardedCache_QueuedPendingEvictCallbackSpawnsSiblingClosureWithoutDeadlock(t *testing.T) {
+	for _, typeErased := range []bool{false, true} {
+		name := "TypedCallback"
+		if typeErased {
+			name = "TypeErasedCallback"
+		}
+		t.Run(name, func(t *testing.T) {
+			done := make(chan struct{})
+			go func() {
+				defer close(done)
+				var c Cache[int]
+				var evicted []string
+				var evictMu sync.Mutex
+				workerDone := make(chan struct{})
+				worker := func() {
+					defer close(workerDone)
+					_, _ = c.Delete("s1/k3")
+				}
+
+				handleEvict := func(key string) {
+					evictMu.Lock()
+					evicted = append(evicted, key)
+					evictMu.Unlock()
+					switch key {
+					case "s0/k1":
+						_, _ = c.Delete("s1/k2")
+					case "s1/k2":
+						go worker()
+						<-workerDone
+					}
+				}
+
+				var evictOpt Option
+				if typeErased {
+					evictOpt = WithOnEvictEntry[any](func(key string, _ any, _ EvictionReason) {
+						handleEvict(key)
+					})
+				} else {
+					evictOpt = WithOnEvictEntry[int](func(key string, _ int, _ EvictionReason) {
+						handleEvict(key)
+					})
+				}
+
+				c = NewShardedCache[int](16, 2, explicitTagShardFunc, WithInvariantChecking(true), evictOpt)
+				_, err := c.Put("s0/k1", 1)
+				assert.NoError(t, err)
+				_, err = c.Put("s1/k2", 2)
+				assert.NoError(t, err)
+				_, err = c.Put("s1/k3", 3)
+				assert.NoError(t, err)
+
+				_, ok := c.Delete("s0/k1")
+				assert.True(t, ok)
+
+				evictMu.Lock()
+				defer evictMu.Unlock()
+				assert.Equal(t, []string{"s0/k1", "s1/k2", "s1/k3"}, evicted)
+			}()
+
+			select {
+			case <-done:
+			case <-time.After(3 * time.Second):
+				t.Fatal("deadlocked when queued pending eviction callback spawned sibling closure")
+			}
+		})
+	}
+}
+
+func TestShardedCache_RecoveredPressureFuncPanicDoesNotPoisonSiblingSamplerOrLeakGIDs(t *testing.T) {
+	t.Run("SiblingSamplerChildReentrancyPreservedAfterParentPanic", func(t *testing.T) {
+		var g0GID, g2GID atomic.Uint64
+		var probeMu sync.Mutex
+		var reenteredCount atomic.Int32
+		c2Ready := make(chan struct{})
+		releaseC2 := make(chan struct{})
+		c2Done := make(chan struct{})
+		g0Entered := make(chan struct{})
+		releaseG0Panic := make(chan struct{})
+
+		var c Cache[int]
+		var pa PressureAwareCache[int]
+		c = NewShardedCache[int](
+			64,
+			2,
+			explicitTagShardFunc,
+			WithInvariantChecking(true),
+			WithPressureFunc(func() float64 {
+				gid := currentGoroutineID()
+				if gid != 0 && gid == g2GID.Load() {
+					probeMu.Lock()
+					defer probeMu.Unlock()
+					go func() {
+						defer close(c2Done)
+						close(c2Ready)
+						<-releaseC2
+						_, _ = c.Delete("s1/existing")
+						_ = pa.EvaluateMemoryPressure()
+					}()
+					<-c2Done
+					return 0.10
+				}
+				if gid != 0 && gid == g0GID.Load() {
+					close(g0Entered)
+					<-releaseG0Panic
+					panic("transient g0 pressure panic")
+				}
+				if !probeMu.TryLock() {
+					reenteredCount.Add(1)
+					return 0.10
+				}
+				probeMu.Unlock()
+				return 0.10
+			}),
+		)
+		pa = c.(PressureAwareCache[int])
+		sc := c.(*shardedCache[int])
+
+		_, err := c.Put("s1/existing", 10)
+		require.NoError(t, err)
+
+		allDone := make(chan struct{})
+		go func() {
+			defer close(allDone)
+			g0GID.Store(currentGoroutineID())
+
+			g2Done := make(chan struct{})
+			go func() {
+				defer close(g2Done)
+				g2GID.Store(currentGoroutineID())
+				_ = pa.EvaluateMemoryPressure()
+			}()
+			<-c2Ready
+
+			var recovered any
+			func() {
+				defer func() {
+					recovered = recover()
+				}()
+				go func() {
+					<-g0Entered
+					close(releaseG0Panic)
+				}()
+				_ = pa.EvaluateMemoryPressure()
+			}()
+			assert.Equal(t, "transient g0 pressure panic", recovered)
+
+			extBefore := sc.coord.externalReclaimEpoch.Load()
+			close(releaseC2)
+			<-g2Done
+			assert.Equal(t, extBefore, sc.coord.externalReclaimEpoch.Load(),
+				"sibling sampler child Delete must be recognized as re-entrant rather than external reclamation")
+		}()
+
+		select {
+		case <-allDone:
+		case <-time.After(3 * time.Second):
+			t.Fatal("deadlocked or poisoned sibling sampler child after recovered PressureFunc panic")
+		}
+		assert.Zero(t, reenteredCount.Load(), "healthy sibling sampler child must not bypass PressureFunc re-entrancy guard")
+	})
+
+	t.Run("BoundedPanickedTrackingAfterRecoveredDispatcherPanic", func(t *testing.T) {
+		var dispGID, bgSamplerGID atomic.Uint64
+		bgEntered := make(chan struct{})
+		releaseBg := make(chan struct{})
+		var shouldPanic atomic.Bool
+
+		c := NewShardedCache[int](
+			512,
+			2,
+			explicitTagShardFunc,
+			WithInvariantChecking(true),
+			WithPressureFunc(func() float64 {
+				gid := currentGoroutineID()
+				if gid != 0 && gid == dispGID.Load() && shouldPanic.CompareAndSwap(true, false) {
+					panic("dispatcher transient panic")
+				}
+				if gid != 0 && gid == bgSamplerGID.Load() {
+					close(bgEntered)
+					<-releaseBg
+					return 0.10
+				}
+				return 0.10
+			}),
+		)
+		pa := c.(PressureAwareCache[int])
+		sc := c.(*shardedCache[int])
+
+		dispDone := make(chan struct{})
+		go func() {
+			defer close(dispDone)
+			dispGID.Store(currentGoroutineID())
+			shouldPanic.Store(true)
+			func() {
+				defer func() { _ = recover() }()
+				_ = pa.EvaluateMemoryPressure()
+			}()
+
+			bgDone := make(chan struct{})
+			go func() {
+				defer close(bgDone)
+				bgSamplerGID.Store(currentGoroutineID())
+				_ = pa.EvaluateMemoryPressure()
+			}()
+			<-bgEntered
+
+			descSeqBefore := sc.coord.panickedDescendantSeq.Load()
+			rootSeqBefore := sc.coord.panickedRootSeq.Load()
+			for i := range 250 {
+				reqDone := make(chan struct{})
+				go func(idx int) {
+					defer close(reqDone)
+					_, _ = c.Put(fmt.Sprintf("s0/req_%d", idx), idx)
+				}(i)
+				<-reqDone
+			}
+			assert.Equal(t, descSeqBefore, sc.coord.panickedDescendantSeq.Load(),
+				"post-recovery request goroutines must not virally insert into panickedDescendantGIDs")
+			assert.Equal(t, rootSeqBefore, sc.coord.panickedRootSeq.Load(),
+				"post-recovery request goroutines must not advance panickedRootSeq")
+
+			close(releaseBg)
+			<-bgDone
+		}()
+		<-dispDone
+	})
+}
+
+func runCallbackHelperPreHookClosureCase(t *testing.T, sharded bool) {
+	t.Helper()
+	finished := make(chan struct{})
+	go func() {
+		defer close(finished)
+		var c Cache[int]
+		done := make(chan struct{})
+		cleanup := func() {
+			defer close(done)
+			_, _ = c.Delete("s1/k2")
+		}
+		evictOpt := WithOnEvictEntry(func(k string, _ int, r EvictionReason) {
+			if k == "s0/k1" && r == EvictionReasonCapacity {
+				runDirectCallbackHelper(done, cleanup)
+			}
+		})
+		if sharded {
+			c = NewShardedCache[int](2, 2, explicitTagShardFunc, WithInvariantChecking(true), evictOpt)
+		} else {
+			c = New[int](2, WithInvariantChecking(true), evictOpt)
+		}
+		_, _ = c.Put("s0/k1", 1)
+		_, _ = c.Put("s1/k2", 2)
+		_, _ = c.Put("s0/k3", 3)
+	}()
+	select {
+	case <-finished:
+	case <-time.After(3 * time.Second):
+		t.Fatal("deadlocked when callback helper spawned pre-hook closure")
+	}
+}
+
+func runCallbackMixedWaitGroupGoCase(t *testing.T, sharded bool) {
+	t.Helper()
+	finished := make(chan struct{})
+	go func() {
+		defer close(finished)
+		var c Cache[int]
+		hold := make(chan struct{})
+		cleanup := func() {
+			defer close(hold)
+			_, _ = c.Delete("s1/k2")
+		}
+		evictOpt := WithOnEvictEntry(func(k string, _ int, r EvictionReason) {
+			if k == "s0/k1" && r == EvictionReasonCapacity {
+				var wg sync.WaitGroup
+				wg.Go(func() { <-hold })
+				wg.Go(cleanup)
+				wg.Wait()
+			}
+		})
+		if sharded {
+			c = NewShardedCache[int](2, 2, explicitTagShardFunc, WithInvariantChecking(true), evictOpt)
+		} else {
+			c = New[int](2, WithInvariantChecking(true), evictOpt)
+		}
+		_, _ = c.Put("s0/k1", 1)
+		_, _ = c.Put("s1/k2", 2)
+		_, _ = c.Put("s0/k3", 3)
+	}()
+	select {
+	case <-finished:
+	case <-time.After(3 * time.Second):
+		t.Fatal("deadlocked when callback WaitGroup.Go launched both inline and outer closures")
+	}
+}
+
+func runCallbackReenteredWaitHelperCase(t *testing.T, sharded, cbFirst bool) {
+	t.Helper()
+	finished := make(chan struct{})
+	go func() {
+		defer close(finished)
+		svc := &reenteredWaitHelperService{cbFirst: cbFirst}
+		var probeArmed atomic.Bool
+		var probeReentered atomic.Int32
+		var inPrimaryProbe atomic.Bool
+		opts := []Option{
+			WithInvariantChecking(true),
+			WithPressureFunc(func() float64 {
+				if !probeArmed.Load() {
+					return 0.10
+				}
+				if inPrimaryProbe.CompareAndSwap(false, true) {
+					defer inPrimaryProbe.Store(false)
+					probeArmed.Store(false)
+					svc.runOp(true, "s1/probe_del")
+					return 0.10
+				}
+				probeReentered.Add(1)
+				return 0.10
+			}),
+			WithOnEvictEntry(func(k string, _ int, r EvictionReason) {
+				if k == "s0/k1" && r == EvictionReasonCapacity {
+					svc.runOp(true, "s1/k2")
+				}
+			}),
+		}
+		if sharded {
+			svc.c = NewShardedCache[int](2, 2, explicitTagShardFunc, opts...)
+		} else {
+			svc.c = New[int](2, opts...)
+		}
+		_, _ = svc.c.Put("s0/k1", 1)
+		_, _ = svc.c.Put("s1/k2", 2)
+		_, _ = svc.c.Delete("s1/k2")
+		_, _ = svc.c.Put("s1/k2", 2)
+		probeArmed.Store(true)
+		svc.runOp(false, "")
+		assert.Zero(t, probeReentered.Load(),
+			"re-entered method child waiting via helper inside PressureFunc must not re-enter PressureFunc")
+	}()
+	select {
+	case <-finished:
+	case <-time.After(3 * time.Second):
+		t.Fatal("deadlocked when re-entered method waited via helper function")
+	}
+}
+
+func TestShardedCache_CallbackChildLineageHelperSpawnMixedWaitGroupAndReenteredWaitHelper(t *testing.T) {
+	for _, sharded := range []bool{false, true} {
+		mode := "Unsharded"
+		if sharded {
+			mode = "Sharded"
+		}
+		t.Run("HelperSpawningPreHookClosure/"+mode, func(t *testing.T) {
+			runCallbackHelperPreHookClosureCase(t, sharded)
+		})
+		t.Run("MixedWaitGroupGoInlineAndOuterClosure/"+mode, func(t *testing.T) {
+			runCallbackMixedWaitGroupGoCase(t, sharded)
+		})
+		for _, cbFirst := range []bool{true, false} {
+			orderName := "NonCallbackFirst"
+			if cbFirst {
+				orderName = "CallbackFirst"
+			}
+			t.Run("ReenteredMethodWaitingViaHelper/"+mode+"/"+orderName, func(t *testing.T) {
+				runCallbackReenteredWaitHelperCase(t, sharded, cbFirst)
+			})
+		}
 	}
 }
 

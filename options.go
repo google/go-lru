@@ -225,16 +225,14 @@ type Options struct {
 	// Shards specifies the number of independent LRU shards when sharding is enabled
 	// on New, NewMapCache, NewRadixCache, or NewArenaRadixCache (NewShardedCache always uses its
 	// explicit shards parameter and ignores WithShards).
-	// When left at 0 (unless WithShards(0) is explicitly passed, which panics), constructors build
-	// a single unsharded cache instance; resetting Shards to 0 in a subsequent Option restores
-	// unsharded mode. When sharding is enabled, Shards must satisfy 1 <= Shards <= maxSize;
-	// otherwise cache construction panics.
+	// When left at 0 (unless WithShards(0) is explicitly passed without a subsequent non-zero Shards
+	// override, which panics), constructors build a single unsharded cache instance; resetting Shards
+	// from a non-zero value back to 0 in a subsequent Option restores unsharded mode. When sharding
+	// is enabled, Shards must satisfy 1 <= Shards <= maxSize; otherwise cache construction panics.
 	Shards              int
 	hasCustomShards     bool
 	customShardsZero    bool
 	hasShardTier2Target bool
-	withShardsApplied   bool
-	builtinOptApplied   bool
 
 	// ShardFunc maps a key to a shard index in [0, Shards) when sharding is enabled.
 	// If nil, DefaultShardFunc is used.
@@ -261,7 +259,6 @@ type Option func(*Options)
 // Supported backends: BackendMap (default), BackendRadix, BackendArenaRadix.
 func WithBackend(backend Backend) Option {
 	return func(o *Options) {
-		o.builtinOptApplied = true
 		o.Backend = backend
 	}
 }
@@ -276,7 +273,6 @@ func WithBackend(backend Backend) Option {
 // (V != any) boxes V into any on every Put and Replace call.
 func WithWeigher[V any](fn func(key string, value V) uint64) Option {
 	return func(o *Options) {
-		o.builtinOptApplied = true
 		if fn == nil {
 			o.Weigher = nil
 			return
@@ -352,7 +348,6 @@ func resolveWeigher[V any](options Options) func(string, V) uint64 {
 // non-pointer Cache[V] (V != any) boxes V into any on each invocation.
 func WithOnEvictValue[V any](fn func(value V, reason EvictionReason)) Option {
 	return func(o *Options) {
-		o.builtinOptApplied = true
 		if fn == nil {
 			o.OnEvictValue = nil
 			return
@@ -410,7 +405,6 @@ func resolveOnEvictValue[V any](options Options) func(V, EvictionReason) {
 // non-pointer Cache[V] (V != any) boxes V into any on each invocation.
 func WithOnEvictEntry[V any](fn func(key string, value V, reason EvictionReason)) Option {
 	return func(o *Options) {
-		o.builtinOptApplied = true
 		if fn == nil {
 			o.OnEvictEntry = nil
 			return
@@ -454,7 +448,6 @@ func resolveOnEvictEntry[V any](options Options) func(string, V, EvictionReason)
 // WithInvariantChecking returns an Option that enables or disables internal invariant checking.
 func WithInvariantChecking(enabled bool) Option {
 	return func(o *Options) {
-		o.builtinOptApplied = true
 		o.EnableInvariantChecking = enabled
 	}
 }
@@ -462,7 +455,6 @@ func WithInvariantChecking(enabled bool) Option {
 // WithPressureFunc configures a custom memory-pressure probe function.
 func WithPressureFunc(fn PressureFunc) Option {
 	return func(o *Options) {
-		o.builtinOptApplied = true
 		o.PressureFunc = fn
 		o.hasCustomPressureFunc = (fn != nil)
 	}
@@ -472,7 +464,6 @@ func WithPressureFunc(fn PressureFunc) Option {
 // runtime/metrics probe when GOMEMLIMIT is unset or higher than the desired process ceiling.
 func WithMemoryBudget(bytes uint64) Option {
 	return func(o *Options) {
-		o.builtinOptApplied = true
 		o.MemoryBudget = bytes
 	}
 }
@@ -485,7 +476,6 @@ func isValidPositiveThreshold(v float64) bool {
 // Passing a non-positive, NaN, or infinite value resets CompactionThreshold to DefaultCompactionThreshold.
 func WithCompactionThreshold(threshold float64) Option {
 	return func(o *Options) {
-		o.builtinOptApplied = true
 		if !isValidPositiveThreshold(threshold) {
 			o.CompactionThreshold = DefaultCompactionThreshold
 			o.hasCustomCompactionThreshold = false
@@ -502,7 +492,6 @@ func WithCompactionThreshold(threshold float64) Option {
 // Passing a non-positive, NaN, or infinite value resets EvictionThreshold to DefaultEvictionThreshold.
 func WithEvictionThreshold(threshold float64) Option {
 	return func(o *Options) {
-		o.builtinOptApplied = true
 		if !isValidPositiveThreshold(threshold) {
 			o.EvictionThreshold = DefaultEvictionThreshold
 			o.hasCustomEvictionThreshold = false
@@ -519,7 +508,6 @@ func WithEvictionThreshold(threshold float64) Option {
 // retained during Critical Pressure LRU shedding.
 func WithEvictionRetentionRatio(ratio float64) Option {
 	return func(o *Options) {
-		o.builtinOptApplied = true
 		o.EvictionRetentionRatio = ratio
 	}
 }
@@ -529,11 +517,10 @@ func WithEvictionRetentionRatio(ratio float64) Option {
 // NewShardedCache always uses its explicit shards parameter and ignores WithShards.
 //
 // When applied to New, NewMapCache, NewRadixCache, or NewArenaRadixCache, shards must be greater
-// than zero and must not exceed maxSize; otherwise cache construction panics.
+// than zero and must not exceed maxSize (unless overridden by a subsequent non-zero Shards setting);
+// otherwise cache construction panics.
 func WithShards(shards int) Option {
 	return func(o *Options) {
-		o.builtinOptApplied = true
-		o.withShardsApplied = true
 		o.Shards = shards
 		o.hasCustomShards = true
 		o.customShardsZero = shards == 0
@@ -545,7 +532,6 @@ func WithShards(shards int) Option {
 // Passing nil resets ShardFunc to DefaultShardFunc.
 func WithShardFunc(fn ShardFunc) Option {
 	return func(o *Options) {
-		o.builtinOptApplied = true
 		o.ShardFunc = fn
 	}
 }
@@ -684,32 +670,13 @@ func normalizeCallbacks(options *Options) {
 	}
 }
 
-const zeroShardsSentinel = math.MinInt + 1
-
 func applySingleOption(options *Options, opt Option) {
 	if opt == nil {
 		return
 	}
-	options.withShardsApplied = false
-	options.builtinOptApplied = false
-	prevShards := options.Shards
-	usedZeroSentinel := options.customShardsZero && prevShards == 0
-	if usedZeroSentinel {
-		options.Shards = zeroShardsSentinel
-	}
 	opt(options)
-	if options.withShardsApplied {
-		return
-	}
-	if usedZeroSentinel {
-		if options.builtinOptApplied || options.Shards == zeroShardsSentinel {
-			options.Shards = 0
-			return
-		}
-		options.customShardsZero = false
-		return
-	}
-	if options.Shards != prevShards {
+	if options.Shards != 0 {
+		options.hasCustomShards = true
 		options.customShardsZero = false
 	}
 }
@@ -732,8 +699,6 @@ func ApplyOptions(opts ...Option) Options {
 	for _, opt := range opts {
 		applySingleOption(&options, opt)
 	}
-	options.withShardsApplied = false
-	options.builtinOptApplied = false
 	if options.Backend != BackendMap && options.Backend != BackendRadix && options.Backend != BackendArenaRadix {
 		options.Backend = BackendMap
 	}
