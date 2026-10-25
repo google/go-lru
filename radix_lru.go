@@ -1115,39 +1115,37 @@ func (c *radixCache[V]) deleteNonEmptyPrefixLocked(evictQ *evictCallbackQueue[V]
 	}
 }
 
-func (c *radixCache[V]) deletePrefixShard(evictQ *evictCallbackQueue[V], prefix string, sample shardSample) shardSample {
+func (c *radixCache[V]) deletePrefixShard(evictQ *evictCallbackQueue[V], prefix string, sample shardSample) (shardSample, bool) {
 	if prefix == "" {
 		c.mu.Lock()
 		if c.isCleanEmptyLocked() {
 			c.deletePrefixExecuted++
 			c.unlock()
-			return sample
+			return sample, sample.hasSample
 		}
-		if sample.hasSample {
-			c.hasValidSample = sample.valid
-			c.syncZeroWatermarkLocked(sample.belowTier2, sample.seq, sample.pressure)
+		if sample.hasSample && c.tryApplyShardSampleLocked(false, &sample) {
 			c.deleteAllPrefixLocked(evictQ, c.reclaimEpoch.Load(), sample.pressure)
 			c.unlock()
-			return sample
+			return sample, true
 		}
 		c.mu.Unlock()
 		sampledEpoch, out := c.lockShardWithSample(&c.mu, false, sample)
 		c.deleteAllPrefixLocked(evictQ, sampledEpoch, out.pressure)
 		c.unlock()
-		return out
+		return out, true
 	}
 
 	sampledEpoch, out := c.lockShardWithSample(&c.mu, false, sample)
 	c.deleteNonEmptyPrefixLocked(evictQ, prefix, sampledEpoch, out.pressure)
 	c.unlock()
-	return out
+	return out, true
 }
 
 // DeletePrefix deletes all entries whose keys start with prefix.
 // Prunes subtrees in O(prefix_length + subtree_size) time and sweeps detached nodes.
 func (c *radixCache[V]) DeletePrefix(prefix string) {
 	var evictQ evictCallbackQueue[V]
-	c.deletePrefixShard(&evictQ, prefix, shardSample{})
+	_, _ = c.deletePrefixShard(&evictQ, prefix, shardSample{})
 	evictQ.invoke(&c.pressureState, c.onEvictValue, c.onEvictEntry)
 }
 

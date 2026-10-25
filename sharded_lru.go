@@ -26,10 +26,11 @@ import (
 // iteration and telemetry aggregation without per-call method-value closures.
 type shardEngine[V any] interface {
 	PressureAwareCache[V]
+	pressureStatePtr() *pressureState
 	iterateAll(yield func(string, V) bool) bool
 	iterateKeys(yield func(string) bool) bool
 	iterateValues(yield func(V) bool) bool
-	deletePrefixShard(evictQ *evictCallbackQueue[V], prefix string, sample shardSample) shardSample
+	deletePrefixShard(evictQ *evictCallbackQueue[V], prefix string, sample shardSample) (shardSample, bool)
 	evaluateShardPressure(evictQ *evictCallbackQueue[V], sample shardSample) ([]V, shardSample)
 }
 
@@ -166,6 +167,7 @@ func newShardedCacheWithOptions[V any](maxSize uint64, shards int, options Optio
 	baseTarget := globalTarget / uint64(shards)
 	targetRem := globalTarget % uint64(shards)
 
+	c.coord.childShards = make([]*pressureState, shards)
 	baseCap := maxSize / uint64(shards)
 	rem := maxSize % uint64(shards)
 	for i := range shards {
@@ -178,7 +180,9 @@ func newShardedCacheWithOptions[V any](maxSize uint64, shards int, options Optio
 			shardTarget++
 		}
 		shardOpts.shardTier2Target = shardTarget
-		c.shards[i] = newSingleShardEngine[V](shardMax, shardOpts)
+		s := newSingleShardEngine[V](shardMax, shardOpts)
+		c.shards[i] = s
+		c.coord.childShards[i] = s.pressureStatePtr()
 	}
 
 	if c.enableInvariantChecking {
@@ -223,13 +227,23 @@ func (c *shardedCache[V]) Replace(key string, value V) error {
 // DeletePrefix deletes all entries whose keys begin with prefix across all shards,
 // invoking any configured eviction callbacks after all shard mutations have completed.
 func (c *shardedCache[V]) DeletePrefix(prefix string) {
-	c.deletePrefixExecuted.Add(1)
 	var evictQ evictCallbackQueue[V]
+	executed := false
+	defer func() {
+		if executed {
+			c.deletePrefixExecuted.Add(1)
+		}
+		evictQ.invoke(&c.coord, c.onEvictValue, c.onEvictEntry)
+	}()
 	var sample shardSample
 	for _, s := range c.shards {
-		sample = s.deletePrefixShard(&evictQ, prefix, sample)
+		var didExec bool
+		sample, didExec = s.deletePrefixShard(&evictQ, prefix, sample)
+		if didExec {
+			executed = true
+		}
 	}
-	evictQ.invoke(&c.coord, c.onEvictValue, c.onEvictEntry)
+	executed = true
 }
 
 // All returns an iterator over all live key-value pairs across all shards, visiting shards
@@ -287,13 +301,13 @@ func (c *shardedCache[V]) Compact() {
 func (c *shardedCache[V]) EvaluateMemoryPressure() []V {
 	var evicted []V
 	var evictQ evictCallbackQueue[V]
+	defer evictQ.invoke(&c.coord, c.onEvictValue, c.onEvictEntry)
 	var sample shardSample
 	for _, s := range c.shards {
 		var shardEvicted []V
 		shardEvicted, sample = s.evaluateShardPressure(&evictQ, sample)
 		evicted = appendEvicted(evicted, shardEvicted)
 	}
-	evictQ.invoke(&c.coord, c.onEvictValue, c.onEvictEntry)
 	return evicted
 }
 

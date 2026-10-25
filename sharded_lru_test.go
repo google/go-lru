@@ -2043,14 +2043,14 @@ func runStragglerMultiShardWatermarkTest(t *testing.T, backend Backend, healthyD
 
 	if healthyDipStraggler {
 		require.Eventually(t, func() bool {
-			return sc.shards[0].Stats().DeletePrefixExecuted > epochBeforeStraggler
+			return sc.shards[0].Stats().DeletePrefixExecuted > epochBeforeStraggler && !shardTryRLock[string](sc.shards[1])
 		}, time.Second, time.Millisecond)
-		_, _ = c.Peek("s0/anchor")
 	} else {
+		// EvaluateMemoryPressure visits shards[0] then shards[1] sequentially;
+		// shards[1] TryRLock fails only after shards[0] has unlocked and shards[1].mu.Lock() is queued.
 		require.Eventually(t, func() bool {
-			return math.Abs(sc.shards[0].Stats().MemoryPressure-0.95) < 1e-9
+			return !shardTryRLock[string](sc.shards[1])
 		}, time.Second, time.Millisecond)
-		_, _ = c.Peek("s0/anchor")
 		// Recover briefly to 0.10 on shard 0 to advance belowTier2Epoch before Episode 2.
 		pressureBits.Store(math.Float64bits(0.10))
 		_, err = c.Put("s0/dip", "d")
@@ -2075,6 +2075,31 @@ func runStragglerMultiShardWatermarkTest(t *testing.T, backend Backend, healthyD
 	assert.Equal(t, 2, sc.shards[2].Stats().ZeroSizeCount)
 }
 
+func shardTryRLock[V any](s any) bool {
+	switch impl := s.(type) {
+	case *mapCache[V]:
+		if impl.mu.TryRLock() {
+			impl.mu.RUnlock()
+			return true
+		}
+		return false
+	case *radixCache[V]:
+		if impl.mu.TryRLock() {
+			impl.mu.RUnlock()
+			return true
+		}
+		return false
+	case *arenaRadix[V]:
+		if impl.mu.TryRLock() {
+			impl.mu.RUnlock()
+			return true
+		}
+		return false
+	default:
+		panic(fmt.Sprintf("unexpected cache type %T", s))
+	}
+}
+
 func TestShardedCache_StragglerMultiShardSampleDoesNotRewindOrWipeEpisodeWatermarks(t *testing.T) {
 	for _, backend := range []Backend{BackendMap, BackendRadix, BackendArenaRadix} {
 		t.Run(backend.String()+"/CriticalEpisode1Straggler", func(t *testing.T) {
@@ -2082,6 +2107,531 @@ func TestShardedCache_StragglerMultiShardSampleDoesNotRewindOrWipeEpisodeWaterma
 		})
 		t.Run(backend.String()+"/HealthyDipStraggler", func(t *testing.T) {
 			runStragglerMultiShardWatermarkTest(t, backend, true)
+		})
+	}
+}
+
+func TestShardedCache_OverflowSamplerCrossShardReentrantReclaimDoesNotLeakGIDs(t *testing.T) {
+	for _, backend := range []Backend{BackendMap, BackendRadix, BackendArenaRadix} {
+		t.Run(backend.String(), func(t *testing.T) {
+			var armed atomic.Bool
+			var slotCall atomic.Int32
+			slot1Ready := make(chan struct{})
+			slot2Ready := make(chan struct{})
+			releaseSlots := make(chan struct{})
+
+			var c Cache[string]
+			c = NewShardedCache[string](
+				120,
+				3,
+				explicitTagShardFunc,
+				WithBackend(backend),
+				WithInvariantChecking(true),
+				WithPressureFunc(func() float64 {
+					if !armed.Load() {
+						return 0.10
+					}
+					switch slotCall.Add(1) {
+					case 1:
+						close(slot1Ready)
+						<-releaseSlots
+						return 0.10
+					case 2:
+						close(slot2Ready)
+						<-releaseSlots
+						return 0.10
+					default:
+						// Overflow sampler targeting shard 0 re-entrantly reclaims on shards 1 and 2.
+						_, _ = c.Put("s1/tmp", "val")
+						_, _ = c.Delete("s1/tmp")
+						var childWG sync.WaitGroup
+						childWG.Go(func() {
+							_, _ = c.Put("s2/tmp", "val")
+							_, _ = c.Delete("s2/tmp")
+						})
+						childWG.Wait()
+						return 0.10
+					}
+				}),
+			)
+			pa := c.(PressureAwareCache[string])
+			sc := c.(*shardedCache[string])
+
+			_, err := c.Put("s0/anchor", "a")
+			require.NoError(t, err)
+			armed.Store(true)
+
+			var holderWG sync.WaitGroup
+			holderWG.Go(func() {
+				_, _ = c.Put("s0/h1", "1")
+			})
+			<-slot1Ready
+			holderWG.Go(func() {
+				_, _ = c.Put("s0/h2", "2")
+			})
+			<-slot2Ready
+
+			var overflowWG sync.WaitGroup
+			for range 16 {
+				overflowWG.Go(func() {
+					_ = pa.EvaluateMemoryPressure()
+				})
+			}
+			overflowWG.Wait()
+
+			close(releaseSlots)
+			holderWG.Wait()
+
+			assert.Zero(t, sc.coord.reentrantReclaimCount.Load())
+			coordLeaked := 0
+			sc.coord.reentrantReclaimGIDs.Range(func(_, _ any) bool {
+				coordLeaked++
+				return true
+			})
+			assert.Zero(t, coordLeaked, "coord.reentrantReclaimGIDs must not retain exited overflow GIDs")
+
+			for i, shard := range sc.shards {
+				ps := shard.pressureStatePtr()
+				assert.Zero(t, ps.reentrantReclaimCount.Load(), "shard %d reentrantReclaimCount must be 0", i)
+				leaked := 0
+				ps.reentrantReclaimGIDs.Range(func(_, _ any) bool {
+					leaked++
+					return true
+				})
+				assert.Zero(t, leaked, "shard %d reentrantReclaimGIDs must not leak exited overflow GIDs", i)
+			}
+		})
+	}
+}
+
+func TestShardedCache_DeletePrefixPressurePanicTelemetryAndCallbacks(t *testing.T) {
+	for _, backend := range []Backend{BackendMap, BackendRadix, BackendArenaRadix} {
+		t.Run(backend.String()+"/InitialSamplePanicDoesNotIncrementExecuted", func(t *testing.T) {
+			var shouldPanic atomic.Bool
+			probe := func() float64 {
+				if shouldPanic.Load() {
+					panic("boom-initial-sample")
+				}
+				return 0.10
+			}
+
+			unsharded := New[string](100, WithBackend(backend), WithInvariantChecking(true), WithPressureFunc(probe))
+			sharded := NewShardedCache[string](100, 2, explicitTagShardFunc, WithBackend(backend), WithInvariantChecking(true), WithPressureFunc(probe))
+
+			// Populate only shard 1 on the sharded cache so shard 0 is clean-empty for DeletePrefix("").
+			_, err := unsharded.Put("s1/item", "v")
+			require.NoError(t, err)
+			_, err = sharded.Put("s1/item", "v")
+			require.NoError(t, err)
+
+			shouldPanic.Store(true)
+			for _, prefix := range []string{"s1/", ""} {
+				assert.PanicsWithValue(t, "boom-initial-sample", func() {
+					unsharded.DeletePrefix(prefix)
+				})
+				assert.PanicsWithValue(t, "boom-initial-sample", func() {
+					sharded.DeletePrefix(prefix)
+				})
+				assert.Zero(t, unsharded.Stats().DeletePrefixExecuted)
+				assert.Zero(t, sharded.Stats().DeletePrefixExecuted, "prefix %q must not increment DeletePrefixExecuted when initial PressureFunc panics", prefix)
+				assert.Equal(t, 1, sharded.Stats().Len)
+			}
+		})
+
+		t.Run(backend.String()+"/ResamplePanicOnLaterShardDeliversEarlierShardCallbacks", func(t *testing.T) {
+			var armed atomic.Bool
+			var inWorker atomic.Bool
+			var nonWorkerSamples atomic.Int32
+			var evictValCount atomic.Int32
+			var evictEntryKeys sync.Map
+			deleteReq := make(chan string)
+			deleteAck := make(chan struct{})
+
+			c := NewShardedCache[string](
+				100,
+				2,
+				explicitTagShardFunc,
+				WithBackend(backend),
+				WithInvariantChecking(true),
+				WithCompactionThreshold(0.50),
+				WithOnEvictValue(func(_ string, _ EvictionReason) {
+					evictValCount.Add(1)
+				}),
+				WithOnEvictEntry(func(k, _ string, _ EvictionReason) {
+					evictEntryKeys.Store(k, true)
+				}),
+				WithPressureFunc(func() float64 {
+					if !armed.Load() || inWorker.Load() {
+						return 0.60
+					}
+					n := nonWorkerSamples.Add(1)
+					if n <= 3 {
+						// Signal pre-spawned non-descendant worker to delete on shard 0, exhausting sameShardRetries (> 2).
+						deleteReq <- fmt.Sprintf("s0/r%d", n)
+						<-deleteAck
+						return 0.60
+					}
+					panic("boom-shard1-resample")
+				}),
+			)
+
+			var workerWG sync.WaitGroup
+			workerWG.Go(func() {
+				for key := range deleteReq {
+					inWorker.Store(true)
+					_, _ = c.Delete(key)
+					inWorker.Store(false)
+					deleteAck <- struct{}{}
+				}
+			})
+			t.Cleanup(func() {
+				close(deleteReq)
+				workerWG.Wait()
+			})
+
+			_, err := c.Put("s0/target", "v0")
+			require.NoError(t, err)
+			for i := 1; i <= 3; i++ {
+				_, err = c.Put(fmt.Sprintf("s0/r%d", i), "r")
+				require.NoError(t, err)
+			}
+			_, err = c.Put("s1/target", "v1")
+			require.NoError(t, err)
+
+			// Run DeletePrefix on its own goroutine so workerWG is not a child goroutine of the sampler.
+			armed.Store(true)
+			panicCh := make(chan any, 1)
+			go func() {
+				defer func() {
+					panicCh <- recover()
+				}()
+				c.DeletePrefix("s")
+			}()
+			assert.Equal(t, "boom-shard1-resample", <-panicCh)
+
+			_, ok0 := c.Peek("s0/target")
+			assert.False(t, ok0, "shard 0 target was deleted before shard 1 resample panic")
+			_, ok1 := c.Peek("s1/target")
+			assert.True(t, ok1, "shard 1 target must remain intact after shard 1 pre-lock panic")
+
+			st := c.Stats()
+			assert.Equal(t, uint64(1), st.DeletePrefixExecuted)
+			assert.Equal(t, uint64(4), st.EvictionsDeleted)
+			assert.Equal(t, int32(4), evictValCount.Load(), "OnEvictValue must be delivered for shard 0 deletions despite shard 1 panic")
+			_, deliveredS0 := evictEntryKeys.Load("s0/target")
+			assert.True(t, deliveredS0, "OnEvictEntry must be delivered for s0/target despite shard 1 panic")
+		})
+	}
+}
+
+func TestShardedCache_ReentrantFastForwardPreservesCausalOrderAndWatermarks(t *testing.T) {
+	for _, backend := range []Backend{BackendMap, BackendRadix, BackendArenaRadix} {
+		t.Run(backend.String(), func(t *testing.T) {
+			var mode atomic.Int32
+			g1Sampled := make(chan struct{})
+			g2Done := make(chan struct{})
+
+			var c Cache[string]
+			c = NewShardedCache[string](
+				90,
+				3,
+				explicitTagShardFunc,
+				WithBackend(backend),
+				WithInvariantChecking(true),
+				WithWeigher(func(_, v string) uint64 { return uint64(len(v)) }),
+				WithCompactionThreshold(0.70),
+				WithEvictionThreshold(0.90),
+				WithEvictionRetentionRatio(0.50),
+				WithPressureFunc(func() float64 {
+					switch mode.Load() {
+					case 0:
+						return 0.10
+					case 1:
+						return 0.95
+					case 2:
+						// G1 re-entrantly reclaims on shard 0, reads transient 0.10, and pauses while G2 samples 0.95.
+						mode.Store(3)
+						_, _ = c.Delete("s0/reclaim")
+						close(g1Sampled)
+						<-g2Done
+						return 0.10
+					default:
+						return 0.95
+					}
+				}),
+			)
+			pa := c.(PressureAwareCache[string])
+			sc := c.(*shardedCache[string])
+
+			_, err := c.Put("s0/reclaim", "rr")
+			require.NoError(t, err)
+			_, err = c.Put("s0/anchor", "aa")
+			require.NoError(t, err)
+			for i := range 4 {
+				_, err = c.Put(fmt.Sprintf("s1/z%d", i), "")
+				require.NoError(t, err)
+			}
+
+			// Episode 1: shed shard 1 from 4 -> 2 zero-weight entries at 0.95.
+			mode.Store(1)
+			require.Len(t, pa.EvaluateMemoryPressure(), 2)
+			require.Equal(t, 2, sc.shards[1].Stats().ZeroSizeCount)
+
+			// Start G1 on shard 0 (mode 2 -> re-entrant Delete + transient 0.10).
+			mode.Store(2)
+			g1Finished := make(chan struct{})
+			go func() {
+				defer close(g1Finished)
+				_, putErr := c.Put("s0/new", "n")
+				assert.NoError(t, putErr)
+			}()
+			<-g1Sampled
+
+			// G2 runs at mode 3 (0.95) on shard 2 without reclaiming, publishing newer seq at 0.95.
+			_, err = c.Put("s2/item", "m")
+			require.NoError(t, err)
+			close(g2Done)
+			<-g1Finished
+
+			assert.InDelta(t, 0.95, c.Stats().MemoryPressure, 1e-9,
+				"stale re-entrant fast-forwarded 0.10 sample must not overwrite newer 0.95 telemetry")
+			assert.Empty(t, pa.EvaluateMemoryPressure(),
+				"stale re-entrant fast-forwarded 0.10 sample must not advance belowTier2Epoch or over-shed shard 1")
+			assert.Equal(t, 2, sc.shards[1].Stats().ZeroSizeCount)
+		})
+	}
+}
+
+func TestShardedCache_ChildSamplerRetryExhaustionDoesNotPropagateStaleWatermark(t *testing.T) {
+	for _, backend := range []Backend{BackendMap, BackendRadix, BackendArenaRadix} {
+		t.Run(backend.String(), func(t *testing.T) {
+			var pressureBits atomic.Uint64
+			pressureBits.Store(math.Float64bits(0.10))
+			var trapParent atomic.Bool
+			parentEntered := make(chan struct{})
+			releaseParent := make(chan struct{})
+			childDone := make(chan struct{})
+
+			var c Cache[string]
+			var pa PressureAwareCache[string]
+			c = NewShardedCache[string](
+				120,
+				4,
+				explicitTagShardFunc,
+				WithBackend(backend),
+				WithInvariantChecking(true),
+				WithWeigher(func(_, v string) uint64 { return uint64(len(v)) }),
+				WithCompactionThreshold(0.50),
+				WithEvictionThreshold(0.90),
+				WithEvictionRetentionRatio(0.50),
+				WithPressureFunc(func() float64 {
+					if trapParent.CompareAndSwap(true, false) {
+						go func() {
+							defer close(childDone)
+							_ = pa.EvaluateMemoryPressure()
+						}()
+						close(parentEntered)
+						<-releaseParent
+					}
+					return math.Float64frombits(pressureBits.Load())
+				}),
+			)
+			pa = c.(PressureAwareCache[string])
+			sc := c.(*shardedCache[string])
+
+			_, err := c.Put("s0/anchor", "a")
+			require.NoError(t, err)
+			_, err = c.Put("s1/hold", "b")
+			require.NoError(t, err)
+			for i := range 4 {
+				_, err = c.Put(fmt.Sprintf("s2/z%d", i), "")
+				require.NoError(t, err)
+			}
+			for i := range 5 {
+				_, err = c.Put(fmt.Sprintf("s3/r%d", i), "r")
+				require.NoError(t, err)
+			}
+
+			// Episode 1: shed shard 2 from 4 -> 2 zero-weight entries.
+			pressureBits.Store(math.Float64bits(0.95))
+			require.Len(t, pa.EvaluateMemoryPressure(), 2)
+			require.Equal(t, 2, sc.shards[2].Stats().ZeroSizeCount)
+
+			// Healthy recovery on shard 3 advances coord.belowTier2Epoch without touching shard 0 or shard 2.
+			pressureBits.Store(math.Float64bits(0.10))
+			_, err = c.Put("s3/dip", "d")
+			require.NoError(t, err)
+
+			// Episode 2: spike to 0.95, hold RLocks on shards 0 and 1, and trap parent PressureFunc.
+			pressureBits.Store(math.Float64bits(0.95))
+			releaseS0 := holdShardRLockViaKeys(t, c, "s0/")
+			releaseS1 := holdShardRLockViaKeys(t, c, "s1/")
+			trapParent.Store(true)
+
+			parentDone := make(chan struct{})
+			go func() {
+				defer close(parentDone)
+				_, putErr := c.Put("s3/trigger", "t")
+				assert.NoError(t, putErr)
+			}()
+			<-parentEntered
+
+			// Wait until the child goroutine queues on shard 0's write lock.
+			require.Eventually(t, func() bool {
+				return !shardTryRLock[string](sc.shards[0])
+			}, time.Second, time.Millisecond)
+
+			// Exhaust crossShardRetries (> 4) on shard 3 and cache Episode 2 (0.95) on coord.
+			for i := range 5 {
+				_, ok := c.Delete(fmt.Sprintf("s3/r%d", i))
+				require.True(t, ok)
+			}
+			_, err = c.Put("s3/cache_ep2", "c")
+			require.NoError(t, err)
+
+			// Release shard 0 so child completes shard 0 while parent is still inside PressureFunc,
+			// and wait until child queues on shard 1's write lock.
+			releaseS0()
+			require.Eventually(t, func() bool {
+				return !shardTryRLock[string](sc.shards[1])
+			}, time.Second, time.Millisecond)
+
+			// Exit parent PressureFunc, then release shard 1 so child proceeds to shard 2.
+			close(releaseParent)
+			<-parentDone
+			releaseS1()
+			<-childDone
+
+			assert.Equal(t, 1, sc.shards[2].Stats().ZeroSizeCount,
+				"once parent PressureFunc exits, child EvaluateMemoryPressure must shed shard 2 in Episode 2 (2 -> 1)")
+		})
+	}
+}
+
+func TestPressure_StalePreRecoverySampleDoesNotOverShedOrSuppressNextEpisode(t *testing.T) {
+	for _, backend := range []Backend{BackendMap, BackendRadix, BackendArenaRadix} {
+		t.Run(backend.String()+"/Sharded", func(t *testing.T) {
+			var pressureBits atomic.Uint64
+			pressureBits.Store(math.Float64bits(0.10))
+
+			c := NewShardedCache[string](
+				90,
+				3,
+				explicitTagShardFunc,
+				WithBackend(backend),
+				WithInvariantChecking(true),
+				WithWeigher(func(_, v string) uint64 { return uint64(len(v)) }),
+				WithCompactionThreshold(0.70),
+				WithEvictionThreshold(0.90),
+				WithEvictionRetentionRatio(0.50),
+				WithPressureFunc(func() float64 {
+					return math.Float64frombits(pressureBits.Load())
+				}),
+			)
+			pa := c.(PressureAwareCache[string])
+			sc := c.(*shardedCache[string])
+
+			_, err := c.Put("s0/anchor", "a")
+			require.NoError(t, err)
+			_, err = c.Put("s1/hold", "b")
+			require.NoError(t, err)
+			for i := range 4 {
+				_, err = c.Put(fmt.Sprintf("s2/z%d", i), "")
+				require.NoError(t, err)
+			}
+
+			// Episode 1: start EvaluateMemoryPressure at 0.95; wait until shard 0 completes and it parks on shard 1.
+			pressureBits.Store(math.Float64bits(0.95))
+			releaseS1 := holdShardRLockViaKeys(t, c, "s1/")
+			ep1Done := make(chan struct{})
+			go func() {
+				defer close(ep1Done)
+				_ = pa.EvaluateMemoryPressure()
+			}()
+			require.Eventually(t, func() bool {
+				return !shardTryRLock[string](sc.shards[1])
+			}, time.Second, time.Millisecond)
+
+			// Recover to 0.10 and run a non-reclaiming op on shard 2, advancing shard 2's causal sequence.
+			pressureBits.Store(math.Float64bits(0.10))
+			_, _ = c.Delete("s2/absent")
+
+			// Release shard 1 while system pressure is healthy (0.10): stale Episode 1 sample must not shed shard 2.
+			releaseS1()
+			<-ep1Done
+			assert.Equal(t, 4, sc.shards[2].Stats().ZeroSizeCount,
+				"stale pre-recovery Episode 1 sample must not shed shard 2 after shard 2 recovered to 0.10")
+
+			// Episode 2: spike back to 0.95; shard 2 must shed 4 -> 2 cleanly without suppression.
+			pressureBits.Store(math.Float64bits(0.95))
+			evictedEp2 := pa.EvaluateMemoryPressure()
+			assert.Len(t, evictedEp2, 2)
+			assert.Equal(t, 2, sc.shards[2].Stats().ZeroSizeCount,
+				"Episode 2 must shed shard 2 from 4 -> 2 without watermark suppression")
+		})
+
+		t.Run(backend.String()+"/Unsharded", func(t *testing.T) {
+			var pressureBits atomic.Uint64
+			pressureBits.Store(math.Float64bits(0.10))
+
+			c := New[string](
+				30,
+				WithBackend(backend),
+				WithInvariantChecking(true),
+				WithWeigher(func(_, v string) uint64 { return uint64(len(v)) }),
+				WithCompactionThreshold(0.70),
+				WithEvictionThreshold(0.90),
+				WithEvictionRetentionRatio(0.50),
+				WithPressureFunc(func() float64 {
+					return math.Float64frombits(pressureBits.Load())
+				}),
+			)
+			pa := c.(PressureAwareCache[string])
+
+			_, err := c.Put("hold", "b")
+			require.NoError(t, err)
+			for i := range 4 {
+				_, err = c.Put(fmt.Sprintf("z%d", i), "")
+				require.NoError(t, err)
+			}
+
+			// Hold RLock so foreground Put at 0.95 samples Episode 1 and parks waiting for mu.Lock().
+			releaseRLock := holdShardRLockViaKeys(t, c, "hold")
+			pressureBits.Store(math.Float64bits(0.95))
+			ep1Done := make(chan struct{})
+			go func() {
+				defer close(ep1Done)
+				_, putErr := c.Put("ep1_item", "x")
+				assert.NoError(t, putErr)
+			}()
+			require.Eventually(t, func() bool {
+				return !shardTryRLock[string](c)
+			}, time.Second, time.Millisecond)
+
+			// Recover to 0.10 and launch Delete("absent") which samples 0.10 (advancing belowTier2Epoch) before mu.Lock().
+			pressureBits.Store(math.Float64bits(0.10))
+			healthyDone := make(chan struct{})
+			go func() {
+				defer close(healthyDone)
+				_, _ = c.Delete("absent")
+			}()
+			require.Eventually(t, func() bool {
+				return math.Abs(math.Float64frombits(c.(interface{ pressureStatePtr() *pressureState }).pressureStatePtr().lastSampledPressureBits.Load())-0.10) < 1e-9
+			}, time.Second, time.Millisecond)
+
+			releaseRLock()
+			<-ep1Done
+			<-healthyDone
+
+			assert.Equal(t, 4, c.Stats().ZeroSizeCount,
+				"stale pre-recovery Episode 1 Put sample must not shed zero-weight entries after recovery to 0.10")
+
+			// Episode 2: spike back to 0.95; cache must shed 4 -> 2 cleanly.
+			pressureBits.Store(math.Float64bits(0.95))
+			evictedEp2 := pa.EvaluateMemoryPressure()
+			assert.Len(t, evictedEp2, 2)
+			assert.Equal(t, 2, c.Stats().ZeroSizeCount,
+				"Episode 2 must shed unsharded cache from 4 -> 2 without watermark suppression")
 		})
 	}
 }
