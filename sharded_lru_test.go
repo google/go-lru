@@ -4884,6 +4884,16 @@ func runTwoInCallbackHelper(fn1, fn2 func()) {
 	wg.Wait()
 }
 
+func makeShardedOrUnshardedIntCacheWithBackend(sharded bool, backend Backend, maxSize uint64, opts ...Option) Cache[int] {
+	allOpts := make([]Option, 0, len(opts)+1)
+	allOpts = append(allOpts, WithBackend(backend))
+	allOpts = append(allOpts, opts...)
+	if sharded {
+		return NewShardedCache[int](maxSize, 2, explicitTagShardFunc, allOpts...)
+	}
+	return New[int](maxSize, allOpts...)
+}
+
 func makeShardedOrUnshardedIntCache(sharded bool, maxSize uint64, opts ...Option) Cache[int] {
 	if sharded {
 		return NewShardedCache[int](maxSize, 2, explicitTagShardFunc, opts...)
@@ -6073,43 +6083,42 @@ func runR11ChannelWaitChildSubcase(t *testing.T, sharded, useReplace bool, subca
 		return
 	}
 
-	var c Cache[int]
-	var armed atomic.Bool
 	var childEvicts atomic.Int32
-	resCh := make(chan bool, 1)
-	outerChildFn := func() {
-		_, ok := c.Delete("s1/victim")
-		resCh <- ok
-	}
-
-	c = makeShardedOrUnshardedIntCache(sharded, 2,
-		WithOnEvictEntry(func(k string, _ int, r EvictionReason) {
-			if k == "s1/victim" && r == EvictionReasonDeleted {
-				childEvicts.Add(1)
-				return
-			}
-			if !armed.Load() || k != "s0/seed" {
-				return
-			}
-			if subcase == 0 {
-				var wg sync.WaitGroup
-				wg.Go(outerChildFn)
-				<-resCh
-				wg.Wait()
-				return
-			}
-			spawnR11HelperChild(outerChildFn)
-			<-resCh
-		}),
-	)
-	warmupUncontendedReplaceEvictions(c, 75)
-	_, _ = c.Put("s0/seed", 1)
-	_, _ = c.Put("s1/victim", 2)
-	armed.Store(true)
-
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
+		var c Cache[int]
+		var armed atomic.Bool
+		resCh := make(chan bool, 1)
+		outerChildFn := func() {
+			_, ok := c.Delete("s1/victim")
+			resCh <- ok
+		}
+
+		c = makeShardedOrUnshardedIntCache(sharded, 2,
+			WithOnEvictEntry(func(k string, _ int, r EvictionReason) {
+				if k == "s1/victim" && r == EvictionReasonDeleted {
+					childEvicts.Add(1)
+					return
+				}
+				if !armed.Load() || k != "s0/seed" {
+					return
+				}
+				if subcase == 0 {
+					var wg sync.WaitGroup
+					wg.Go(outerChildFn)
+					<-resCh
+					wg.Wait()
+					return
+				}
+				spawnR11HelperChild(outerChildFn)
+				<-resCh
+			}),
+		)
+		warmupUncontendedReplaceEvictions(c, 75)
+		_, _ = c.Put("s0/seed", 1)
+		_, _ = c.Put("s1/victim", 2)
+		armed.Store(true)
 		if useReplace {
 			_ = c.Replace("s0/seed", 10)
 		} else {
@@ -6369,76 +6378,112 @@ func execR12PprofChildBehaviorMore(subcase int, spawnInlineWG func(*sync.WaitGro
 	}
 }
 
-func runR12PprofDoChildSubcase(t *testing.T, sharded, useReplace bool, subcase int) {
-	t.Helper()
-	var c Cache[int]
-	var armed atomic.Bool
-	var step, childEvicts atomic.Int32
-	resCh := make(chan bool, 1)
-	outerChildFn := func() {
-		_, ok := c.Delete("s1/victim")
-		resCh <- ok
+func triggerR12PprofOuterOp(c Cache[int], useReplace, outerPprofScope bool, subcase int) {
+	runOp := func() {
+		if useReplace {
+			_ = c.Replace("s0/seed", 10)
+			return
+		}
+		_, _ = c.Put("s0/trigger", 3)
 	}
-	outerChildPprofDo := func() {
-		pprof.Do(context.Background(), pprof.Labels("worker", "1"), func(context.Context) {
-			_, ok := c.Delete("s1/victim")
-			resCh <- ok
+	if subcase == 8 {
+		_ = c.Replace("s0/seed", 9)
+		runOp()
+		return
+	}
+	if outerPprofScope {
+		pprof.Do(context.Background(), pprof.Labels("outer", "req"), func(context.Context) {
+			runOp()
 		})
+		return
 	}
+	runOp()
+}
 
-	c = makeShardedOrUnshardedIntCache(sharded, 2,
-		WithOnEvictEntry(func(k string, _ int, r EvictionReason) {
-			if k == "s1/victim" && r == EvictionReasonDeleted {
-				childEvicts.Add(1)
-				return
-			}
-			if !armed.Load() || k != "s0/seed" {
-				return
-			}
-			spawnInlineWG := func(wg *sync.WaitGroup, fn func()) {
-				wg.Go(func() { fn() })
-			}
-			if subcase == 8 {
-				if step.Add(1) == 1 {
-					pprof.Do(context.Background(), pprof.Labels("k", "v"), func(context.Context) {})
-					return
-				}
-				var wg sync.WaitGroup
-				wg.Go(outerChildFn)
-				<-resCh
-				wg.Wait()
-				return
-			}
-			execR12PprofChildBehavior(subcase, c, spawnInlineWG, outerChildFn, outerChildPprofDo, resCh)
-		}),
-	)
-
-	warmupUncontendedReplaceEvictions(c, 75)
-	_, _ = c.Put("s0/seed", 0)
-	_ = c.Replace("s0/seed", 1)
-	require.True(t, coordPressureState(c).evictFastMode.Load())
-	_, _ = c.Put("s1/victim", 2)
-	armed.Store(true)
-
+func runR12PprofDoChildSubcaseWithBackend(t *testing.T, sharded bool, backend Backend, useReplace, outerPprofScope bool, subcase int) {
+	t.Helper()
+	var childEvicts atomic.Int32
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
 		defer pprof.SetGoroutineLabels(context.Background())
-		if subcase == 8 {
-			_ = c.Replace("s0/seed", 9)
+
+		var c Cache[int]
+		var armed atomic.Bool
+		var step atomic.Int32
+		resCh := make(chan bool, 1)
+		outerChildFn := func() {
+			_, ok := c.Delete("s1/victim")
+			resCh <- ok
 		}
-		if useReplace {
-			_ = c.Replace("s0/seed", 10)
+		outerChildPprofDo := func() {
+			pprof.Do(context.Background(), pprof.Labels("worker", "1"), func(context.Context) {
+				_, ok := c.Delete("s1/victim")
+				resCh <- ok
+			})
+		}
+
+		c = makeShardedOrUnshardedIntCacheWithBackend(sharded, backend, 2,
+			WithOnEvictEntry(func(k string, _ int, r EvictionReason) {
+				if k == "s1/victim" && r == EvictionReasonDeleted {
+					childEvicts.Add(1)
+					return
+				}
+				if !armed.Load() {
+					if !outerPprofScope && subcase != 8 {
+						pprof.Do(context.Background(), pprof.Labels("init", "latch"), func(context.Context) {})
+					}
+					return
+				}
+				if k != "s0/seed" {
+					return
+				}
+				spawnInlineWG := func(wg *sync.WaitGroup, fn func()) {
+					wg.Go(func() { fn() })
+				}
+				if subcase == 8 {
+					if step.Add(1) == 1 {
+						pprof.Do(context.Background(), pprof.Labels("k", "v"), func(context.Context) {})
+						return
+					}
+					var wg sync.WaitGroup
+					wg.Go(outerChildFn)
+					<-resCh
+					wg.Wait()
+					return
+				}
+				execR12PprofChildBehavior(subcase, c, spawnInlineWG, outerChildFn, outerChildPprofDo, resCh)
+			}),
+		)
+
+		warmupUncontendedReplaceEvictions(c, 75)
+		_, _ = c.Put("s0/seed", 0)
+		_ = c.Replace("s0/seed", 1)
+		if outerPprofScope || subcase == 8 {
+			assert.True(t, coordPressureState(c).evictFastMode.Load())
 		} else {
-			_, _ = c.Put("s0/trigger", 3)
+			assert.False(t, coordPressureState(c).evictFastMode.Load())
 		}
+		_, _ = c.Put("s1/victim", 2)
+		armed.Store(true)
+		triggerR12PprofOuterOp(c, useReplace, outerPprofScope, subcase)
 	}()
 	select {
 	case <-done:
 	case <-time.After(2 * time.Second):
-		t.Fatalf("deadlocked in pprof post-warmup OnEvict sharded=%v replace=%v subcase=%d", sharded, useReplace, subcase)
+		t.Fatalf("deadlocked in pprof OnEvict sharded=%v backend=%s replace=%v outerScope=%v subcase=%d", sharded, backend, useReplace, outerPprofScope, subcase)
 	}
 	assert.Equal(t, int32(1), childEvicts.Load())
+}
+
+func runR12PprofDoChildSubcase(t *testing.T, sharded, useReplace bool, subcase int) {
+	t.Helper()
+	for _, backend := range []Backend{BackendMap, BackendRadix, BackendArenaRadix} {
+		runR12PprofDoChildSubcaseWithBackend(t, sharded, backend, useReplace, true, subcase)
+		if subcase != 8 && backend == BackendArenaRadix {
+			runR12PprofDoChildSubcaseWithBackend(t, sharded, backend, useReplace, false, subcase)
+		}
+	}
 }
 
 func verifyR12CallerGoroutineLabelInPprof(t *testing.T, wantSubstr string) {
@@ -6724,7 +6769,9 @@ func runR13ChildClearsLabelsCase(t *testing.T, sharded, afterPprofDo, holderScop
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
-		assert.NoError(t, c.Replace("s0/trigger", 20))
+		pprof.Do(context.Background(), pprof.Labels("outer", "r13"), func(context.Context) {
+			assert.NoError(t, c.Replace("s0/trigger", 20))
+		})
 	}()
 	select {
 	case <-done:
@@ -6736,92 +6783,98 @@ func runR13ChildClearsLabelsCase(t *testing.T, sharded, afterPprofDo, holderScop
 
 func runR13SleepPollWGGoWithPprofCase(t *testing.T, sharded bool) {
 	t.Helper()
-	var c Cache[int]
-	var armed, childDone atomic.Bool
-	var victimEvicts atomic.Int32
-
-	outerChildFn := func() {
-		_, _ = c.Delete("s1/victim")
-		childDone.Store(true)
-	}
-
-	c = makeShardedOrUnshardedIntCache(sharded, 4,
-		WithOnEvictEntry(func(k string, _ int, r EvictionReason) {
-			if k == "s1/victim" && r == EvictionReasonDeleted {
-				victimEvicts.Add(1)
-				return
+	for _, backend := range []Backend{BackendMap, BackendRadix, BackendArenaRadix} {
+		var victimEvicts atomic.Int32
+		done := make(chan struct{})
+		go func() {
+			defer close(done)
+			var c Cache[int]
+			var armed, childDone atomic.Bool
+			outerChildFn := func() {
+				_, _ = c.Delete("s1/victim")
+				childDone.Store(true)
 			}
-			if !armed.Load() || k != "s0/seed" || r != EvictionReasonReplaced {
-				return
-			}
-			pprof.Do(context.Background(), pprof.Labels("op", "evict"), func(context.Context) {
-				var wg sync.WaitGroup
-				wg.Go(outerChildFn)
-				for !childDone.Load() {
-					time.Sleep(time.Millisecond)
-				}
-				wg.Wait()
+
+			c = makeShardedOrUnshardedIntCacheWithBackend(sharded, backend, 4,
+				WithOnEvictEntry(func(k string, _ int, r EvictionReason) {
+					if k == "s1/victim" && r == EvictionReasonDeleted {
+						victimEvicts.Add(1)
+						return
+					}
+					if !armed.Load() || k != "s0/seed" || r != EvictionReasonReplaced {
+						return
+					}
+					pprof.Do(context.Background(), pprof.Labels("op", "evict"), func(context.Context) {
+						var wg sync.WaitGroup
+						wg.Go(outerChildFn)
+						for !childDone.Load() {
+							time.Sleep(time.Millisecond)
+						}
+						wg.Wait()
+					})
+				}),
+			)
+
+			warmupUncontendedReplaceEvictions(c, 10)
+			_, _ = c.Put("s0/seed", 1)
+			_, _ = c.Put("s1/victim", 2)
+			armed.Store(true)
+			pprof.Do(context.Background(), pprof.Labels("outer", "r13-sleep"), func(context.Context) {
+				assert.NoError(t, c.Replace("s0/seed", 10))
 			})
-		}),
-	)
-
-	warmupUncontendedReplaceEvictions(c, 10)
-	_, _ = c.Put("s0/seed", 1)
-	_, _ = c.Put("s1/victim", 2)
-	armed.Store(true)
-
-	done := make(chan struct{})
-	go func() {
-		defer close(done)
-		assert.NoError(t, c.Replace("s0/seed", 10))
-	}()
-	select {
-	case <-done:
-	case <-time.After(2 * time.Second):
-		t.Fatal("deadlock when OnEvict combines pprof.Do with wg.Go and time.Sleep polling")
+		}()
+		select {
+		case <-done:
+		case <-time.After(2 * time.Second):
+			t.Fatalf("deadlock when OnEvict combines pprof.Do with wg.Go and time.Sleep polling (backend=%s)", backend)
+		}
+		assert.Equal(t, int32(1), victimEvicts.Load())
 	}
-	assert.Equal(t, int32(1), victimEvicts.Load())
 }
 
 func runR13ReenteredRunnerWithPprofCase(t *testing.T, sharded bool) {
 	t.Helper()
-	runner := &r13TaskRunner{}
-	var armed atomic.Bool
-	var victimReplaced atomic.Int32
+	for _, backend := range []Backend{BackendMap, BackendRadix, BackendArenaRadix} {
+		runner := &r13TaskRunner{}
+		var armed atomic.Bool
+		var victimReplaced atomic.Int32
 
-	runner.c = makeShardedOrUnshardedIntCache(sharded, 4,
-		WithOnEvictEntry(func(k string, _ int, r EvictionReason) {
-			if k == "s1/victim" && r == EvictionReasonReplaced {
-				victimReplaced.Add(1)
-				return
-			}
-			if !armed.Load() || k != "s0/trigger" || r != EvictionReasonReplaced {
-				return
-			}
-			ctx := pprof.WithLabels(context.Background(), pprof.Labels("runner", "reenter"))
-			pprof.SetGoroutineLabels(ctx)
-			defer pprof.SetGoroutineLabels(context.Background())
-			ch := runner.run(true, "s1/victim", 99)
-			<-ch
-		}),
-	)
+		runner.c = makeShardedOrUnshardedIntCacheWithBackend(sharded, backend, 4,
+			WithOnEvictEntry(func(k string, _ int, r EvictionReason) {
+				if k == "s1/victim" && r == EvictionReasonReplaced {
+					victimReplaced.Add(1)
+					return
+				}
+				if !armed.Load() || k != "s0/trigger" || r != EvictionReasonReplaced {
+					return
+				}
+				ctx := pprof.WithLabels(context.Background(), pprof.Labels("runner", "reenter"))
+				pprof.SetGoroutineLabels(ctx)
+				defer pprof.SetGoroutineLabels(context.Background())
+				ch := runner.run(true, "s1/victim", 99)
+				<-ch
+			}),
+		)
 
-	warmupUncontendedReplaceEvictions(runner.c, 10)
-	_, _ = runner.c.Put("s0/trigger", 1)
-	_, _ = runner.c.Put("s1/victim", 2)
-	armed.Store(true)
+		warmupUncontendedReplaceEvictions(runner.c, 10)
+		_, _ = runner.c.Put("s0/trigger", 1)
+		_, _ = runner.c.Put("s1/victim", 2)
+		armed.Store(true)
 
-	done := make(chan struct{})
-	go func() {
-		defer close(done)
-		_ = runner.run(false, "s0/trigger", 11)
-	}()
-	select {
-	case <-done:
-	case <-time.After(2 * time.Second):
-		t.Fatal("deadlock when OnEvict sets pprof labels and re-enters shared helper method")
+		done := make(chan struct{})
+		go func() {
+			defer close(done)
+			pprof.Do(context.Background(), pprof.Labels("outer", "r13-runner"), func(context.Context) {
+				_ = runner.run(false, "s0/trigger", 11)
+			})
+		}()
+		select {
+		case <-done:
+		case <-time.After(2 * time.Second):
+			t.Fatalf("deadlock when OnEvict sets pprof labels and re-enters shared helper method (backend=%s)", backend)
+		}
+		assert.Equal(t, int32(1), victimReplaced.Load())
 	}
-	assert.Equal(t, int32(1), victimReplaced.Load())
 }
 
 func runR13PeerLabeledWithUntamperedHolderCase(t *testing.T, sharded, fgPanics bool) {
@@ -7356,7 +7409,7 @@ func runR14AfterFuncWaitGroupAndCondPanicCase(t *testing.T, sharded, useCond boo
 	assert.True(t, peerEvicted.Load(), "peer OnEvict callback must never be dropped when foreground OnEvict panics")
 }
 
-func runR14InnerChildContendsWhilePanickingPeerSerializesCase(t *testing.T, sharded bool) {
+func runR14InnerChildContendsWhilePanickingPeerSerializesCase(t *testing.T, sharded, childModifiesPprof bool) {
 	t.Helper()
 	var c Cache[int]
 	var armed, childEvicted atomic.Bool
@@ -7376,9 +7429,13 @@ func runR14InnerChildContendsWhilePanickingPeerSerializesCase(t *testing.T, shar
 				assert.True(t, waitUntilEvictSlowWaiterParked(c))
 				var innerWG sync.WaitGroup
 				innerWG.Go(func() {
-					pprof.Do(context.Background(), pprof.Labels("inner", "child"), func(context.Context) {
-						_, _ = c.Delete("s1/child")
-					})
+					if childModifiesPprof {
+						pprof.Do(context.Background(), pprof.Labels("inner", "child"), func(context.Context) {
+							_, _ = c.Delete("s1/child")
+						})
+						return
+					}
+					_, _ = c.Delete("s1/child")
 				})
 				innerWG.Wait()
 			case "s1/child":
@@ -7408,6 +7465,12 @@ func runR14InnerChildContendsWhilePanickingPeerSerializesCase(t *testing.T, shar
 	})
 
 	require.NotPanics(t, func() {
+		if childModifiesPprof {
+			pprof.Do(context.Background(), pprof.Labels("outer", "fg"), func(context.Context) {
+				assert.NoError(t, c.Replace("s0/fg", 10))
+			})
+			return
+		}
 		assert.NoError(t, c.Replace("s0/fg", 10))
 	})
 	assert.True(t, childEvicted.Load(), "inner wg.Go child OnEvict must drain before foreground Replace returns")
@@ -7594,8 +7657,11 @@ func TestShardedCache_R14EvictFastModePeerAndDetachedIsolation(t *testing.T) {
 				})
 			}
 		}
-		t.Run("InnerChildContendsWhilePanickingPeerSerializes/"+mode, func(t *testing.T) {
-			runR14InnerChildContendsWhilePanickingPeerSerializesCase(t, sharded)
+		t.Run("InnerChildContendsWhilePanickingPeerSerializes_FastMode/"+mode, func(t *testing.T) {
+			runR14InnerChildContendsWhilePanickingPeerSerializesCase(t, sharded, false)
+		})
+		t.Run("InnerChildContendsWhilePanickingPeerSerializes_PprofChild/"+mode, func(t *testing.T) {
+			runR14InnerChildContendsWhilePanickingPeerSerializesCase(t, sharded, true)
 		})
 		t.Run("ForeignExitedHopAndNestedDeliver/"+mode, func(t *testing.T) {
 			runR14ForeignExitedHopAndNestedDeliverCase(t, sharded)
@@ -7626,138 +7692,152 @@ func r15SpawnWGWorkerHelper(wg *sync.WaitGroup, c Cache[int], updateLabels bool)
 
 func runR15C1ContractCases(t *testing.T, sharded bool, mode int) {
 	t.Helper()
-	var c Cache[int]
-	var armed atomic.Bool
-	var victimEvicts atomic.Int32
+	for _, backend := range []Backend{BackendMap, BackendRadix, BackendArenaRadix} {
+		var c Cache[int]
+		var armed atomic.Bool
+		var victimEvicts atomic.Int32
 
-	c = makeShardedOrUnshardedIntCache(sharded, 4,
-		WithOnEvictEntry(func(k string, _ int, r EvictionReason) {
-			if k == "s1/victim" && r == EvictionReasonDeleted {
-				victimEvicts.Add(1)
-				return
-			}
-			if !armed.Load() || k != "s0/trigger" || r != EvictionReasonReplaced {
-				return
-			}
-			var wg sync.WaitGroup
-			switch mode {
-			case 0:
-				r15SpawnWGWorkerHelper(&wg, c, false)
-			case 1:
-				r15SpawnWGWorkerHelper(&wg, c, true)
-			case 2:
-				wg.Go(func() {
-					pprof.Do(context.Background(), pprof.Labels("worker", "inline"), func(context.Context) {
-						_, _ = c.Delete("s1/victim")
+		c = makeShardedOrUnshardedIntCacheWithBackend(sharded, backend, 4,
+			WithOnEvictEntry(func(k string, _ int, r EvictionReason) {
+				if k == "s1/victim" && r == EvictionReasonDeleted {
+					victimEvicts.Add(1)
+					return
+				}
+				if !armed.Load() {
+					if mode == 2 {
+						pprof.Do(context.Background(), pprof.Labels("init", "r15"), func(context.Context) {})
+					}
+					return
+				}
+				if k != "s0/trigger" || r != EvictionReasonReplaced {
+					return
+				}
+				var wg sync.WaitGroup
+				switch mode {
+				case 0:
+					r15SpawnWGWorkerHelper(&wg, c, false)
+				case 1:
+					r15SpawnWGWorkerHelper(&wg, c, true)
+				case 2:
+					wg.Go(func() {
+						pprof.Do(context.Background(), pprof.Labels("worker", "inline"), func(context.Context) {
+							_, _ = c.Delete("s1/victim")
+						})
 					})
-				})
-			}
-			wg.Wait()
-		}),
-	)
+				}
+				wg.Wait()
+			}),
+		)
 
-	warmupUncontendedReplaceEvictions(c, 10)
-	_, _ = c.Put("s0/trigger", 0)
-	_ = c.Replace("s0/trigger", 1)
-	require.True(t, coordPressureState(c).evictFastMode.Load())
-	_, _ = c.Put("s1/victim", 2)
-	armed.Store(true)
-
-	done := make(chan struct{})
-	go func() {
-		defer close(done)
-		if mode == 1 {
-			pprof.Do(context.Background(), pprof.Labels("outer", "req"), func(context.Context) {
-				assert.NoError(t, c.Replace("s0/trigger", 10))
-			})
-			return
+		warmupUncontendedReplaceEvictions(c, 10)
+		_, _ = c.Put("s0/trigger", 0)
+		_ = c.Replace("s0/trigger", 1)
+		if mode != 2 {
+			require.True(t, coordPressureState(c).evictFastMode.Load())
 		}
-		assert.NoError(t, c.Replace("s0/trigger", 10))
-	}()
-	select {
-	case <-done:
-	case <-time.After(2 * time.Second):
-		t.Fatalf("deadlocked in R15 C1 sharded=%v mode=%d", sharded, mode)
+		_, _ = c.Put("s1/victim", 2)
+		armed.Store(true)
+
+		done := make(chan struct{})
+		go func() {
+			defer close(done)
+			if mode == 1 {
+				pprof.Do(context.Background(), pprof.Labels("outer", "req"), func(context.Context) {
+					assert.NoError(t, c.Replace("s0/trigger", 10))
+				})
+				return
+			}
+			assert.NoError(t, c.Replace("s0/trigger", 10))
+		}()
+		select {
+		case <-done:
+		case <-time.After(2 * time.Second):
+			t.Fatalf("deadlocked in R15 C1 sharded=%v backend=%s mode=%d", sharded, backend, mode)
+		}
+		assert.Equal(t, int32(1), victimEvicts.Load())
 	}
-	assert.Equal(t, int32(1), victimEvicts.Load())
 }
 
 func runR15C2PprofScopeExitAndExitedWGHop(t *testing.T, sharded, exitedWGHop, twoHopGo bool) {
 	t.Helper()
-	var c Cache[int]
-	var armed atomic.Bool
-	var victimEvicts atomic.Int32
+	for _, backend := range []Backend{BackendMap, BackendRadix, BackendArenaRadix} {
+		var c Cache[int]
+		var armed atomic.Bool
+		var victimEvicts atomic.Int32
 
-	c = makeShardedOrUnshardedIntCache(sharded, 4,
-		WithOnEvictEntry(func(k string, _ int, r EvictionReason) {
-			if k == "s1/victim" && r == EvictionReasonDeleted {
-				victimEvicts.Add(1)
-				return
-			}
-			if !armed.Load() || k != "s0/trigger" || r != EvictionReasonReplaced {
-				return
-			}
-			if exitedWGHop {
-				var wg1, wg2 sync.WaitGroup
-				hop1Done := make(chan struct{})
-				wg1.Go(func() {
-					wg2.Go(func() {
-						<-hop1Done
-						pprof.Do(context.Background(), pprof.Labels("hop", "2"), func(context.Context) {
-							_, _ = c.Delete("s1/victim")
-						})
-					})
-				})
-				wg1.Wait()
-				close(hop1Done)
-				wg2.Wait()
-				return
-			}
-			start := make(chan struct{})
-			done := make(chan struct{})
-			pprof.Do(context.Background(), pprof.Labels("op", "evict"), func(context.Context) {
-				if twoHopGo {
-					hopExited := make(chan struct{})
-					go func() {
-						defer close(hopExited)
-						go func() {
-							<-start
-							_, _ = c.Delete("s1/victim")
-							close(done)
-						}()
-					}()
-					<-hopExited
+		c = makeShardedOrUnshardedIntCacheWithBackend(sharded, backend, 4,
+			WithOnEvictEntry(func(k string, _ int, r EvictionReason) {
+				if k == "s1/victim" && r == EvictionReasonDeleted {
+					victimEvicts.Add(1)
 					return
 				}
-				go func() {
-					<-start
-					_, _ = c.Delete("s1/victim")
-					close(done)
-				}()
+				if !armed.Load() || k != "s0/trigger" || r != EvictionReasonReplaced {
+					return
+				}
+				if exitedWGHop {
+					var wg1, wg2 sync.WaitGroup
+					hop1Done := make(chan struct{})
+					wg1.Go(func() {
+						wg2.Go(func() {
+							<-hop1Done
+							pprof.Do(context.Background(), pprof.Labels("hop", "2"), func(context.Context) {
+								_, _ = c.Delete("s1/victim")
+							})
+						})
+					})
+					wg1.Wait()
+					close(hop1Done)
+					wg2.Wait()
+					return
+				}
+				start := make(chan struct{})
+				done := make(chan struct{})
+				pprof.Do(context.Background(), pprof.Labels("op", "evict"), func(context.Context) {
+					if twoHopGo {
+						hopExited := make(chan struct{})
+						go func() {
+							defer close(hopExited)
+							go func() {
+								<-start
+								_, _ = c.Delete("s1/victim")
+								close(done)
+							}()
+						}()
+						<-hopExited
+						return
+					}
+					go func() {
+						<-start
+						_, _ = c.Delete("s1/victim")
+						close(done)
+					}()
+				})
+				close(start)
+				<-done
+			}),
+		)
+
+		warmupUncontendedReplaceEvictions(c, 10)
+		_, _ = c.Put("s0/trigger", 0)
+		_ = c.Replace("s0/trigger", 1)
+		require.True(t, coordPressureState(c).evictFastMode.Load())
+		_, _ = c.Put("s1/victim", 2)
+		armed.Store(true)
+
+		done := make(chan struct{})
+		go func() {
+			defer close(done)
+			pprof.Do(context.Background(), pprof.Labels("outer", "r15-c2"), func(context.Context) {
+				assert.NoError(t, c.Replace("s0/trigger", 10))
 			})
-			close(start)
-			<-done
-		}),
-	)
-
-	warmupUncontendedReplaceEvictions(c, 10)
-	_, _ = c.Put("s0/trigger", 0)
-	_ = c.Replace("s0/trigger", 1)
-	require.True(t, coordPressureState(c).evictFastMode.Load())
-	_, _ = c.Put("s1/victim", 2)
-	armed.Store(true)
-
-	done := make(chan struct{})
-	go func() {
-		defer close(done)
-		assert.NoError(t, c.Replace("s0/trigger", 10))
-	}()
-	select {
-	case <-done:
-	case <-time.After(2 * time.Second):
-		t.Fatalf("deadlocked in R15 C2 sharded=%v exitedWGHop=%v twoHopGo=%v", sharded, exitedWGHop, twoHopGo)
+		}()
+		select {
+		case <-done:
+		case <-time.After(2 * time.Second):
+			t.Fatalf("deadlocked in R15 C2 sharded=%v backend=%s exitedWGHop=%v twoHopGo=%v", sharded, backend, exitedWGHop, twoHopGo)
+		}
+		assert.Equal(t, int32(1), victimEvicts.Load())
 	}
-	assert.Equal(t, int32(1), victimEvicts.Load())
 }
 
 type r15C3Service struct {
@@ -7910,6 +7990,679 @@ func TestShardedCache_R15EvictFastModeLineageAndPprofFixes(t *testing.T) {
 			})
 			t.Run("C3_NoPanicHijackOnPeerPanic_"+lblSuffix+"/"+mode, func(t *testing.T) {
 				runR15C3ReenteredMethodPeerIsolationCase(t, sharded, peerLabels, 2)
+			})
+		}
+	}
+}
+
+func applyR16DetachedLabelMode(sharedCtx context.Context, labelMode int, fn func()) {
+	switch labelMode {
+	case 0:
+		pprof.Do(context.Background(), pprof.Labels("bg", "r16-wg"), func(context.Context) { fn() })
+	case 1:
+		pprof.SetGoroutineLabels(context.Background())
+		fn()
+	default:
+		pprof.SetGoroutineLabels(sharedCtx)
+		defer pprof.SetGoroutineLabels(context.Background())
+		fn()
+	}
+}
+
+func applyR16Hold2LabelMode(sharedCtx context.Context, labelMode int) func() {
+	switch labelMode {
+	case 1:
+		pprof.SetGoroutineLabels(context.Background())
+		return func() {}
+	case 2:
+		pprof.SetGoroutineLabels(sharedCtx)
+		return func() { pprof.SetGoroutineLabels(context.Background()) }
+	default:
+		return func() {}
+	}
+}
+
+func runR16C1SingleDetachedCase(t *testing.T, sharded bool, backend Backend, useLongWG bool, labelMode, panicMode int) {
+	t.Helper()
+	var c Cache[int]
+	var bgWG sync.WaitGroup
+	var holdIdx atomic.Int32
+	var fgInHold2, returnedEarly atomic.Bool
+	var victimEvicted atomic.Int32
+	inHold2 := make(chan struct{})
+	detachedDone := make(chan any, 1)
+	sharedCtx := pprof.WithLabels(context.Background(), pprof.Labels("shared", "r16"))
+
+	spawnDetached := func() {
+		task := func() {
+			var rec any
+			defer func() { detachedDone <- rec }()
+			defer func() { rec = recover() }()
+			<-inHold2
+			applyR16DetachedLabelMode(sharedCtx, labelMode, func() {
+				_, _ = c.Delete("s1/victim")
+				returnedEarly.Store(fgInHold2.Load())
+			})
+		}
+		if useLongWG {
+			bgWG.Go(task)
+			return
+		}
+		go task()
+	}
+
+	c = makeShardedOrUnshardedIntCacheWithBackend(sharded, backend, 8,
+		WithOnEvictEntry(func(k string, _ int, _ EvictionReason) {
+			if k == "s1/victim" {
+				victimEvicted.Add(1)
+				if panicMode == 2 {
+					panic("r16-detached-victim-panic")
+				}
+				return
+			}
+			if k != "s0/slot" {
+				return
+			}
+			switch holdIdx.Add(1) {
+			case 1:
+				spawnDetached()
+			case 2:
+				fgInHold2.Store(true)
+				defer fgInHold2.Store(false)
+				restore := applyR16Hold2LabelMode(sharedCtx, labelMode)
+				defer restore()
+				close(inHold2)
+				var localWG sync.WaitGroup
+				localWG.Go(func() {
+					assert.True(t, waitUntilEvictSlowWaiterParked(c))
+				})
+				localWG.Wait()
+				if panicMode == 1 {
+					panic("r16-hold2-fg-panic")
+				}
+			}
+		}),
+	)
+
+	warmupUncontendedReplaceEvictions(c, 8)
+	_, _ = c.Put("s0/slot", 0)
+	_, _ = c.Put("s1/victim", 99)
+	require.NoError(t, c.Replace("s0/slot", 1)) // Hold 1: spawns prior-hold detached goroutine
+	if panicMode == 1 {
+		assert.PanicsWithValue(t, "r16-hold2-fg-panic", func() {
+			_ = c.Replace("s0/slot", 2) // Hold 2 on same goroutine
+		})
+	} else {
+		require.NotPanics(t, func() {
+			assert.NoError(t, c.Replace("s0/slot", 2))
+		})
+	}
+	detachedRecovered := <-detachedDone
+	bgWG.Wait()
+	assert.False(t, returnedEarly.Load(), "prior-hold detached goroutine must never return while Hold 2 holds evictCallbackMu")
+	assert.Equal(t, int32(1), victimEvicted.Load(), "prior-hold detached goroutine OnEvict callback must never be dropped")
+	if panicMode == 2 {
+		assert.Equal(t, "r16-detached-victim-panic", detachedRecovered)
+	} else {
+		assert.Nil(t, detachedRecovered)
+	}
+}
+
+func TestShardedCache_R16C1DetachedGoroutineIsolation(t *testing.T) {
+	for _, sharded := range []bool{false, true} {
+		mode := "Unsharded"
+		if sharded {
+			mode = "Sharded"
+		}
+		for _, backend := range []Backend{BackendMap, BackendRadix, BackendArenaRadix} {
+			bName := backend.String()
+			t.Run("LongLivedWG_PprofDo_Hold2Panics/"+mode+"/"+bName, func(t *testing.T) {
+				runR16C1SingleDetachedCase(t, sharded, backend, true, 0, 1)
+			})
+			t.Run("LongLivedWG_PprofDo_DetachedPanics/"+mode+"/"+bName, func(t *testing.T) {
+				runR16C1SingleDetachedCase(t, sharded, backend, true, 0, 2)
+			})
+			t.Run("PlainGo_ClearedLabels_Hold2Panics/"+mode+"/"+bName, func(t *testing.T) {
+				runR16C1SingleDetachedCase(t, sharded, backend, false, 1, 1)
+			})
+			t.Run("PlainGo_ClearedLabels_DetachedPanics/"+mode+"/"+bName, func(t *testing.T) {
+				runR16C1SingleDetachedCase(t, sharded, backend, false, 1, 2)
+			})
+			t.Run("PlainGo_SharedLabels_Hold2Panics/"+mode+"/"+bName, func(t *testing.T) {
+				runR16C1SingleDetachedCase(t, sharded, backend, false, 2, 1)
+			})
+		}
+	}
+}
+
+type r16ArenaWorker struct {
+	c          Cache[int]
+	useReplace bool
+}
+
+//go:noinline
+func (w *r16ArenaWorker) mutateOther() {
+	if w.useReplace {
+		_ = w.c.Replace("s1/other", 99)
+		return
+	}
+	_, _ = w.c.Put("s1/other-new", 99)
+}
+
+func runR16C2ArenaRadixMethodMatchCase(t *testing.T, sharded, useReplace, initTamper bool) {
+	t.Helper()
+	for _, backend := range []Backend{BackendMap, BackendRadix, BackendArenaRadix} {
+		worker := &r16ArenaWorker{useReplace: useReplace}
+		var armed atomic.Bool
+		var childEvicts atomic.Int32
+		worker.c = makeShardedOrUnshardedIntCacheWithBackend(sharded, backend, 2,
+			WithOnEvictEntry(func(k string, _ int, _ EvictionReason) {
+				if strings.HasPrefix(k, "s1/") {
+					childEvicts.Add(1)
+					return
+				}
+				if !armed.Load() {
+					if initTamper {
+						pprof.Do(context.Background(), pprof.Labels("init", "tamper"), func(context.Context) {})
+					}
+					return
+				}
+				if k != "s0/seed" {
+					return
+				}
+				pprof.Do(context.Background(), pprof.Labels("op", "evict"), func(context.Context) {
+					var wg sync.WaitGroup
+					wg.Go(worker.mutateOther)
+					wg.Wait()
+				})
+			}),
+		)
+		warmupUncontendedReplaceEvictions(worker.c, 8)
+		_, _ = worker.c.Put("s0/seed", 1)
+		_, _ = worker.c.Put("s1/other", 2)
+		armed.Store(true)
+
+		done := make(chan struct{})
+		go func() {
+			defer close(done)
+			runTrigger := func() {
+				if useReplace {
+					assert.NoError(t, worker.c.Replace("s0/seed", 10))
+				} else {
+					_, _ = worker.c.Put("s0/trigger", 10)
+				}
+			}
+			if !initTamper {
+				pprof.Do(context.Background(), pprof.Labels("outer", "c2"), func(context.Context) { runTrigger() })
+				return
+			}
+			runTrigger()
+		}()
+		select {
+		case <-done:
+		case <-time.After(2 * time.Second):
+			t.Fatalf("deadlocked in R16 C2 sharded=%v backend=%s replace=%v initTamper=%v", sharded, backend, useReplace, initTamper)
+		}
+		assert.Equal(t, int32(1), childEvicts.Load())
+	}
+}
+
+func runR16C3InlineGoLabelTransitionCase(t *testing.T, sharded, variantB, initTamper bool) {
+	t.Helper()
+	for _, backend := range []Backend{BackendMap, BackendRadix, BackendArenaRadix} {
+		var c Cache[int]
+		var armed atomic.Bool
+		var victimEvicts atomic.Int32
+		c = makeShardedOrUnshardedIntCacheWithBackend(sharded, backend, 4,
+			WithOnEvictEntry(func(k string, _ int, r EvictionReason) {
+				if k == "s1/victim" && r == EvictionReasonDeleted {
+					victimEvicts.Add(1)
+					return
+				}
+				if !armed.Load() {
+					if initTamper {
+						pprof.SetGoroutineLabels(context.Background())
+					}
+					return
+				}
+				if k != "s0/trigger" || r != EvictionReasonReplaced {
+					return
+				}
+				childDone := make(chan struct{})
+				if !variantB {
+					lbl := pprof.WithLabels(context.Background(), pprof.Labels("op", "evict-a"))
+					pprof.SetGoroutineLabels(lbl)
+					go func() {
+						defer close(childDone)
+						_, _ = c.Delete("s1/victim")
+					}()
+					pprof.SetGoroutineLabels(context.Background())
+					<-childDone
+					return
+				}
+				pprof.SetGoroutineLabels(context.Background())
+				go func() {
+					defer close(childDone)
+					_, _ = c.Delete("s1/victim")
+				}()
+				pprof.Do(context.Background(), pprof.Labels("op", "wait-b"), func(context.Context) {
+					<-childDone
+				})
+			}),
+		)
+		warmupUncontendedReplaceEvictions(c, 8)
+		_, _ = c.Put("s0/trigger", 1)
+		_, _ = c.Put("s1/victim", 2)
+		armed.Store(true)
+
+		done := make(chan struct{})
+		go func() {
+			defer close(done)
+			if !initTamper {
+				pprof.Do(context.Background(), pprof.Labels("outer", "c3"), func(context.Context) {
+					assert.NoError(t, c.Replace("s0/trigger", 10))
+				})
+				return
+			}
+			assert.NoError(t, c.Replace("s0/trigger", 10))
+		}()
+		select {
+		case <-done:
+		case <-time.After(2 * time.Second):
+			t.Fatalf("deadlocked in R16 C3 sharded=%v backend=%s variantB=%v initTamper=%v", sharded, backend, variantB, initTamper)
+		}
+		assert.Equal(t, int32(1), victimEvicts.Load())
+	}
+}
+
+func TestShardedCache_R16C2AndC3ArenaRadixAndPprofContracts(t *testing.T) {
+	t.Run("InternalLRUMethodFrameClassification", func(t *testing.T) {
+		positives := []string{
+			"github.com/google/go-lru.(*arenaRadix[int]).Put",
+			"github.com/google/go-lru.(*arenaRadix[go.shape.int]).Replace",
+			"github.com/google/go-lru.(*mapCache[int]).Delete",
+			"github.com/google/go-lru.(*radixCache[int]).DeletePrefix",
+			"github.com/google/go-lru.(*shardedCache[int]).EvaluateMemoryPressure",
+			"github.com/google/go-lru.(*evictCallbackQueue[int]).invokeNonEmpty",
+			"github.com/google/go-lru.(*pressureState).lockWithPressure",
+			"github.com/google/go-lru.Cache[int].Put-fm",
+			"github.com/google/go-lru.PressureAwareCache[int].EvaluateMemoryPressure-fm",
+			"github.com/google/go-lru.StatsProvider.Stats-fm",
+		}
+		for _, sym := range positives {
+			assert.True(t, isInternalLRUMethodFrame([]byte(sym)), sym)
+		}
+		negatives := []string{
+			"github.com/google/go-lru.TestShardedCache_R16C2AndC3ArenaRadixAndPprofContracts",
+			"github.com/google/go-lru.(*r16ArenaWorker).mutateOther",
+			"main.worker",
+		}
+		for _, sym := range negatives {
+			assert.False(t, isInternalLRUMethodFrame([]byte(sym)), sym)
+		}
+	})
+	for _, sharded := range []bool{false, true} {
+		mode := "Unsharded"
+		if sharded {
+			mode = "Sharded"
+		}
+		for _, useReplace := range []bool{true, false} {
+			op := "Put"
+			if useReplace {
+				op = "Replace"
+			}
+			t.Run("C2_OuterScope_"+op+"/"+mode, func(t *testing.T) {
+				runR16C2ArenaRadixMethodMatchCase(t, sharded, useReplace, false)
+			})
+			t.Run("C2_InitTamper_"+op+"/"+mode, func(t *testing.T) {
+				runR16C2ArenaRadixMethodMatchCase(t, sharded, useReplace, true)
+			})
+		}
+		t.Run("C3_VariantA_OuterScope/"+mode, func(t *testing.T) {
+			runR16C3InlineGoLabelTransitionCase(t, sharded, false, false)
+		})
+		t.Run("C3_VariantA_InitTamper/"+mode, func(t *testing.T) {
+			runR16C3InlineGoLabelTransitionCase(t, sharded, false, true)
+		})
+		t.Run("C3_VariantB_OuterScope/"+mode, func(t *testing.T) {
+			runR16C3InlineGoLabelTransitionCase(t, sharded, true, false)
+		})
+		t.Run("C3_VariantB_InitTamper/"+mode, func(t *testing.T) {
+			runR16C3InlineGoLabelTransitionCase(t, sharded, true, true)
+		})
+	}
+}
+
+func runR16C4NestedOnEvictExitedParentCase(t *testing.T, sharded bool, backend Backend) {
+	t.Helper()
+	var outerCache Cache[int]
+	var outerArmed, outerFgActive, peerDuringFg, peerEvicted atomic.Bool
+	inInner := make(chan struct{})
+	parentExited := make(chan struct{})
+	peerDone := make(chan struct{})
+
+	innerCache := New[string](4,
+		WithBackend(backend),
+		WithOnEvictEntry(func(k, _ string, _ EvictionReason) {
+			if k == "inner-k" && outerArmed.Load() {
+				close(inInner)
+				assert.True(t, waitUntilEvictSlowWaiterParked(outerCache))
+				panic("r16-c4-inner-panic")
+			}
+		}),
+	)
+	_, _ = innerCache.Put("inner-k", "v1")
+
+	outerCache = makeShardedOrUnshardedIntCacheWithBackend(sharded, backend, 4,
+		WithOnEvictEntry(func(k string, _ int, _ EvictionReason) {
+			if !outerArmed.Load() {
+				return
+			}
+			if k == "s0/outer-fg" {
+				outerFgActive.Store(true)
+				defer outerFgActive.Store(false)
+				_ = innerCache.Replace("inner-k", "v2")
+				return
+			}
+			if k == "s1/outer-peer" {
+				peerEvicted.Store(true)
+			}
+		}),
+	)
+	_, _ = outerCache.Put("s0/outer-fg", 1)
+	_, _ = outerCache.Put("s1/outer-peer", 2)
+	outerArmed.Store(true)
+
+	go func() {
+		<-inInner
+		go func() {
+			defer close(peerDone)
+			<-parentExited
+			_, _ = outerCache.Delete("s1/outer-peer")
+			peerDuringFg.Store(outerFgActive.Load())
+		}()
+		close(parentExited)
+	}()
+
+	assert.PanicsWithValue(t, "r16-c4-inner-panic", func() {
+		_ = outerCache.Replace("s0/outer-fg", 10)
+	})
+	<-peerDone
+	assert.False(t, peerDuringFg.Load(), "unrelated caller with exited parent must not return while outerCache OnEvict is active")
+	assert.True(t, peerEvicted.Load(), "unrelated caller OnEvict callback must not be dropped when nested cache panics")
+}
+
+func runR16C4NestedPressureExitedParentCase(t *testing.T, sharded bool, backend Backend) {
+	t.Helper()
+	innerCache := New[string](8,
+		WithBackend(backend),
+		WithPressureFunc(func() float64 { return 0.10 }),
+	)
+	_, _ = innerCache.Put("ik", "iv")
+
+	var armed atomic.Bool
+	inSampler := make(chan struct{})
+	releaseSampler := make(chan struct{})
+	var firstEntered atomic.Bool
+
+	outerCache := makeShardedOrUnshardedIntCacheWithBackend(sharded, backend, 8,
+		WithEvictionRetentionRatio(0.25),
+		WithPressureFunc(func() float64 {
+			if !armed.Load() {
+				return 0.10
+			}
+			_ = innerCache.(PressureAwareCache[string]).EvaluateMemoryPressure()
+			if firstEntered.CompareAndSwap(false, true) {
+				close(inSampler)
+				<-releaseSampler
+			}
+			return 0.99
+		}),
+	)
+	for i := range 8 {
+		_, _ = outerCache.Put(fmt.Sprintf("s%d/k%d", i%2, i), i+1)
+	}
+	armed.Store(true)
+
+	fgDone := make(chan struct{})
+	go func() {
+		defer close(fgDone)
+		_ = outerCache.(PressureAwareCache[int]).EvaluateMemoryPressure()
+	}()
+	<-inSampler
+
+	parentExited := make(chan struct{})
+	peerEvictedCh := make(chan int, 1)
+	go func() {
+		go func() {
+			<-parentExited
+			evicted := outerCache.(PressureAwareCache[int]).EvaluateMemoryPressure()
+			peerEvictedCh <- len(evicted)
+			close(releaseSampler)
+		}()
+		close(parentExited)
+	}()
+
+	peerEvicted := <-peerEvictedCh
+	<-fgDone
+	assert.Positive(t, peerEvicted, "unrelated caller with exited parent must execute critical Tier 2 shedding instead of re-entrant fallback")
+	assert.LessOrEqual(t, outerCache.Stats().Len, 2)
+}
+
+func TestShardedCache_R16C4ExitedParentNestedCacheIsolation(t *testing.T) {
+	for _, sharded := range []bool{false, true} {
+		mode := "Unsharded"
+		if sharded {
+			mode = "Sharded"
+		}
+		for _, backend := range []Backend{BackendMap, BackendRadix, BackendArenaRadix} {
+			bName := backend.String()
+			t.Run("ScenarioA_OnEvict/"+mode+"/"+bName, func(t *testing.T) {
+				runR16C4NestedOnEvictExitedParentCase(t, sharded, backend)
+			})
+			t.Run("ScenarioB_PressureFunc/"+mode+"/"+bName, func(t *testing.T) {
+				runR16C4NestedPressureExitedParentCase(t, sharded, backend)
+			})
+		}
+	}
+}
+
+type r16C5PeerTask struct {
+	c            Cache[int]
+	parentExited chan struct{}
+	done         chan struct{}
+	fgActive     *atomic.Bool
+	duringFg     *atomic.Bool
+}
+
+//go:noinline
+func r16SingleCachePeerPut(task *r16C5PeerTask) {
+	defer close(task.done)
+	<-task.parentExited
+	_, _ = task.c.Put("s1/peer-old", 99)
+	task.duringFg.Store(task.fgActive.Load())
+}
+
+func runR16C5SingleCacheExitedParentCase(t *testing.T, sharded bool, backend Backend) {
+	t.Helper()
+	var c Cache[int]
+	var armed, fgActive, peerDuringFg, peerEvicted atomic.Bool
+	var childWeighOnce sync.Once
+	inChildWeigh := make(chan struct{})
+	releaseChildWeigh := make(chan struct{})
+
+	c = makeShardedOrUnshardedIntCacheWithBackend(sharded, backend, 4,
+		WithWeigher(func(k string, _ int) uint64 {
+			if k == "s0/child-put" {
+				childWeighOnce.Do(func() {
+					close(inChildWeigh)
+					<-releaseChildWeigh
+				})
+			}
+			return 1
+		}),
+		WithOnEvictEntry(func(k string, _ int, r EvictionReason) {
+			if !armed.Load() {
+				return
+			}
+			if k == "s0/fg" && r == EvictionReasonReplaced {
+				fgActive.Store(true)
+				defer fgActive.Store(false)
+				var wg sync.WaitGroup
+				wg.Go(func() {
+					_, _ = c.Put("s0/child-put", 10)
+				})
+				<-inChildWeigh
+				assert.True(t, waitUntilEvictSlowWaiterParked(c))
+				close(releaseChildWeigh)
+				wg.Wait()
+				panic("r16-c5-fg-panic")
+			}
+			if k == "s1/peer-old" && r == EvictionReasonReplaced {
+				peerEvicted.Store(true)
+			}
+		}),
+	)
+
+	_, _ = c.Put("s0/fg", 1)
+	_, _ = c.Put("s1/peer-old", 2)
+	armed.Store(true)
+
+	task := &r16C5PeerTask{
+		c:            c,
+		parentExited: make(chan struct{}),
+		done:         make(chan struct{}),
+		fgActive:     &fgActive,
+		duringFg:     &peerDuringFg,
+	}
+	go func() {
+		<-inChildWeigh
+		go r16SingleCachePeerPut(task)
+		close(task.parentExited)
+	}()
+
+	assert.PanicsWithValue(t, "r16-c5-fg-panic", func() {
+		_ = c.Replace("s0/fg", 11)
+	})
+	<-task.done
+	assert.False(t, peerDuringFg.Load(), "named peer entry calling Put at frame index 1 must not bridge onto live OnEvict child")
+	assert.True(t, peerEvicted.Load(), "named peer entry OnEvict callback must never be dropped")
+}
+
+func TestShardedCache_R16C5BlockOwnsExitedChildSingleCacheIsolation(t *testing.T) {
+	for _, sharded := range []bool{false, true} {
+		mode := "Unsharded"
+		if sharded {
+			mode = "Sharded"
+		}
+		for _, backend := range []Backend{BackendMap, BackendRadix, BackendArenaRadix} {
+			t.Run(mode+"/"+backend.String(), func(t *testing.T) {
+				runR16C5SingleCacheExitedParentCase(t, sharded, backend)
+			})
+		}
+	}
+}
+
+type r16SharedEvictRecorder struct {
+	t            *testing.T
+	cacheB       Cache[int]
+	armed        atomic.Bool
+	bFgActive    atomic.Bool
+	peerDuringFg atomic.Bool
+	bPeerEvicted atomic.Bool
+	inBQueued    chan struct{}
+	aExited      chan struct{}
+	peerDone     chan struct{}
+}
+
+//go:noinline
+func (r *r16SharedEvictRecorder) onEvict(k string, _ int, _ EvictionReason) {
+	if !r.armed.Load() {
+		return
+	}
+	switch k {
+	case "s0/b-first":
+		_, _ = r.cacheB.Delete("s0/b-second")
+	case "s0/b-second":
+		r.bFgActive.Store(true)
+		defer r.bFgActive.Store(false)
+		close(r.inBQueued)
+		assert.True(r.t, waitUntilEvictSlowWaiterParked(r.cacheB))
+		panic("r16-c6-queued-panic")
+	case "s0/a-trigger":
+		go func() {
+			defer close(r.peerDone)
+			<-r.aExited
+			_, _ = r.cacheB.Delete("s1/b-peer")
+			r.peerDuringFg.Store(r.bFgActive.Load())
+		}()
+	case "s1/b-peer":
+		r.bPeerEvicted.Store(true)
+	}
+}
+
+func runR16C6PendingBatchSharedCallbackCase(t *testing.T, sharded bool, backend Backend) {
+	t.Helper()
+	rec := &r16SharedEvictRecorder{
+		t:         t,
+		inBQueued: make(chan struct{}),
+		aExited:   make(chan struct{}),
+		peerDone:  make(chan struct{}),
+	}
+	cacheA := makeShardedOrUnshardedIntCacheWithBackend(sharded, backend, 4, WithOnEvictEntry(rec.onEvict))
+	rec.cacheB = makeShardedOrUnshardedIntCacheWithBackend(sharded, backend, 4, WithOnEvictEntry(rec.onEvict))
+
+	_, _ = cacheA.Put("s0/a-trigger", 1)
+	_, _ = rec.cacheB.Put("s0/b-first", 1)
+	_, _ = rec.cacheB.Put("s0/b-second", 2)
+	_, _ = rec.cacheB.Put("s1/b-peer", 3)
+	rec.armed.Store(true)
+
+	go func() {
+		<-rec.inBQueued
+		_, _ = cacheA.Delete("s0/a-trigger")
+		close(rec.aExited)
+	}()
+
+	assert.PanicsWithValue(t, "r16-c6-queued-panic", func() {
+		_, _ = rec.cacheB.Delete("s0/b-first")
+	})
+	<-rec.peerDone
+	assert.False(t, rec.peerDuringFg.Load(), "shared callback spawned from cacheA must not enqueue as child of cacheB pending batch")
+	assert.True(t, rec.bPeerEvicted.Load(), "b-peer OnEvict callback must never be dropped when cacheB pending batch panics")
+}
+
+func TestShardedCache_R16C6InternalCallbackDispatchFramesIsolation(t *testing.T) {
+	t.Run("InternalCallbackDispatchFrameClassification", func(t *testing.T) {
+		positives := []string{
+			"github.com/google/go-lru.(*evictCallbackQueue[int]).tryEnqueuePendingCallback.func1",
+			"github.com/google/go-lru.(*evictCallbackQueue[int]).enqueuePendingCallback",
+			"github.com/google/go-lru.(*evictCallbackQueue[int]).deliverCallbacks",
+			"github.com/google/go-lru.(*evictCallbackQueue[int]).deliverCallbacksSlow",
+			"github.com/google/go-lru.(*evictCallbackQueue[int]).deliverMultiCallbacks",
+			"github.com/google/go-lru.resolveOnEvictEntry[int]",
+			"github.com/google/go-lru.(*pressureState).dispatchFastPrimaryPressure",
+			"github.com/google/go-lru.(*pressureState).invokeFastPrimaryPressure0",
+		}
+		for _, sym := range positives {
+			assert.True(t, isInternalCallbackDispatchFrame([]byte(sym)), sym)
+		}
+		negatives := []string{
+			"github.com/google/go-lru.(*r16SharedEvictRecorder).onEvict",
+			"example.com/pkg.tryEnqueuePendingCallback.func1",
+		}
+		for _, sym := range negatives {
+			assert.False(t, isInternalCallbackDispatchFrame([]byte(sym)), sym)
+		}
+	})
+	for _, sharded := range []bool{false, true} {
+		mode := "Unsharded"
+		if sharded {
+			mode = "Sharded"
+		}
+		for _, backend := range []Backend{BackendMap, BackendRadix, BackendArenaRadix} {
+			t.Run(mode+"/"+backend.String(), func(t *testing.T) {
+				runR16C6PendingBatchSharedCallbackCase(t, sharded, backend)
 			})
 		}
 	}

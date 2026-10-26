@@ -27,12 +27,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"unsafe"
-	"weak"
 )
-
-type pprofStackRecord struct {
-	Stack []uintptr
-}
 
 //go:linkname runtimeGetProfLabel runtime/pprof.runtime_getProfLabel
 func runtimeGetProfLabel() unsafe.Pointer
@@ -40,36 +35,11 @@ func runtimeGetProfLabel() unsafe.Pointer
 //go:linkname runtimeSetProfLabel runtime/pprof.runtime_setProfLabel
 func runtimeSetProfLabel(labels unsafe.Pointer)
 
-//go:linkname pprofGoroutineProfileWithLabels runtime.pprof_goroutineProfileWithLabels
-func pprofGoroutineProfileWithLabels(p []pprofStackRecord, labels []unsafe.Pointer) (n int, ok bool)
-
 const (
 	goroutinesCreatedMetric = "/sched/goroutines-created:goroutines"
 	evictLabelRingSize      = 1024
 	evictLabelRingMask      = evictLabelRingSize - 1
 )
-
-type evictRingCleanupArg struct {
-	addr uintptr
-	wp   weak.Pointer[byte]
-}
-
-var globalEvictRingTags sync.Map
-
-func cleanupGlobalEvictRingTag(arg evictRingCleanupArg) {
-	globalEvictRingTags.CompareAndDelete(arg.addr, arg.wp)
-}
-
-func isAnyEvictRingTag(label unsafe.Pointer) bool {
-	if label == nil {
-		return false
-	}
-	v, ok := globalEvictRingTags.Load(uintptr(label))
-	if !ok {
-		return false
-	}
-	return v.(weak.Pointer[byte]).Value() == (*byte)(label)
-}
 
 func newEvictLabelRing() *[evictLabelRingSize]unsafe.Pointer {
 	ring := new([evictLabelRingSize]unsafe.Pointer)
@@ -79,15 +49,7 @@ func newEvictLabelRing() *[evictLabelRingSize]unsafe.Pointer {
 	bg := context.Background()
 	for i := range ring {
 		pprof.SetGoroutineLabels(pprof.WithLabels(bg, emptyLabels))
-		tag := runtimeGetProfLabel()
-		ring[i] = tag
-		if tag != nil {
-			bPtr := (*byte)(tag)
-			wp := weak.Make(bPtr)
-			addr := uintptr(tag)
-			globalEvictRingTags.Store(addr, wp)
-			runtime.AddCleanup(bPtr, cleanupGlobalEvictRingTag, evictRingCleanupArg{addr: addr, wp: wp})
-		}
+		ring[i] = runtimeGetProfLabel()
 	}
 	return ring
 }
@@ -493,10 +455,48 @@ func hasClosureOwnedBy(aboveHook, blk, owner []byte) bool {
 	return false
 }
 
+func isInternalLRUInterfaceFrame(fn []byte) bool {
+	rest, ok := bytes.CutPrefix(fn, []byte("github.com/google/go-lru."))
+	if !ok {
+		return false
+	}
+	return bytes.HasPrefix(rest, []byte("Cache[")) ||
+		bytes.HasPrefix(rest, []byte("PressureAwareCache[")) ||
+		bytes.HasPrefix(rest, []byte("StatsProvider.")) ||
+		bytes.HasPrefix(rest, []byte("shardEngine["))
+}
+
+func isInternalLRUMethodFrame(fn []byte) bool {
+	if isInternalLRUInterfaceFrame(fn) {
+		return true
+	}
+	rest, ok := bytes.CutPrefix(fn, []byte("github.com/google/go-lru.(*"))
+	if !ok {
+		return false
+	}
+	return bytes.HasPrefix(rest, []byte("mapCache[")) ||
+		bytes.HasPrefix(rest, []byte("radixCache[")) ||
+		bytes.HasPrefix(rest, []byte("arenaRadix[")) ||
+		bytes.HasPrefix(rest, []byte("shardedCache[")) ||
+		bytes.HasPrefix(rest, []byte("evictCallbackQueue[")) ||
+		bytes.HasPrefix(rest, []byte("pressureState)"))
+}
+
+func isStdlibWaitGroupGoCreator(fn []byte) bool {
+	return bytes.Equal(trimClosureOffset(fn), []byte("sync.(*WaitGroup).Go"))
+}
+
 func isInternalCallbackDispatchFrame(fn []byte) bool {
-	return bytes.Contains(fn, []byte("deliverMultiCallbacks")) ||
+	if !bytes.HasPrefix(fn, []byte("github.com/google/go-lru.")) {
+		return false
+	}
+	return bytes.Contains(fn, []byte("deliverCallbacks")) ||
+		bytes.Contains(fn, []byte("deliverMultiCallbacks")) ||
+		bytes.Contains(fn, []byte("tryEnqueuePendingCallback")) ||
 		bytes.Contains(fn, []byte("enqueuePendingCallback")) ||
-		bytes.Contains(fn, []byte("resolveOnEvict"))
+		bytes.Contains(fn, []byte("resolveOnEvict")) ||
+		bytes.Contains(fn, []byte("dispatchFastPrimaryPressure")) ||
+		bytes.Contains(fn, []byte("invokeFastPrimaryPressure"))
 }
 
 func isOnlyDirectCallbackEntryAboveHook(blk []byte, hookIdx int, currCreator []byte) bool {
@@ -507,7 +507,7 @@ func isOnlyDirectCallbackEntryAboveHook(blk []byte, hookIdx int, currCreator []b
 	rest := blk[:hookIdx]
 	var entryFn []byte
 	foundEntry := false
-	for range 4 {
+	for range 8 {
 		entryFn, rest = popBottomCallFrame(rest)
 		if len(entryFn) == 0 {
 			return false
@@ -545,7 +545,7 @@ func isWrapperEntryFrame(fn, currCreator []byte) bool {
 }
 
 func blockOwnsExitedChild(blk, currCreator, currChildStack []byte) bool {
-	if len(currCreator) > 0 {
+	if len(currCreator) > 0 && !isInternalLRUMethodFrame(currCreator) && !isStdlibWaitGroupGoCreator(currCreator) {
 		if containsCreatorCallFrame(blk, currCreator) || len(findClosureOwnerInStack(blk, currCreator)) > 0 {
 			return true
 		}
@@ -559,7 +559,7 @@ func blockOwnsExitedChild(blk, currCreator, currChildStack []byte) bool {
 	for i := range 2 {
 		var fn []byte
 		fn, rest = popBottomCallFrame(rest)
-		if len(fn) == 0 {
+		if len(fn) == 0 || isInternalLRUMethodFrame(fn) {
 			return false
 		}
 		if containsCreatorCallFrame(blk, fn) || len(findClosureOwnerInStack(blk, fn)) > 0 {
@@ -660,44 +660,11 @@ func handleRejectedAncestorGID(bridge *ancestorBridgeState, allStacks []byte, ma
 	return bridge.backtrack(allStacks, matchAncestor, rejectGID)
 }
 
-type ancestorMatchDetail struct {
-	gid             uint64
-	holderBlk       []byte
-	hopCreator      []byte
-	hopChildStack   []byte
-	directHop       bool
-	hasChainDeliver bool
-}
-
-func stackHasDeliverCallbacks(stk []byte) bool {
-	return bytes.Contains(stk, []byte("deliverCallbacks"))
-}
-
-func advanceChainDeliver(chainDeliver *bool, stk []byte) {
-	if !*chainDeliver && stackHasDeliverCallbacks(stk) {
-		*chainDeliver = true
-	}
-}
-
 func stepBridgeOrRejectedAncestor(bridge *ancestorBridgeState, missingCurr bool, allStacks []byte, matchAncestor, rejectGID func(uint64) bool) (uint64, []byte, []byte, bool) {
 	if missingCurr {
 		return bridge.backtrack(allStacks, matchAncestor, rejectGID)
 	}
 	return handleRejectedAncestorGID(bridge, allStacks, matchAncestor, rejectGID)
-}
-
-func fallbackAncestorMatchDetail(allStacks, currCreator, currChildStack, creatorFunc, callerStack, hookName []byte, chainDeliver bool, matchAncestor, rejectGID func(uint64) bool) (ancestorMatchDetail, bool) {
-	gid, hBlk, matched := matchAncestorFallbackForExactPostHook(allStacks, currCreator, currChildStack, creatorFunc, callerStack, hookName, matchAncestor, rejectGID)
-	if !matched {
-		return ancestorMatchDetail{}, false
-	}
-	return ancestorMatchDetail{
-		gid:             gid,
-		holderBlk:       hBlk,
-		hopCreator:      currCreator,
-		hopChildStack:   currChildStack,
-		hasChainDeliver: chainDeliver,
-	}, true
 }
 
 func matchesTargetBlockAboveHook(blk, hookName []byte) bool {
@@ -706,13 +673,8 @@ func matchesTargetBlockAboveHook(blk, hookName []byte) bool {
 }
 
 func findAncestorCreatorAboveHookOpts(allStacks, callerStack []byte, parentGID uint64, creatorFunc, hookName []byte, matchAncestor, rejectGID func(uint64) bool) (uint64, bool) {
-	det, ok := findAncestorCreatorAboveHookDetail(allStacks, callerStack, parentGID, creatorFunc, hookName, matchAncestor, rejectGID)
-	return det.gid, ok
-}
-
-func findAncestorCreatorAboveHookDetail(allStacks, callerStack []byte, parentGID uint64, creatorFunc, hookName []byte, matchAncestor, rejectGID func(uint64) bool) (ancestorMatchDetail, bool) {
 	if parentGID == 0 {
-		return ancestorMatchDetail{}, false
+		return 0, false
 	}
 	if len(allStacks) == 0 {
 		var bufPtr *[16384]byte
@@ -721,7 +683,6 @@ func findAncestorCreatorAboveHookDetail(allStacks, callerStack []byte, parentGID
 	}
 	callerGID, _ := parseStackGoroutineAndParentID(callerStack)
 	currGID, currCreator, currChildStack := parentGID, creatorFunc, callerStack
-	chainDeliver := stackHasDeliverCallbacks(callerStack)
 	bridge := ancestorBridgeState{
 		callerGID:        callerGID,
 		exitedCreator:    creatorFunc,
@@ -733,45 +694,35 @@ func findAncestorCreatorAboveHookDetail(allStacks, callerStack []byte, parentGID
 		if currGID == 0 || isRejectedAncestorGID(currGID, rejectGID) {
 			currGID, currCreator, currChildStack, ok = stepBridgeOrRejectedAncestor(&bridge, currGID == 0, allStacks, matchAncestor, rejectGID)
 			if !ok {
-				return ancestorMatchDetail{}, false
+				return 0, false
 			}
-			advanceChainDeliver(&chainDeliver, currChildStack)
 			continue
 		}
 		blk, nextParentGID, nextCreator, foundBlock := findGoroutineBlockByID(allStacks, currGID)
 		if !foundBlock {
-			if det, matched := fallbackAncestorMatchDetail(allStacks, currCreator, currChildStack, creatorFunc, callerStack, hookName, chainDeliver, matchAncestor, rejectGID); matched {
-				return det, true
+			if gid, _, matched := matchAncestorFallbackForExactPostHook(allStacks, currCreator, currChildStack, creatorFunc, callerStack, hookName, matchAncestor, rejectGID); matched {
+				return gid, true
 			}
 			currGID, currCreator, currChildStack, ok = bridge.bridgeExited(allStacks, currCreator, currChildStack, matchAncestor, rejectGID)
 			if !ok {
-				return ancestorMatchDetail{}, false
+				return 0, false
 			}
-			advanceChainDeliver(&chainDeliver, currChildStack)
 			continue
 		}
 		if !matchAncestor(currGID) {
-			advanceChainDeliver(&chainDeliver, blk)
 			currGID, currCreator, currChildStack = nextParentGID, nextCreator, blk
 			continue
 		}
 		if matchesTargetBlockAboveHook(blk, hookName) {
-			return ancestorMatchDetail{
-				gid:             currGID,
-				holderBlk:       blk,
-				hopCreator:      currCreator,
-				hopChildStack:   currChildStack,
-				directHop:       bridge.bridgeCount == 0,
-				hasChainDeliver: chainDeliver,
-			}, true
+			return currGID, true
 		}
 		currGID, currCreator, currChildStack, ok = bridge.backtrack(allStacks, matchAncestor, rejectGID)
 		if !ok {
-			return ancestorMatchDetail{}, false
+			return 0, false
 		}
-		advanceChainDeliver(&chainDeliver, currChildStack)
 	}
-	return fallbackAncestorMatchDetail(allStacks, currCreator, currChildStack, creatorFunc, callerStack, hookName, chainDeliver, matchAncestor, rejectGID)
+	gid, _, matched := matchAncestorFallbackForExactPostHook(allStacks, currCreator, currChildStack, creatorFunc, callerStack, hookName, matchAncestor, rejectGID)
+	return gid, matched
 }
 
 func aboveHookOwnsSymbol(blk, aboveHook, sym []byte) bool {
@@ -787,7 +738,7 @@ func aboveHookOwnsSymbol(blk, aboveHook, sym []byte) bool {
 
 func aboveHookOwnsExitedChild(blk []byte, hookIdx int, currCreator, childStack []byte) bool {
 	aboveHook := blk[:hookIdx]
-	if aboveHookOwnsSymbol(blk, aboveHook, currCreator) {
+	if !isInternalLRUMethodFrame(currCreator) && !isStdlibWaitGroupGoCreator(currCreator) && aboveHookOwnsSymbol(blk, aboveHook, currCreator) {
 		return true
 	}
 	end := bytes.LastIndex(childStack, []byte("\ncreated by "))
@@ -799,7 +750,7 @@ func aboveHookOwnsExitedChild(blk []byte, hookIdx int, currCreator, childStack [
 	for range maxBottomFrames {
 		var fn []byte
 		fn, rest = popBottomCallFrame(rest)
-		if len(fn) == 0 {
+		if len(fn) == 0 || isInternalLRUMethodFrame(fn) {
 			return false
 		}
 		if bytes.Equal(fn, []byte("sync.(*WaitGroup).Go.func1")) {
@@ -878,17 +829,6 @@ var (
 		[]byte("invokeFastEvictCallbacks5("),
 		[]byte("invokeFastEvictCallbacks6("),
 		[]byte("invokeFastEvictCallbacks7("),
-	}
-
-	fastEvictFuncSuffixes = [numPressureHookTags]string{
-		".invokeFastEvictCallbacks0",
-		".invokeFastEvictCallbacks1",
-		".invokeFastEvictCallbacks2",
-		".invokeFastEvictCallbacks3",
-		".invokeFastEvictCallbacks4",
-		".invokeFastEvictCallbacks5",
-		".invokeFastEvictCallbacks6",
-		".invokeFastEvictCallbacks7",
 	}
 )
 
@@ -3638,404 +3578,14 @@ func (p *pressureState) cacheNonDescendantEvictParent(parentGID, holder, holdSeq
 	}
 }
 
-func (p *pressureState) findExactEvictHolderDetail(allStacks, stack []byte, parentGID uint64, creatorFunc []byte, holder, holdSeq, startSnap uint64) (ancestorMatchDetail, bool) {
+func (p *pressureState) findExactEvictHolder(allStacks, stack []byte, parentGID uint64, creatorFunc []byte, holder, holdSeq, startSnap uint64) bool {
 	rejectFn := func(ancGID uint64) bool {
 		return ancGID != holder && p.wasLiveAtOrBeforeSnap(ancGID, startSnap)
 	}
-	det, ok := findAncestorCreatorAboveHookDetail(allStacks, stack, parentGID, creatorFunc, []byte("deliverCallbacks"), func(ancGID uint64) bool {
+	_, ok := findAncestorCreatorAboveHookOpts(allStacks, stack, parentGID, creatorFunc, []byte("deliverCallbacks"), func(ancGID uint64) bool {
 		return ancGID == holder
 	}, rejectFn)
 	if ok {
-		return det, true
-	}
-	p.cacheNonDescendantEvictParent(parentGID, holder, holdSeq)
-	return ancestorMatchDetail{}, false
-}
-
-func extractHolderTopFileLine(holderBlk []byte) (string, int) {
-	_, after, ok := bytes.Cut(holderBlk, []byte("\n\t"))
-	if !ok {
-		return "", 0
-	}
-	lineBytes, _, _ := bytes.Cut(after, []byte{'\n'})
-	if sp := bytes.LastIndexByte(lineBytes, ' '); sp > 0 {
-		lineBytes = lineBytes[:sp]
-	}
-	colon := bytes.LastIndexByte(lineBytes, ':')
-	if colon <= 0 {
-		return "", 0
-	}
-	lineNum, consumed := parseDecimalUint64(lineBytes[colon+1:])
-	if consumed == 0 {
-		return "", 0
-	}
-	return string(lineBytes[:colon]), int(lineNum)
-}
-
-func fetchPprofGoroutineProfile() ([]pprofStackRecord, []unsafe.Pointer) {
-	n, _ := pprofGoroutineProfileWithLabels(nil, nil)
-	for {
-		size := n + 16
-		recs := make([]pprofStackRecord, size)
-		labels := make([]unsafe.Pointer, size)
-		got, ok := pprofGoroutineProfileWithLabels(recs, labels)
-		if ok {
-			return recs[:got], labels[:got]
-		}
-		n = got
-	}
-}
-
-func scanPprofRecordFlags(pcs []uintptr, fastFuncSuffix, topFile string, topLine int) (bool, bool, bool) {
-	if len(pcs) == 0 {
-		return false, false, false
-	}
-	var hasFast, hasDeliver, hasTopLoc bool
-	frames := runtime.CallersFrames(pcs)
-	for {
-		fr, more := frames.Next()
-		if fastFuncSuffix != "" && strings.HasSuffix(fr.Function, fastFuncSuffix) {
-			hasFast = true
-		}
-		if strings.Contains(fr.Function, "deliverCallbacks") {
-			hasDeliver = true
-		}
-		if topLine > 0 && fr.Line == topLine && fr.File == topFile {
-			hasTopLoc = true
-		}
-		if !more {
-			return hasFast, hasDeliver, hasTopLoc
-		}
-	}
-}
-
-func lookupHolderPprofLabel(holderBlk []byte, activeTag unsafe.Pointer, fastTag uint32, hasFastTag bool) (unsafe.Pointer, bool) {
-	topFile, topLine := extractHolderTopFileLine(holderBlk)
-	var fastSuffix string
-	if hasFastTag && fastTag < numPressureHookTags {
-		fastSuffix = fastEvictFuncSuffixes[fastTag]
-	}
-	recs, labels := fetchPprofGoroutineProfile()
-	var fbLabel unsafe.Pointer
-	var fbMatches int
-	for i := range recs {
-		hasFast, hasDeliver, hasTop := scanPprofRecordFlags(recs[i].Stack, fastSuffix, topFile, topLine)
-		if hasFast {
-			return labels[i], true
-		}
-		if !hasDeliver {
-			continue
-		}
-		if activeTag != nil && labels[i] == activeTag && (topLine == 0 || hasTop) {
-			return labels[i], true
-		}
-		if hasTop {
-			fbLabel = labels[i]
-			fbMatches++
-		}
-	}
-	if fbMatches == 1 {
-		return fbLabel, true
-	}
-	return nil, false
-}
-
-func parseFileAndLineAfterTab(s []byte) ([]byte, uint64) {
-	if len(s) > 0 && s[0] == '\t' {
-		s = s[1:]
-	}
-	lineBytes, _, _ := bytes.Cut(s, []byte{'\n'})
-	if sp := bytes.LastIndex(lineBytes, []byte(" +0x")); sp > 0 {
-		lineBytes = lineBytes[:sp]
-	}
-	colon := bytes.LastIndexByte(lineBytes, ':')
-	if colon <= 0 {
-		return nil, 0
-	}
-	lineNum, consumed := parseDecimalUint64(lineBytes[colon+1:])
-	if consumed == 0 {
-		return nil, 0
-	}
-	return lineBytes[:colon], lineNum
-}
-
-func parseCreatedByFileLine(childStack []byte) ([]byte, uint64) {
-	idx := bytes.LastIndex(childStack, []byte("\ncreated by "))
-	if idx < 0 {
-		return nil, 0
-	}
-	_, afterTab, ok := bytes.Cut(childStack[idx+1:], []byte("\n\t"))
-	if !ok {
-		return nil, 0
-	}
-	return parseFileAndLineAfterTab(afterTab)
-}
-
-func frameMatchesCreator(fnLine, creatorFunc []byte) bool {
-	if len(creatorFunc) == 0 {
-		return false
-	}
-	brackIdx := bytes.IndexByte(creatorFunc, '[')
-	if brackIdx < 0 {
-		return bytes.HasPrefix(fnLine, creatorFunc) && isCallFrameBoundary(fnLine[len(creatorFunc):])
-	}
-	return brackIdx > 0 && bytes.HasPrefix(fnLine, creatorFunc[:brackIdx]) && matchCreatorLine(fnLine, creatorFunc)
-}
-
-func recordCreatorLineBounds(ln uint64, minLine, maxLine *uint64, matched *bool) {
-	if !*matched || ln < *minLine {
-		*minLine = ln
-	}
-	if !*matched || ln > *maxLine {
-		*maxLine = ln
-	}
-	*matched = true
-}
-
-func scanCreatorLinesInFile(stackSlice, creatorFunc, wantFile []byte) (minLine, maxLine uint64, matchedInFile bool) {
-	if len(creatorFunc) == 0 || len(wantFile) == 0 {
-		return 0, 0, false
-	}
-	for rem := stackSlice; len(rem) > 0; {
-		nl := bytes.IndexByte(rem, '\n')
-		if nl < 0 {
-			break
-		}
-		fnLine, afterFn, ok := bytes.Cut(rem[nl+1:], []byte{'\n'})
-		if !ok {
-			break
-		}
-		if len(afterFn) > 0 && afterFn[0] == '\t' && frameMatchesCreator(fnLine, creatorFunc) {
-			if f, ln := parseFileAndLineAfterTab(afterFn); ln > 0 && bytes.Equal(f, wantFile) {
-				recordCreatorLineBounds(ln, &minLine, &maxLine, &matchedInFile)
-			}
-		}
-		rem = afterFn
-	}
-	return minLine, maxLine, matchedInFile
-}
-
-func creatorSpawnAfterBelowCall(belowHook, hopCreator, spawnFile []byte, spawnLine uint64) bool {
-	if spawnLine == 0 || len(spawnFile) == 0 {
-		return false
-	}
-	_, maxBelowLine, ok := scanCreatorLinesInFile(belowHook, hopCreator, spawnFile)
-	return ok && spawnLine > maxBelowLine
-}
-
-func creatorSpawnMatchesReenteredBothHooks(aboveHook, belowHook, hopCreator, spawnFile []byte, spawnLine uint64) bool {
-	if creatorSpawnAfterBelowCall(belowHook, hopCreator, spawnFile, spawnLine) {
-		return true
-	}
-	minAbove, _, okAbove := scanCreatorLinesInFile(aboveHook, hopCreator, spawnFile)
-	minBelow, _, okBelow := scanCreatorLinesInFile(belowHook, hopCreator, spawnFile)
-	return okAbove && okBelow && minAbove < minBelow && spawnLine <= minAbove
-}
-
-func directCallbackEntryAboveHook(aboveHook []byte) []byte {
-	rest := aboveHook
-	for range 4 {
-		var fn []byte
-		fn, rest = popBottomCallFrame(rest)
-		if len(fn) == 0 {
-			return nil
-		}
-		if !isInternalCallbackDispatchFrame(fn) {
-			return trimClosureOffset(fn)
-		}
-	}
-	return nil
-}
-
-func strictCallbackEntryAboveHook(aboveHook, belowHook []byte) []byte {
-	entry := directCallbackEntryAboveHook(aboveHook)
-	if len(entry) == 0 || containsCreatorCallFrame(belowHook, entry) {
-		return nil
-	}
-	return entry
-}
-
-func isClosureStrictlyInside(fn, owner []byte) bool {
-	if len(owner) == 0 {
-		return false
-	}
-	curr := trimClosureOffset(fn)
-	for {
-		dot := lastDotOutsideBrackets(curr)
-		if dot <= 0 || !isClosureSuffix(curr[dot+1:]) {
-			return false
-		}
-		curr = curr[:dot]
-		if sameFuncSymbolIgnoringTypeArgs(curr, owner) {
-			return true
-		}
-	}
-}
-
-func isInternalLRUMethodFrame(fn []byte) bool {
-	rest, ok := bytes.CutPrefix(fn, []byte("github.com/google/go-lru.(*"))
-	if !ok {
-		return false
-	}
-	return bytes.HasPrefix(rest, []byte("mapCache[")) ||
-		bytes.HasPrefix(rest, []byte("radixCache[")) ||
-		bytes.HasPrefix(rest, []byte("ArenaRadixCache[")) ||
-		bytes.HasPrefix(rest, []byte("shardedCache[")) ||
-		bytes.HasPrefix(rest, []byte("evictCallbackQueue[")) ||
-		bytes.HasPrefix(rest, []byte("pressureState)."))
-}
-
-func classifyChildBottomFrame(aboveHook, belowHook, strictEntry, fn []byte, strictOnly bool) (owned, rejected bool) {
-	if strictOnly {
-		if isClosureStrictlyInside(fn, strictEntry) {
-			return true, false
-		}
-		if containsCreatorCallFrame(belowHook, fn) || len(findClosureOwnerInStack(belowHook, fn)) > 0 {
-			return false, true
-		}
-		return false, false
-	}
-	inAbove := containsCreatorCallFrame(aboveHook, fn)
-	inBelow := containsCreatorCallFrame(belowHook, fn)
-	if inAbove || inBelow {
-		return inAbove && !inBelow, inBelow
-	}
-	if aboveOwner := findClosureOwnerInStack(aboveHook, fn); len(aboveOwner) > 0 {
-		if containsCreatorCallFrame(belowHook, aboveOwner) {
-			return false, true
-		}
-		return true, false
-	}
-	if len(findClosureOwnerInStack(belowHook, fn)) > 0 {
-		return false, true
-	}
-	return false, false
-}
-
-func bottomFramesStrictlyOwnedAboveHook(aboveHook, belowHook, strictEntry, childStack []byte, inheritedModifiedScope, strictOnly bool) bool {
-	end := bytes.LastIndex(childStack, []byte("\ncreated by "))
-	if end <= 0 {
-		return false
-	}
-	rest := childStack[:end]
-	const maxBottomFrames = 8
-	for range maxBottomFrames {
-		var fn []byte
-		fn, rest = popBottomCallFrame(rest)
-		if len(fn) == 0 || isInternalLRUMethodFrame(fn) {
-			break
-		}
-		if bytes.Equal(fn, []byte("sync.(*WaitGroup).Go.func1")) {
-			continue
-		}
-		owned, rejected := classifyChildBottomFrame(aboveHook, belowHook, strictEntry, fn, strictOnly)
-		if rejected {
-			return false
-		}
-		if owned {
-			return true
-		}
-	}
-	return inheritedModifiedScope
-}
-
-func matchDirectHopCreatorInStack(aboveHook, belowHook, hopCreator, childStack []byte, holderFound bool, callerLabel, holderLabel unsafe.Pointer) (matched, decided bool) {
-	spawnFile, spawnLine := parseCreatedByFileLine(childStack)
-	inAbove := containsCreatorCallFrame(aboveHook, hopCreator)
-	inBelow := containsCreatorCallFrame(belowHook, hopCreator)
-	if inAbove {
-		if !inBelow {
-			return true, true
-		}
-		return creatorSpawnMatchesReenteredBothHooks(aboveHook, belowHook, hopCreator, spawnFile, spawnLine), true
-	}
-	if inBelow {
-		return (!holderFound || callerLabel == holderLabel) && creatorSpawnAfterBelowCall(belowHook, hopCreator, spawnFile, spawnLine), true
-	}
-	return false, false
-}
-
-func detailStrictlyOwnsEvictChildAboveHook(det ancestorMatchDetail, hookIdx int, activeTag, callerLabel, holderLabel unsafe.Pointer, holderFound bool) bool {
-	aboveHook := det.holderBlk[:hookIdx]
-	belowHook := det.holderBlk[hookIdx:]
-	hopCreator := trimClosureOffset(det.hopCreator)
-	strictEntry := strictCallbackEntryAboveHook(aboveHook, belowHook)
-	if len(strictEntry) > 0 && (sameFuncSymbolIgnoringTypeArgs(hopCreator, strictEntry) || isClosureStrictlyInside(hopCreator, strictEntry)) {
-		return true
-	}
-	if matched, decided := matchDirectHopCreatorInStack(aboveHook, belowHook, hopCreator, det.hopChildStack, holderFound, callerLabel, holderLabel); decided {
-		return matched
-	}
-	inheritedModifiedScope := holderFound && holderLabel != nil && holderLabel != activeTag && callerLabel == holderLabel
-	strictOnly := holderFound && !inheritedModifiedScope
-	return bottomFramesStrictlyOwnedAboveHook(aboveHook, belowHook, strictEntry, det.hopChildStack, inheritedModifiedScope, strictOnly)
-}
-
-func resolveHolderEvictHookIdx(holderBlk []byte, fastTag uint32, hasFastTag bool) int {
-	searchBlk := holderBlk
-	if hasFastTag && fastTag < numPressureHookTags {
-		mIdx := bytes.Index(holderBlk, fastEvictCallbackMarkers[fastTag])
-		if mIdx <= 0 {
-			return -1
-		}
-		searchBlk = holderBlk[:mIdx]
-	}
-	rawIdx := bytes.LastIndex(searchBlk, []byte("deliverCallbacks"))
-	if rawIdx <= 0 {
-		return -1
-	}
-	if lineNL := bytes.LastIndexByte(holderBlk[:rawIdx], '\n'); lineNL > 0 {
-		return lineNL
-	}
-	return -1
-}
-
-func isForeignUntamperedRingTag(det ancestorMatchDetail, activeTag, callerLabel, holderLabel unsafe.Pointer, holderFound bool) bool {
-	return callerLabel != nil && isAnyEvictRingTag(callerLabel) &&
-		holderFound && holderLabel == activeTag && !det.hasChainDeliver
-}
-
-func isInheritedScopedPprofChild(det ancestorMatchDetail, hookIdx int, callerLabel unsafe.Pointer) bool {
-	if callerLabel == nil || isAnyEvictRingTag(callerLabel) || bytes.Contains(det.hopChildStack, []byte("\nruntime/pprof.Do(")) {
-		return false
-	}
-	strictEntry := strictCallbackEntryAboveHook(det.holderBlk[:hookIdx], det.holderBlk[hookIdx:])
-	return isClosureStrictlyInside(det.hopCreator, strictEntry)
-}
-
-func acceptFastModeHolderMatch(det ancestorMatchDetail, hookIdx int, activeTag, callerLabel, holderLabel unsafe.Pointer, holderFound bool) bool {
-	if !holderFound {
-		return true
-	}
-	if holderLabel != activeTag && (callerLabel == holderLabel || isInheritedScopedPprofChild(det, hookIdx, callerLabel)) {
-		return true
-	}
-	return bytes.Equal(trimClosureOffset(det.hopCreator), []byte("sync.(*WaitGroup).Go"))
-}
-
-func (p *pressureState) inspectFastModePprofDescendant(det ancestorMatchDetail, parentGID, holder, holdSeq uint64, activeTag, callerLabel unsafe.Pointer) bool {
-	fastTag, hasFastTag := p.activeFastEvictTag()
-	hookIdx := resolveHolderEvictHookIdx(det.holderBlk, fastTag, hasFastTag)
-	if hookIdx <= 0 || !hasCallFrameAboveHook(det.holderBlk[:hookIdx]) {
-		p.cacheNonDescendantEvictParent(parentGID, holder, holdSeq)
-		return false
-	}
-	holderLabel, holderFound := lookupHolderPprofLabel(det.holderBlk, activeTag, fastTag, hasFastTag)
-	if p.evictHoldSeq.Load() != holdSeq || p.evictCallbackGID.Load() != holder {
-		return false
-	}
-	if holderFound && activeTag != nil && holderLabel != activeTag {
-		p.latchEvictLabelTampered()
-	}
-	if isForeignUntamperedRingTag(det, activeTag, callerLabel, holderLabel, holderFound) ||
-		!detailStrictlyOwnsEvictChildAboveHook(det, hookIdx, activeTag, callerLabel, holderLabel, holderFound) {
-		p.cacheNonDescendantEvictParent(parentGID, holder, holdSeq)
-		return false
-	}
-	if holderFound && holderLabel == activeTag {
-		p.latchEvictLabelTampered()
-	}
-	if acceptFastModeHolderMatch(det, hookIdx, activeTag, callerLabel, holderLabel, holderFound) {
 		return true
 	}
 	p.cacheNonDescendantEvictParent(parentGID, holder, holdSeq)
@@ -4047,22 +3597,20 @@ func (p *pressureState) isDescendantOfEvictHolder(stack []byte, gid, parentGID u
 	if p.preRejectEvictDescendant(gid, parentGID, holder, holdSeq, startSnap) {
 		return false
 	}
-	if activeTag != nil && callerLabel == activeTag {
-		return true
-	}
-	if !exactSnap && callerLabel != nil && p.isEvictRingTag(callerLabel) {
+	if !exactSnap {
+		if activeTag != nil && callerLabel == activeTag {
+			return true
+		}
+		if callerLabel == nil || !p.isEvictRingTag(callerLabel) {
+			p.latchEvictLabelTampered()
+		}
 		p.cacheNonDescendantEvictParent(parentGID, holder, holdSeq)
 		return false
 	}
 	allStacks, bufPtr := captureAllGoroutineStacks()
-	det, ok := p.findExactEvictHolderDetail(allStacks, stack, parentGID, creatorFunc, holder, holdSeq, startSnap)
-	if exactSnap || !ok {
-		releaseAllGoroutineStacks(bufPtr)
-		return ok
-	}
-	matched := p.inspectFastModePprofDescendant(det, parentGID, holder, holdSeq, activeTag, callerLabel)
+	ok := p.findExactEvictHolder(allStacks, stack, parentGID, creatorFunc, holder, holdSeq, startSnap)
 	releaseAllGoroutineStacks(bufPtr)
-	return matched
+	return ok
 }
 
 func (p *pressureState) activeEvictRingTagForSeq(holdSeq uint64) unsafe.Pointer {
@@ -4390,6 +3938,7 @@ func (q *evictCallbackQueue[V]) deliverMultiCallbacks(onVal func(V, EvictionReas
 //go:noinline
 func (p *pressureState) finishFastEvictDeliverySlow() bool {
 	p.clearHeldEvictLabelLocked()
+	p.advanceEvictHoldSeqToIdleLocked()
 	p.evictCallbackMu.Unlock()
 	if p.evictPendingEnqueues.Load() != 0 && p.evictCallbackMu.TryLock() {
 		p.beginEvictCallbackHold(true)
