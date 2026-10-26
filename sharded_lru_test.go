@@ -6290,6 +6290,325 @@ func TestShardedCache_PostWarmupChannelWaitChildNoDeadlockAndPprofLabels(t *test
 	}
 }
 
+func execR12PprofChildBehavior(subcase int, c Cache[int], outerChildFn, outerChildPprofDo func(), resCh <-chan bool) {
+	bg := context.Background()
+	lbls := pprof.Labels("op", "evict")
+	switch subcase {
+	case 0:
+		pprof.Do(bg, lbls, func(context.Context) {
+			ch := make(chan bool, 1)
+			go func() {
+				_, ok := c.Delete("s1/victim")
+				ch <- ok
+			}()
+			<-ch
+		})
+	case 1:
+		pprof.Do(bg, lbls, func(context.Context) {
+			var wg sync.WaitGroup
+			wg.Go(outerChildFn)
+			<-resCh
+			wg.Wait()
+		})
+	case 2:
+		var wg sync.WaitGroup
+		pprof.Do(bg, lbls, func(context.Context) {
+			wg.Go(outerChildFn)
+		})
+		<-resCh
+		wg.Wait()
+	case 3:
+		pprof.Do(bg, lbls, func(context.Context) {})
+		ch := make(chan bool, 1)
+		go func() {
+			_, ok := c.Delete("s1/victim")
+			ch <- ok
+		}()
+		<-ch
+	default:
+		execR12PprofChildBehaviorMore(subcase, outerChildFn, outerChildPprofDo, resCh)
+	}
+}
+
+func execR12PprofChildBehaviorMore(subcase int, outerChildFn, outerChildPprofDo func(), resCh <-chan bool) {
+	bg := context.Background()
+	lbls := pprof.Labels("op", "evict")
+	switch subcase {
+	case 4:
+		pprof.Do(bg, lbls, func(context.Context) {})
+		var wg sync.WaitGroup
+		wg.Go(outerChildFn)
+		<-resCh
+		wg.Wait()
+	case 5:
+		pprof.SetGoroutineLabels(pprof.WithLabels(bg, pprof.Labels("trace", "xyz")))
+		var wg sync.WaitGroup
+		wg.Go(outerChildFn)
+		<-resCh
+		wg.Wait()
+	case 6:
+		pprof.SetGoroutineLabels(bg)
+		var wg sync.WaitGroup
+		wg.Go(outerChildFn)
+		<-resCh
+		wg.Wait()
+	case 7:
+		var wg sync.WaitGroup
+		wg.Go(outerChildPprofDo)
+		<-resCh
+		wg.Wait()
+	}
+}
+
+func runR12PprofDoChildSubcase(t *testing.T, sharded, useReplace bool, subcase int) {
+	t.Helper()
+	var c Cache[int]
+	var armed atomic.Bool
+	var step, childEvicts atomic.Int32
+	resCh := make(chan bool, 1)
+	outerChildFn := func() {
+		_, ok := c.Delete("s1/victim")
+		resCh <- ok
+	}
+	outerChildPprofDo := func() {
+		pprof.Do(context.Background(), pprof.Labels("worker", "1"), func(context.Context) {
+			_, ok := c.Delete("s1/victim")
+			resCh <- ok
+		})
+	}
+
+	c = makeShardedOrUnshardedIntCache(sharded, 2,
+		WithOnEvictEntry(func(k string, _ int, r EvictionReason) {
+			if k == "s1/victim" && r == EvictionReasonDeleted {
+				childEvicts.Add(1)
+				return
+			}
+			if !armed.Load() || k != "s0/seed" {
+				return
+			}
+			if subcase == 8 {
+				if step.Add(1) == 1 {
+					pprof.Do(context.Background(), pprof.Labels("k", "v"), func(context.Context) {})
+					return
+				}
+				var wg sync.WaitGroup
+				wg.Go(outerChildFn)
+				<-resCh
+				wg.Wait()
+				return
+			}
+			execR12PprofChildBehavior(subcase, c, outerChildFn, outerChildPprofDo, resCh)
+		}),
+	)
+
+	warmupUncontendedReplaceEvictions(c, 75)
+	_, _ = c.Put("s0/seed", 0)
+	_ = c.Replace("s0/seed", 1)
+	require.True(t, coordPressureState(c).evictFastMode.Load())
+	_, _ = c.Put("s1/victim", 2)
+	armed.Store(true)
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		defer pprof.SetGoroutineLabels(context.Background())
+		if subcase == 8 {
+			_ = c.Replace("s0/seed", 9)
+		}
+		if useReplace {
+			_ = c.Replace("s0/seed", 10)
+		} else {
+			_, _ = c.Put("s0/trigger", 3)
+		}
+	}()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatalf("deadlocked in pprof post-warmup OnEvict sharded=%v replace=%v subcase=%d", sharded, useReplace, subcase)
+	}
+	assert.Equal(t, int32(1), childEvicts.Load())
+}
+
+func verifyR12CallerGoroutineLabelInPprof(t *testing.T, wantSubstr string) {
+	t.Helper()
+	var buf strings.Builder
+	prof := pprof.Lookup("goroutine")
+	if assert.NotNil(t, prof) && assert.NoError(t, prof.WriteTo(&buf, 1)) {
+		assert.Contains(t, buf.String(), wantSubstr)
+	}
+}
+
+func runR12SetGoroutineLabelsPreservedCase(t *testing.T, sharded, shouldPanic bool) {
+	t.Helper()
+	var armed atomic.Bool
+	var expectedPtr atomic.Uintptr
+	wantVal := "norm-123"
+	if shouldPanic {
+		wantVal = "panic-456"
+	}
+
+	c := makeShardedOrUnshardedIntCache(sharded, 4,
+		WithOnEvictValue(func(_ int, r EvictionReason) {
+			if !armed.Load() || r != EvictionReasonReplaced {
+				return
+			}
+			ctx := pprof.WithLabels(context.Background(), pprof.Labels("trace_id", wantVal))
+			pprof.SetGoroutineLabels(ctx)
+			expectedPtr.Store(uintptr(runtimeGetProfLabel()))
+			if shouldPanic {
+				panic("c2-label-panic")
+			}
+		}),
+	)
+
+	warmupUncontendedReplaceEvictions(c, 75)
+	_, _ = c.Put("s0/k", 0)
+	_ = c.Replace("s0/k", 1)
+	p := coordPressureState(c)
+	require.True(t, p.evictFastMode.Load())
+	armed.Store(true)
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		defer pprof.SetGoroutineLabels(context.Background())
+		if shouldPanic {
+			assert.PanicsWithValue(t, "c2-label-panic", func() {
+				_ = c.Replace("s0/k", 2)
+			})
+		} else {
+			assert.NoError(t, c.Replace("s0/k", 2))
+		}
+		gotPtr := uintptr(runtimeGetProfLabel())
+		assert.NotZero(t, expectedPtr.Load())
+		assert.Equal(t, expectedPtr.Load(), gotPtr, "user goroutine labels set via SetGoroutineLabels inside OnEvict must not be erased")
+		verifyR12CallerGoroutineLabelInPprof(t, `"trace_id":"`+wantVal+`"`)
+	}()
+	<-done
+	assert.True(t, p.evictLabelTampered.Load())
+	assert.False(t, p.evictFastMode.Load())
+}
+
+func runR12BgIsolationWithPprofDoCase(t *testing.T, sharded bool) {
+	t.Helper()
+	var c Cache[int]
+	var armed, fgInEvict, bgDuringFg atomic.Bool
+	inFg := make(chan struct{})
+	bgDone := make(chan struct{})
+
+	c = makeShardedOrUnshardedIntCache(sharded, 4,
+		WithOnEvictEntry(func(k string, _ int, r EvictionReason) {
+			if !armed.Load() || k != "s0/fg" || r != EvictionReasonReplaced {
+				return
+			}
+			fgInEvict.Store(true)
+			defer fgInEvict.Store(false)
+			pprof.Do(context.Background(), pprof.Labels("fg", "1"), func(context.Context) {
+				close(inFg)
+				waitUntilEvictContendedFor(c, 20*time.Millisecond)
+			})
+		}),
+	)
+
+	warmupUncontendedReplaceEvictions(c, 75)
+	_, _ = c.Put("s0/fg", 1)
+	_, _ = c.Put("s1/bg", 2)
+	armed.Store(true)
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		go func() {
+			defer close(bgDone)
+			<-inFg
+			_, _ = c.Delete("s1/bg")
+			bgDuringFg.Store(fgInEvict.Load())
+		}()
+		assert.NoError(t, c.Replace("s0/fg", 10))
+	}()
+	<-done
+	<-bgDone
+	assert.False(t, bgDuringFg.Load(), "unrelated background sibling must serialize behind OnEvict even when OnEvict uses pprof.Do")
+
+	// Also verify pre-existing outerWG.Go panic isolation when post-warmup OnEvict calls pprof.Do and panics.
+	var panicArmed atomic.Bool
+	inPanicFg := make(chan struct{})
+	bgPanicErr := make(chan any, 1)
+	var outerWG sync.WaitGroup
+	c2 := makeShardedOrUnshardedIntCache(sharded, 4,
+		WithOnEvictEntry(func(k string, _ int, _ EvictionReason) {
+			if !panicArmed.Load() {
+				return
+			}
+			if k == "s0/fg" {
+				pprof.Do(context.Background(), pprof.Labels("fg", "panic"), func(context.Context) {})
+				close(inPanicFg)
+				time.Sleep(25 * time.Millisecond)
+				panic("fg-panic")
+			}
+			if k == "s1/bg" {
+				panic("bg-panic")
+			}
+		}),
+	)
+	warmupUncontendedReplaceEvictions(c2, 75)
+	_, _ = c2.Put("s0/fg", 0)
+	_ = c2.Replace("s0/fg", 1)
+	require.True(t, coordPressureState(c2).evictFastMode.Load())
+	_, _ = c2.Put("s1/bg", 2)
+	panicArmed.Store(true)
+
+	outerWG.Go(func() {
+		defer func() { bgPanicErr <- recover() }()
+		<-inPanicFg
+		_, _ = c2.Delete("s1/bg")
+	})
+	assert.PanicsWithValue(t, "fg-panic", func() {
+		_ = c2.Replace("s0/fg", 10)
+	})
+	outerWG.Wait()
+	assert.Equal(t, "bg-panic", <-bgPanicErr)
+}
+
+func TestShardedCache_PostWarmupPprofDoAndSetLabels(t *testing.T) {
+	subcaseNames := []string{
+		"PprofDo_GoInline",
+		"PprofDo_WGGoOuter_WaitInside",
+		"PprofDo_SpawnInside_WaitAfterReturn",
+		"PprofDo_ReturnThenGoInline",
+		"PprofDo_ReturnThenWGGoOuter",
+		"SetLabels_NonEmpty_WGGoOuter",
+		"SetLabels_Background_WGGoOuter",
+		"ChildCallsPprofDo",
+		"PprofDoEvict76_ChildEvict77",
+	}
+	for _, sharded := range []bool{false, true} {
+		mode := "Unsharded"
+		if sharded {
+			mode = "Sharded"
+		}
+		for idx, name := range subcaseNames {
+			t.Run(name+"_Replace/"+mode, func(t *testing.T) {
+				runR12PprofDoChildSubcase(t, sharded, true, idx)
+			})
+			if idx <= 4 {
+				t.Run(name+"_Put/"+mode, func(t *testing.T) {
+					runR12PprofDoChildSubcase(t, sharded, false, idx)
+				})
+			}
+		}
+		t.Run("SetLabelsPreserved_Return/"+mode, func(t *testing.T) {
+			runR12SetGoroutineLabelsPreservedCase(t, sharded, false)
+		})
+		t.Run("SetLabelsPreserved_Panic/"+mode, func(t *testing.T) {
+			runR12SetGoroutineLabelsPreservedCase(t, sharded, true)
+		})
+		t.Run("BgIsolationAndDualPanic/"+mode, func(t *testing.T) {
+			runR12BgIsolationWithPprofDoCase(t, sharded)
+		})
+	}
+}
+
 func BenchmarkShardedParallelThroughput(b *testing.B) {
 	const capTotal = 16384
 	keys := make([]string, capTotal*2)
