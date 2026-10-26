@@ -5054,30 +5054,53 @@ func TestShardedCache_MultiChildCallbackDescendantsLineage(t *testing.T) {
 	}
 }
 
-func waitUntilEvictContended(c Cache[int]) {
-	var p *pressureState
+func coordPressureState(c Cache[int]) *pressureState {
 	if sc, ok := c.(*shardedCache[int]); ok {
-		p = &sc.coord
-	} else if provider, ok := c.(interface{ pressureStatePtr() *pressureState }); ok {
-		p = provider.pressureStatePtr()
+		return &sc.coord
 	}
+	if provider, ok := c.(interface{ pressureStatePtr() *pressureState }); ok {
+		return provider.pressureStatePtr()
+	}
+	return nil
+}
+
+func waitUntilEvictContendedFor(c Cache[int], hold time.Duration) {
+	p := coordPressureState(c)
 	deadline := time.Now().Add(2 * time.Second)
 	for time.Now().Before(deadline) {
 		if p != nil && p.evictCallbackContended.Load() {
-			time.Sleep(5 * time.Millisecond)
+			<-time.After(hold)
 			return
 		}
 		runtime.Gosched()
 	}
 }
 
-func runC2OuterWGBeforeEvictPanic(t *testing.T, sharded, warmup bool) {
+func waitUntilEvictContended(c Cache[int]) {
+	waitUntilEvictContendedFor(c, 5*time.Millisecond)
+}
+
+func launchC2HelperWorker(done chan struct{}, fn func()) {
+	go func() {
+		defer close(done)
+		fn()
+	}()
+}
+
+func runC2PreExistingEvictCase(t *testing.T, sharded, warmup bool, spawnMode int, shouldPanic bool) {
 	t.Helper()
 	var c Cache[int]
 	armed := atomic.Bool{}
 	inFgEvict := make(chan struct{})
+	var fgInEvict atomic.Bool
 	var bgEvictDone atomic.Bool
 	var bgSawSyncEvict atomic.Bool
+	var bgReturnedDuringFg atomic.Bool
+
+	holdDur := 10 * time.Millisecond
+	if warmup {
+		holdDur = 350 * time.Millisecond
+	}
 
 	c = makeShardedOrUnshardedIntCache(sharded, 4,
 		WithOnEvictEntry(func(k string, _ int, r EvictionReason) {
@@ -5086,12 +5109,16 @@ func runC2OuterWGBeforeEvictPanic(t *testing.T, sharded, warmup bool) {
 				return
 			}
 			if armed.Load() && k == "s0/fg" && r == EvictionReasonReplaced {
+				fgInEvict.Store(true)
+				defer fgInEvict.Store(false)
 				close(inFgEvict)
 				var innerWG sync.WaitGroup
 				innerWG.Go(pkgNoopCallbackWorker)
 				innerWG.Wait()
-				waitUntilEvictContended(c)
-				panic("fg boom")
+				waitUntilEvictContendedFor(c, holdDur)
+				if shouldPanic {
+					panic("fg boom")
+				}
 			}
 		}),
 	)
@@ -5103,18 +5130,45 @@ func runC2OuterWGBeforeEvictPanic(t *testing.T, sharded, warmup bool) {
 	armed.Store(true)
 
 	var outerWG sync.WaitGroup
-	outerWG.Go(func() {
+	bgDone := make(chan struct{})
+	bgWork := func() {
 		<-inFgEvict
 		_, ok := c.Delete("s1/bg")
 		assert.True(t, ok)
+		bgReturnedDuringFg.Store(fgInEvict.Load())
 		bgSawSyncEvict.Store(bgEvictDone.Load())
-	})
-	assert.PanicsWithValue(t, "fg boom", func() {
-		_ = c.Replace("s0/fg", 10)
-	})
+	}
+	switch spawnMode {
+	case 0:
+		outerWG.Go(func() {
+			defer close(bgDone)
+			bgWork()
+		})
+	case 1:
+		go func() {
+			defer close(bgDone)
+			bgWork()
+		}()
+	default:
+		launchC2HelperWorker(bgDone, bgWork)
+	}
+	if shouldPanic {
+		assert.PanicsWithValue(t, "fg boom", func() {
+			_ = c.Replace("s0/fg", 10)
+		})
+	} else {
+		require.NoError(t, c.Replace("s0/fg", 10))
+	}
+	<-bgDone
 	outerWG.Wait()
-	assert.True(t, bgEvictDone.Load(), "pre-existing goroutine must not lose its OnEvict callback on holder panic")
+	assert.False(t, bgReturnedDuringFg.Load(), "pre-existing goroutine Delete must not return while foreground OnEvict still holds evictCallbackMu")
+	assert.True(t, bgEvictDone.Load(), "pre-existing goroutine must not lose its OnEvict callback")
 	assert.True(t, bgSawSyncEvict.Load(), "pre-existing goroutine Delete must run OnEvict synchronously before returning")
+}
+
+func runC2OuterWGBeforeEvictPanic(t *testing.T, sharded, warmup bool) {
+	t.Helper()
+	runC2PreExistingEvictCase(t, sharded, warmup, 0, true)
 }
 
 type c2BranchOrderService struct {
@@ -5254,12 +5308,177 @@ func TestShardedCache_PreExistingGoroutineNotMisclassifiedAsCallbackChild(t *tes
 			t.Run("OnEvictPanicAndSync/"+mode+"/"+warmName, func(t *testing.T) {
 				runC2OuterWGBeforeEvictPanic(t, sharded, warmup)
 			})
+			t.Run("OnEvictNormalReturnSync/"+mode+"/"+warmName, func(t *testing.T) {
+				runC2PreExistingEvictCase(t, sharded, warmup, 0, false)
+			})
+			t.Run("DirectGoEvictPanicAndNormal/"+mode+"/"+warmName, func(t *testing.T) {
+				runC2PreExistingEvictCase(t, sharded, warmup, 1, true)
+				runC2PreExistingEvictCase(t, sharded, warmup, 1, false)
+			})
+			t.Run("HelperGoEvictPanicAndNormal/"+mode+"/"+warmName, func(t *testing.T) {
+				runC2PreExistingEvictCase(t, sharded, warmup, 2, true)
+				runC2PreExistingEvictCase(t, sharded, warmup, 2, false)
+			})
 			t.Run("PressureAndCompact/"+mode+"/"+warmName, func(t *testing.T) {
 				runC2OuterWGBeforePressureAndCompact(t, sharded, warmup)
 			})
 		}
 		t.Run("MultiBranchSpawnLineOrder/"+mode, func(t *testing.T) {
 			runC2MultiBranchSpawnLineOrder(t, sharded)
+		})
+	}
+}
+
+func spawnHelperAsyncForSleepPoll(fn func()) {
+	go fn()
+}
+
+func sleepPollUntilDone(done *atomic.Bool) {
+	for !done.Load() {
+		time.Sleep(1 * time.Millisecond)
+	}
+}
+
+func runPostWarmupSleepPollChildCase(t *testing.T, sharded, useReplace bool, variant int) {
+	t.Helper()
+	var c Cache[int]
+	var childEvicts atomic.Int32
+	var armed atomic.Bool
+	var childDone atomic.Bool
+
+	outerChild := func() {
+		defer childDone.Store(true)
+		_, ok := c.Delete("s1/victim")
+		assert.True(t, ok)
+	}
+
+	c = makeShardedOrUnshardedIntCache(sharded, 2,
+		WithOnEvictEntry(func(k string, _ int, r EvictionReason) {
+			if k == "s1/victim" && r == EvictionReasonDeleted {
+				childEvicts.Add(1)
+				return
+			}
+			if !armed.Load() || k != "s0/seed" {
+				return
+			}
+			switch variant {
+			case 0:
+				go func() {
+					defer childDone.Store(true)
+					_, ok := c.Delete("s1/victim")
+					assert.True(t, ok)
+				}()
+				sleepPollUntilDone(&childDone)
+			case 1:
+				var wg sync.WaitGroup
+				wg.Go(func() {
+					defer childDone.Store(true)
+					_, ok := c.Delete("s1/victim")
+					assert.True(t, ok)
+				})
+				sleepPollUntilDone(&childDone)
+				wg.Wait()
+			default:
+				spawnHelperAsyncForSleepPoll(outerChild)
+				sleepPollUntilDone(&childDone)
+			}
+		}),
+	)
+
+	warmupUncontendedReplaceEvictions(c, 75)
+	_, _ = c.Put("s0/seed", 1)
+	_, _ = c.Put("s1/victim", 2)
+	armed.Store(true)
+
+	finished := make(chan struct{})
+	go func() {
+		defer close(finished)
+		if useReplace {
+			assert.NoError(t, c.Replace("s0/seed", 10))
+		} else {
+			_, _ = c.Put("s0/trigger", 3)
+		}
+		_, _ = c.Put("s1/after", 4)
+		_, ok := c.Delete("s1/after")
+		assert.True(t, ok)
+	}()
+
+	select {
+	case <-finished:
+	case <-time.After(3 * time.Second):
+		t.Fatalf("deadlocked in post-warmup sleep-polling OnEvict sharded=%v replace=%v variant=%d", sharded, useReplace, variant)
+	}
+	assert.Equal(t, int32(1), childEvicts.Load())
+}
+
+func TestShardedCache_PostWarmupSleepPollingCallbackChildNoDeadlock(t *testing.T) {
+	for _, sharded := range []bool{false, true} {
+		mode := "Unsharded"
+		if sharded {
+			mode = "Sharded"
+		}
+		t.Run("DirectGo_Replace/"+mode, func(t *testing.T) {
+			runPostWarmupSleepPollChildCase(t, sharded, true, 0)
+		})
+		t.Run("DirectGo_Put/"+mode, func(t *testing.T) {
+			runPostWarmupSleepPollChildCase(t, sharded, false, 0)
+		})
+		t.Run("InlineWG_Replace/"+mode, func(t *testing.T) {
+			runPostWarmupSleepPollChildCase(t, sharded, true, 1)
+		})
+		t.Run("HelperOuterClosure_Replace/"+mode, func(t *testing.T) {
+			runPostWarmupSleepPollChildCase(t, sharded, true, 2)
+		})
+	}
+}
+
+func TestShardedCache_PressureFuncWithoutOnEvictPrunesPreHookLiveGIDs(t *testing.T) {
+	for _, sharded := range []bool{false, true} {
+		mode := "Unsharded"
+		if sharded {
+			mode = "Sharded"
+		}
+		t.Run(mode, func(t *testing.T) {
+			c := makeShardedOrUnshardedIntCache(sharded, 64,
+				WithPressureFunc(func() float64 {
+					return 0.10
+				}),
+			)
+			for batch := range 250 {
+				var wg sync.WaitGroup
+				for j := range 10 {
+					idx := batch*10 + j
+					wg.Go(func() {
+						_, _ = c.Put(fmt.Sprintf("s%d/k_%d", idx%2, idx%96), idx)
+					})
+				}
+				wg.Wait()
+			}
+			p := coordPressureState(c)
+			require.NotNil(t, p)
+			p.preHookMu.Lock()
+			boundedLen := len(p.preHookLiveGIDs)
+			p.preHookMu.Unlock()
+			assert.LessOrEqual(t, boundedLen, 530, "preHookLiveGIDs must stay bounded across 2,500 short-lived goroutines")
+
+			pa := c.(PressureAwareCache[int])
+			for range 520 {
+				var wg sync.WaitGroup
+				wg.Go(func() {
+					_ = pa.EvaluateMemoryPressure()
+				})
+				wg.Wait()
+				p.preHookMu.Lock()
+				curLen := len(p.preHookLiveGIDs)
+				p.preHookMu.Unlock()
+				if curLen < 64 {
+					break
+				}
+			}
+			p.preHookMu.Lock()
+			prunedLen := len(p.preHookLiveGIDs)
+			p.preHookMu.Unlock()
+			assert.Less(t, prunedLen, 64, "preHookLiveGIDs must prune exited goroutines down to live set once crossing 512")
 		})
 	}
 }
