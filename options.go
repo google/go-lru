@@ -67,13 +67,23 @@ func (r EvictionReason) String() string {
 // OnEvictValue is a callback invoked with the value and EvictionReason whenever a cache entry
 // is evicted, deleted, or has its value replaced.
 // The callback runs synchronously after the cache's internal state has been updated and its
-// exclusive write lock has been released.
+// exclusive write lock has been released, serialized per cache instance. Re-entrant calls into
+// the same Cache from the callback goroutine or from awaited child goroutines are supported
+// (if a child goroutine spawned inside the callback replaces its inherited runtime/pprof
+// goroutine labels via pprof.Do or pprof.SetGoroutineLabels before re-entering the same Cache,
+// spawn it with sync.WaitGroup.Go; detached goroutines that outlive the callback serialize as
+// independent callers).
 type OnEvictValue[V any] func(value V, reason EvictionReason)
 
 // OnEvictEntry is a callback invoked with the key, value, and EvictionReason whenever a cache entry
 // is evicted, deleted, or has its value replaced.
 // The callback runs synchronously after the cache's internal state has been updated and its
-// exclusive write lock has been released.
+// exclusive write lock has been released, serialized per cache instance. Re-entrant calls into
+// the same Cache from the callback goroutine or from awaited child goroutines are supported
+// (if a child goroutine spawned inside the callback replaces its inherited runtime/pprof
+// goroutine labels via pprof.Do or pprof.SetGoroutineLabels before re-entering the same Cache,
+// spawn it with sync.WaitGroup.Go; detached goroutines that outlive the callback serialize as
+// independent callers).
 type OnEvictEntry[V any] func(key string, value V, reason EvictionReason)
 
 // Backend identifies the underlying cache data structure engine constructed by New.
@@ -336,7 +346,12 @@ func resolveWeigher[V any](options Options) func(string, V) uint64 {
 // Passing nil clears any previously configured OnEvictValue callback.
 //
 // The callback executes synchronously after the cache's internal state has been updated and its
-// exclusive write lock has been released. When both WithOnEvictValue and WithOnEvictEntry are
+// exclusive write lock has been released, serialized per cache instance. Re-entrant calls into
+// the same Cache from the callback goroutine or from awaited child goroutines are supported
+// (if a child goroutine spawned inside the callback replaces its inherited runtime/pprof
+// goroutine labels via pprof.Do or pprof.SetGoroutineLabels before re-entering the same Cache,
+// spawn it with sync.WaitGroup.Go; detached goroutines that outlive the callback serialize as
+// independent callers). When both WithOnEvictValue and WithOnEvictEntry are
 // configured, OnEvictValue is invoked before OnEvictEntry. Capacity and pressure evictions invoke
 // callbacks in LRU-to-MRU order; DeletePrefix invokes callbacks once per removed entry in an
 // unspecified order. Prefer WithOnEvictValue when the key is not needed, as it avoids key
@@ -394,7 +409,12 @@ func resolveOnEvictValue[V any](options Options) func(V, EvictionReason) {
 // Passing nil clears any previously configured OnEvictEntry callback.
 //
 // The callback executes synchronously after the cache's internal state has been updated and its
-// exclusive write lock has been released. When both WithOnEvictValue and WithOnEvictEntry are
+// exclusive write lock has been released, serialized per cache instance. Re-entrant calls into
+// the same Cache from the callback goroutine or from awaited child goroutines are supported
+// (if a child goroutine spawned inside the callback replaces its inherited runtime/pprof
+// goroutine labels via pprof.Do or pprof.SetGoroutineLabels before re-entering the same Cache,
+// spawn it with sync.WaitGroup.Go; detached goroutines that outlive the callback serialize as
+// independent callers). When both WithOnEvictValue and WithOnEvictEntry are
 // configured, OnEvictValue is invoked before OnEvictEntry. Capacity and pressure evictions invoke
 // callbacks in LRU-to-MRU order; DeletePrefix invokes callbacks once per removed entry in an
 // unspecified order.

@@ -112,7 +112,7 @@ For high-contention multi-core workloads, any backend can be partitioned across 
 | `WithEvictionThreshold(float64)` | `0.90` (`DefaultEvictionThreshold`) | All engines | Tier 2 Critical Pressure threshold triggering proactive LRU tail shedding + compaction |
 | `WithEvictionRetentionRatio(float64)` | `0.50` (`DefaultEvictionRetentionRatio`) | All engines | Target fraction `[0.0, 1.0]` of `maxSize` retained during Tier 2 Critical Pressure shedding |
 
-Eviction callbacks receive an `EvictionReason` (`EvictionReasonCapacity`, `EvictionReasonPressure`, `EvictionReasonDeleted`, or `EvictionReasonReplaced`) and run synchronously inside the mutating operation after the cache's write lock is released (serialized per cache via `evictCallbackMu`, safely supporting re-entrant calls into the same or other `Cache` instances).
+Eviction callbacks receive an `EvictionReason` (`EvictionReasonCapacity`, `EvictionReasonPressure`, `EvictionReasonDeleted`, or `EvictionReasonReplaced`) and run synchronously inside the mutating operation after the cache's write lock is released (serialized per cache via `evictCallbackMu`, safely supporting re-entrant calls into the same or other `Cache` instances from the callback goroutine or awaited child goroutines; if a child goroutine spawned inside the callback replaces its inherited `runtime/pprof` goroutine labels via `pprof.Do` or `pprof.SetGoroutineLabels` before re-entering the same `Cache`, spawn it with `sync.WaitGroup.Go`, while detached goroutines that outlive the callback serialize as independent callers).
 
 ---
 
