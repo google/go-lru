@@ -158,6 +158,7 @@ func newShardedCacheWithOptions[V any](maxSize uint64, shards int, options Optio
 		enableInvariantChecking: options.EnableInvariantChecking,
 		coord:                   pressureState{options: coordOpts},
 	}
+	c.coord.initCoordinator(c.onEvictValue != nil || c.onEvictEntry != nil)
 
 	shardOpts := coordOpts
 	shardOpts.sharedPressure = &c.coord
@@ -227,7 +228,7 @@ func (c *shardedCache[V]) Replace(key string, value V) error {
 // DeletePrefix deletes all entries whose keys begin with prefix across all shards,
 // invoking any configured eviction callbacks after all shard mutations have completed.
 func (c *shardedCache[V]) DeletePrefix(prefix string) {
-	var evictQ evictCallbackQueue[V]
+	evictQ := evictCallbackQueue[V]{exactSnap: true}
 	executed := false
 	defer func() {
 		if executed {
@@ -300,7 +301,7 @@ func (c *shardedCache[V]) Compact() {
 // and returning all values evicted during Tier 2 shedding.
 func (c *shardedCache[V]) EvaluateMemoryPressure() []V {
 	var evicted []V
-	var evictQ evictCallbackQueue[V]
+	evictQ := evictCallbackQueue[V]{exactSnap: true}
 	defer evictQ.invoke(&c.coord, c.onEvictValue, c.onEvictEntry)
 	var sample shardSample
 	for _, s := range c.shards {

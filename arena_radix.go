@@ -148,16 +148,32 @@ func (c *arenaRadix[V]) hashNodeKeySlow(nodeID uint32) uint64 {
 }
 
 // hashNodeKey computes the 64-bit FNV-1a hash of the full key for nodeID
-// by walking the ancestor chain. Uses a 64-level stack buffer for common depths
-// and seamlessly handles arbitrary depths > 64.
+// by walking the ancestor chain. Uses an 8-level register/stack fast path,
+// a 64-level stack buffer for deeper trees, and seamlessly handles depths > 64.
 func (c *arenaRadix[V]) hashNodeKey(nodeID uint32) uint64 {
 	if nodeID == nilNode || nodeID == c.root {
 		return offset64
 	}
-	if c.nodes[nodeID].parent == c.root {
+	p1 := c.nodes[nodeID].parent
+	if p1 == c.root || p1 == nilNode {
 		return hashString(c.nodes[nodeID].prefix)
 	}
-	return c.hashNodeKeySlow(nodeID)
+	var buf [8]uint32
+	buf[0] = nodeID
+	buf[1] = p1
+	n := 2
+	for curr := c.nodes[p1].parent; curr != c.root && curr != nilNode; curr = c.nodes[curr].parent {
+		if n == len(buf) {
+			return c.hashNodeKeySlow(nodeID)
+		}
+		buf[n] = curr
+		n++
+	}
+	h := offset64
+	for i := n - 1; i >= 0; i-- {
+		h = hashStringCont(h, c.nodes[buf[i]].prefix)
+	}
+	return h
 }
 
 // allocateNode allocates a node index from the free-list or appends to the arena slice.
@@ -204,13 +220,14 @@ func (c *arenaRadix[V]) freeNode(id uint32) {
 // getChild finds a child node of nID whose prefix starts with the given byte b.
 // Returns nilNode if no matching child is found.
 func (c *arenaRadix[V]) getChild(nID uint32, b byte) uint32 {
-	n := &c.nodes[nID]
-	for curr := n.child; curr != nilNode; curr = c.nodes[curr].sibling {
-		if c.nodes[curr].prefix[0] == b {
+	nodes := c.nodes
+	for curr := nodes[nID].child; curr != nilNode; curr = nodes[curr].sibling {
+		c0 := nodes[curr].prefix[0]
+		if c0 == b {
 			return curr
 		}
 		// Sibling chains are maintained in sorted lexicographical order, so early exit is possible.
-		if c.nodes[curr].prefix[0] > b {
+		if c0 > b {
 			return nilNode
 		}
 	}
@@ -405,14 +422,20 @@ func (c *arenaRadix[V]) lookupNodeKeyWithHash(key string, keyHash uint64) (uint3
 // getNodeKeyWithHash finds a value-bearing node index for key under exclusive write lock,
 // healing c.nodeMap[keyHash] if resolved via the slow-path trie walk.
 func (c *arenaRadix[V]) getNodeKeyWithHash(key string, keyHash uint64) (uint32, bool) {
+	nodeID, found, _ := c.getNodeKeyForPut(key, keyHash)
+	return nodeID, found
+}
+
+func (c *arenaRadix[V]) getNodeKeyForPut(key string, keyHash uint64) (nodeID uint32, found, mapMiss bool) {
 	if id, ok := c.nodeMap[keyHash]; ok {
 		if id < uint32(len(c.nodes)) && c.nodes[id].hasValue && c.verifyKey(id, key) {
-			return id, true
+			return id, true, false
 		}
 	} else if len(c.nodeMap)+c.collisionCount == c.len {
-		return nilNode, false
+		return nilNode, false, true
 	}
-	return c.walkNodeKeyFallback(key, keyHash, true)
+	id, ok := c.walkNodeKeyFallback(key, keyHash, true)
+	return id, ok, false
 }
 
 // compressPathUpwards walks up the tree, pruning empty leaf nodes and merging single-child intermediate routing nodes.
@@ -776,12 +799,23 @@ func (c *arenaRadix[V]) completeShedAndCompactLocked(evictedCount int, retention
 	}
 }
 
+func (c *arenaRadix[V]) autoCompactTier2OnlyLocked(protectedNodeID uint32) {
+	if c.shouldAutoCompactLocked(protectedNodeID) && c.compactDataStructuresLocked() {
+		c.compactionsPressureTier2++
+		c.markReclaimedLocked()
+	}
+}
+
 // shedAndCompactLocked evicts least-recently-used entries strictly from c.tail in a single O(N) pass
 // until c.currentSize <= targetSize (and proportionally sheds zero-size entries down to targetZeroCount),
 // protecting protectedNodeID when specified by the foreground mutation caller,
 // then performs lossless arena and map compaction if fragmentation warrants it.
 // Caller MUST hold c.mu.Lock().
 func (c *arenaRadix[V]) shedAndCompactLocked(evictQ *evictCallbackQueue[V], targetSize uint64, retention float64, protectedNodeID uint32) []V {
+	if c.currentSize <= targetSize && c.zeroSizeCount == 0 && retention > 0.0 {
+		c.autoCompactTier2OnlyLocked(protectedNodeID)
+		return nil
+	}
 	autoCompactID := protectedNodeID
 	if protectedNodeID == foregroundNoProtect || (protectedNodeID != nilNode && !c.nodes[protectedNodeID].hasValue) {
 		protectedNodeID = nilNode

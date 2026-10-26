@@ -161,6 +161,10 @@ func NewMapCache[V any](maxSize uint64, opts ...Option) Cache[V] {
 }
 
 func newMapCacheWithOptions[V any](maxSize uint64, options Options) *mapCache[V] {
+	if !options.hasShardTier2Target {
+		options.hasShardTier2Target = true
+		options.shardTier2Target = computeTargetSize(maxSize, options.EvictionRetentionRatio)
+	}
 	c := &mapCache[V]{
 		maxSize:       maxSize,
 		index:         make(map[string]*entry[V]),
@@ -169,6 +173,7 @@ func newMapCacheWithOptions[V any](maxSize uint64, options Options) *mapCache[V]
 		onEvictEntry:  resolveOnEvictEntry[V](options),
 		pressureState: pressureState{options: options},
 	}
+	c.initCoordinator(c.onEvictValue != nil || c.onEvictEntry != nil)
 	if c.options.EnableInvariantChecking {
 		c.checkInvariants()
 	}
@@ -503,7 +508,7 @@ func (c *mapCache[V]) resetEmptyIndexLocked() {
 // Returns the value of the deleted entry and true, or the zero value of V and false if the key was not found.
 func (c *mapCache[V]) Delete(key string) (V, bool) {
 	sampledEpoch, pressure := c.lockWithPressure(&c.mu, false)
-	var evictQ evictCallbackQueue[V]
+	evictQ := evictCallbackQueue[V]{exactSnap: true}
 
 	sizeBefore := c.currentSize
 	deleted, ok := c.eraseInternal(&evictQ, key, EvictionReasonDeleted)
@@ -751,7 +756,7 @@ func (c *mapCache[V]) deletePrefixShard(evictQ *evictCallbackQueue[V], prefix st
 // DeletePrefix removes all entries from the cache whose keys start with prefix.
 // If prefix is empty (""), all entries in the cache are deleted.
 func (c *mapCache[V]) DeletePrefix(prefix string) {
-	var evictQ evictCallbackQueue[V]
+	evictQ := evictCallbackQueue[V]{exactSnap: true}
 	_, _ = c.deletePrefixShard(&evictQ, prefix, shardSample{})
 	evictQ.invoke(&c.pressureState, c.onEvictValue, c.onEvictEntry)
 }
@@ -937,7 +942,7 @@ func (c *mapCache[V]) evaluateShardPressure(evictQ *evictCallbackQueue[V], sampl
 // EvaluateMemoryPressure samples the configured memory-pressure probe and executes
 // Tier 2 (LRU shedding + map compaction) or Tier 1 (lossless map compaction) if thresholds are met.
 func (c *mapCache[V]) EvaluateMemoryPressure() []V {
-	var evictQ evictCallbackQueue[V]
+	evictQ := evictCallbackQueue[V]{exactSnap: true}
 	evicted, _ := c.evaluateShardPressure(&evictQ, shardSample{})
 	evictQ.invoke(&c.pressureState, c.onEvictValue, c.onEvictEntry)
 	return evicted

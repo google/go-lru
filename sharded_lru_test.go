@@ -19,6 +19,7 @@ import (
 	"maps"
 	"math"
 	"math/rand/v2"
+	"runtime"
 	"slices"
 	"strings"
 	"sync"
@@ -4869,6 +4870,530 @@ func TestShardedCache_CallbackChildLineageHelperSpawnMixedWaitGroupAndReenteredW
 			})
 		}
 	}
+}
+
+func pkgNoopCallbackWorker() {}
+
+func runTwoInCallbackHelper(fn1, fn2 func()) {
+	var wg sync.WaitGroup
+	wg.Go(fn1)
+	wg.Go(fn2)
+	wg.Wait()
+}
+
+func makeShardedOrUnshardedIntCache(sharded bool, maxSize uint64, opts ...Option) Cache[int] {
+	if sharded {
+		return NewShardedCache[int](maxSize, 2, explicitTagShardFunc, opts...)
+	}
+	return New[int](maxSize, opts...)
+}
+
+func warmupUncontendedReplaceEvictions(c Cache[int], count int) {
+	_, _ = c.Put("s0/warm", 0)
+	for i := range count {
+		_ = c.Replace("s0/warm", i+1)
+	}
+	_, _ = c.Delete("s0/warm")
+}
+
+func warmupUncontendedPressurePuts(c Cache[int], count int) {
+	for i := range count {
+		_, _ = c.Put("s0/warm", i+1)
+	}
+	_, _ = c.Delete("s0/warm")
+}
+
+type multiChildReenteredRunner struct {
+	c        Cache[int]
+	evictHit *atomic.Int32
+}
+
+func (r *multiChildReenteredRunner) execStep(inCallback bool, outerFn func()) {
+	if !inCallback {
+		_, _ = r.c.Put("s0/trigger", 99)
+		return
+	}
+	var wg sync.WaitGroup
+	wg.Go(outerFn)
+	wg.Go(func() {
+		_, _ = r.c.Get("s1/other")
+	})
+	wg.Wait()
+	r.evictHit.Add(1)
+}
+
+func runC1EvictMultiChildVariant(t *testing.T, sharded, warmup bool, variant int) {
+	t.Helper()
+	var c Cache[int]
+	var childCallbacks atomic.Int32
+	var stepHits atomic.Int32
+	armed := atomic.Bool{}
+
+	outerOwnedClosure := func() {
+		_, ok := c.Delete("s1/victim")
+		assert.True(t, ok)
+	}
+	runner := &multiChildReenteredRunner{evictHit: &stepHits}
+	c = makeShardedOrUnshardedIntCache(sharded, 2,
+		WithOnEvictEntry(func(k string, _ int, r EvictionReason) {
+			if k == "s1/victim" && r == EvictionReasonDeleted {
+				childCallbacks.Add(1)
+				return
+			}
+			if !armed.Load() || k != "s0/seed" || r != EvictionReasonCapacity {
+				return
+			}
+			switch variant {
+			case 0:
+				var wg sync.WaitGroup
+				wg.Go(outerOwnedClosure)
+				wg.Go(func() { _, _ = c.Get("s1/other") })
+				wg.Go(pkgNoopCallbackWorker)
+				wg.Wait()
+			case 1:
+				runTwoInCallbackHelper(outerOwnedClosure, func() { _, _ = c.Get("s1/other") })
+			default:
+				runner.execStep(true, outerOwnedClosure)
+			}
+		}),
+	)
+	runner.c = c
+	if warmup {
+		warmupUncontendedReplaceEvictions(c, 75)
+	}
+	_, _ = c.Put("s0/seed", 1)
+	_, _ = c.Put("s1/victim", 2)
+	armed.Store(true)
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		if variant == 2 {
+			runner.execStep(false, outerOwnedClosure)
+		} else {
+			_, _ = c.Put("s0/trigger", 3)
+		}
+	}()
+	select {
+	case <-done:
+	case <-time.After(3 * time.Second):
+		t.Fatalf("deadlocked in C1 OnEvict variant=%d sharded=%v warmup=%v", variant, sharded, warmup)
+	}
+	assert.Equal(t, int32(1), childCallbacks.Load())
+}
+
+func runC1PressureMultiChildVariant(t *testing.T, sharded, warmup bool) {
+	t.Helper()
+	var c Cache[int]
+	var armed atomic.Bool
+	var reentered atomic.Int32
+	inHook := atomic.Bool{}
+
+	outerOwnedClosure := func() {
+		_, _ = c.Put("s1/from_child", 10)
+	}
+	c = makeShardedOrUnshardedIntCache(sharded, 4,
+		WithPressureFunc(func() float64 {
+			if !armed.Load() {
+				return 0.10
+			}
+			if !inHook.CompareAndSwap(false, true) {
+				reentered.Add(1)
+				return 0.10
+			}
+			defer inHook.Store(false)
+			var wg sync.WaitGroup
+			wg.Go(outerOwnedClosure)
+			wg.Go(func() { _, _ = c.Get("s1/other") })
+			wg.Go(pkgNoopCallbackWorker)
+			wg.Wait()
+			return 0.10
+		}),
+	)
+	if warmup {
+		warmupUncontendedPressurePuts(c, 75)
+	}
+	armed.Store(true)
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		_, _ = c.Put("s0/trigger", 1)
+	}()
+	select {
+	case <-done:
+	case <-time.After(3 * time.Second):
+		t.Fatalf("deadlocked in C1 PressureFunc sharded=%v warmup=%v", sharded, warmup)
+	}
+	assert.Zero(t, reentered.Load())
+}
+
+func TestShardedCache_MultiChildCallbackDescendantsLineage(t *testing.T) {
+	for _, sharded := range []bool{false, true} {
+		mode := "Unsharded"
+		if sharded {
+			mode = "Sharded"
+		}
+		for _, warmup := range []bool{false, true} {
+			warmName := "Cold"
+			if warmup {
+				warmName = "PostWarmup"
+			}
+			t.Run("OnEvict_WG/"+mode+"/"+warmName, func(t *testing.T) {
+				runC1EvictMultiChildVariant(t, sharded, warmup, 0)
+			})
+			t.Run("OnEvict_Helper/"+mode+"/"+warmName, func(t *testing.T) {
+				runC1EvictMultiChildVariant(t, sharded, warmup, 1)
+			})
+			t.Run("OnEvict_ReenteredTwoGo/"+mode+"/"+warmName, func(t *testing.T) {
+				runC1EvictMultiChildVariant(t, sharded, warmup, 2)
+			})
+			t.Run("PressureFunc_WG/"+mode+"/"+warmName, func(t *testing.T) {
+				runC1PressureMultiChildVariant(t, sharded, warmup)
+			})
+		}
+	}
+}
+
+func waitUntilEvictContended(c Cache[int]) {
+	var p *pressureState
+	if sc, ok := c.(*shardedCache[int]); ok {
+		p = &sc.coord
+	} else if provider, ok := c.(interface{ pressureStatePtr() *pressureState }); ok {
+		p = provider.pressureStatePtr()
+	}
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if p != nil && p.evictCallbackContended.Load() {
+			time.Sleep(5 * time.Millisecond)
+			return
+		}
+		runtime.Gosched()
+	}
+}
+
+func runC2OuterWGBeforeEvictPanic(t *testing.T, sharded, warmup bool) {
+	t.Helper()
+	var c Cache[int]
+	armed := atomic.Bool{}
+	inFgEvict := make(chan struct{})
+	var bgEvictDone atomic.Bool
+	var bgSawSyncEvict atomic.Bool
+
+	c = makeShardedOrUnshardedIntCache(sharded, 4,
+		WithOnEvictEntry(func(k string, _ int, r EvictionReason) {
+			if k == "s1/bg" && r == EvictionReasonDeleted {
+				bgEvictDone.Store(true)
+				return
+			}
+			if armed.Load() && k == "s0/fg" && r == EvictionReasonReplaced {
+				close(inFgEvict)
+				var innerWG sync.WaitGroup
+				innerWG.Go(pkgNoopCallbackWorker)
+				innerWG.Wait()
+				waitUntilEvictContended(c)
+				panic("fg boom")
+			}
+		}),
+	)
+	if warmup {
+		warmupUncontendedReplaceEvictions(c, 75)
+	}
+	_, _ = c.Put("s0/fg", 1)
+	_, _ = c.Put("s1/bg", 2)
+	armed.Store(true)
+
+	var outerWG sync.WaitGroup
+	outerWG.Go(func() {
+		<-inFgEvict
+		_, ok := c.Delete("s1/bg")
+		assert.True(t, ok)
+		bgSawSyncEvict.Store(bgEvictDone.Load())
+	})
+	assert.PanicsWithValue(t, "fg boom", func() {
+		_ = c.Replace("s0/fg", 10)
+	})
+	outerWG.Wait()
+	assert.True(t, bgEvictDone.Load(), "pre-existing goroutine must not lose its OnEvict callback on holder panic")
+	assert.True(t, bgSawSyncEvict.Load(), "pre-existing goroutine Delete must run OnEvict synchronously before returning")
+}
+
+type c2BranchOrderService struct {
+	c         Cache[int]
+	inFgEvict chan struct{}
+	bgDone    chan struct{}
+	evictRan  *atomic.Bool
+	syncRan   *atomic.Bool
+}
+
+func (s *c2BranchOrderService) dispatch(mode int) {
+	switch mode {
+	case 0:
+		_, _ = s.c.Delete("s0/fg")
+	case 1:
+		go func() {
+			defer close(s.bgDone)
+			<-s.inFgEvict
+			_, ok := s.c.Delete("s1/bg")
+			if ok && s.evictRan.Load() {
+				s.syncRan.Store(true)
+			}
+		}()
+	default:
+		close(s.inFgEvict)
+		waitUntilEvictContended(s.c)
+		panic("branch boom")
+	}
+}
+
+func runC2MultiBranchSpawnLineOrder(t *testing.T, sharded bool) {
+	t.Helper()
+	var evictRan, syncRan atomic.Bool
+	svc := &c2BranchOrderService{
+		inFgEvict: make(chan struct{}),
+		bgDone:    make(chan struct{}),
+		evictRan:  &evictRan,
+		syncRan:   &syncRan,
+	}
+	svc.c = makeShardedOrUnshardedIntCache(sharded, 4,
+		WithOnEvictEntry(func(k string, _ int, r EvictionReason) {
+			if k == "s1/bg" && r == EvictionReasonDeleted {
+				evictRan.Store(true)
+				return
+			}
+			if k == "s0/fg" && r == EvictionReasonDeleted {
+				svc.dispatch(2)
+			}
+		}),
+	)
+	_, _ = svc.c.Put("s0/fg", 1)
+	_, _ = svc.c.Put("s1/bg", 2)
+	svc.dispatch(1)
+	assert.PanicsWithValue(t, "branch boom", func() {
+		svc.dispatch(0)
+	})
+	<-svc.bgDone
+	assert.True(t, evictRan.Load())
+	assert.True(t, syncRan.Load())
+}
+
+func createCompactionSlackOnS0(c Cache[int]) {
+	for i := range 20 {
+		_, _ = c.Put(fmt.Sprintf("s0/slack_%02d", i), i)
+	}
+	for i := range 20 {
+		_, _ = c.Delete(fmt.Sprintf("s0/slack_%02d", i))
+	}
+}
+
+func runC2OuterWGBeforePressureAndCompact(t *testing.T, sharded, warmup bool) {
+	t.Helper()
+	var c Cache[int]
+	var armed atomic.Bool
+	var pressureBits atomic.Uint64
+	pressureBits.Store(0x3fb999999999999a) // 0.10
+	fgEntered := make(chan struct{})
+	releaseFg := make(chan struct{})
+	var fgPaused atomic.Bool
+	var bgProbeCalls atomic.Int32
+
+	c = makeShardedOrUnshardedIntCache(sharded, 64,
+		WithBackend(BackendMap),
+		WithEvictionRetentionRatio(0.0),
+		WithPressureFunc(func() float64 {
+			if armed.Load() && fgPaused.CompareAndSwap(false, true) {
+				close(fgEntered)
+				<-releaseFg
+				return 0.95
+			}
+			if armed.Load() {
+				bgProbeCalls.Add(1)
+			}
+			return float64FromBitsLocal(pressureBits.Load())
+		}),
+	)
+	if warmup {
+		warmupUncontendedPressurePuts(c, 75)
+	}
+	createCompactionSlackOnS0(c)
+	_, _ = c.Put("s1/live", 42)
+	armed.Store(true)
+
+	var outerWG sync.WaitGroup
+	outerWG.Go(func() {
+		<-fgEntered
+		c.(PressureAwareCache[int]).Compact()
+		_, _ = c.Put("s1/bg_probe", 7)
+		close(releaseFg)
+	})
+	_, _ = c.Put("s1/fg_write", 9)
+	outerWG.Wait()
+
+	assert.GreaterOrEqual(t, bgProbeCalls.Load(), int32(1), "pre-existing goroutine must not bypass PressureFunc")
+	_, ok := c.Peek("s1/live")
+	assert.True(t, ok, "external Compact from pre-existing goroutine must invalidate foreground stale 0.95 sample")
+}
+
+func float64FromBitsLocal(b uint64) float64 {
+	if b == 0x3fee666666666666 {
+		return 0.95
+	}
+	return 0.10
+}
+
+func TestShardedCache_PreExistingGoroutineNotMisclassifiedAsCallbackChild(t *testing.T) {
+	for _, sharded := range []bool{false, true} {
+		mode := "Unsharded"
+		if sharded {
+			mode = "Sharded"
+		}
+		for _, warmup := range []bool{false, true} {
+			warmName := "Cold"
+			if warmup {
+				warmName = "PostWarmup"
+			}
+			t.Run("OnEvictPanicAndSync/"+mode+"/"+warmName, func(t *testing.T) {
+				runC2OuterWGBeforeEvictPanic(t, sharded, warmup)
+			})
+			t.Run("PressureAndCompact/"+mode+"/"+warmName, func(t *testing.T) {
+				runC2OuterWGBeforePressureAndCompact(t, sharded, warmup)
+			})
+		}
+		t.Run("MultiBranchSpawnLineOrder/"+mode, func(t *testing.T) {
+			runC2MultiBranchSpawnLineOrder(t, sharded)
+		})
+	}
+}
+
+type c3OrphanSyncChans struct {
+	startG3      chan struct{}
+	g1Entered    chan struct{}
+	g2Entered    chan struct{}
+	releaseG2    chan struct{}
+	orphanAct    chan struct{}
+	orphanDone   chan struct{}
+	g3Entered    chan struct{}
+	releaseG3    chan struct{}
+	mExited      chan struct{}
+	allowOrphans chan struct{}
+}
+
+func newC3OrphanSyncChans() c3OrphanSyncChans {
+	return c3OrphanSyncChans{
+		startG3:      make(chan struct{}),
+		g1Entered:    make(chan struct{}),
+		g2Entered:    make(chan struct{}),
+		releaseG2:    make(chan struct{}),
+		orphanAct:    make(chan struct{}),
+		orphanDone:   make(chan struct{}),
+		g3Entered:    make(chan struct{}),
+		releaseG3:    make(chan struct{}),
+		mExited:      make(chan struct{}),
+		allowOrphans: make(chan struct{}),
+	}
+}
+
+func invokePutViaSharedFrame(c Cache[int], key string, val int) {
+	_, _ = c.Put(key, val)
+}
+
+func spawnC3OrphanAndOverflow(c Cache[int], ch c3OrphanSyncChans, extrasWG *sync.WaitGroup) {
+	go func() {
+		defer close(ch.mExited)
+		go func() {
+			<-ch.orphanAct
+			orphanExited := make(chan struct{})
+			go func() {
+				defer close(ch.orphanDone)
+				<-orphanExited
+				c.(PressureAwareCache[int]).Compact()
+				_, _ = c.Put("s0/orphan_probe", 5)
+			}()
+			close(orphanExited)
+		}()
+		for range 140 {
+			extrasWG.Go(func() {
+				<-ch.allowOrphans
+			})
+		}
+	}()
+	<-ch.mExited
+}
+
+func TestShardedCache_PanickedSamplerDeadParentOrphanWithConcurrentSamplerAndOverflow(t *testing.T) {
+	ch := newC3OrphanSyncChans()
+	var extrasWG sync.WaitGroup
+	var phase atomic.Int32
+	var c Cache[int]
+
+	g3Done := make(chan struct{})
+	go func() {
+		defer close(g3Done)
+		<-ch.startG3
+		invokePutViaSharedFrame(c, "s1/g3_write", 99)
+	}()
+
+	c = NewShardedCache[int](64, 2, explicitTagShardFunc,
+		WithBackend(BackendMap),
+		WithEvictionRetentionRatio(0.0),
+		WithPressureFunc(func() float64 {
+			switch phase.Load() {
+			case 1:
+				phase.Store(2)
+				close(ch.g1Entered)
+				<-ch.g2Entered
+				spawnC3OrphanAndOverflow(c, ch, &extrasWG)
+				panic("g1 sampler boom")
+			case 2:
+				phase.Store(3)
+				close(ch.g2Entered)
+				<-ch.releaseG2
+				return 0.10
+			case 4:
+				phase.Store(5)
+				close(ch.g3Entered)
+				<-ch.releaseG3
+				return 0.95
+			default:
+				return 0.10
+			}
+		}),
+	)
+
+	createCompactionSlackOnS0(c)
+	_, _ = c.Put("s1/live", 777)
+
+	phase.Store(1)
+	g2Done := make(chan struct{})
+	g1Done := make(chan struct{})
+	go func() {
+		defer close(g1Done)
+		assert.PanicsWithValue(t, "g1 sampler boom", func() {
+			invokePutViaSharedFrame(c, "s0/g1", 1)
+		})
+	}()
+	<-ch.g1Entered
+	go func() {
+		defer close(g2Done)
+		_, _ = c.Put("s1/g2", 2)
+	}()
+	<-g1Done
+	close(ch.releaseG2)
+	<-g2Done
+
+	phase.Store(4)
+	close(ch.startG3)
+	<-ch.g3Entered
+
+	close(ch.orphanAct)
+	<-ch.orphanDone
+	close(ch.releaseG3)
+	<-g3Done
+	close(ch.allowOrphans)
+	extrasWG.Wait()
+
+	_, ok := c.Peek("s1/live")
+	assert.True(t, ok, "orphaned grandchild of panicked sampler G1 must not be misattributed to later sampler G3")
+	assert.InDelta(t, 0.10, c.Stats().MemoryPressure, 1e-9)
 }
 
 func BenchmarkShardedParallelThroughput(b *testing.B) {

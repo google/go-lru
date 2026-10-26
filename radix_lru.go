@@ -89,6 +89,10 @@ func NewRadixCache[V any](maxSize uint64, opts ...Option) Cache[V] {
 }
 
 func newRadixCacheWithOptions[V any](maxSize uint64, options Options) *radixCache[V] {
+	if !options.hasShardTier2Target {
+		options.hasShardTier2Target = true
+		options.shardTier2Target = computeTargetSize(maxSize, options.EvictionRetentionRatio)
+	}
 	c := &radixCache[V]{
 		maxSize:       maxSize,
 		root:          &radixNode[V]{},
@@ -97,6 +101,7 @@ func newRadixCacheWithOptions[V any](maxSize uint64, options Options) *radixCach
 		onEvictEntry:  resolveOnEvictEntry[V](options),
 		pressureState: pressureState{options: options},
 	}
+	c.initCoordinator(c.onEvictValue != nil || c.onEvictEntry != nil)
 
 	if c.options.EnableInvariantChecking {
 		c.checkInvariants()
@@ -843,7 +848,7 @@ func (c *radixCache[V]) Put(key string, value V) ([]V, error) {
 
 // Delete removes the entry associated with key, returning its value and true (or the zero value of V and false if not found).
 func (c *radixCache[V]) Delete(key string) (value V, ok bool) {
-	var evictQ evictCallbackQueue[V]
+	evictQ := evictCallbackQueue[V]{exactSnap: true}
 	sampledEpoch, pressure := c.lockWithPressure(&c.mu, false)
 
 	node, found := c.getNode(key)
@@ -1148,7 +1153,7 @@ func (c *radixCache[V]) deletePrefixShard(evictQ *evictCallbackQueue[V], prefix 
 // DeletePrefix deletes all entries whose keys start with prefix.
 // Prunes subtrees in O(prefix_length + subtree_size) time and sweeps detached nodes.
 func (c *radixCache[V]) DeletePrefix(prefix string) {
-	var evictQ evictCallbackQueue[V]
+	evictQ := evictCallbackQueue[V]{exactSnap: true}
 	_, _ = c.deletePrefixShard(&evictQ, prefix, shardSample{})
 	evictQ.invoke(&c.pressureState, c.onEvictValue, c.onEvictEntry)
 }
@@ -1336,7 +1341,7 @@ func (c *radixCache[V]) evaluateShardPressure(evictQ *evictCallbackQueue[V], sam
 // EvaluateMemoryPressure samples the configured memory-pressure probe and sheds LRU tail entries
 // down to maxSize * EvictionRetentionRatio if critical pressure is reached.
 func (c *radixCache[V]) EvaluateMemoryPressure() []V {
-	var evictQ evictCallbackQueue[V]
+	evictQ := evictCallbackQueue[V]{exactSnap: true}
 	evicted, _ := c.evaluateShardPressure(&evictQ, shardSample{})
 	evictQ.invoke(&c.pressureState, c.onEvictValue, c.onEvictEntry)
 	return evicted
