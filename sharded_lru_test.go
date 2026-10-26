@@ -6299,7 +6299,7 @@ func TestShardedCache_PostWarmupChannelWaitChildNoDeadlockAndPprofLabels(t *test
 	}
 }
 
-func execR12PprofChildBehavior(subcase int, c Cache[int], outerChildFn, outerChildPprofDo func(), resCh <-chan bool) {
+func execR12PprofChildBehavior(subcase int, c Cache[int], spawnInlineWG func(*sync.WaitGroup, func()), outerChildFn, outerChildPprofDo func(), resCh <-chan bool) {
 	bg := context.Background()
 	lbls := pprof.Labels("op", "evict")
 	switch subcase {
@@ -6322,7 +6322,7 @@ func execR12PprofChildBehavior(subcase int, c Cache[int], outerChildFn, outerChi
 	case 2:
 		var wg sync.WaitGroup
 		pprof.Do(bg, lbls, func(context.Context) {
-			wg.Go(outerChildFn)
+			spawnInlineWG(&wg, outerChildFn)
 		})
 		<-resCh
 		wg.Wait()
@@ -6335,18 +6335,18 @@ func execR12PprofChildBehavior(subcase int, c Cache[int], outerChildFn, outerChi
 		}()
 		<-ch
 	default:
-		execR12PprofChildBehaviorMore(subcase, outerChildFn, outerChildPprofDo, resCh)
+		execR12PprofChildBehaviorMore(subcase, spawnInlineWG, outerChildFn, outerChildPprofDo, resCh)
 	}
 }
 
-func execR12PprofChildBehaviorMore(subcase int, outerChildFn, outerChildPprofDo func(), resCh <-chan bool) {
+func execR12PprofChildBehaviorMore(subcase int, spawnInlineWG func(*sync.WaitGroup, func()), outerChildFn, outerChildPprofDo func(), resCh <-chan bool) {
 	bg := context.Background()
 	lbls := pprof.Labels("op", "evict")
 	switch subcase {
 	case 4:
 		pprof.Do(bg, lbls, func(context.Context) {})
 		var wg sync.WaitGroup
-		wg.Go(outerChildFn)
+		spawnInlineWG(&wg, outerChildFn)
 		<-resCh
 		wg.Wait()
 	case 5:
@@ -6358,12 +6358,12 @@ func execR12PprofChildBehaviorMore(subcase int, outerChildFn, outerChildPprofDo 
 	case 6:
 		pprof.SetGoroutineLabels(bg)
 		var wg sync.WaitGroup
-		wg.Go(outerChildFn)
+		spawnInlineWG(&wg, outerChildFn)
 		<-resCh
 		wg.Wait()
 	case 7:
 		var wg sync.WaitGroup
-		wg.Go(outerChildPprofDo)
+		spawnInlineWG(&wg, outerChildPprofDo)
 		<-resCh
 		wg.Wait()
 	}
@@ -6395,6 +6395,9 @@ func runR12PprofDoChildSubcase(t *testing.T, sharded, useReplace bool, subcase i
 			if !armed.Load() || k != "s0/seed" {
 				return
 			}
+			spawnInlineWG := func(wg *sync.WaitGroup, fn func()) {
+				wg.Go(func() { fn() })
+			}
 			if subcase == 8 {
 				if step.Add(1) == 1 {
 					pprof.Do(context.Background(), pprof.Labels("k", "v"), func(context.Context) {})
@@ -6406,7 +6409,7 @@ func runR12PprofDoChildSubcase(t *testing.T, sharded, useReplace bool, subcase i
 				wg.Wait()
 				return
 			}
-			execR12PprofChildBehavior(subcase, c, outerChildFn, outerChildPprofDo, resCh)
+			execR12PprofChildBehavior(subcase, c, spawnInlineWG, outerChildFn, outerChildPprofDo, resCh)
 		}),
 	)
 
@@ -7605,6 +7608,310 @@ func TestShardedCache_R14EvictFastModePeerAndDetachedIsolation(t *testing.T) {
 		t.Run("LongHold400ms_"+backend.String()+"/Sharded", func(t *testing.T) {
 			runR14LongHoldBackendPeerDeletePrefixCase(t, backend, true)
 		})
+	}
+}
+
+//go:noinline
+func r15SpawnWGWorkerHelper(wg *sync.WaitGroup, c Cache[int], updateLabels bool) {
+	wg.Go(func() {
+		if updateLabels {
+			pprof.Do(context.Background(), pprof.Labels("worker", "helper"), func(context.Context) {
+				_, _ = c.Delete("s1/victim")
+			})
+			return
+		}
+		_, _ = c.Delete("s1/victim")
+	})
+}
+
+func runR15C1ContractCases(t *testing.T, sharded bool, mode int) {
+	t.Helper()
+	var c Cache[int]
+	var armed atomic.Bool
+	var victimEvicts atomic.Int32
+
+	c = makeShardedOrUnshardedIntCache(sharded, 4,
+		WithOnEvictEntry(func(k string, _ int, r EvictionReason) {
+			if k == "s1/victim" && r == EvictionReasonDeleted {
+				victimEvicts.Add(1)
+				return
+			}
+			if !armed.Load() || k != "s0/trigger" || r != EvictionReasonReplaced {
+				return
+			}
+			var wg sync.WaitGroup
+			switch mode {
+			case 0:
+				r15SpawnWGWorkerHelper(&wg, c, false)
+			case 1:
+				r15SpawnWGWorkerHelper(&wg, c, true)
+			case 2:
+				wg.Go(func() {
+					pprof.Do(context.Background(), pprof.Labels("worker", "inline"), func(context.Context) {
+						_, _ = c.Delete("s1/victim")
+					})
+				})
+			}
+			wg.Wait()
+		}),
+	)
+
+	warmupUncontendedReplaceEvictions(c, 10)
+	_, _ = c.Put("s0/trigger", 0)
+	_ = c.Replace("s0/trigger", 1)
+	require.True(t, coordPressureState(c).evictFastMode.Load())
+	_, _ = c.Put("s1/victim", 2)
+	armed.Store(true)
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		if mode == 1 {
+			pprof.Do(context.Background(), pprof.Labels("outer", "req"), func(context.Context) {
+				assert.NoError(t, c.Replace("s0/trigger", 10))
+			})
+			return
+		}
+		assert.NoError(t, c.Replace("s0/trigger", 10))
+	}()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatalf("deadlocked in R15 C1 sharded=%v mode=%d", sharded, mode)
+	}
+	assert.Equal(t, int32(1), victimEvicts.Load())
+}
+
+func runR15C2PprofScopeExitAndExitedWGHop(t *testing.T, sharded, exitedWGHop, twoHopGo bool) {
+	t.Helper()
+	var c Cache[int]
+	var armed atomic.Bool
+	var victimEvicts atomic.Int32
+
+	c = makeShardedOrUnshardedIntCache(sharded, 4,
+		WithOnEvictEntry(func(k string, _ int, r EvictionReason) {
+			if k == "s1/victim" && r == EvictionReasonDeleted {
+				victimEvicts.Add(1)
+				return
+			}
+			if !armed.Load() || k != "s0/trigger" || r != EvictionReasonReplaced {
+				return
+			}
+			if exitedWGHop {
+				var wg1, wg2 sync.WaitGroup
+				hop1Done := make(chan struct{})
+				wg1.Go(func() {
+					wg2.Go(func() {
+						<-hop1Done
+						pprof.Do(context.Background(), pprof.Labels("hop", "2"), func(context.Context) {
+							_, _ = c.Delete("s1/victim")
+						})
+					})
+				})
+				wg1.Wait()
+				close(hop1Done)
+				wg2.Wait()
+				return
+			}
+			start := make(chan struct{})
+			done := make(chan struct{})
+			pprof.Do(context.Background(), pprof.Labels("op", "evict"), func(context.Context) {
+				if twoHopGo {
+					hopExited := make(chan struct{})
+					go func() {
+						defer close(hopExited)
+						go func() {
+							<-start
+							_, _ = c.Delete("s1/victim")
+							close(done)
+						}()
+					}()
+					<-hopExited
+					return
+				}
+				go func() {
+					<-start
+					_, _ = c.Delete("s1/victim")
+					close(done)
+				}()
+			})
+			close(start)
+			<-done
+		}),
+	)
+
+	warmupUncontendedReplaceEvictions(c, 10)
+	_, _ = c.Put("s0/trigger", 0)
+	_ = c.Replace("s0/trigger", 1)
+	require.True(t, coordPressureState(c).evictFastMode.Load())
+	_, _ = c.Put("s1/victim", 2)
+	armed.Store(true)
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		assert.NoError(t, c.Replace("s0/trigger", 10))
+	}()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatalf("deadlocked in R15 C2 sharded=%v exitedWGHop=%v twoHopGo=%v", sharded, exitedWGHop, twoHopGo)
+	}
+	assert.Equal(t, int32(1), victimEvicts.Load())
+}
+
+type r15C3Service struct {
+	t            *testing.T
+	c            Cache[int]
+	armed        atomic.Bool
+	fgActive     atomic.Bool
+	peerDuringFg atomic.Bool
+	peerEvictRan atomic.Bool
+	inFg         chan struct{}
+	peerEntering chan struct{}
+	peerPanicCh  chan any
+	panicMode    int // 0: normal, 1: fg panics, 2: peer panics
+	peerLabels   bool
+}
+
+//go:noinline
+func (s *r15C3Service) runOp(inCallback bool) error {
+	if inCallback {
+		close(s.inFg)
+		<-s.peerEntering
+		assert.True(s.t, waitUntilEvictSlowWaiterParked(s.c))
+		if s.panicMode == 1 {
+			panic("r15-fg-callback-boom")
+		}
+		return nil
+	}
+	var outerWG sync.WaitGroup
+	outerWG.Go(func() {
+		defer func() { s.peerPanicCh <- recover() }()
+		<-s.inFg
+		runPeerDelete := func() {
+			close(s.peerEntering)
+			_, _ = s.c.Delete("s1/peer")
+			s.peerDuringFg.Store(s.fgActive.Load())
+		}
+		if s.peerLabels {
+			pprof.Do(context.Background(), pprof.Labels("peer", "1"), func(context.Context) {
+				runPeerDelete()
+			})
+			return
+		}
+		runPeerDelete()
+	})
+
+	var err error
+	if s.panicMode == 1 {
+		assert.PanicsWithValue(s.t, "r15-fg-callback-boom", func() {
+			_ = s.c.Replace("s0/fg", 10)
+		})
+	} else {
+		err = s.c.Replace("s0/fg", 10)
+	}
+	outerWG.Wait()
+	return err
+}
+
+func runR15C3ReenteredMethodPeerIsolationCase(t *testing.T, sharded, peerLabels bool, panicMode int) {
+	t.Helper()
+	svc := &r15C3Service{
+		t:            t,
+		inFg:         make(chan struct{}),
+		peerEntering: make(chan struct{}),
+		peerPanicCh:  make(chan any, 1),
+		panicMode:    panicMode,
+		peerLabels:   peerLabels,
+	}
+	svc.c = makeShardedOrUnshardedIntCache(sharded, 4,
+		WithOnEvictEntry(func(k string, _ int, _ EvictionReason) {
+			if !svc.armed.Load() {
+				return
+			}
+			if k == "s0/fg" {
+				svc.fgActive.Store(true)
+				defer svc.fgActive.Store(false)
+				_ = svc.runOp(true)
+				return
+			}
+			if k == "s1/peer" {
+				svc.peerEvictRan.Store(true)
+				if svc.panicMode == 2 {
+					panic("r15-peer-callback-boom")
+				}
+			}
+		}),
+	)
+
+	warmupUncontendedReplaceEvictions(svc.c, 10)
+	_, _ = svc.c.Put("s0/fg", 0)
+	_ = svc.c.Replace("s0/fg", 1)
+	require.True(t, coordPressureState(svc.c).evictFastMode.Load())
+	_, _ = svc.c.Put("s1/peer", 2)
+	svc.armed.Store(true)
+
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- svc.runOp(false)
+	}()
+	select {
+	case err := <-errCh:
+		require.NoError(t, err)
+	case <-time.After(2 * time.Second):
+		t.Fatalf("deadlocked in R15 C3 sharded=%v peerLabels=%v panicMode=%d", sharded, peerLabels, panicMode)
+	}
+
+	assert.False(t, svc.peerDuringFg.Load(), "independent outerWG.Go peer must never return while foreground OnEvict is active")
+	assert.True(t, svc.peerEvictRan.Load(), "independent outerWG.Go peer OnEvict must never be dropped")
+	peerRecovered := <-svc.peerPanicCh
+	if panicMode == 2 {
+		assert.Equal(t, "r15-peer-callback-boom", peerRecovered, "peer panic must propagate on peer goroutine, not foreground holder")
+	} else {
+		assert.Nil(t, peerRecovered)
+	}
+}
+
+func TestShardedCache_R15EvictFastModeLineageAndPprofFixes(t *testing.T) {
+	for _, sharded := range []bool{false, true} {
+		mode := "Unsharded"
+		if sharded {
+			mode = "Sharded"
+		}
+		t.Run("C1_HelperNoLabelOverwrite/"+mode, func(t *testing.T) {
+			runR15C1ContractCases(t, sharded, 0)
+		})
+		t.Run("C1_HelperWithOuterPprofScope/"+mode, func(t *testing.T) {
+			runR15C1ContractCases(t, sharded, 1)
+		})
+		t.Run("C1_InlineWGWithChildPprofDo/"+mode, func(t *testing.T) {
+			runR15C1ContractCases(t, sharded, 2)
+		})
+		t.Run("C2_ScenarioA_PprofDoScopeExit/"+mode, func(t *testing.T) {
+			runR15C2PprofScopeExitAndExitedWGHop(t, sharded, false, false)
+		})
+		t.Run("C2_ScenarioA_TwoHopExitedGo/"+mode, func(t *testing.T) {
+			runR15C2PprofScopeExitAndExitedWGHop(t, sharded, false, true)
+		})
+		t.Run("C2_ScenarioB_ExitedIntermediateWGGo/"+mode, func(t *testing.T) {
+			runR15C2PprofScopeExitAndExitedWGHop(t, sharded, true, false)
+		})
+		for _, peerLabels := range []bool{false, true} {
+			lblSuffix := "UnlabeledPeer"
+			if peerLabels {
+				lblSuffix = "LabeledPeer"
+			}
+			t.Run("C3_NoAsyncReturn_"+lblSuffix+"/"+mode, func(t *testing.T) {
+				runR15C3ReenteredMethodPeerIsolationCase(t, sharded, peerLabels, 0)
+			})
+			t.Run("C3_NoCallbackLossOnFgPanic_"+lblSuffix+"/"+mode, func(t *testing.T) {
+				runR15C3ReenteredMethodPeerIsolationCase(t, sharded, peerLabels, 1)
+			})
+			t.Run("C3_NoPanicHijackOnPeerPanic_"+lblSuffix+"/"+mode, func(t *testing.T) {
+				runR15C3ReenteredMethodPeerIsolationCase(t, sharded, peerLabels, 2)
+			})
+		}
 	}
 }
 

@@ -69,10 +69,13 @@ func (r EvictionReason) String() string {
 // The callback runs synchronously after the cache's internal state has been updated and its
 // exclusive write lock has been released, serialized per cache instance. Re-entrant calls into
 // the same Cache from the callback goroutine or from awaited child goroutines are supported
-// (if a child goroutine spawned inside the callback replaces its inherited runtime/pprof
-// goroutine labels via pprof.Do or pprof.SetGoroutineLabels before re-entering the same Cache,
-// spawn it with sync.WaitGroup.Go; detached goroutines that outlive the callback serialize as
-// independent callers).
+// (when runtime/pprof goroutine labels are modified via pprof.Do or pprof.SetGoroutineLabels
+// inside the callback or its child goroutines before a child re-enters the same Cache, either
+// invoke the outer Cache operation within an active runtime/pprof label scope or spawn the child
+// via an inline closure literal defined directly inside the callback—using sync.WaitGroup.Go if
+// the child itself modifies goroutine labels—when that callback is not also active below the
+// outer Cache call; detached goroutines that outlive the callback serialize as independent
+// callers).
 type OnEvictValue[V any] func(value V, reason EvictionReason)
 
 // OnEvictEntry is a callback invoked with the key, value, and EvictionReason whenever a cache entry
@@ -80,10 +83,13 @@ type OnEvictValue[V any] func(value V, reason EvictionReason)
 // The callback runs synchronously after the cache's internal state has been updated and its
 // exclusive write lock has been released, serialized per cache instance. Re-entrant calls into
 // the same Cache from the callback goroutine or from awaited child goroutines are supported
-// (if a child goroutine spawned inside the callback replaces its inherited runtime/pprof
-// goroutine labels via pprof.Do or pprof.SetGoroutineLabels before re-entering the same Cache,
-// spawn it with sync.WaitGroup.Go; detached goroutines that outlive the callback serialize as
-// independent callers).
+// (when runtime/pprof goroutine labels are modified via pprof.Do or pprof.SetGoroutineLabels
+// inside the callback or its child goroutines before a child re-enters the same Cache, either
+// invoke the outer Cache operation within an active runtime/pprof label scope or spawn the child
+// via an inline closure literal defined directly inside the callback—using sync.WaitGroup.Go if
+// the child itself modifies goroutine labels—when that callback is not also active below the
+// outer Cache call; detached goroutines that outlive the callback serialize as independent
+// callers).
 type OnEvictEntry[V any] func(key string, value V, reason EvictionReason)
 
 // Backend identifies the underlying cache data structure engine constructed by New.
@@ -348,10 +354,13 @@ func resolveWeigher[V any](options Options) func(string, V) uint64 {
 // The callback executes synchronously after the cache's internal state has been updated and its
 // exclusive write lock has been released, serialized per cache instance. Re-entrant calls into
 // the same Cache from the callback goroutine or from awaited child goroutines are supported
-// (if a child goroutine spawned inside the callback replaces its inherited runtime/pprof
-// goroutine labels via pprof.Do or pprof.SetGoroutineLabels before re-entering the same Cache,
-// spawn it with sync.WaitGroup.Go; detached goroutines that outlive the callback serialize as
-// independent callers). When both WithOnEvictValue and WithOnEvictEntry are
+// (when runtime/pprof goroutine labels are modified via pprof.Do or pprof.SetGoroutineLabels
+// inside the callback or its child goroutines before a child re-enters the same Cache, either
+// invoke the outer Cache operation within an active runtime/pprof label scope or spawn the child
+// via an inline closure literal defined directly inside the callback—using sync.WaitGroup.Go if
+// the child itself modifies goroutine labels—when that callback is not also active below the
+// outer Cache call; detached goroutines that outlive the callback serialize as independent
+// callers). When both WithOnEvictValue and WithOnEvictEntry are
 // configured, OnEvictValue is invoked before OnEvictEntry. Capacity and pressure evictions invoke
 // callbacks in LRU-to-MRU order; DeletePrefix invokes callbacks once per removed entry in an
 // unspecified order. Prefer WithOnEvictValue when the key is not needed, as it avoids key
@@ -411,10 +420,13 @@ func resolveOnEvictValue[V any](options Options) func(V, EvictionReason) {
 // The callback executes synchronously after the cache's internal state has been updated and its
 // exclusive write lock has been released, serialized per cache instance. Re-entrant calls into
 // the same Cache from the callback goroutine or from awaited child goroutines are supported
-// (if a child goroutine spawned inside the callback replaces its inherited runtime/pprof
-// goroutine labels via pprof.Do or pprof.SetGoroutineLabels before re-entering the same Cache,
-// spawn it with sync.WaitGroup.Go; detached goroutines that outlive the callback serialize as
-// independent callers). When both WithOnEvictValue and WithOnEvictEntry are
+// (when runtime/pprof goroutine labels are modified via pprof.Do or pprof.SetGoroutineLabels
+// inside the callback or its child goroutines before a child re-enters the same Cache, either
+// invoke the outer Cache operation within an active runtime/pprof label scope or spawn the child
+// via an inline closure literal defined directly inside the callback—using sync.WaitGroup.Go if
+// the child itself modifies goroutine labels—when that callback is not also active below the
+// outer Cache call; detached goroutines that outlive the callback serialize as independent
+// callers). When both WithOnEvictValue and WithOnEvictEntry are
 // configured, OnEvictValue is invoked before OnEvictEntry. Capacity and pressure evictions invoke
 // callbacks in LRU-to-MRU order; DeletePrefix invokes callbacks once per removed entry in an
 // unspecified order.
