@@ -15,17 +15,20 @@
 package lru
 
 import (
+	"context"
 	"fmt"
 	"maps"
 	"math"
 	"math/rand/v2"
 	"runtime"
+	"runtime/pprof"
 	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
+	"weak"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -5099,7 +5102,7 @@ func runC2PreExistingEvictCase(t *testing.T, sharded, warmup bool, spawnMode int
 
 	holdDur := 10 * time.Millisecond
 	if warmup {
-		holdDur = 350 * time.Millisecond
+		holdDur = 35 * time.Millisecond
 	}
 
 	c = makeShardedOrUnshardedIntCache(sharded, 4,
@@ -5113,9 +5116,11 @@ func runC2PreExistingEvictCase(t *testing.T, sharded, warmup bool, spawnMode int
 				defer fgInEvict.Store(false)
 				close(inFgEvict)
 				var innerWG sync.WaitGroup
-				innerWG.Go(pkgNoopCallbackWorker)
+				innerWG.Go(func() {
+					pkgNoopCallbackWorker()
+					waitUntilEvictContendedFor(c, holdDur)
+				})
 				innerWG.Wait()
-				waitUntilEvictContendedFor(c, holdDur)
 				if shouldPanic {
 					panic("fg boom")
 				}
@@ -5613,6 +5618,676 @@ func TestShardedCache_PanickedSamplerDeadParentOrphanWithConcurrentSamplerAndOve
 	_, ok := c.Peek("s1/live")
 	assert.True(t, ok, "orphaned grandchild of panicked sampler G1 must not be misattributed to later sampler G3")
 	assert.InDelta(t, 0.10, c.Stats().MemoryPressure, 1e-9)
+}
+
+type r11NamedBgWorker struct {
+	c          Cache[int]
+	inFg       chan struct{}
+	done       chan struct{}
+	fgInEvict  *atomic.Bool
+	bgEvictRan *atomic.Bool
+	duringFg   *atomic.Bool
+	sawSync    *atomic.Bool
+}
+
+func (w *r11NamedBgWorker) run() {
+	defer close(w.done)
+	<-w.inFg
+	_, ok := w.c.Delete("s1/bg")
+	if ok {
+		w.duringFg.Store(w.fgInEvict.Load())
+		w.sawSync.Store(w.bgEvictRan.Load())
+	}
+}
+
+func spawnR11NamedWorkerViaHelper(w *r11NamedBgWorker) {
+	go w.run()
+}
+
+func runR11NamedMethodPreExistingCase(t *testing.T, sharded bool) {
+	t.Helper()
+	var c Cache[int]
+	var armed, fgInEvict, bgEvictRan, duringFg, sawSync atomic.Bool
+	inFg := make(chan struct{})
+
+	c = makeShardedOrUnshardedIntCache(sharded, 4,
+		WithOnEvictEntry(func(k string, _ int, r EvictionReason) {
+			if k == "s1/bg" && r == EvictionReasonDeleted {
+				bgEvictRan.Store(true)
+				return
+			}
+			if armed.Load() && k == "s0/fg" && r == EvictionReasonReplaced {
+				fgInEvict.Store(true)
+				defer fgInEvict.Store(false)
+				close(inFg)
+				waitUntilEvictContendedFor(c, 40*time.Millisecond)
+			}
+		}),
+	)
+	warmupUncontendedReplaceEvictions(c, 75)
+	_, _ = c.Put("s0/fg", 1)
+	_, _ = c.Put("s1/bg", 2)
+	armed.Store(true)
+
+	w := &r11NamedBgWorker{
+		c:          c,
+		inFg:       inFg,
+		done:       make(chan struct{}),
+		fgInEvict:  &fgInEvict,
+		bgEvictRan: &bgEvictRan,
+		duringFg:   &duringFg,
+		sawSync:    &sawSync,
+	}
+	spawnR11NamedWorkerViaHelper(w)
+	require.NoError(t, c.Replace("s0/fg", 10))
+	<-w.done
+
+	assert.False(t, duringFg.Load(), "helper-spawned method goroutine must block until foreground OnEvict finishes")
+	assert.True(t, sawSync.Load(), "helper-spawned method goroutine must run its own OnEvict synchronously")
+}
+
+func runR11PreExistingPanicIsolationCase(t *testing.T, sharded, fgPanics bool) {
+	t.Helper()
+	var c Cache[int]
+	var armed atomic.Bool
+	inFg := make(chan struct{})
+
+	c = makeShardedOrUnshardedIntCache(sharded, 4,
+		WithOnEvictEntry(func(k string, _ int, r EvictionReason) {
+			if k == "s1/bg" && r == EvictionReasonDeleted {
+				panic("bg boom")
+			}
+			if armed.Load() && k == "s0/fg" && r == EvictionReasonReplaced {
+				close(inFg)
+				if fgPanics {
+					waitUntilEvictContended(c)
+					time.Sleep(30 * time.Millisecond)
+					panic("fg boom")
+				}
+				var innerWG sync.WaitGroup
+				innerWG.Go(func() {
+					waitUntilEvictContendedFor(c, 35*time.Millisecond)
+				})
+				innerWG.Wait()
+			}
+		}),
+	)
+	warmupUncontendedReplaceEvictions(c, 75)
+	_, _ = c.Put("s0/fg", 1)
+	_, _ = c.Put("s1/bg", 2)
+	armed.Store(true)
+
+	var bgRecovered atomic.Value
+	var outerWG sync.WaitGroup
+	outerWG.Go(func() {
+		defer func() {
+			if r := recover(); r != nil {
+				bgRecovered.Store(r)
+			}
+		}()
+		<-inFg
+		_, _ = c.Delete("s1/bg")
+	})
+
+	if fgPanics {
+		assert.PanicsWithValue(t, "fg boom", func() {
+			_ = c.Replace("s0/fg", 10)
+		})
+	} else {
+		require.NoError(t, c.Replace("s0/fg", 10))
+	}
+	outerWG.Wait()
+	assert.Equal(t, "bg boom", bgRecovered.Load(), "background OnEvict panic must stay on background goroutine and never be stolen or swallowed")
+}
+
+func runR11PriorHoldDetachedIsolationCase(t *testing.T, sharded bool) {
+	t.Helper()
+	var c Cache[int]
+	var phase atomic.Int32
+	var fgInHold2, bgEvictRan, duringHold2, sawSync atomic.Bool
+	startDetached := make(chan struct{})
+	inHold2 := make(chan struct{})
+	detachedDone := make(chan struct{})
+
+	c = makeShardedOrUnshardedIntCache(sharded, 4,
+		WithOnEvictEntry(func(k string, _ int, r EvictionReason) {
+			if k == "s1/bg" && r == EvictionReasonDeleted {
+				bgEvictRan.Store(true)
+				return
+			}
+			if k != "s0/fg" || r != EvictionReasonReplaced {
+				return
+			}
+			switch phase.Load() {
+			case 1:
+				go func() {
+					defer close(detachedDone)
+					<-startDetached
+					<-inHold2
+					_, ok := c.Delete("s1/bg")
+					if ok {
+						duringHold2.Store(fgInHold2.Load())
+						sawSync.Store(bgEvictRan.Load())
+					}
+				}()
+			case 2:
+				fgInHold2.Store(true)
+				defer fgInHold2.Store(false)
+				close(inHold2)
+				waitUntilEvictContendedFor(c, 25*time.Millisecond)
+			}
+		}),
+	)
+	warmupUncontendedReplaceEvictions(c, 75)
+	_, _ = c.Put("s0/fg", 1)
+	_, _ = c.Put("s1/bg", 2)
+
+	phase.Store(1)
+	require.NoError(t, c.Replace("s0/fg", 10))
+	close(startDetached)
+
+	phase.Store(2)
+	require.NoError(t, c.Replace("s0/fg", 20))
+	<-detachedDone
+
+	assert.False(t, duringHold2.Load(), "detached goroutine from an earlier OnEvict hold must not be treated as child of a later hold")
+	assert.True(t, sawSync.Load())
+}
+
+func TestShardedCache_PostWarmupPreExistingGoroutinesSyncAndPanicIsolation(t *testing.T) {
+	for _, sharded := range []bool{false, true} {
+		mode := "Unsharded"
+		if sharded {
+			mode = "Sharded"
+		}
+		t.Run("HelperMethodChannelWait/"+mode, func(t *testing.T) {
+			runR11NamedMethodPreExistingCase(t, sharded)
+		})
+		t.Run("BgPanicNotStolen/"+mode, func(t *testing.T) {
+			runR11PreExistingPanicIsolationCase(t, sharded, false)
+		})
+		t.Run("DualPanicNeverSwallowed/"+mode, func(t *testing.T) {
+			runR11PreExistingPanicIsolationCase(t, sharded, true)
+		})
+		t.Run("PriorHoldDetachedIsolated/"+mode, func(t *testing.T) {
+			runR11PriorHoldDetachedIsolationCase(t, sharded)
+		})
+	}
+}
+
+func makeShardedOrUnshardedPtrCache(sharded bool, maxSize uint64, opts ...Option) (Cache[*[4]int], *pressureState) {
+	if sharded {
+		sc := NewShardedCache[*[4]int](maxSize, 2, explicitTagShardFunc, opts...).(*shardedCache[*[4]int])
+		return sc, &sc.coord
+	}
+	c := New[*[4]int](maxSize, opts...)
+	return c, extractPressureStateForIter2Test(c)
+}
+
+//go:noinline
+func seedR11WeakVictim(t *testing.T, c Cache[*[4]int]) weak.Pointer[[4]int] {
+	t.Helper()
+	v := new([4]int)
+	wp := weak.Make(v)
+	_, err := c.Put("s1/victim", v)
+	require.NoError(t, err)
+	return wp
+}
+
+func runR11ChildCallbackPanicUnwindCase(t *testing.T, sharded, primaryPanics bool) {
+	t.Helper()
+	var c Cache[*[4]int]
+	var armed, childRan atomic.Bool
+
+	outerChildDelete := func() {
+		_, _ = c.Delete("s1/victim")
+	}
+
+	c, p := makeShardedOrUnshardedPtrCache(sharded, 4,
+		WithOnEvictEntry(func(k string, _ *[4]int, r EvictionReason) {
+			if k == "s1/victim" && r == EvictionReasonDeleted {
+				childRan.Store(true)
+				panic("child boom")
+			}
+			if armed.Load() && k == "s0/fg" && r == EvictionReasonReplaced {
+				var wg sync.WaitGroup
+				wg.Go(outerChildDelete)
+				wg.Wait()
+				if primaryPanics {
+					panic("primary boom")
+				}
+			}
+		}),
+	)
+
+	dummy := new([4]int)
+	_, err := c.Put("s0/warm", dummy)
+	require.NoError(t, err)
+	for range 75 {
+		require.NoError(t, c.Replace("s0/warm", dummy))
+	}
+	_, err = c.Put("s0/fg", dummy)
+	require.NoError(t, err)
+	wpVictim := seedR11WeakVictim(t, c)
+	armed.Store(true)
+
+	expectedPanic := "child boom"
+	if primaryPanics {
+		expectedPanic = "primary boom"
+	}
+	assert.PanicsWithValue(t, expectedPanic, func() {
+		_ = c.Replace("s0/fg", dummy)
+	})
+	assert.Zero(t, p.evictPendingEnqueues.Load())
+
+	if primaryPanics {
+		assert.False(t, childRan.Load(), "pending child callback must not execute during primary callback panic unwind")
+		for range 6 {
+			runtime.GC()
+			runtime.Gosched()
+		}
+		assert.Nil(t, wpVictim.Value(), "discarded pending child callback must release captured value references")
+	} else {
+		assert.True(t, childRan.Load(), "pending child callback must execute and propagate its panic when primary succeeds")
+	}
+}
+
+func TestShardedCache_PostWarmupChildCallbackPanicUnwindAndPropagation(t *testing.T) {
+	for _, sharded := range []bool{false, true} {
+		mode := "Unsharded"
+		if sharded {
+			mode = "Sharded"
+		}
+		t.Run("PrimaryPanicDiscardsChild/"+mode, func(t *testing.T) {
+			runR11ChildCallbackPanicUnwindCase(t, sharded, true)
+		})
+		t.Run("ChildPanicPropagates/"+mode, func(t *testing.T) {
+			runR11ChildCallbackPanicUnwindCase(t, sharded, false)
+		})
+	}
+}
+
+//go:noinline
+func enqueueR11WeakPendingEvent(p *pressureState, delivered *atomic.Int32) weak.Pointer[[8]int] {
+	v := new([8]int)
+	wp := weak.Make(v)
+	var q evictCallbackQueue[*[8]int]
+	q.enqueue("s0/pending", v, EvictionReasonDeleted)
+	q.enqueuePendingCallback(p, nil, func(_ string, val *[8]int, _ EvictionReason) {
+		if val != nil {
+			delivered.Add(1)
+		}
+	})
+	return wp
+}
+
+func populateOver512PreHookGIDs(c Cache[int]) {
+	for batch := range 55 {
+		var wg sync.WaitGroup
+		for j := range 10 {
+			idx := batch*10 + j
+			wg.Go(func() {
+				_, _ = c.Put(fmt.Sprintf("s%d/p_%d", idx%2, idx%32), idx)
+			})
+		}
+		wg.Wait()
+	}
+}
+
+func TestShardedCache_PreHookPruneDoesNotStrandPendingEvictOrLatchContention(t *testing.T) {
+	t.Run("NoStrandedPendingCallbacks", func(t *testing.T) {
+		c := NewShardedCache[int](64, 2, explicitTagShardFunc,
+			WithPressureFunc(func() float64 { return 0.10 }),
+			WithOnEvictEntry(func(string, int, EvictionReason) {}),
+		)
+		populateOver512PreHookGIDs(c)
+		p := coordPressureState(c)
+		pa := c.(PressureAwareCache[int])
+
+		var stop atomic.Bool
+		var prunerWG sync.WaitGroup
+		prunerWG.Go(func() {
+			for !stop.Load() {
+				_ = p.isEvictIdleForPrune(false)
+				_ = pa.EvaluateMemoryPressure()
+			}
+		})
+
+		const total = 80
+		var delivered atomic.Int32
+		wps := make([]weak.Pointer[[8]int], total)
+		for i := range total {
+			wps[i] = enqueueR11WeakPendingEvent(p, &delivered)
+		}
+		stop.Store(true)
+		prunerWG.Wait()
+
+		assert.Equal(t, int32(total), delivered.Load(), "concurrent preHook pruning must never strand queued OnEvict callbacks")
+		assert.Zero(t, p.evictPendingEnqueues.Load())
+		for range 6 {
+			runtime.GC()
+			runtime.Gosched()
+		}
+		for i := range wps {
+			assert.Nil(t, wps[i].Value(), "queued callback value %d must be collectible after delivery", i)
+		}
+	})
+
+	t.Run("NoSpuriousContentionLatch", func(t *testing.T) {
+		c := NewShardedCache[int](64, 2, explicitTagShardFunc,
+			WithPressureFunc(func() float64 { return 0.10 }),
+			WithOnEvictEntry(func(string, int, EvictionReason) {}),
+		)
+		p := coordPressureState(c)
+		_, _ = c.Put("s0/hot", 1)
+
+		var stop atomic.Bool
+		var wg sync.WaitGroup
+		wg.Go(func() {
+			for !stop.Load() {
+				_ = p.isEvictIdleForPrune(false)
+				runtime.Gosched()
+			}
+		})
+		for i := range 200 {
+			require.NoError(t, c.Replace("s0/hot", i+2))
+		}
+		stop.Store(true)
+		wg.Wait()
+		assert.False(t, p.evictCallbackEverContended.Load(), "isEvictIdleForPrune must not touch evictCallbackMu or latch evictCallbackEverContended")
+	})
+}
+
+func spawnR11HelperChild(fn func()) {
+	go fn()
+}
+
+type r11ReenteredChannelService struct {
+	c       Cache[int]
+	armed   atomic.Bool
+	evicts  atomic.Int32
+	useRepl bool
+}
+
+func (s *r11ReenteredChannelService) handle(entry bool) {
+	if entry {
+		if s.useRepl {
+			_ = s.c.Replace("s0/seed", 99)
+		} else {
+			_, _ = s.c.Put("s0/trigger", 99)
+		}
+		return
+	}
+	if !s.armed.Load() {
+		return
+	}
+	resCh := make(chan bool, 1)
+	var wg sync.WaitGroup
+	wg.Go(func() {
+		_, ok := s.c.Delete("s1/victim")
+		resCh <- ok
+	})
+	<-resCh
+	wg.Wait()
+}
+
+func runR11ChannelWaitChildSubcase(t *testing.T, sharded, useReplace bool, subcase int) {
+	t.Helper()
+	if subcase == 2 {
+		svc := &r11ReenteredChannelService{useRepl: useReplace}
+		svc.c = makeShardedOrUnshardedIntCache(sharded, 2,
+			WithOnEvictEntry(func(k string, _ int, r EvictionReason) {
+				if k == "s1/victim" && r == EvictionReasonDeleted {
+					svc.evicts.Add(1)
+					return
+				}
+				if k == "s0/seed" {
+					svc.handle(false)
+				}
+			}),
+		)
+		warmupUncontendedReplaceEvictions(svc.c, 75)
+		_, _ = svc.c.Put("s0/seed", 1)
+		_, _ = svc.c.Put("s1/victim", 2)
+		svc.armed.Store(true)
+		done := make(chan struct{})
+		go func() {
+			defer close(done)
+			svc.handle(true)
+		}()
+		select {
+		case <-done:
+		case <-time.After(2 * time.Second):
+			t.Fatalf("deadlocked in re-entered method channel-wait OnEvict sharded=%v replace=%v", sharded, useReplace)
+		}
+		assert.Equal(t, int32(1), svc.evicts.Load())
+		return
+	}
+
+	var c Cache[int]
+	var armed atomic.Bool
+	var childEvicts atomic.Int32
+	resCh := make(chan bool, 1)
+	outerChildFn := func() {
+		_, ok := c.Delete("s1/victim")
+		resCh <- ok
+	}
+
+	c = makeShardedOrUnshardedIntCache(sharded, 2,
+		WithOnEvictEntry(func(k string, _ int, r EvictionReason) {
+			if k == "s1/victim" && r == EvictionReasonDeleted {
+				childEvicts.Add(1)
+				return
+			}
+			if !armed.Load() || k != "s0/seed" {
+				return
+			}
+			if subcase == 0 {
+				var wg sync.WaitGroup
+				wg.Go(outerChildFn)
+				<-resCh
+				wg.Wait()
+				return
+			}
+			spawnR11HelperChild(outerChildFn)
+			<-resCh
+		}),
+	)
+	warmupUncontendedReplaceEvictions(c, 75)
+	_, _ = c.Put("s0/seed", 1)
+	_, _ = c.Put("s1/victim", 2)
+	armed.Store(true)
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		if useReplace {
+			_ = c.Replace("s0/seed", 10)
+		} else {
+			_, _ = c.Put("s0/trigger", 3)
+		}
+	}()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatalf("deadlocked in channel-wait OnEvict sharded=%v replace=%v subcase=%d", sharded, useReplace, subcase)
+	}
+	assert.Equal(t, int32(1), childEvicts.Load())
+}
+
+func runR11PprofLabelAndRotationCase(t *testing.T, sharded bool) {
+	t.Helper()
+	var c Cache[int]
+	var armed, panicMode atomic.Bool
+	var hookLabelPtr, childLabelPtr atomic.Uintptr
+	inFg := make(chan struct{})
+	bgDone := make(chan struct{})
+	var fgInEvict, bgDuringFg atomic.Bool
+
+	resCh := make(chan bool, 1)
+	outerChild := func() {
+		childLabelPtr.Store(uintptr(runtimeGetProfLabel()))
+		_, ok := c.Delete("s1/child")
+		resCh <- ok
+	}
+
+	c = makeShardedOrUnshardedIntCache(sharded, 4,
+		WithOnEvictEntry(func(k string, _ int, r EvictionReason) {
+			if !armed.Load() || k != "s0/fg" || r != EvictionReasonReplaced {
+				return
+			}
+			hookLabelPtr.Store(uintptr(runtimeGetProfLabel()))
+			if panicMode.Load() {
+				panic("pprof panic")
+			}
+			fgInEvict.Store(true)
+			defer fgInEvict.Store(false)
+			close(inFg)
+			waitUntilEvictContendedFor(c, 20*time.Millisecond)
+			var wg sync.WaitGroup
+			wg.Go(outerChild)
+			<-resCh
+			wg.Wait()
+		}),
+	)
+	warmupUncontendedReplaceEvictions(c, 75)
+	_, _ = c.Put("s0/fg", 1)
+	_, _ = c.Put("s1/bg", 2)
+	_, _ = c.Put("s1/child", 3)
+	armed.Store(true)
+
+	var expectedPtr uintptr
+	pprof.Do(context.Background(), pprof.Labels("req_id", "abc-123"), func(ctx context.Context) {
+		val, ok := pprof.Label(ctx, "req_id")
+		assert.True(t, ok)
+		assert.Equal(t, "abc-123", val)
+		expectedPtr = uintptr(runtimeGetProfLabel())
+		assert.NotZero(t, expectedPtr)
+		go func() {
+			defer close(bgDone)
+			<-inFg
+			_, _ = c.Delete("s1/bg")
+			bgDuringFg.Store(fgInEvict.Load())
+		}()
+		require.NoError(t, c.Replace("s0/fg", 10))
+		assert.Equal(t, expectedPtr, uintptr(runtimeGetProfLabel()))
+		panicMode.Store(true)
+		assert.PanicsWithValue(t, "pprof panic", func() {
+			_ = c.Replace("s0/fg", 20)
+		})
+		assert.Equal(t, expectedPtr, uintptr(runtimeGetProfLabel()))
+	})
+	<-bgDone
+	assert.Zero(t, uintptr(runtimeGetProfLabel()))
+	assert.Equal(t, expectedPtr, hookLabelPtr.Load())
+	assert.Equal(t, expectedPtr, childLabelPtr.Load())
+	assert.False(t, bgDuringFg.Load())
+
+	// Also verify >1024 evictions across the 1024-slot label-ring rotation with a live detached goroutine.
+	releaseDetached := make(chan struct{})
+	var detachedWG sync.WaitGroup
+	var rotCache Cache[int]
+	var spawnOnce atomic.Bool
+	rotCache = makeShardedOrUnshardedIntCache(sharded, 4,
+		WithOnEvictEntry(func(k string, _ int, r EvictionReason) {
+			if k == "s0/rot" && r == EvictionReasonReplaced && spawnOnce.CompareAndSwap(false, true) {
+				detachedWG.Go(func() {
+					<-releaseDetached
+				})
+			}
+		}),
+	)
+	_, _ = rotCache.Put("s0/rot", 1)
+	for i := range 1060 {
+		if i == 80 {
+			spawnOnce.Store(false)
+		}
+		require.NoError(t, rotCache.Replace("s0/rot", i+2))
+	}
+	close(releaseDetached)
+	detachedWG.Wait()
+}
+
+func runR11NestedCachesPostWarmupCase(t *testing.T, sharded bool) {
+	t.Helper()
+	var cacheA, cacheB Cache[int]
+	var armed atomic.Bool
+	var childDeletes atomic.Int32
+
+	cacheB = makeShardedOrUnshardedIntCache(sharded, 4,
+		WithOnEvictEntry(func(k string, _ int, r EvictionReason) {
+			if !armed.Load() || k != "s0/b" || r != EvictionReasonReplaced {
+				return
+			}
+			ch := make(chan struct{})
+			go func() {
+				defer close(ch)
+				if _, ok := cacheA.Delete("s1/a_victim"); ok {
+					childDeletes.Add(1)
+				}
+				if _, ok := cacheB.Delete("s1/b_victim"); ok {
+					childDeletes.Add(1)
+				}
+			}()
+			<-ch
+		}),
+	)
+	cacheA = makeShardedOrUnshardedIntCache(sharded, 4,
+		WithOnEvictEntry(func(k string, _ int, r EvictionReason) {
+			if armed.Load() && k == "s0/a" && r == EvictionReasonReplaced {
+				_ = cacheB.Replace("s0/b", 20)
+			}
+		}),
+	)
+	warmupUncontendedReplaceEvictions(cacheA, 75)
+	warmupUncontendedReplaceEvictions(cacheB, 75)
+	_, _ = cacheA.Put("s0/a", 1)
+	_, _ = cacheA.Put("s1/a_victim", 2)
+	_, _ = cacheB.Put("s0/b", 3)
+	_, _ = cacheB.Put("s1/b_victim", 4)
+	armed.Store(true)
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		_ = cacheA.Replace("s0/a", 10)
+	}()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatalf("deadlocked in nested cacheA->cacheB post-warmup OnEvict sharded=%v", sharded)
+	}
+	assert.Equal(t, int32(2), childDeletes.Load())
+}
+
+func TestShardedCache_PostWarmupChannelWaitChildNoDeadlockAndPprofLabels(t *testing.T) {
+	for _, sharded := range []bool{false, true} {
+		mode := "Unsharded"
+		if sharded {
+			mode = "Sharded"
+		}
+		for _, useReplace := range []bool{true, false} {
+			op := "Replace"
+			if !useReplace {
+				op = "Put"
+			}
+			t.Run("WGGoOuter_"+op+"/"+mode, func(t *testing.T) {
+				runR11ChannelWaitChildSubcase(t, sharded, useReplace, 0)
+			})
+			t.Run("HelperOuter_"+op+"/"+mode, func(t *testing.T) {
+				runR11ChannelWaitChildSubcase(t, sharded, useReplace, 1)
+			})
+			t.Run("ReenteredMethod_"+op+"/"+mode, func(t *testing.T) {
+				runR11ChannelWaitChildSubcase(t, sharded, useReplace, 2)
+			})
+		}
+		t.Run("PprofLabelsAndRingRotation/"+mode, func(t *testing.T) {
+			runR11PprofLabelAndRotationCase(t, sharded)
+		})
+		t.Run("NestedCaches/"+mode, func(t *testing.T) {
+			runR11NestedCachesPostWarmupCase(t, sharded)
+		})
+	}
 }
 
 func BenchmarkShardedParallelThroughput(b *testing.B) {

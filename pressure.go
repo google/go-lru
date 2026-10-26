@@ -16,18 +16,43 @@ package lru
 
 import (
 	"bytes"
+	"context"
 	"fmt"
 	"math"
 	"runtime"
 	"runtime/metrics"
+	"runtime/pprof"
 	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
-	"time"
+	"unsafe"
 )
 
-const goroutinesCreatedMetric = "/sched/goroutines-created:goroutines"
+//go:linkname runtimeGetProfLabel runtime/pprof.runtime_getProfLabel
+func runtimeGetProfLabel() unsafe.Pointer
+
+//go:linkname runtimeSetProfLabel runtime/pprof.runtime_setProfLabel
+func runtimeSetProfLabel(labels unsafe.Pointer)
+
+const (
+	goroutinesCreatedMetric = "/sched/goroutines-created:goroutines"
+	evictLabelRingSize      = 1024
+	evictLabelRingMask      = evictLabelRingSize - 1
+)
+
+func newEvictLabelRing() *[evictLabelRingSize]unsafe.Pointer {
+	ring := new([evictLabelRingSize]unsafe.Pointer)
+	prev := runtimeGetProfLabel()
+	defer runtimeSetProfLabel(prev)
+	emptyLabels := pprof.Labels()
+	bg := context.Background()
+	for i := range ring {
+		pprof.SetGoroutineLabels(pprof.WithLabels(bg, emptyLabels))
+		ring[i] = runtimeGetProfLabel()
+	}
+	return ring
+}
 
 var (
 	goroutineStackBufPool = sync.Pool{
@@ -1016,6 +1041,7 @@ type pressureState struct {
 	anyShardReentrantReclaim   atomic.Bool
 	reentrantReclaimCount      atomic.Int32
 	overflowSamplingCount      atomic.Int32
+	activeSnapSamplers         atomic.Int32
 	samplingGID                atomic.Uint64
 	samplingParentGID          atomic.Uint64
 	fallbackGID                atomic.Uint64
@@ -1041,7 +1067,7 @@ type pressureState struct {
 	evictCallbackContended     atomic.Bool
 	evictPendingEnqueues       atomic.Int32
 	evictCallbackResolveMu     sync.Mutex
-	pendingEvictCallbacks      []pendingEvictCallback
+	pendingEvictCallbacks      []func()
 	samplingResolveMu          sync.Mutex
 	primaryFastSlot            *atomic.Uint64
 	primaryFastIdle            uint64
@@ -1051,10 +1077,15 @@ type pressureState struct {
 	evictFastIdle              uint64
 	evictFastTag               uint32
 	evictCallbackEverContended atomic.Bool
+	evictLabelTampered         atomic.Bool
 	evictExactSnap             atomic.Bool
+	evictHasActiveRingTag      atomic.Bool
+	evictFastMode              atomic.Bool
+	evictHeldTag               unsafe.Pointer
 	evictHoldSeq               atomic.Uint64
 	evictStartSnapSeq          atomic.Uint64
-	ambiguousWaiters           []*ambiguousHookWaiter
+	evictRingEpochGCreated     uint64
+	evictLabelRing             atomic.Pointer[[evictLabelRingSize]unsafe.Pointer]
 	evictNonDescendantParent   atomic.Uint64
 	evictNonDescendantHolder   atomic.Uint64
 	belowTier1Epoch            atomic.Uint64
@@ -1083,6 +1114,7 @@ type pressureState struct {
 	preHookSnapSeq             atomic.Uint64
 	lastObservedGCreated       atomic.Uint64
 	preHookMu                  sync.Mutex
+	preHookPruning             atomic.Bool
 	preHookLiveGIDs            map[uint64]uint64
 	hasPanickedEntries         atomic.Bool
 	panickedMu                 sync.Mutex
@@ -1338,15 +1370,6 @@ func (p *pressureState) hasActiveSampler() bool {
 		p.overflowSamplingCount.Load() > 0
 }
 
-func (p *pressureState) hasOtherActiveCustomSampler(holdsPrimary bool) bool {
-	if !p.options.hasCustomPressureFunc {
-		return false
-	}
-	return (!holdsPrimary && p.samplingPressure.Load()) ||
-		p.fallbackSampling.Load() ||
-		p.overflowSamplingCount.Load() > 0
-}
-
 func (p *pressureState) checkSamplingGoroutine() (bool, uint64) {
 	sampling, rootGID, _ := p.checkSamplingGoroutineOrChild()
 	if !sampling {
@@ -1418,8 +1441,14 @@ func (p *pressureState) initCoordinator(hasOnEvict bool) {
 	if p.options.sharedPressure != nil {
 		return
 	}
+	if hasOnEvict {
+		p.evictLabelRing.Store(newEvictLabelRing())
+	}
 	if p.options.hasCustomPressureFunc || hasOnEvict {
 		p.observePreHookLiveGIDs(false)
+		if hasOnEvict {
+			p.evictRingEpochGCreated = p.lastObservedGCreated.Load()
+		}
 	}
 }
 
@@ -1451,24 +1480,31 @@ func pruneUnreferencedKeys(m map[uint64]uint64, keep map[uint64]struct{}) {
 }
 
 func (p *pressureState) isEvictIdleForPrune(holdsEvictMu bool) bool {
-	if p.isEvictCallbackActive() {
+	if p.isEvictCallbackActive() || p.evictPendingEnqueues.Load() != 0 {
 		return false
 	}
-	if holdsEvictMu {
-		return true
+	return holdsEvictMu || !p.evictCallbackContended.Load()
+}
+
+func (p *pressureState) canPrunePreHookNow(holdsEvictMu bool) bool {
+	return p.activeSnapSamplers.Load() == 0 && p.isEvictIdleForPrune(holdsEvictMu)
+}
+
+func (p *pressureState) capturePreHookPruneGuard(canPrune, holdsEvictMu bool) (bool, uint64) {
+	if !canPrune || len(p.preHookLiveGIDs) <= 512 {
+		return false, 0
 	}
-	if !p.evictCallbackMu.TryLock() {
+	return p.canPrunePreHookNow(holdsEvictMu), p.evictHoldSeq.Load()
+}
+
+func (p *pressureState) confirmPreHookPruneGuard(holdsEvictMu, wasIdle bool, evictSeqBefore uint64) bool {
+	if !wasIdle || !p.canPrunePreHookNow(holdsEvictMu) {
 		return false
 	}
-	p.evictCallbackMu.Unlock()
-	return true
+	return holdsEvictMu || p.evictHoldSeq.Load() == evictSeqBefore
 }
 
-func (p *pressureState) shouldPrunePreHookMap(canPrune, holdsEvictMu, holdsPrimarySampler bool) bool {
-	return canPrune && len(p.preHookLiveGIDs) > 512 && !p.hasOtherActiveCustomSampler(holdsPrimarySampler) && p.isEvictIdleForPrune(holdsEvictMu)
-}
-
-func (p *pressureState) observePreHookLiveGIDsWithSample(canPrune, holdsEvictMu, holdsPrimarySampler bool, sampleBuf *[1]metrics.Sample) uint64 {
+func (p *pressureState) tryFastPreHookSnap(acquireSamplerSnap bool, sampleBuf *[1]metrics.Sample) uint64 {
 	lastG := p.lastObservedGCreated.Load()
 	var curG uint64
 	if sampleBuf != nil {
@@ -1476,31 +1512,56 @@ func (p *pressureState) observePreHookLiveGIDsWithSample(canPrune, holdsEvictMu,
 	} else {
 		curG = readGoroutinesCreated()
 	}
-	if snap := p.preHookSnapSeq.Load(); snap != 0 && curG == lastG {
+	snap := p.preHookSnapSeq.Load()
+	if snap == 0 || curG != lastG {
+		return 0
+	}
+	if !acquireSamplerSnap {
+		return snap
+	}
+	p.activeSnapSamplers.Add(1)
+	if p.preHookSnapSeq.Load() == snap && !p.preHookPruning.Load() {
+		return snap
+	}
+	p.activeSnapSamplers.Add(-1)
+	return 0
+}
+
+func (p *pressureState) observePreHookLiveGIDsWithSample(canPrune, holdsEvictMu, acquireSamplerSnap bool, sampleBuf *[1]metrics.Sample) uint64 {
+	if snap := p.tryFastPreHookSnap(acquireSamplerSnap, sampleBuf); snap != 0 {
 		return snap
 	}
 	p.preHookMu.Lock()
 	defer p.preHookMu.Unlock()
-	curG = readGoroutinesCreated()
+	curG := readGoroutinesCreated()
 	if snap := p.preHookSnapSeq.Load(); snap != 0 && curG == p.lastObservedGCreated.Load() {
+		if acquireSamplerSnap {
+			p.activeSnapSamplers.Add(1)
+		}
 		return snap
 	}
 	if p.preHookLiveGIDs == nil {
 		p.preHookLiveGIDs = make(map[uint64]uint64, 64)
 	}
+	p.preHookPruning.Store(true)
+	defer p.preHookPruning.Store(false)
+	wasIdle, evictSeqBefore := p.capturePreHookPruneGuard(canPrune, holdsEvictMu)
 	allStacks, bufPtr := captureAllGoroutineStacks()
 	defer releaseAllGoroutineStacks(bufPtr)
 	newSnap := p.preHookSnapSeq.Load() + 1
 	var keep map[uint64]struct{}
-	if p.shouldPrunePreHookMap(canPrune, holdsEvictMu, holdsPrimarySampler) {
+	if wasIdle {
 		keep = make(map[uint64]struct{}, 64)
 	}
 	collectLiveAndParentGIDs(allStacks, newSnap, p.preHookLiveGIDs, keep)
-	if keep != nil {
+	if keep != nil && p.confirmPreHookPruneGuard(holdsEvictMu, wasIdle, evictSeqBefore) {
 		pruneUnreferencedKeys(p.preHookLiveGIDs, keep)
 	}
 	p.preHookSnapSeq.Store(newSnap)
 	p.lastObservedGCreated.Store(curG)
+	if acquireSamplerSnap {
+		p.activeSnapSamplers.Add(1)
+	}
 	return newSnap
 }
 
@@ -2795,7 +2856,7 @@ func (p *pressureState) releasePrimarySamplerSlot(gid uint64, fastPrimary, compl
 }
 
 func (p *pressureState) prepareSamplerLineage(canPrune bool) (uint64, uint64) {
-	return p.panickedSamplerEpoch.Load(), p.observePreHookLiveGIDs(canPrune)
+	return p.panickedSamplerEpoch.Load(), p.observePreHookLiveGIDsWithSample(canPrune, false, true, nil)
 }
 
 func (p *pressureState) preparePrimarySamplerLineage(canPrune bool) {
@@ -2816,6 +2877,7 @@ func (p *pressureState) sampleWithSlot(targetShard *pressureState, gid, parentGI
 		return p.invokeAndStorePressure(targetShard, 0, samplerSlotPrimary, false, 0)
 	}
 	p.preparePrimarySamplerLineage(canPrune)
+	defer p.activeSnapSamplers.Add(-1)
 	if gid == 0 {
 		if slot := p.primaryFastSlot; slot != nil && slot.CompareAndSwap(p.primaryFastIdle, p.primaryFastIdle|1) {
 			p.samplingActive.Store(true)
@@ -2844,12 +2906,8 @@ func (p *pressureState) sampleWithSlot(targetShard *pressureState, gid, parentGI
 //go:noinline
 func (p *pressureState) sampleWithFallbackSlot(targetShard *pressureState, gid, parentGID uint64) pressureSample {
 	if p.options.hasCustomPressureFunc {
-		panicEpoch, snapSeq := p.prepareSamplerLineage(false)
 		gid, parentGID = p.ensureSamplingGID(gid, parentGID)
-		p.fallbackStartPanicEpoch.Store(panicEpoch)
-		p.fallbackStartSnapSeq.Store(snapSeq)
-		p.fallbackParentGID.Store(parentGID)
-		p.fallbackGID.Store(gid)
+		panicEpoch, snapSeq := p.prepareSamplerLineage(true)
 		defer func() {
 			p.pressureWriteMu.Lock()
 			p.recordExitedSamplerGID(gid)
@@ -2858,8 +2916,13 @@ func (p *pressureState) sampleWithFallbackSlot(targetShard *pressureState, gid, 
 			p.fallbackGID.Store(0)
 			p.fallbackParentGID.Store(0)
 			p.fallbackSampling.Store(false)
+			p.activeSnapSamplers.Add(-1)
 			p.pressureWriteMu.Unlock()
 		}()
+		p.fallbackStartPanicEpoch.Store(panicEpoch)
+		p.fallbackStartSnapSeq.Store(snapSeq)
+		p.fallbackParentGID.Store(parentGID)
+		p.fallbackGID.Store(gid)
 	} else {
 		defer p.fallbackSampling.Store(false)
 	}
@@ -2869,6 +2932,7 @@ func (p *pressureState) sampleWithFallbackSlot(targetShard *pressureState, gid, 
 func (p *pressureState) sampleWithOverflowSlot(targetShard *pressureState, gid, parentGID uint64) pressureSample {
 	p.overflowSamplingCount.Add(1)
 	var storedGID uint64
+	acquiredSnap := false
 	defer func() {
 		if p.options.hasCustomPressureFunc {
 			p.pressureWriteMu.Lock()
@@ -2877,6 +2941,9 @@ func (p *pressureState) sampleWithOverflowSlot(targetShard *pressureState, gid, 
 				p.overflowSamplingGIDs.Delete(storedGID)
 			}
 			p.overflowSamplingCount.Add(-1)
+			if acquiredSnap {
+				p.activeSnapSamplers.Add(-1)
+			}
 			p.clearReentrantSlot(storedGID, samplerSlotOverflow)
 			p.clearChildShardsReentrantSlot(nil, storedGID, samplerSlotOverflow)
 			p.pressureWriteMu.Unlock()
@@ -2885,8 +2952,9 @@ func (p *pressureState) sampleWithOverflowSlot(targetShard *pressureState, gid, 
 		p.overflowSamplingCount.Add(-1)
 	}()
 	if p.options.hasCustomPressureFunc {
-		panicEpoch, snapSeq := p.prepareSamplerLineage(false)
 		gid, parentGID = p.ensureSamplingGID(gid, parentGID)
+		panicEpoch, snapSeq := p.prepareSamplerLineage(true)
+		acquiredSnap = true
 		storedGID = gid
 		p.overflowSamplingGIDs.Store(gid, overflowSamplerInfo{
 			parentGID:       parentGID,
@@ -3354,19 +3422,100 @@ func (p *pressureState) isCachedNonDescendantEvictParent(parentGID, holdSeq uint
 }
 
 func (p *pressureState) refreshEvictSnapLocked() {
+	if p.evictFastMode.Load() {
+		p.evictFastMode.Store(false)
+	}
 	snap := p.observePreHookLiveGIDsOpts(true, true)
 	p.evictStartSnapSeq.Store(snap)
-	p.evictExactSnap.Store(true)
+	if !p.evictExactSnap.Load() {
+		p.evictExactSnap.Store(true)
+	}
+}
+
+func (p *pressureState) maybeRotateEvictLabelRingLocked(ring *[evictLabelRingSize]unsafe.Pointer) (*[evictLabelRingSize]unsafe.Pointer, bool) {
+	if ring == nil {
+		return nil, true
+	}
+	if readGoroutinesCreated() != p.evictRingEpochGCreated {
+		ring = newEvictLabelRing()
+		p.evictLabelRing.Store(ring)
+		p.evictRingEpochGCreated = readGoroutinesCreated()
+		return ring, true
+	}
+	return ring, false
+}
+
+func (p *pressureState) needsExactEvictSnap(exact, ringRotated bool, seq uint64, hasCallerLabel bool, ring *[evictLabelRingSize]unsafe.Pointer) bool {
+	return exact || ringRotated || seq <= 4 ||
+		hasCallerLabel || ring == nil ||
+		p.evictLabelTampered.Load() || p.evictCallbackEverContended.Load()
+}
+
+//go:noinline
+func (p *pressureState) beginEvictCallbackHoldSlow(exact bool, seq uint64, hasCallerLabel bool) {
+	ring := p.evictLabelRing.Load()
+	ringRotated := false
+	if (seq & evictLabelRingMask) == 0 {
+		ring, ringRotated = p.maybeRotateEvictLabelRingLocked(ring)
+	}
+	exactSnap := p.needsExactEvictSnap(exact, ringRotated, seq, hasCallerLabel, ring)
+	if exactSnap {
+		p.refreshEvictSnapLocked()
+	} else if p.evictExactSnap.Load() {
+		p.evictExactSnap.Store(false)
+	}
+	if !hasCallerLabel && ring != nil {
+		tag := ring[seq&evictLabelRingMask]
+		p.evictHeldTag = tag
+		if !p.evictHasActiveRingTag.Load() {
+			p.evictHasActiveRingTag.Store(true)
+		}
+		if !exactSnap && !p.evictFastMode.Load() {
+			p.evictFastMode.Store(true)
+		}
+		p.evictHoldSeq.Store(seq)
+		runtimeSetProfLabel(tag)
+		return
+	}
+	p.evictHeldTag = nil
+	if p.evictFastMode.Load() {
+		p.evictFastMode.Store(false)
+	}
+	if p.evictHasActiveRingTag.Load() {
+		p.evictHasActiveRingTag.Store(false)
+	}
+	p.evictHoldSeq.Store(seq)
 }
 
 func (p *pressureState) beginEvictCallbackHold(exact bool) {
 	seq := p.evictHoldSeq.Load() + 1
-	if exact || seq <= 64 || (seq&255) == 0 || p.evictCallbackEverContended.Load() {
-		p.refreshEvictSnapLocked()
-	} else {
-		p.evictExactSnap.Store(false)
+	callerLabel := runtimeGetProfLabel()
+	if !exact && (seq&evictLabelRingMask) != 0 && callerLabel == nil && p.evictFastMode.Load() {
+		tag := p.evictLabelRing.Load()[seq&evictLabelRingMask]
+		p.evictHeldTag = tag
+		p.evictHoldSeq.Store(seq)
+		runtimeSetProfLabel(tag)
+		return
 	}
-	p.evictHoldSeq.Store(seq)
+	p.beginEvictCallbackHoldSlow(exact, seq, callerLabel != nil)
+}
+
+func (p *pressureState) clearHeldEvictLabelLocked() {
+	tag := p.evictHeldTag
+	if tag == nil {
+		return
+	}
+	p.evictHeldTag = nil
+	if p.evictFastMode.Load() {
+		runtimeSetProfLabel(nil)
+		return
+	}
+	if runtimeGetProfLabel() == tag {
+		runtimeSetProfLabel(nil)
+	} else {
+		p.evictLabelTampered.Store(true)
+		p.evictFastMode.Store(false)
+	}
 }
 
 func (p *pressureState) preRejectEvictDescendant(gid, parentGID, holder, holdSeq, startSnap uint64) bool {
@@ -3389,463 +3538,88 @@ func (p *pressureState) cacheNonDescendantEvictParent(parentGID, holder, holdSeq
 	}
 }
 
-func (p *pressureState) findEvictHolderDetail(allStacks, stack []byte, gid, parentGID uint64, creatorFunc []byte, holder, holdSeq, startSnap uint64) (ancestorMatchDetail, bool) {
-	if p.preRejectEvictDescendant(gid, parentGID, holder, holdSeq, startSnap) {
-		return ancestorMatchDetail{}, false
-	}
+func (p *pressureState) matchesExactEvictHolder(allStacks, stack []byte, parentGID uint64, creatorFunc []byte, holder, holdSeq, startSnap uint64) bool {
 	rejectFn := func(ancGID uint64) bool {
 		return ancGID != holder && p.wasLiveAtOrBeforeSnap(ancGID, startSnap)
 	}
-	det, ok := findAncestorCreatorAboveHookDetail(allStacks, stack, parentGID, creatorFunc, []byte("deliverCallbacks"), func(ancGID uint64) bool {
+	if _, ok := findAncestorCreatorAboveHookOpts(allStacks, stack, parentGID, creatorFunc, []byte("deliverCallbacks"), func(ancGID uint64) bool {
 		return ancGID == holder
-	}, rejectFn)
-	if ok {
-		return det, true
-	}
-	p.cacheNonDescendantEvictParent(parentGID, holder, holdSeq)
-	return ancestorMatchDetail{}, false
-}
-
-func (p *pressureState) isDescendantOfEvictHolder(allStacks, stack []byte, gid, parentGID uint64, creatorFunc []byte, holder, holdSeq, startSnap uint64) bool {
-	_, ok := p.findEvictHolderDetail(allStacks, stack, gid, parentGID, creatorFunc, holder, holdSeq, startSnap)
-	return ok
-}
-
-func callbackEntryFrameAboveHook(aboveHook []byte) []byte {
-	rest := aboveHook
-	for range 4 {
-		var entryFn []byte
-		entryFn, rest = popBottomCallFrame(rest)
-		if len(entryFn) == 0 {
-			return nil
-		}
-		if !isInternalCallbackDispatchFrame(entryFn) {
-			return trimClosureOffset(entryFn)
-		}
-	}
-	return nil
-}
-
-func isOwnedByCallbackEntry(sym, cbEntryFn []byte) bool {
-	sym = trimClosureOffset(sym)
-	if len(sym) == 0 || len(cbEntryFn) == 0 {
-		return false
-	}
-	if sameFuncSymbolIgnoringTypeArgs(sym, cbEntryFn) {
+	}, rejectFn); ok {
 		return true
 	}
-	for {
-		dot := lastDotOutsideBrackets(sym)
-		if dot <= 0 || !isClosureSuffix(sym[dot+1:]) {
-			return false
-		}
-		sym = sym[:dot]
-		if sameFuncSymbolIgnoringTypeArgs(sym, cbEntryFn) {
-			return true
-		}
-	}
-}
-
-func firstUserEntryFrame(childStack []byte) []byte {
-	end := bytes.LastIndex(childStack, []byte("\ncreated by "))
-	if end <= 0 {
-		return nil
-	}
-	rest := childStack[:end]
-	for range 4 {
-		var fn []byte
-		fn, rest = popBottomCallFrame(rest)
-		if len(fn) == 0 {
-			return nil
-		}
-		if bytes.Equal(fn, []byte("sync.(*WaitGroup).Go.func1")) {
-			continue
-		}
-		return trimClosureOffset(fn)
-	}
-	return nil
-}
-
-func isStrictlyCallbackOwnedHop(belowHook, hopCreator, entryFn, cbEntryFn []byte) bool {
-	if len(cbEntryFn) == 0 || containsCreatorCallFrame(belowHook, cbEntryFn) {
-		return false
-	}
-	return isOwnedByCallbackEntry(hopCreator, cbEntryFn) || isOwnedByCallbackEntry(entryFn, cbEntryFn)
-}
-
-func isDirectBelowHookNonChild(aboveHook, belowHook, hopCreator []byte, directHop, isWGGo bool) bool {
-	if !directHop || isWGGo || len(hopCreator) == 0 {
-		return false
-	}
-	return containsCreatorCallFrame(belowHook, hopCreator) && !containsCreatorCallFrame(aboveHook, hopCreator)
-}
-
-func isStrictBelowHookClosure(aboveHook, belowHook, fn, cbEntryFn []byte) bool {
-	if isOwnedByCallbackEntry(fn, cbEntryFn) {
-		return false
-	}
-	owner := findClosureOwnerInStack(belowHook, fn)
-	return len(owner) > 0 && !containsCreatorCallFrame(aboveHook, owner)
-}
-
-func hasBelowHookOwnedClosureEntry(aboveHook, belowHook, childStack, cbEntryFn []byte) bool {
-	end := bytes.LastIndex(childStack, []byte("\ncreated by "))
-	if end <= 0 {
-		return false
-	}
-	rest := childStack[:end]
-	for range 4 {
-		var fn []byte
-		fn, rest = popBottomCallFrame(rest)
-		if len(fn) == 0 {
-			return false
-		}
-		if isStrictBelowHookClosure(aboveHook, belowHook, fn, cbEntryFn) {
-			return true
-		}
-	}
+	p.cacheNonDescendantEvictParent(parentGID, holder, holdSeq)
 	return false
-}
-
-func classifyHolderChildHop(det ancestorMatchDetail) (int, bool) {
-	hookIdx := bytes.LastIndex(det.holderBlk, []byte("deliverCallbacks"))
-	if hookIdx <= 0 {
-		return evictContendLockDirect, false
-	}
-	aboveHook := det.holderBlk[:hookIdx]
-	belowHook := det.holderBlk[hookIdx:]
-	hopCreator := trimClosureOffset(det.hopCreator)
-	cbEntryFn := callbackEntryFrameAboveHook(aboveHook)
-	entryFn := firstUserEntryFrame(det.hopChildStack)
-	if isStrictlyCallbackOwnedHop(belowHook, hopCreator, entryFn, cbEntryFn) {
-		return evictContendEnqueueChild, false
-	}
-	isWGGo := det.directHop && bytes.Equal(hopCreator, []byte("sync.(*WaitGroup).Go"))
-	if isDirectBelowHookNonChild(aboveHook, belowHook, hopCreator, det.directHop, isWGGo) {
-		return evictContendLockDirect, false
-	}
-	belowClosureViaHelper := det.directHop && !containsCreatorCallFrame(aboveHook, hopCreator) &&
-		hasBelowHookOwnedClosureEntry(aboveHook, belowHook, det.hopChildStack, cbEntryFn)
-	return evictContendWaitAmbiguous, isWGGo || belowClosureViaHelper
-}
-
-const (
-	evictContendLockDirect = iota
-	evictContendEnqueueChild
-	evictContendWaitAmbiguous
-)
-
-type pendingEvictCallback struct {
-	fn              func()
-	preserveOnPanic bool
-}
-
-type ambiguousHookWaiter struct {
-	holder          uint64
-	holdSeq         uint64
-	waiterGID       uint64
-	fromWaitGroupGo bool
-	gateMu          sync.Mutex
-	released        atomic.Bool
-	enqueueAsChild  bool
-	done            chan struct{}
-}
-
-func (w *ambiguousHookWaiter) release(asChild bool) {
-	if w.released.CompareAndSwap(false, true) {
-		w.enqueueAsChild = asChild
-		close(w.done)
-		w.gateMu.Unlock()
-	}
-}
-
-func (p *pressureState) releaseAllAmbiguousWaitersLocked(asChild bool) {
-	s := p.ambiguousWaiters
-	for i, w := range s {
-		s[i] = nil
-		w.release(asChild)
-	}
-	p.ambiguousWaiters = s[:0]
-}
-
-func (p *pressureState) releaseAmbiguousHookWaiter(w *ambiguousHookWaiter, asChild bool) {
-	p.evictCallbackResolveMu.Lock()
-	s := p.ambiguousWaiters
-	for i, cur := range s {
-		if cur == w {
-			last := len(s) - 1
-			s[i] = s[last]
-			s[last] = nil
-			p.ambiguousWaiters = s[:last]
-			break
-		}
-	}
-	p.evictCallbackResolveMu.Unlock()
-	w.release(asChild)
-}
-
-var (
-	syncWaitStatusPrefixes = [...][]byte{
-		[]byte("chan receive"),
-		[]byte("chan send"),
-		[]byte("select"),
-		[]byte("semacquire"),
-		[]byte("sync."),
-		[]byte("synctest."),
-	}
-	systemIdleStatusPrefixes = [...][]byte{
-		[]byte("force gc (idle)"),
-		[]byte("GC sweep wait"),
-		[]byte("GC scavenge wait"),
-		[]byte("finalizer wait"),
-		[]byte("cleanup wait"),
-		[]byte("GOMAXPROCS updater (idle)"),
-		[]byte("GC worker (idle)"),
-		[]byte("trace reader (blocked)"),
-		[]byte("wait for GC cycle"),
-		[]byte("IO wait"),
-		[]byte("coroutine"),
-	}
-)
-
-func goroutineHeaderStatus(blk []byte) []byte {
-	nl := bytes.IndexByte(blk, '\n')
-	if nl <= 0 {
-		return nil
-	}
-	header := blk[:nl]
-	open := bytes.IndexByte(header, '[')
-	closeIdx := bytes.LastIndexByte(header, ']')
-	if open < 0 || closeIdx <= open {
-		return nil
-	}
-	return header[open+1 : closeIdx]
-}
-
-func isGoroutineInSyncWait(status []byte) bool {
-	for _, prefix := range syncWaitStatusPrefixes {
-		if bytes.HasPrefix(status, prefix) {
-			return true
-		}
-	}
-	return false
-}
-
-func isSystemIdleGoroutine(status []byte) bool {
-	for _, prefix := range systemIdleStatusPrefixes {
-		if bytes.HasPrefix(status, prefix) {
-			return true
-		}
-	}
-	return false
-}
-
-type ambiguousQuiescenceScan struct {
-	holderAlive           bool
-	holderInNonWGSyncWait bool
-	procQuiescent         bool
-	subtreeQuiescent      bool
-}
-
-func inspectAmbiguousHolderBlock(blk, status []byte, st *ambiguousQuiescenceScan) {
-	hookIdx := bytes.LastIndex(blk, []byte("deliverCallbacks"))
-	st.holderAlive = hookIdx >= 0
-	inSyncWait := isGoroutineInSyncWait(status)
-	if hookIdx > 0 && inSyncWait {
-		st.holderInNonWGSyncWait = !containsCreatorCallFrame(blk[:hookIdx], []byte("sync.(*WaitGroup).Wait"))
-	}
-	if !inSyncWait {
-		st.procQuiescent = false
-		st.subtreeQuiescent = false
-	}
-}
-
-func (p *pressureState) scanAmbiguousGoroutineBlock(allStacks, blk []byte, w *ambiguousHookWaiter, startSnap uint64, st *ambiguousQuiescenceScan) {
-	if bytes.Contains(blk, []byte("monitorAmbiguousHookWaiter")) {
-		return
-	}
-	gID, pGID, creator := parseStackGoroutineParentAndCreator(blk)
-	if gID == 0 || gID == w.waiterGID {
-		return
-	}
-	status := goroutineHeaderStatus(blk)
-	if gID == w.holder {
-		inspectAmbiguousHolderBlock(blk, status, st)
-		return
-	}
-	if isGoroutineInSyncWait(status) || isSystemIdleGoroutine(status) {
-		return
-	}
-	st.procQuiescent = false
-	if st.subtreeQuiescent && p.isDescendantOfEvictHolder(allStacks, blk, gID, pGID, creator, w.holder, 0, startSnap) {
-		st.subtreeQuiescent = false
-	}
-}
-
-func (p *pressureState) inspectAmbiguousWaiterQuiescence(w *ambiguousHookWaiter, startSnap uint64) ambiguousQuiescenceScan {
-	allStacks, bufPtr := captureAllGoroutineStacks()
-	defer releaseAllGoroutineStacks(bufPtr)
-	st := ambiguousQuiescenceScan{procQuiescent: true, subtreeQuiescent: true}
-	for rem := allStacks; len(rem) > 0; {
-		var blk []byte
-		blk, rem = nextGoroutineBlock(rem)
-		p.scanAmbiguousGoroutineBlock(allStacks, blk, w, startSnap, &st)
-	}
-	return st
-}
-
-func advanceStreak(cond bool, streak *int) int {
-	if cond {
-		*streak++
-		return *streak
-	}
-	*streak = 0
-	return 0
-}
-
-type ambiguousMonitorStreaks struct {
-	proc    int
-	subtree int
-	nonWG   int
-	total   int
-}
-
-func (p *pressureState) stepAmbiguousHookWaiterTick(w *ambiguousHookWaiter, startSnap uint64, streaks *ambiguousMonitorStreaks) (done, asChild bool) {
-	if !p.isEvictCallbackActive() || p.evictCallbackGID.Load() != w.holder || p.evictHoldSeq.Load() != w.holdSeq {
-		return true, false
-	}
-	st := p.inspectAmbiguousWaiterQuiescence(w, startSnap)
-	if !st.holderAlive {
-		return true, false
-	}
-	if w.fromWaitGroupGo && advanceStreak(st.holderInNonWGSyncWait, &streaks.nonWG) >= 10 {
-		return true, false
-	}
-	pStreak := advanceStreak(st.procQuiescent, &streaks.proc)
-	sStreak := advanceStreak(st.subtreeQuiescent, &streaks.subtree)
-	streaks.total++
-	if pStreak >= 60 || sStreak >= 100 || streaks.total >= 160 {
-		return true, true
-	}
-	return false, false
-}
-
-func (p *pressureState) monitorAmbiguousHookWaiter(w *ambiguousHookWaiter, startSnap uint64) {
-	ticker := time.NewTicker(5 * time.Millisecond)
-	defer ticker.Stop()
-	var streaks ambiguousMonitorStreaks
-	for {
-		select {
-		case <-w.done:
-			return
-		case <-ticker.C:
-			if done, asChild := p.stepAmbiguousHookWaiterTick(w, startSnap, &streaks); done {
-				p.releaseAmbiguousHookWaiter(w, asChild)
-				return
-			}
-		}
-	}
-}
-
-func (p *pressureState) registerAmbiguousEvictWaiter(holder, holdSeq, waiterGID, startSnap uint64, fromWGGo bool) *ambiguousHookWaiter {
-	p.evictCallbackResolveMu.Lock()
-	p.evictCallbackContended.Store(true)
-	if !p.isEvictCallbackActive() || p.evictCallbackGID.Load() != holder || p.evictHoldSeq.Load() != holdSeq {
-		p.evictCallbackResolveMu.Unlock()
-		return nil
-	}
-	w := &ambiguousHookWaiter{
-		holder:          holder,
-		holdSeq:         holdSeq,
-		waiterGID:       waiterGID,
-		fromWaitGroupGo: fromWGGo,
-		done:            make(chan struct{}),
-	}
-	w.gateMu.Lock()
-	p.ambiguousWaiters = append(p.ambiguousWaiters, w)
-	p.evictCallbackResolveMu.Unlock()
-	go p.monitorAmbiguousHookWaiter(w, startSnap)
-	return w
-}
-
-func (p *pressureState) classifyInexactContendedEvictCaller(stack []byte, gid, parentGID uint64, creatorFunc []byte, holder, holdSeq, startSnap uint64, exactSnap bool) (int, *ambiguousHookWaiter) {
-	if p.preRejectEvictDescendant(gid, parentGID, holder, holdSeq, startSnap) {
-		return evictContendLockDirect, nil
-	}
-	allStacks, bufPtr := captureAllGoroutineStacks()
-	det, ok := p.findEvictHolderDetail(allStacks, stack, gid, parentGID, creatorFunc, holder, holdSeq, startSnap)
-	if !ok {
-		releaseAllGoroutineStacks(bufPtr)
-		return evictContendLockDirect, nil
-	}
-	if exactSnap {
-		releaseAllGoroutineStacks(bufPtr)
-		return evictContendEnqueueChild, nil
-	}
-	mode, fromWGGo := classifyHolderChildHop(det)
-	releaseAllGoroutineStacks(bufPtr)
-	if mode != evictContendWaitAmbiguous {
-		return mode, nil
-	}
-	w := p.registerAmbiguousEvictWaiter(holder, holdSeq, gid, startSnap, fromWGGo)
-	if w == nil {
-		return evictContendLockDirect, nil
-	}
-	return evictContendWaitAmbiguous, w
-}
-
-func (p *pressureState) classifyContendedEvictCaller(stack []byte, gid, parentGID uint64, creatorFunc []byte, holder uint64) (int, *ambiguousHookWaiter) {
-	if holder == 0 {
-		return evictContendLockDirect, nil
-	}
-	if holder == gid {
-		return evictContendEnqueueChild, nil
-	}
-	holdSeq := p.evictHoldSeq.Load()
-	exactSnap := p.evictExactSnap.Load()
-	startSnap := p.evictStartSnapSeq.Load()
-	if p.evictCallbackGID.Load() != holder || p.evictHoldSeq.Load() != holdSeq {
-		return evictContendLockDirect, nil
-	}
-	return p.classifyInexactContendedEvictCaller(stack, gid, parentGID, creatorFunc, holder, holdSeq, startSnap, exactSnap)
 }
 
 //go:noinline
-func (p *pressureState) lockEvictCallbackSlow() (bool, bool) {
+func (p *pressureState) isDescendantOfEvictHolder(stack []byte, gid, parentGID uint64, creatorFunc []byte, holder, holdSeq, startSnap uint64, exactSnap bool, activeTag, callerLabel unsafe.Pointer) bool {
+	if activeTag != nil && callerLabel == activeTag {
+		return !p.wasLiveAtOrBeforeSnap(gid, startSnap)
+	}
+	if !exactSnap || p.preRejectEvictDescendant(gid, parentGID, holder, holdSeq, startSnap) {
+		return false
+	}
+	allStacks, bufPtr := captureAllGoroutineStacks()
+	defer releaseAllGoroutineStacks(bufPtr)
+	return p.matchesExactEvictHolder(allStacks, stack, parentGID, creatorFunc, holder, holdSeq, startSnap)
+}
+
+func (p *pressureState) isContendedCallerEvictChild(stack []byte, gid, parentGID uint64, creatorFunc []byte, holder uint64) (bool, uint64) {
+	if holder == 0 {
+		return false, 0
+	}
+	holdSeq := p.evictHoldSeq.Load()
+	if holder == gid {
+		return true, holdSeq
+	}
+	var activeTag unsafe.Pointer
+	if p.evictHasActiveRingTag.Load() {
+		if ring := p.evictLabelRing.Load(); ring != nil {
+			activeTag = ring[holdSeq&evictLabelRingMask]
+		}
+	}
+	exactSnap := p.evictExactSnap.Load()
+	startSnap := p.evictStartSnapSeq.Load()
+	if p.evictCallbackGID.Load() != holder || p.evictHoldSeq.Load() != holdSeq {
+		return false, 0
+	}
+	if p.isDescendantOfEvictHolder(stack, gid, parentGID, creatorFunc, holder, holdSeq, startSnap, exactSnap, activeTag, runtimeGetProfLabel()) {
+		return true, holdSeq
+	}
+	return false, 0
+}
+
+//go:noinline
+func (p *pressureState) lockEvictCallbackSlow() (bool, uint64) {
 	p.evictCallbackEverContended.Store(true)
+	if p.evictFastMode.Load() {
+		p.evictFastMode.Store(false)
+	}
 	stack, bufPtr := captureCurrentGoroutineStack()
 	gid, parentGID, creatorFunc := parseStackGoroutineParentAndCreator(stack)
 	fastTag, hasFastTag := p.activeFastEvictTag()
 	isMyTagFrame := hasFastTag && bytes.Contains(stack, fastEvictCallbackMarkers[fastTag])
 
 	holder := p.resolveActiveEvictCallbackHolder(gid, parentGID, isMyTagFrame)
-	mode, waiter := p.classifyContendedEvictCaller(stack, gid, parentGID, creatorFunc, holder)
+	isChild, matchedHoldSeq := p.isContendedCallerEvictChild(stack, gid, parentGID, creatorFunc, holder)
 	releaseCurrentGoroutineStack(bufPtr)
 
-	switch mode {
-	case evictContendEnqueueChild:
-		return false, false
-	case evictContendWaitAmbiguous:
-		waiter.gateMu.Lock()
-		asChild := waiter.enqueueAsChild
-		waiter.gateMu.Unlock()
-		if asChild {
-			return false, true
-		}
+	if isChild {
+		return false, matchedHoldSeq
 	}
 
 	p.evictCallbackMu.Lock()
 	p.beginEvictCallbackHold(true)
 	p.registerSlowEvictHolder(gid, parentGID)
-	return true, false
+	return true, 0
 }
 
 //go:noinline
-func (p *pressureState) deliverCallbacksPendingBatch(queue []pendingEvictCallback) {
+func (p *pressureState) deliverCallbacksPendingBatch(queue []func()) {
 	defer clear(queue)
-	for i, item := range queue {
-		queue[i] = pendingEvictCallback{}
-		item.fn()
+	for i, fn := range queue {
+		queue[i] = nil
+		fn()
 	}
 }
 
@@ -3921,6 +3695,23 @@ func (p *pressureState) tryDrainPostUnlock() {
 	}
 }
 
+func (p *pressureState) tryDiscardPostPanicUnlock(panicHoldSeq uint64) {
+	if p.evictPendingEnqueues.Load() == 0 || !p.evictCallbackMu.TryLock() {
+		return
+	}
+	if p.evictHoldSeq.Load() != panicHoldSeq {
+		p.beginEvictCallbackHold(true)
+		p.drainPendingEvictCallbacksSlow()
+		return
+	}
+	p.evictCallbackResolveMu.Lock()
+	clear(p.pendingEvictCallbacks)
+	p.pendingEvictCallbacks = nil
+	p.evictPendingEnqueues.Store(0)
+	p.evictCallbackResolveMu.Unlock()
+	p.evictCallbackMu.Unlock()
+}
+
 func (p *pressureState) prepareSlowEvictDrain() {
 	if p.evictCallbackGID.Load() == 0 {
 		p.registerSlowEvictHolder(0, 0)
@@ -3931,92 +3722,28 @@ func (p *pressureState) prepareSlowEvictDrain() {
 	p.evictCallbackResolveMu.Unlock()
 }
 
-func (p *pressureState) detachPreservedOnPanicLocked() []pendingEvictCallback {
-	if len(p.pendingEvictCallbacks) == 0 {
-		p.evictPendingEnqueues.Store(0)
-		return nil
-	}
-	var preserved []pendingEvictCallback
-	for i, item := range p.pendingEvictCallbacks {
-		p.pendingEvictCallbacks[i] = pendingEvictCallback{}
-		if item.preserveOnPanic {
-			item.preserveOnPanic = false
-			preserved = append(preserved, item)
-		}
-	}
-	p.pendingEvictCallbacks = nil
-	p.evictPendingEnqueues.Store(0)
-	return preserved
-}
-
-func invokePreservedCallbackSafely(fn func()) (panicked bool) {
-	panicked = true
-	defer func() {
-		if panicked {
-			_ = recover()
-		}
-	}()
-	fn()
-	panicked = false
-	return false
-}
-
-//go:noinline
-func (p *pressureState) deliverCallbacksPreservedBatch(preserved []pendingEvictCallback) {
-	defer clear(preserved)
-	for i, item := range preserved {
-		preserved[i] = pendingEvictCallback{}
-		if invokePreservedCallbackSafely(item.fn) {
-			p.evictCallbackResolveMu.Lock()
-			sub := p.detachPreservedOnPanicLocked()
-			p.evictCallbackResolveMu.Unlock()
-			if len(sub) > 0 {
-				p.deliverCallbacksPreservedBatch(sub)
-			}
-		}
-	}
-}
-
-func (p *pressureState) drainPreservedCallbacksOnPanic(preserved []pendingEvictCallback) {
-	p.evictCallbackMu.Lock()
-	p.beginEvictCallbackHold(true)
-	p.registerSlowEvictHolder(0, 0)
-	p.deliverCallbacksPreservedBatch(preserved)
-	for p.evictPendingEnqueues.Load() != 0 {
-		p.evictCallbackResolveMu.Lock()
-		queue := p.pendingEvictCallbacks
-		p.pendingEvictCallbacks = nil
-		p.evictPendingEnqueues.Store(0)
-		p.evictCallbackResolveMu.Unlock()
-		if len(queue) > 0 {
-			p.deliverCallbacksPreservedBatch(queue)
-		}
-	}
-	p.unlockEvictCallbackSlow(true)
-}
-
 func (p *pressureState) finishEvictCallbackUnlock(panicked bool) {
+	panicHoldSeq := p.evictHoldSeq.Load()
 	p.clearActiveFastEvictTag()
 	p.evictCallbackResolveMu.Lock()
-	var preserved []pendingEvictCallback
 	if panicked {
-		preserved = p.detachPreservedOnPanicLocked()
+		clear(p.pendingEvictCallbacks)
+		p.pendingEvictCallbacks = nil
+		p.evictPendingEnqueues.Store(0)
 	}
-	p.releaseAllAmbiguousWaitersLocked(false)
 	p.evictCallbackActive.Store(false)
 	p.evictCallbackGID.Store(0)
 	p.evictCallbackParentGID.Store(0)
 	p.evictNonDescendantHolder.Store(0)
 	p.evictCallbackContended.Store(false)
 	p.evictCallbackResolveMu.Unlock()
+	p.clearHeldEvictLabelLocked()
 	p.evictCallbackMu.Unlock()
-	if len(preserved) > 0 {
-		p.drainPreservedCallbacksOnPanic(preserved)
+	if panicked {
+		p.tryDiscardPostPanicUnlock(panicHoldSeq)
 		return
 	}
-	if !panicked {
-		p.tryDrainPostUnlock()
-	}
+	p.tryDrainPostUnlock()
 }
 
 func (p *pressureState) unlockEvictCallbackSlow(completed bool) {
@@ -4049,12 +3776,8 @@ func (q *evictCallbackQueue[V]) reset() {
 	}
 }
 
-func (q *evictCallbackQueue[V]) enqueuePendingCallback(p *pressureState, onVal func(V, EvictionReason), onEntry func(string, V, EvictionReason)) {
-	q.enqueuePendingCallbackOpts(p, onVal, onEntry, false)
-}
-
 //go:noinline
-func (q *evictCallbackQueue[V]) enqueuePendingCallbackOpts(p *pressureState, onVal func(V, EvictionReason), onEntry func(string, V, EvictionReason), preserveOnPanic bool) {
+func (q *evictCallbackQueue[V]) enqueuePendingCallback(p *pressureState, onVal func(V, EvictionReason), onEntry func(string, V, EvictionReason)) {
 	events := make([]evictEvent[V], 0, q.n)
 	inlineCount := min(q.n, len(q.buf))
 	for i := range inlineCount {
@@ -4064,21 +3787,18 @@ func (q *evictCallbackQueue[V]) enqueuePendingCallbackOpts(p *pressureState, onV
 	q.reset()
 
 	p.evictCallbackResolveMu.Lock()
-	p.pendingEvictCallbacks = append(p.pendingEvictCallbacks, pendingEvictCallback{
-		preserveOnPanic: preserveOnPanic,
-		fn: func() {
-			defer clear(events)
-			for i := range events {
-				ev := events[i]
-				events[i] = evictEvent[V]{}
-				if onVal != nil {
-					onVal(ev.value, ev.reason)
-				}
-				if onEntry != nil {
-					onEntry(ev.key, ev.value, ev.reason)
-				}
+	p.pendingEvictCallbacks = append(p.pendingEvictCallbacks, func() {
+		defer clear(events)
+		for i := range events {
+			ev := events[i]
+			events[i] = evictEvent[V]{}
+			if onVal != nil {
+				onVal(ev.value, ev.reason)
 			}
-		},
+			if onEntry != nil {
+				onEntry(ev.key, ev.value, ev.reason)
+			}
+		}
 	})
 	p.evictPendingEnqueues.Store(1)
 	p.evictCallbackResolveMu.Unlock()
@@ -4118,6 +3838,18 @@ func (q *evictCallbackQueue[V]) deliverMultiCallbacks(onVal func(V, EvictionReas
 	q.n = 0
 }
 
+//go:noinline
+func (p *pressureState) finishFastEvictDeliverySlow() bool {
+	p.clearHeldEvictLabelLocked()
+	p.evictCallbackMu.Unlock()
+	if p.evictPendingEnqueues.Load() != 0 && p.evictCallbackMu.TryLock() {
+		p.beginEvictCallbackHold(true)
+		p.prepareSlowEvictDrain()
+		return true
+	}
+	return false
+}
+
 func (p *pressureState) finishFastEvictDelivery() bool {
 	if p.evictCallbackContended.Load() || p.evictPendingEnqueues.Load() != 0 {
 		p.prepareSlowEvictDrain()
@@ -4128,13 +3860,18 @@ func (p *pressureState) finishFastEvictDelivery() bool {
 		p.prepareSlowEvictDrain()
 		return true
 	}
-	p.evictCallbackMu.Unlock()
-	if p.evictPendingEnqueues.Load() != 0 && p.evictCallbackMu.TryLock() {
-		p.beginEvictCallbackHold(true)
-		p.prepareSlowEvictDrain()
-		return true
+	if p.evictHeldTag != nil && p.evictFastMode.Load() {
+		p.evictHeldTag = nil
+		runtimeSetProfLabel(nil)
+		p.evictCallbackMu.Unlock()
+		if p.evictPendingEnqueues.Load() != 0 && p.evictCallbackMu.TryLock() {
+			p.beginEvictCallbackHold(true)
+			p.prepareSlowEvictDrain()
+			return true
+		}
+		return false
 	}
-	return false
+	return p.finishFastEvictDeliverySlow()
 }
 
 //go:noinline
@@ -4252,18 +3989,31 @@ func (q *evictCallbackQueue[V]) invokeSlow(p *pressureState, onVal func(V, Evict
 		q.reset()
 		return
 	}
-	locked, preserveOnPanic := p.lockEvictCallbackSlow()
-	if !locked {
-		q.enqueuePendingCallbackOpts(p, onVal, onEntry, preserveOnPanic)
-		return
+	for {
+		locked, matchedHoldSeq := p.lockEvictCallbackSlow()
+		if locked {
+			q.deliverCallbacksSlow(p, onVal, onEntry)
+			p.unlockEvictCallbackSlow(true)
+			return
+		}
+		if matchedHoldSeq == 0 || p.evictHoldSeq.Load() == matchedHoldSeq {
+			q.enqueuePendingCallback(p, onVal, onEntry)
+			return
+		}
 	}
-	q.deliverCallbacksSlow(p, onVal, onEntry)
-	p.unlockEvictCallbackSlow(true)
 }
 
 func (q *evictCallbackQueue[V]) invokeNonEmpty(p *pressureState, onVal func(V, EvictionReason), onEntry func(string, V, EvictionReason)) {
 	if (onVal != nil || onEntry != nil) && p.evictCallbackMu.TryLock() {
-		p.beginEvictCallbackHold(q.exactSnap)
+		seq := p.evictHoldSeq.Load() + 1
+		if !q.exactSnap && (seq&evictLabelRingMask) != 0 && p.evictFastMode.Load() && runtimeGetProfLabel() == nil {
+			tag := p.evictLabelRing.Load()[seq&evictLabelRingMask]
+			p.evictHeldTag = tag
+			p.evictHoldSeq.Store(seq)
+			runtimeSetProfLabel(tag)
+		} else {
+			p.beginEvictCallbackHoldSlow(q.exactSnap, seq, runtimeGetProfLabel() != nil)
+		}
 		if slot := p.evictFastSlot; slot != nil && slot.CompareAndSwap(p.evictFastIdle, p.evictFastIdle|1) {
 			q.dispatchFastCallbacks(p, p.evictFastTag, onVal, onEntry)
 			return
