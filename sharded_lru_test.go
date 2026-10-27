@@ -10091,6 +10091,241 @@ func TestShardedCache_R22CrossMGoroutineCreationLineageIsolation(t *testing.T) {
 	}
 }
 
+//go:noinline
+func spawnR23PeerFromHelper(fn func()) {
+	go fn()
+}
+
+func attemptR23OnTargetP(targetPID int, fn func()) bool {
+	var (
+		claimed   atomic.Bool
+		won       atomic.Bool
+		remaining atomic.Int32
+		wg        sync.WaitGroup
+	)
+	workers := max(runtime.GOMAXPROCS(0), targetPID+1)
+	remaining.Store(int32(workers - 1))
+	wg.Add(workers)
+	for range workers {
+		go func() {
+			defer wg.Done()
+			for !claimed.Load() {
+				pid := runtimeProcPin()
+				if pid == targetPID && claimed.CompareAndSwap(false, true) {
+					runtimeProcUnpin()
+					runtime.LockOSThread()
+					defer runtime.UnlockOSThread()
+					for i := 0; remaining.Load() > 0; i++ {
+						if i > 100000 {
+							runtime.Gosched()
+						}
+					}
+					curPID := runtimeProcPin()
+					runtimeProcUnpin()
+					if curPID == targetPID {
+						fn()
+						won.Store(true)
+					}
+					return
+				}
+				for range 256 {
+					if claimed.Load() {
+						break
+					}
+				}
+				runtimeProcUnpin()
+				runtime.Gosched()
+			}
+			remaining.Add(-1)
+		}()
+	}
+	wg.Wait()
+	return won.Load()
+}
+
+func runR23OnTargetP(t *testing.T, targetPID int, fn func()) {
+	t.Helper()
+	for range 64 {
+		if attemptR23OnTargetP(targetPID, fn) {
+			return
+		}
+	}
+	t.Fatalf("failed to schedule onto target P %d", targetPID)
+}
+
+func runR23NewPBatchEvictCase(t *testing.T, targetPID int, backend Backend) {
+	t.Helper()
+	var (
+		holdCount         atomic.Int64
+		hStillInEvict     atomic.Bool
+		peerReturnedEarly atomic.Bool
+		peerEvicted       atomic.Bool
+		inPanickingHold   = make(chan struct{})
+		releasePanicHold  = make(chan struct{})
+	)
+	peerDone := make(chan struct{})
+	c := NewShardedCache[int](60, 2, explicitTagShardFunc,
+		WithBackend(backend),
+		WithOnEvictEntry(func(k string, _ int, r EvictionReason) {
+			switch {
+			case k == "s0/fg" && r == EvictionReasonReplaced:
+				if holdCount.Add(1) == 70 {
+					hStillInEvict.Store(true)
+					defer hStillInEvict.Store(false)
+					close(inPanickingHold)
+					<-releasePanicHold
+					panic("boom-r23-new-p-evict")
+				}
+			case k == "s1/peer" && r == EvictionReasonDeleted:
+				peerEvicted.Store(true)
+			}
+		}),
+	)
+	_, err := c.Put("s0/fg", 0)
+	require.NoError(t, err)
+	_, err = c.Put("s1/peer", 999)
+	require.NoError(t, err)
+
+	runR23OnTargetP(t, targetPID, func() {
+		// Trigger a batch refill on targetPID while active and latch from another P.
+		ch := make(chan struct{})
+		go func() { close(ch) }()
+		<-ch
+		latchDone := make(chan struct{})
+		go func() {
+			_, _ = captureGoidFastSnap()
+			close(latchDone)
+		}()
+		<-latchDone
+
+		for i := 1; i <= 69; i++ {
+			require.NoError(t, c.Replace("s0/fg", i))
+		}
+		spawnR23PeerFromHelper(func() {
+			defer close(peerDone)
+			pprof.Do(context.Background(), pprof.Labels("r23", "new-p-peer"), func(context.Context) {
+				<-inPanickingHold
+				_, _ = c.Delete("s1/peer")
+				if hStillInEvict.Load() {
+					peerReturnedEarly.Store(true)
+				}
+			})
+		})
+		go func() {
+			<-inPanickingHold
+			time.Sleep(10 * time.Millisecond)
+			close(releasePanicHold)
+		}()
+		assert.PanicsWithValue(t, "boom-r23-new-p-evict", func() {
+			_ = c.Replace("s0/fg", 70)
+		})
+	})
+
+	<-peerDone
+	require.Eventually(t, peerEvicted.Load, 2*time.Second, time.Millisecond,
+		"peer spawned from new-P goidcache batch must not have its OnEvict callback dropped")
+	assert.False(t, peerReturnedEarly.Load(),
+		"peer spawned from new-P goidcache batch must serialize behind active OnEvict")
+}
+
+func runR23NewPBatchPressureCase(t *testing.T, targetPID int, backend Backend) {
+	t.Helper()
+	var (
+		armed        atomic.Bool
+		inHook       = make(chan struct{})
+		releaseHook  = make(chan struct{})
+		hookEntered  atomic.Bool
+		peerEvicted  atomic.Int64
+		pressureEval atomic.Int64
+	)
+	peerDone := make(chan struct{})
+	c := NewShardedCache[int](40, 2, explicitTagShardFunc,
+		WithBackend(backend),
+		WithCompactionThreshold(0.5),
+		WithEvictionThreshold(0.8),
+		WithEvictionRetentionRatio(0.5),
+		WithOnEvictValue(func(_ int, _ EvictionReason) {
+			peerEvicted.Add(1)
+		}),
+		WithPressureFunc(func() float64 {
+			if !armed.Load() {
+				return 0.0
+			}
+			pressureEval.Add(1)
+			if hookEntered.CompareAndSwap(false, true) {
+				close(inHook)
+				<-releaseHook
+			}
+			return 0.95
+		}),
+	)
+	for i := range 16 {
+		_, err := c.Put(fmt.Sprintf("s1/k%02d", i), i)
+		require.NoError(t, err)
+	}
+
+	runR23OnTargetP(t, targetPID, func() {
+		_, err := c.Put("s0/seed", 1)
+		require.NoError(t, err)
+		for range 260 {
+			_, _ = c.Delete("s0/absent")
+		}
+		require.NoError(t, c.Replace("s0/seed", 2))
+		spawnR23PeerFromHelper(func() {
+			defer close(peerDone)
+			<-inHook
+			_, _ = c.Put("s1/peer-put", 999)
+			close(releaseHook)
+		})
+		for range 260 {
+			_, _ = c.Delete("s0/absent")
+		}
+		armed.Store(true)
+		_, _ = c.Delete("s0/absent")
+	})
+
+	<-peerDone
+	assert.GreaterOrEqual(t, pressureEval.Load(), int64(2),
+		"peer spawned from new-P goidcache batch must evaluate PressureFunc rather than receiving 0.0 fallback")
+	assert.Positive(t, peerEvicted.Load(),
+		"peer spawned from new-P goidcache batch must shed entries under critical pressure")
+}
+
+func TestShardedCache_R23ActivePGoidBatchLineageIsolation(t *testing.T) {
+	origProcs := runtime.GOMAXPROCS(0)
+	targetPID := max(int(maxKnownPID.Load())+1, origProcs)
+	if targetPID >= len(knownPPtrs) {
+		targetPID = origProcs - 1
+	} else {
+		runtime.GOMAXPROCS(targetPID + 1)
+		defer runtime.GOMAXPROCS(origProcs)
+	}
+
+	runR23OnTargetP(t, targetPID, func() {
+		g0 := readGoroutinesCreated()
+		s0, ok0 := currentGoroutinesCreatedFast()
+		require.True(t, ok0)
+		ch := make(chan struct{})
+		go func() { close(ch) }()
+		<-ch
+		g1 := readGoroutinesCreated()
+		s1, ok1 := currentGoroutinesCreatedFast()
+		require.True(t, ok1)
+		assert.Greater(t, s1, s0, "currentGoroutinesCreatedFast must advance within a per-P goidcache batch on targetPID")
+		assert.Equal(t, g1-g0, s1-s0, "currentGoroutinesCreatedFast delta must match readGoroutinesCreated delta")
+	})
+
+	for _, backend := range []Backend{BackendMap, BackendRadix, BackendArenaRadix} {
+		bName := backend.String()
+		t.Run("NewPEvictPeer/"+bName, func(t *testing.T) {
+			runR23NewPBatchEvictCase(t, targetPID, backend)
+		})
+		t.Run("NewPPressurePeer/"+bName, func(t *testing.T) {
+			runR23NewPBatchPressureCase(t, targetPID, backend)
+		})
+	}
+}
+
 func BenchmarkShardedParallelThroughput(b *testing.B) {
 	const capTotal = 16384
 	keys := make([]string, capTotal*2)
