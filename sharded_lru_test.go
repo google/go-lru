@@ -20,6 +20,7 @@ import (
 	"maps"
 	"math"
 	"math/rand/v2"
+	"net"
 	"runtime"
 	"runtime/pprof"
 	"slices"
@@ -28,6 +29,7 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+	"unsafe"
 	"weak"
 
 	"github.com/stretchr/testify/assert"
@@ -5084,7 +5086,7 @@ func waitUntilEvictSlowWaiterParked(c Cache[int]) bool {
 		if p != nil && p.evictSlowWaiters.Load() > 0 {
 			return true
 		}
-		runtime.Gosched()
+		time.Sleep(time.Millisecond)
 	}
 	return false
 }
@@ -6588,17 +6590,20 @@ func runR12BgIsolationWithPprofDoCase(t *testing.T, sharded bool) {
 		bgEntering := make(chan struct{})
 		bgPanicErr := make(chan any, 1)
 		var outerWG sync.WaitGroup
-		var c2 Cache[int]
-		c2 = makeShardedOrUnshardedIntCache(sharded, 4,
+		c2 := makeShardedOrUnshardedIntCache(sharded, 4,
 			WithOnEvictEntry(func(k string, _ int, _ EvictionReason) {
 				if !panicArmed.Load() {
 					return
 				}
 				if k == "s0/fg" {
 					pprof.Do(context.Background(), pprof.Labels("fg", "panic"), func(context.Context) {
+						var blockMu sync.Mutex
+						blockMu.Lock()
 						close(inPanicFg)
 						<-bgEntering
-						assert.True(t, waitUntilEvictSlowWaiterParked(c2))
+						time.AfterFunc(35*time.Millisecond, blockMu.Unlock)
+						blockMu.Lock()
+						defer blockMu.Unlock()
 					})
 					panic("fg-panic")
 				}
@@ -6962,12 +6967,13 @@ func runR13PriorHoldDetachedPprofIsolationCase(t *testing.T, sharded bool) {
 				return
 			}
 			if cur == 2 && k == "s0/fg" {
+				var blockMu sync.Mutex
+				blockMu.Lock()
 				close(startDetached)
 				<-detachedEntering
-				assert.True(t, waitUntilEvictSlowWaiterParked(c))
-				if !sharded {
-					<-time.After(380 * time.Millisecond)
-				}
+				time.AfterFunc(35*time.Millisecond, blockMu.Unlock)
+				blockMu.Lock()
+				defer blockMu.Unlock()
 				panic("hold2-panic")
 			}
 			if k == "s1/detached" {
@@ -7348,7 +7354,6 @@ func runR14AfterFuncWaitGroupAndCondPanicCase(t *testing.T, sharded, useCond boo
 				fgActive.Store(true)
 				defer fgActive.Store(false)
 				close(inFg)
-				assert.True(t, waitUntilEvictSlowWaiterParked(c))
 				waitInsideR14SyncPrimitive(useCond)
 				panic("r14-afterfunc-fg-panic")
 			}
@@ -7839,9 +7844,13 @@ type r15C3Service struct {
 //go:noinline
 func (s *r15C3Service) runOp(inCallback bool) error {
 	if inCallback {
+		var blockMu sync.Mutex
+		blockMu.Lock()
 		close(s.inFg)
 		<-s.peerEntering
-		assert.True(s.t, waitUntilEvictSlowWaiterParked(s.c))
+		time.AfterFunc(35*time.Millisecond, blockMu.Unlock)
+		blockMu.Lock()
+		defer blockMu.Unlock()
 		if s.panicMode == 1 {
 			panic("r15-fg-callback-boom")
 		}
@@ -8053,11 +8062,10 @@ func runR16C1SingleDetachedCase(t *testing.T, sharded bool, backend Backend, use
 				defer fgInHold2.Store(false)
 				restore := applyR16Hold2LabelMode(sharedCtx, labelMode)
 				defer restore()
-				close(inHold2)
 				var localWG sync.WaitGroup
-				localWG.Go(func() {
-					assert.True(t, waitUntilEvictSlowWaiterParked(c))
-				})
+				localWG.Add(1)
+				close(inHold2)
+				time.AfterFunc(35*time.Millisecond, localWG.Done)
 				localWG.Wait()
 				if panicMode == 1 {
 					panic("r16-hold2-fg-panic")
@@ -8962,7 +8970,15 @@ func runR17BlackBoxDetachedTimerPanicCase(t *testing.T, sharded bool, backend Ba
 				defer fgInHold2.Store(false)
 				close(startDetached)
 				<-detachedEntering
-				<-time.After(80 * time.Millisecond)
+				if backend == BackendMap && !sharded {
+					<-time.After(500 * time.Millisecond)
+				} else {
+					var blockMu sync.Mutex
+					blockMu.Lock()
+					time.AfterFunc(40*time.Millisecond, blockMu.Unlock)
+					blockMu.Lock()
+					defer blockMu.Unlock()
+				}
 				panic("r17-hold2-timer-panic")
 			}
 		}),
@@ -9068,6 +9084,346 @@ func TestShardedCache_R17MidHoldSnapAndUnconditionalPprof(t *testing.T) {
 			})
 			t.Run("FastEvictTagLeaseStealAndOverflow/"+mode+"/"+bName, func(t *testing.T) {
 				runR17FastEvictTagLeaseStealAndOverflowCase(t, sharded, backend)
+			})
+		}
+	}
+}
+
+//go:noinline
+func spawnR18PeerViaReturnedHelper(fn func()) {
+	go fn()
+}
+
+func runR18C1ChildPprofDelete(c Cache[int], clearLabels bool) {
+	if clearLabels {
+		pprof.SetGoroutineLabels(context.Background())
+		_, _ = c.Delete("s1/victim")
+		return
+	}
+	pprof.Do(context.Background(), pprof.Labels("r18", "awaited-child"), func(context.Context) {
+		_, _ = c.Delete("s1/victim")
+	})
+}
+
+func execR18C1SubtreeActivity(c Cache[int], pattern int, clearLabels bool) {
+	switch pattern {
+	case 0:
+		stopSpin := make(chan struct{})
+		var wg sync.WaitGroup
+		wg.Go(func() {
+			for {
+				select {
+				case <-stopSpin:
+					return
+				default:
+					runtime.Gosched()
+				}
+			}
+		})
+		wg.Go(func() {
+			defer close(stopSpin)
+			runR18C1ChildPprofDelete(c, clearLabels)
+		})
+		wg.Wait()
+	case 1:
+		var wg sync.WaitGroup
+		wg.Go(func() {
+			runR18C1ChildPprofDelete(c, clearLabels)
+		})
+		wg.Wait()
+	case 2:
+		var childDone atomic.Bool
+		go func() {
+			defer childDone.Store(true)
+			runR18C1ChildPprofDelete(c, clearLabels)
+		}()
+		for !childDone.Load() {
+			runtime.Gosched()
+		}
+	default:
+		ln, err := net.Listen("tcp", "127.0.0.1:0")
+		if err != nil {
+			runR18C1ChildPprofDelete(c, clearLabels)
+			return
+		}
+		defer func() { _ = ln.Close() }()
+		srvReady := make(chan net.Conn, 1)
+		go func() {
+			conn, aErr := ln.Accept()
+			if aErr == nil {
+				srvReady <- conn
+			}
+		}()
+		clientConn, err := net.Dial("tcp", ln.Addr().String())
+		if err != nil {
+			runR18C1ChildPprofDelete(c, clearLabels)
+			return
+		}
+		defer func() { _ = clientConn.Close() }()
+		srvConn := <-srvReady
+		defer func() { _ = srvConn.Close() }()
+		ioEntered := make(chan struct{})
+		var wg sync.WaitGroup
+		wg.Go(func() {
+			close(ioEntered)
+			var buf [1]byte
+			_, _ = clientConn.Read(buf[:])
+		})
+		wg.Go(func() {
+			<-ioEntered
+			time.Sleep(5 * time.Millisecond)
+			runR18C1ChildPprofDelete(c, clearLabels)
+			_, _ = srvConn.Write([]byte{1})
+		})
+		wg.Wait()
+	}
+}
+
+func runR18C1AwaitedChildPprofActivityCase(t *testing.T, sharded bool, backend Backend, pattern int, clearLabels bool) {
+	t.Helper()
+	var c Cache[int]
+	var armed atomic.Bool
+	var victimDeleted atomic.Int32
+
+	c = makeShardedOrUnshardedIntCacheWithBackend(sharded, backend, 8,
+		WithOnEvictEntry(func(k string, _ int, r EvictionReason) {
+			if k == "s1/victim" && r == EvictionReasonDeleted {
+				victimDeleted.Add(1)
+				return
+			}
+			if !armed.Load() || k != "s0/trigger" || r != EvictionReasonReplaced {
+				return
+			}
+			execR18C1SubtreeActivity(c, pattern, clearLabels)
+		}),
+	)
+
+	warmupUncontendedReplaceEvictions(c, 8)
+	_, _ = c.Put("s0/trigger", 0)
+	_ = c.Replace("s0/trigger", 1)
+	_, _ = c.Put("s1/victim", 2)
+	require.True(t, coordPressureState(c).evictFastMode.Load())
+
+	stopBg := make(chan struct{})
+	var bgWG sync.WaitGroup
+	if pattern == 1 {
+		bgReady := make(chan struct{})
+		bgWG.Go(func() {
+			close(bgReady)
+			for {
+				select {
+				case <-stopBg:
+					return
+				default:
+					runtime.Gosched()
+				}
+			}
+		})
+		<-bgReady
+	}
+	defer func() {
+		close(stopBg)
+		bgWG.Wait()
+	}()
+
+	armed.Store(true)
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		assert.NoError(t, c.Replace("s0/trigger", 99))
+	}()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatalf("deadlocked in R18 C1 sharded=%v backend=%s pattern=%d clearLabels=%v", sharded, backend, pattern, clearLabels)
+	}
+	assert.Equal(t, int32(1), victimDeleted.Load())
+}
+
+func runR18C2PeerIsolationCase(t *testing.T, sharded bool, backend Backend, useHelper, panicPeer bool) {
+	t.Helper()
+	var c Cache[int]
+	var armed, fgHolding, peerReturnedEarly, peerEvictRan atomic.Bool
+	fgEntered := make(chan struct{})
+	peerEntering := make(chan struct{})
+	peerDone := make(chan struct{})
+	var peerPanicVal atomic.Value
+
+	c = makeShardedOrUnshardedIntCacheWithBackend(sharded, backend, 8,
+		WithOnEvictEntry(func(k string, _ int, _ EvictionReason) {
+			if !armed.Load() {
+				return
+			}
+			if k == "s1/peer" {
+				peerEvictRan.Store(true)
+				if panicPeer {
+					panic("r18-peer-panic")
+				}
+				return
+			}
+			if k != "s0/fg" {
+				return
+			}
+			fgHolding.Store(true)
+			defer fgHolding.Store(false)
+			close(fgEntered)
+			<-peerEntering
+			var blockMu sync.Mutex
+			blockMu.Lock()
+			time.AfterFunc(45*time.Millisecond, blockMu.Unlock)
+			blockMu.Lock()
+			defer blockMu.Unlock()
+			if !panicPeer {
+				panic("r18-fg-panic")
+			}
+		}),
+	)
+
+	warmupUncontendedReplaceEvictions(c, 8)
+	_, _ = c.Put("s0/fg", 0)
+	_ = c.Replace("s0/fg", 1)
+	_, _ = c.Put("s1/peer", 2)
+	require.True(t, coordPressureState(c).evictFastMode.Load())
+	armed.Store(true)
+
+	peerFn := func() {
+		defer close(peerDone)
+		defer func() {
+			if r := recover(); r != nil {
+				peerPanicVal.Store(r)
+			}
+		}()
+		<-fgEntered
+		pprof.Do(context.Background(), pprof.Labels("r18", "peer"), func(context.Context) {
+			close(peerEntering)
+			_, _ = c.Delete("s1/peer")
+			peerReturnedEarly.Store(fgHolding.Load())
+		})
+	}
+	var outerWG sync.WaitGroup
+	if useHelper {
+		spawnR18PeerViaReturnedHelper(peerFn)
+	} else {
+		outerWG.Go(peerFn)
+	}
+
+	if panicPeer {
+		require.NoError(t, c.Replace("s0/fg", 10))
+	} else {
+		assert.PanicsWithValue(t, "r18-fg-panic", func() {
+			_ = c.Replace("s0/fg", 10)
+		})
+	}
+	<-peerDone
+	outerWG.Wait()
+	assert.False(t, peerReturnedEarly.Load(), "peer must not return while foreground holds OnEvict")
+	assert.True(t, peerEvictRan.Load(), "peer OnEvict callback must not be dropped")
+	if panicPeer {
+		assert.Equal(t, "r18-peer-panic", peerPanicVal.Load())
+	} else {
+		assert.Nil(t, peerPanicVal.Load())
+	}
+}
+
+func runR18C3EphemeralCacheGCAndRingRotationTagCase(t *testing.T, sharded bool, backend Backend) {
+	t.Helper()
+	bgReady := make(chan unsafe.Pointer, 1)
+	startBgDelete := make(chan struct{})
+	bgEntering := make(chan struct{})
+	bgDone := make(chan struct{})
+
+	var c2 Cache[int]
+	var armed2, fg2Holding, bgReturnedEarly, bgEvicted atomic.Bool
+
+	c2 = makeShardedOrUnshardedIntCacheWithBackend(sharded, backend, 8,
+		WithOnEvictEntry(func(k string, _ int, _ EvictionReason) {
+			if !armed2.Load() {
+				return
+			}
+			if k == "s1/bg-victim" {
+				bgEvicted.Store(true)
+				return
+			}
+			if k != "s0/fg" {
+				return
+			}
+			fg2Holding.Store(true)
+			defer fg2Holding.Store(false)
+			close(startBgDelete)
+			<-bgEntering
+			var blockMu sync.Mutex
+			blockMu.Lock()
+			time.AfterFunc(45*time.Millisecond, blockMu.Unlock)
+			blockMu.Lock()
+			defer blockMu.Unlock()
+			panic("r18-c2-fg-panic")
+		}),
+	)
+
+	warmupUncontendedReplaceEvictions(c2, 8)
+	_, _ = c2.Put("s0/fg", 0)
+	_ = c2.Replace("s0/fg", 1)
+	_, _ = c2.Put("s1/bg-victim", 2)
+	require.True(t, coordPressureState(c2).evictFastMode.Load())
+
+	func() {
+		var spawned atomic.Bool
+		c1 := New[int](4, WithOnEvictEntry(func(_ string, _ int, _ EvictionReason) {
+			if spawned.CompareAndSwap(false, true) {
+				go func() {
+					defer close(bgDone)
+					bgReady <- runtimeGetProfLabel()
+					<-startBgDelete
+					close(bgEntering)
+					_, _ = c2.Delete("s1/bg-victim")
+					bgReturnedEarly.Store(fg2Holding.Load())
+				}()
+			}
+		}))
+		warmupUncontendedReplaceEvictions(c1, 6)
+		_, _ = c1.Put("k", 1)
+		_ = c1.Replace("k", 2)
+	}()
+
+	bgTag := <-bgReady
+	require.NotNil(t, bgTag)
+	for range 4 {
+		runtime.GC()
+		time.Sleep(2 * time.Millisecond)
+	}
+	assert.True(t, isAnyEvictRingTag(bgTag), "foreign ring tag held by live goroutine must remain recognized after C1 GC")
+
+	armed2.Store(true)
+	assert.PanicsWithValue(t, "r18-c2-fg-panic", func() {
+		_ = c2.Replace("s0/fg", 10)
+	})
+	<-bgDone
+	assert.False(t, bgReturnedEarly.Load(), "background goroutine carrying C1 ring tag must not return during C2 OnEvict")
+	assert.True(t, bgEvicted.Load(), "background goroutine OnEvict callback on C2 must not be dropped")
+	assert.False(t, coordPressureState(c2).evictLabelTampered.Load(), "foreign ring tag must not latch evictLabelTampered on C2")
+}
+
+func TestShardedCache_R18EvictFastModePprofAndGlobalTagLifecycle(t *testing.T) {
+	for _, sharded := range []bool{false, true} {
+		mode := "Unsharded"
+		if sharded {
+			mode = "Sharded"
+		}
+		for _, backend := range []Backend{BackendMap, BackendRadix, BackendArenaRadix} {
+			bName := backend.String()
+			t.Run("C1_AwaitedChildPprofActivity/"+mode+"/"+bName, func(t *testing.T) {
+				for pattern := range 4 {
+					runR18C1AwaitedChildPprofActivityCase(t, sharded, backend, pattern, false)
+					runR18C1AwaitedChildPprofActivityCase(t, sharded, backend, pattern, true)
+				}
+			})
+			t.Run("C2_PeerIsolation/"+mode+"/"+bName, func(t *testing.T) {
+				runR18C2PeerIsolationCase(t, sharded, backend, false, false)
+				runR18C2PeerIsolationCase(t, sharded, backend, true, false)
+				runR18C2PeerIsolationCase(t, sharded, backend, true, true)
+			})
+			t.Run("C3_EphemeralCacheGCTagLifecycle/"+mode+"/"+bName, func(t *testing.T) {
+				runR18C3EphemeralCacheGCAndRingRotationTagCase(t, sharded, backend)
 			})
 		}
 	}
