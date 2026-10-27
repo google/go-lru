@@ -10,6 +10,25 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ---
 
+## [1.1.0] - 2026-10-27
+
+### Added
+- **Concurrency-Scalable Sharded LRU Cache (`NewShardedCache`, `WithShards`, `WithShardFunc`, `DefaultShardFunc`)**:
+  - Added `NewShardedCache[V any](maxSize uint64, shards int, shardFn ShardFunc, opts ...Option) Cache[V]`, `WithShards(shards int)`, `WithShardFunc(fn ShardFunc)`, and `DefaultShardFunc(key string, numShards int) int` (zero-allocation 64-bit FNV-1a routing with a bitmask fast path for power-of-two shard counts) across `BackendMap`, `BackendRadix`, and `BackendArenaRadix` (#21).
+  - Evenly partitions capacity (`maxSize`) and Tier 2 critical-pressure retention targets across `shards` independent LRU instances (`maxSize / shards`, with the first `maxSize % shards` shards receiving `+1` so shard capacities sum to `maxSize`).
+  - Coordinates cross-shard memory-pressure sampling (`DeletePrefix` and `EvaluateMemoryPressure` share a single pressure sample across shards while tracking per-shard and coordinator reclamation epochs and causal sample sequences) and serializes `OnEvictValue` / `OnEvictEntry` callbacks per cache instance with full synchronous and spawned-descendant re-entrancy protection and panic isolation.
+  - Aggregates point-in-time `Stats()` across shards with `0 allocs/op` and full `github.com/google/go-lru/otellru` compatibility.
+
+### Changed
+- **Benchmark Target Calibration & Noise Floors (`cmd/benchcheck`)**:
+  - Recalibrated benchmark targets, added low-iteration allocation noise floors, and enforced `pipefail` in the CI benchmark workflow (#19).
+
+### Fixed
+- **Low-Pressure Epoch Fast-Forward Across Re-Entrant Reclamations**:
+  - Avoids spurious `PressureFunc` resampling when concurrent overflow samplers perform re-entrant reclamations (`Delete` / `Compact`) during a low-pressure (`< CompactionThreshold`) sample window while preserving forced resampling on external reclamations (#20).
+
+---
+
 ## [1.0.0] - 2026-10-22
 
 ### Added
@@ -61,7 +80,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## Release & Versioning Workflow
 
-To cut a new semantic version release (e.g. `v1.0.0` and `otellru/v1.0.0`):
+To cut a new semantic version release (e.g. `v1.1.0` and `otellru/v1.1.0`):
 
 ```bash
 # 1. Verify formatting, static analysis, race-enabled test suite, and examples (root and otellru)
@@ -77,9 +96,9 @@ go test -v -run=^Example ./...
 go test -run=^$ -bench=. -benchmem -benchtime=10ms ./...
 (cd otellru && go test -run=^$ -bench=. -benchmem -benchtime=10ms ./...)
 
-# 3. Update otellru/go.mod to require github.com/google/go-lru v1.0.0 (if releasing together),
+# 3. Update otellru/go.mod to require github.com/google/go-lru v1.1.0 (if releasing together),
 #    then create and push annotated semantic version tags
-git tag -a v1.0.0 -m "Release v1.0.0"
-git tag -a otellru/v1.0.0 -m "Release otellru/v1.0.0"
+git tag -a v1.1.0 -m "Release v1.1.0"
+git tag -a otellru/v1.1.0 -m "Release otellru/v1.1.0"
 git push origin --tags
 ```
