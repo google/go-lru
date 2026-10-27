@@ -67,13 +67,17 @@ func (r EvictionReason) String() string {
 // OnEvictValue is a callback invoked with the value and EvictionReason whenever a cache entry
 // is evicted, deleted, or has its value replaced.
 // The callback runs synchronously after the cache's internal state has been updated and its
-// exclusive write lock has been released.
+// exclusive write lock has been released, serialized per cache instance. Re-entrant calls into
+// the same Cache from the callback goroutine or from awaited child goroutines are supported
+// (detached goroutines that outlive the callback serialize as independent callers).
 type OnEvictValue[V any] func(value V, reason EvictionReason)
 
 // OnEvictEntry is a callback invoked with the key, value, and EvictionReason whenever a cache entry
 // is evicted, deleted, or has its value replaced.
 // The callback runs synchronously after the cache's internal state has been updated and its
-// exclusive write lock has been released.
+// exclusive write lock has been released, serialized per cache instance. Re-entrant calls into
+// the same Cache from the callback goroutine or from awaited child goroutines are supported
+// (detached goroutines that outlive the callback serialize as independent callers).
 type OnEvictEntry[V any] func(key string, value V, reason EvictionReason)
 
 // Backend identifies the underlying cache data structure engine constructed by New.
@@ -127,6 +131,12 @@ const (
 // indicate moderate pressure, and values >= EvictionThreshold indicate critical pressure.
 type PressureFunc func() float64
 
+// ShardFunc maps a cache key to a shard index in [0, numShards).
+// Implementations must be safe for concurrent invocation by multiple goroutines
+// and deterministic for a given key and numShards. Returning an index outside
+// [0, numShards) causes the cache operation to panic.
+type ShardFunc func(key string, numShards int) int
+
 // gomemlimitSamplePool pools 1-element runtime/metrics sample arrays so DefaultRuntimePressureFunc(0)
 // can check /gc/gomemlimit:bytes without acquiring runtime.metricsLock or sweeping per-P heap stats
 // when GOMEMLIMIT is unbounded.
@@ -157,7 +167,8 @@ var metricsSamplePool = sync.Pool{
 // reclamation (on Put, Delete, Replace, and DeletePrefix) and explicit
 // EvaluateMemoryPressure() / Compact() calls across ArenaRadixCache, MapCache, and RadixCache.
 type Options struct {
-	// Backend selects the underlying cache engine when calling New.
+	// Backend selects the underlying cache engine when calling New or NewShardedCache
+	// (explicit backend constructors NewMapCache, NewRadixCache, and NewArenaRadixCache override Backend).
 	// Defaults to BackendMap.
 	Backend Backend
 
@@ -214,12 +225,41 @@ type Options struct {
 	// when Critical Pressure (EvictionThreshold) is reached.
 	// Defaults to DefaultEvictionRetentionRatio (0.50) if unset, negative, or NaN.
 	EvictionRetentionRatio float64
+
+	// Shards specifies the number of independent LRU shards when sharding is enabled
+	// on New, NewMapCache, NewRadixCache, or NewArenaRadixCache (NewShardedCache always uses its
+	// explicit shards parameter and ignores WithShards).
+	// When left at 0 (unless WithShards(0) is explicitly passed without a subsequent non-zero Shards
+	// override, which panics), constructors build a single unsharded cache instance; resetting Shards
+	// from a non-zero value back to 0 in a subsequent Option restores unsharded mode. When sharding
+	// is enabled, Shards must satisfy 1 <= Shards <= maxSize; otherwise cache construction panics.
+	Shards              int
+	hasCustomShards     bool
+	customShardsZero    bool
+	hasShardTier2Target bool
+
+	// ShardFunc maps a key to a shard index in [0, Shards) when sharding is enabled.
+	// If nil, DefaultShardFunc is used.
+	ShardFunc ShardFunc
+
+	// sharedPressure coordinates memory-pressure sampling, reclamation epochs, and eviction
+	// callback serialization across all shards of a single shardedCache.
+	sharedPressure *pressureState
+
+	// shardTier2Target holds the pre-partitioned Tier 2 target retention capacity for a shard
+	// when hasShardTier2Target is true.
+	shardTier2Target uint64
+}
+
+func (o Options) shouldShard() bool {
+	return o.hasCustomShards || o.Shards != 0
 }
 
 // Option is a functional option for configuring a Cache instance.
 type Option func(*Options)
 
-// WithBackend configures the cache engine backend constructed by New.
+// WithBackend configures the cache engine backend constructed by New or NewShardedCache.
+// Explicit backend constructors (NewMapCache, NewRadixCache, and NewArenaRadixCache) ignore WithBackend.
 // Supported backends: BackendMap (default), BackendRadix, BackendArenaRadix.
 func WithBackend(backend Backend) Option {
 	return func(o *Options) {
@@ -300,7 +340,9 @@ func resolveWeigher[V any](options Options) func(string, V) uint64 {
 // Passing nil clears any previously configured OnEvictValue callback.
 //
 // The callback executes synchronously after the cache's internal state has been updated and its
-// exclusive write lock has been released. When both WithOnEvictValue and WithOnEvictEntry are
+// exclusive write lock has been released, serialized per cache instance. Re-entrant calls into
+// the same Cache from the callback goroutine or from awaited child goroutines are supported
+// (detached goroutines that outlive the callback serialize as independent callers). When both WithOnEvictValue and WithOnEvictEntry are
 // configured, OnEvictValue is invoked before OnEvictEntry. Capacity and pressure evictions invoke
 // callbacks in LRU-to-MRU order; DeletePrefix invokes callbacks once per removed entry in an
 // unspecified order. Prefer WithOnEvictValue when the key is not needed, as it avoids key
@@ -358,7 +400,9 @@ func resolveOnEvictValue[V any](options Options) func(V, EvictionReason) {
 // Passing nil clears any previously configured OnEvictEntry callback.
 //
 // The callback executes synchronously after the cache's internal state has been updated and its
-// exclusive write lock has been released. When both WithOnEvictValue and WithOnEvictEntry are
+// exclusive write lock has been released, serialized per cache instance. Re-entrant calls into
+// the same Cache from the callback goroutine or from awaited child goroutines are supported
+// (detached goroutines that outlive the callback serialize as independent callers). When both WithOnEvictValue and WithOnEvictEntry are
 // configured, OnEvictValue is invoked before OnEvictEntry. Capacity and pressure evictions invoke
 // callbacks in LRU-to-MRU order; DeletePrefix invokes callbacks once per removed entry in an
 // unspecified order.
@@ -473,6 +517,30 @@ func WithEvictionThreshold(threshold float64) Option {
 func WithEvictionRetentionRatio(ratio float64) Option {
 	return func(o *Options) {
 		o.EvictionRetentionRatio = ratio
+	}
+}
+
+// WithShards configures New, NewMapCache, NewRadixCache, or NewArenaRadixCache to partition
+// keys and capacity across the specified number of independent LRU shards of the selected Backend.
+// NewShardedCache always uses its explicit shards parameter and ignores WithShards.
+//
+// When applied to New, NewMapCache, NewRadixCache, or NewArenaRadixCache, shards must be greater
+// than zero and must not exceed maxSize (unless overridden by a subsequent non-zero Shards setting);
+// otherwise cache construction panics.
+func WithShards(shards int) Option {
+	return func(o *Options) {
+		o.Shards = shards
+		o.hasCustomShards = true
+		o.customShardsZero = shards == 0
+	}
+}
+
+// WithShardFunc configures a custom key-to-shard routing function used when sharding is enabled
+// via WithShards or NewShardedCache (when NewShardedCache's shardFn parameter is nil).
+// Passing nil resets ShardFunc to DefaultShardFunc.
+func WithShardFunc(fn ShardFunc) Option {
+	return func(o *Options) {
+		o.ShardFunc = fn
 	}
 }
 
@@ -605,6 +673,26 @@ func normalizeCallbacks(options *Options) {
 	} else {
 		options.hasCustomPressureFunc = true
 	}
+	if options.ShardFunc == nil {
+		options.ShardFunc = DefaultShardFunc
+	}
+}
+
+func applySingleOption(options *Options, opt Option) {
+	if opt == nil {
+		return
+	}
+	opt(options)
+	if options.Shards != 0 {
+		options.hasCustomShards = true
+		options.customShardsZero = false
+	}
+}
+
+func reconcileShards(options *Options) {
+	if options.hasCustomShards && options.Shards == 0 && !options.customShardsZero {
+		options.hasCustomShards = false
+	}
 }
 
 // ApplyOptions parses and applies the provided slice of Option functions onto a default Options configuration.
@@ -617,13 +705,12 @@ func ApplyOptions(opts ...Option) Options {
 	}
 
 	for _, opt := range opts {
-		if opt != nil {
-			opt(&options)
-		}
+		applySingleOption(&options, opt)
 	}
 	if options.Backend != BackendMap && options.Backend != BackendRadix && options.Backend != BackendArenaRadix {
 		options.Backend = BackendMap
 	}
+	reconcileShards(&options)
 	sanitizeThresholds(&options)
 	reconcileThresholdWindow(&options)
 	options.EvictionRetentionRatio = normalizeRetentionRatio(options.EvictionRetentionRatio)

@@ -16,14 +16,667 @@ package lru
 
 import (
 	"bytes"
+	"context"
 	"fmt"
 	"math"
 	"runtime"
+	"runtime/metrics"
+	"runtime/pprof"
 	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
+	"unsafe"
+	"weak"
 )
+
+type pprofStackRecord struct {
+	Stack []uintptr
+}
+
+//go:linkname runtimeGetProfLabel runtime/pprof.runtime_getProfLabel
+func runtimeGetProfLabel() unsafe.Pointer
+
+//go:linkname runtimeSetProfLabel runtime/pprof.runtime_setProfLabel
+func runtimeSetProfLabel(labels unsafe.Pointer)
+
+//go:linkname pprofGoroutineProfileWithLabels runtime.pprof_goroutineProfileWithLabels
+func pprofGoroutineProfileWithLabels(p []pprofStackRecord, labels []unsafe.Pointer) (n int, ok bool)
+
+//go:linkname runtimeGetm runtime.getm
+func runtimeGetm() *[256]uint32
+
+//go:linkname runtimeProcPin runtime.procPin
+func runtimeProcPin() int
+
+//go:linkname runtimeProcUnpin runtime.procUnpin
+func runtimeProcUnpin()
+
+//go:linkname runtimeSched runtime.sched
+var runtimeSched [256]uint32
+
+var (
+	mPWordIdx              = -1
+	mAllpSnapWordIdx       = -1
+	pGoidcacheIdx          = -1
+	schedMidleWordIdx      = -1
+	schedPidleWordIdx      = -1
+	schedProcresizeWordIdx = -1
+	knownPPtrs             [256]atomic.Pointer[[256]uint32]
+	knownPCount            atomic.Int32
+	maxKnownPID            atomic.Int32
+	activePPtrs            [256]atomic.Pointer[[256]uint32]
+	activePCount           atomic.Int32
+	activePMask            [4]atomic.Uint64
+	lastActiveGoidgen      atomic.Uint64
+	cachedProcs            atomic.Int32
+	cachedResizeTime       atomic.Uint64
+)
+
+type goidFastSnap struct {
+	goidgen    uint64
+	resizeTime uint64
+	curPGoid   uint64
+	curPTicks  uint64
+	headPGoid  uint64
+	headTicks  uint64
+	goidSum    uint64
+	pidleAddr  uintptr
+	pid        int32
+	procs      int32
+}
+
+func loadWord64(words *[256]uint32, idx int) uint64 {
+	if uintptr(unsafe.Pointer(&words[idx]))&7 == 0 {
+		return atomic.LoadUint64((*uint64)(unsafe.Pointer(&words[idx])))
+	}
+	for {
+		hi1 := atomic.LoadUint32(&words[idx+1])
+		lo := atomic.LoadUint32(&words[idx])
+		hi2 := atomic.LoadUint32(&words[idx+1])
+		if hi1 == hi2 {
+			return uint64(lo) | (uint64(hi1) << 32)
+		}
+	}
+}
+
+func loadPtrUintptr(words *[256]uint32, idx int) uintptr {
+	if unsafe.Sizeof(uintptr(0)) == 8 {
+		return uintptr(loadWord64(words, idx))
+	}
+	return uintptr(atomic.LoadUint32(&words[idx]))
+}
+
+func loadWordPtr(words *[256]uint32, idx int) *[256]uint32 {
+	ptr := atomic.LoadPointer((*unsafe.Pointer)(unsafe.Pointer(&words[idx])))
+	return (*[256]uint32)(ptr)
+}
+
+func discoverMLocksWordIdx(mp *[256]uint32) int {
+	var snap0, snap1, snap2 [256]uint32
+	for i := range snap0 {
+		snap0[i] = atomic.LoadUint32(&mp[i])
+	}
+	runtimeProcPin()
+	for i := range snap1 {
+		snap1[i] = atomic.LoadUint32(&mp[i])
+	}
+	runtimeProcPin()
+	for i := range snap2 {
+		snap2[i] = atomic.LoadUint32(&mp[i])
+	}
+	runtimeProcUnpin()
+	runtimeProcUnpin()
+	for i := range snap0 {
+		v3 := atomic.LoadUint32(&mp[i])
+		if snap0[i] >= 1 && snap1[i] == snap0[i]+1 && snap2[i] == snap0[i]+2 && v3 == snap0[i] {
+			return i
+		}
+	}
+	return -1
+}
+
+func isValidMPWordCandidate(mp *[256]uint32, pid, candIdx, ptrWords int) bool {
+	if candIdx < 0 || candIdx+ptrWords >= len(mp) {
+		return false
+	}
+	if loadPtrUintptr(mp, candIdx+ptrWords) != 0 {
+		return false
+	}
+	pAddr := loadPtrUintptr(mp, candIdx)
+	if pAddr <= 4096 || pAddr%unsafe.Alignof(uintptr(0)) != 0 {
+		return false
+	}
+	pWords := loadWordPtr(mp, candIdx)
+	return pWords != nil &&
+		int(int32(atomic.LoadUint32(&pWords[0]))) == pid &&
+		atomic.LoadUint32(&pWords[1]) == 1
+}
+
+func discoverMPWordIdx() (int, int) {
+	pid := runtimeProcPin()
+	defer runtimeProcUnpin()
+	mp := runtimeGetm()
+	if mp == nil {
+		return -1, -1
+	}
+	locksIdx := discoverMLocksWordIdx(mp)
+	if locksIdx < 0 {
+		return -1, -1
+	}
+	ptrWords := int(unsafe.Sizeof(uintptr(0)) / 4)
+	for _, delta := range [2]int{5*ptrWords + 4, 5*ptrWords + 5} {
+		cand := locksIdx - delta
+		if isValidMPWordCandidate(mp, pid, cand, ptrWords) {
+			return cand, locksIdx + 6 + ptrWords
+		}
+	}
+	return -1, -1
+}
+
+func isValidPGoidcacheCandidate(snaps *[4][128]uint32, idx int, maxEnd uint64) bool {
+	read64 := func(s int, w int) uint64 {
+		return uint64(snaps[s][w]) | (uint64(snaps[s][w+1]) << 32)
+	}
+	v0 := read64(0, idx)
+	v3, end3 := read64(3, idx), read64(3, idx+2)
+	if v0 == 0 || v3 > end3 || end3 > v3+16 || end3 > maxEnd {
+		return false
+	}
+	for k := range 3 {
+		vk, endk := read64(k, idx), read64(k, idx+2)
+		vk1, endk1 := read64(k+1, idx), read64(k+1, idx+2)
+		stepOK := (vk1 == vk+1 && endk1 == endk) || (vk1 > vk && endk1 == vk1+15)
+		if !stepOK {
+			return false
+		}
+	}
+	return true
+}
+
+func discoverPGoidcacheWordIdx(mPIdx int) int {
+	if mPIdx < 0 {
+		return -1
+	}
+	ch := make(chan struct{})
+	runtimeProcPin()
+	mp := runtimeGetm()
+	if mp == nil {
+		runtimeProcUnpin()
+		close(ch)
+		return -1
+	}
+	pWords := loadWordPtr(mp, mPIdx)
+	if pWords == nil {
+		runtimeProcUnpin()
+		close(ch)
+		return -1
+	}
+	var snaps [4][128]uint32
+	for s := range 4 {
+		go func() { <-ch }()
+		for i := range snaps[s] {
+			snaps[s][i] = atomic.LoadUint32(&pWords[i])
+		}
+	}
+	runtimeProcUnpin()
+	close(ch)
+
+	schedWords := &runtimeSched
+	maxEnd := loadWord64(schedWords, 0) + 1
+	for i := range 124 {
+		if isValidPGoidcacheCandidate(&snaps, i, maxEnd) {
+			return i
+		}
+	}
+	return -1
+}
+
+func discoverSchedWordOffsets() (int, int, int) {
+	ptrWords := int(unsafe.Sizeof(uintptr(0)) / 4)
+	schedWords := &runtimeSched
+	for i := 0; i+8 < len(runtimeSched); i++ {
+		if atomic.LoadUint32(&runtimeSched[i]) == 10000 {
+			pidleIdx := i + 6
+			midleIdx := i - 4 - 3*ptrWords
+			procresizeIdx := -1
+			cand := pidleIdx + 26*ptrWords + 4 - (2 - ptrWords)
+			if cand+3 < len(runtimeSched) && loadWord64(schedWords, cand) > 0 {
+				procresizeIdx = cand
+			}
+			return pidleIdx, midleIdx, procresizeIdx
+		}
+	}
+	return -1, -1, -1
+}
+
+func isActiveP(pid int) bool {
+	if pid < 0 || pid >= len(activePPtrs) {
+		return false
+	}
+	word, bit := pid/64, uint64(1)<<(uint(pid)%64)
+	return activePMask[word].Load()&bit != 0
+}
+
+func markActiveP(pid int, pWords *[256]uint32) {
+	if pid < 0 || pid >= len(activePPtrs) || pWords == nil {
+		return
+	}
+	word, bit := pid/64, uint64(1)<<(uint(pid)%64)
+	for {
+		old := activePMask[word].Load()
+		if old&bit != 0 {
+			return
+		}
+		if activePMask[word].CompareAndSwap(old, old|bit) {
+			idx := int(activePCount.Add(1) - 1)
+			activePPtrs[idx].Store(pWords)
+			return
+		}
+	}
+}
+
+func registerKnownP(pid int, pWords *[256]uint32) {
+	if pid < 0 || pid >= len(knownPPtrs) || pWords == nil {
+		return
+	}
+	if knownPPtrs[pid].Load() == nil && knownPPtrs[pid].CompareAndSwap(nil, pWords) {
+		knownPCount.Add(1)
+	}
+	for {
+		curMax := maxKnownPID.Load()
+		if int32(pid) <= curMax || maxKnownPID.CompareAndSwap(curMax, int32(pid)) {
+			break
+		}
+	}
+	if pGoidcacheIdx >= 0 && !isActiveP(pid) {
+		markActiveP(pid, pWords)
+	}
+}
+
+func registerAllpSliceElements(allpBase unsafe.Pointer, allpLen int) {
+	for i := range allpLen {
+		elemPtr := (*unsafe.Pointer)(unsafe.Add(allpBase, uintptr(i)*unsafe.Sizeof(uintptr(0))))
+		pAddr := uintptr(atomic.LoadPointer(elemPtr))
+		if pAddr <= 4096 || pAddr%unsafe.Alignof(uintptr(0)) != 0 {
+			continue
+		}
+		pWords := (*[256]uint32)(atomic.LoadPointer(elemPtr))
+		if pWords != nil &&
+			int(int32(atomic.LoadUint32(&pWords[0]))) == i &&
+			atomic.LoadUint32(&pWords[1]) <= 4 {
+			registerKnownP(i, pWords)
+		}
+	}
+}
+
+func scanAllpFromIdleM(schedWords *[256]uint32) {
+	if schedMidleWordIdx < 0 || mAllpSnapWordIdx < 0 {
+		return
+	}
+	mAddr := loadPtrUintptr(schedWords, schedMidleWordIdx)
+	if mAddr <= 4096 || mAddr%unsafe.Alignof(uintptr(0)) != 0 {
+		return
+	}
+	idleM := loadWordPtr(schedWords, schedMidleWordIdx)
+	if idleM == nil {
+		return
+	}
+	ptrWords := int(unsafe.Sizeof(uintptr(0)) / 4)
+	dataAddr := loadPtrUintptr(idleM, mAllpSnapWordIdx)
+	allpLen := int(loadPtrUintptr(idleM, mAllpSnapWordIdx+ptrWords))
+	allpCap := int(loadPtrUintptr(idleM, mAllpSnapWordIdx+2*ptrWords))
+	if dataAddr <= 4096 || dataAddr%unsafe.Alignof(uintptr(0)) != 0 ||
+		allpLen <= 0 || allpLen > len(knownPPtrs) {
+		return
+	}
+	if allpCap > allpLen && allpCap <= len(knownPPtrs) {
+		allpLen = allpCap
+	}
+	if allpBase := atomic.LoadPointer((*unsafe.Pointer)(unsafe.Pointer(&idleM[mAllpSnapWordIdx]))); allpBase != nil {
+		registerAllpSliceElements(allpBase, allpLen)
+	}
+}
+
+func scanIdlePsFromSched() {
+	if schedPidleWordIdx < 0 {
+		return
+	}
+	schedWords := &runtimeSched
+	scanAllpFromIdleM(schedWords)
+	pAddr := loadPtrUintptr(schedWords, schedPidleWordIdx)
+	if pAddr <= 4096 || pAddr%unsafe.Alignof(uintptr(0)) != 0 {
+		return
+	}
+	pWords := loadWordPtr(schedWords, schedPidleWordIdx)
+	for range len(knownPPtrs) {
+		if pWords == nil {
+			break
+		}
+		id := int(int32(atomic.LoadUint32(&pWords[0])))
+		status := atomic.LoadUint32(&pWords[1])
+		if id < 0 || id >= len(knownPPtrs) || status > 4 {
+			break
+		}
+		registerKnownP(id, pWords)
+		nextAddr := loadPtrUintptr(pWords, 2)
+		if nextAddr <= 4096 || nextAddr%unsafe.Alignof(uintptr(0)) != 0 {
+			break
+		}
+		pWords = loadWordPtr(pWords, 2)
+	}
+}
+
+func registerCurrentPAndScanIdle() {
+	if mPWordIdx < 0 {
+		return
+	}
+	pid := runtimeProcPin()
+	if mp := runtimeGetm(); mp != nil && pid >= 0 && pid < len(knownPPtrs) {
+		if pWords := loadWordPtr(mp, mPWordIdx); pWords != nil {
+			registerKnownP(pid, pWords)
+		}
+	}
+	scanIdlePsFromSched()
+	runtimeProcUnpin()
+}
+
+func syncActivePPtrs(goidgen uint64) {
+	scanIdlePsFromSched()
+	procs := runtime.GOMAXPROCS(0)
+	limit := min(max(int(maxKnownPID.Load())+1, procs), len(knownPPtrs))
+	allKnown := procs > 0 && procs <= len(knownPPtrs)
+	sawLatestBatch := goidgen == 0
+	for i := range limit {
+		pWords := knownPPtrs[i].Load()
+		if pWords == nil {
+			if i < procs {
+				allKnown = false
+			}
+			continue
+		}
+		markActiveP(i, pWords)
+		cache := loadWord64(pWords, pGoidcacheIdx)
+		end := loadWord64(pWords, pGoidcacheIdx+2)
+		if end == goidgen+1 && end >= cache && end-cache <= 15 {
+			sawLatestBatch = true
+		}
+	}
+	if !allKnown {
+		return
+	}
+	schedWords := &runtimeSched
+	if schedProcresizeWordIdx >= 0 {
+		cachedProcs.Store(int32(procs))
+		cachedResizeTime.Store(loadWord64(schedWords, schedProcresizeWordIdx))
+	}
+	if sawLatestBatch && goidgen != 0 {
+		lastActiveGoidgen.Store(goidgen)
+	}
+}
+
+func discoverRuntimeGoidOffsets() {
+	mPWordIdx, mAllpSnapWordIdx = discoverMPWordIdx()
+	schedPidleWordIdx, schedMidleWordIdx, schedProcresizeWordIdx = discoverSchedWordOffsets()
+	if mPWordIdx >= 0 {
+		registerCurrentPAndScanIdle()
+	}
+	pGoidcacheIdx = discoverPGoidcacheWordIdx(mPWordIdx)
+	if mPWordIdx < 0 || pGoidcacheIdx < 0 {
+		return
+	}
+	registerCurrentPAndScanIdle()
+	procs := runtime.GOMAXPROCS(0)
+	if int(knownPCount.Load()) < procs {
+		var wg sync.WaitGroup
+		release := make(chan struct{})
+		for range procs {
+			wg.Go(func() {
+				registerCurrentPAndScanIdle()
+				<-release
+			})
+		}
+		close(release)
+		wg.Wait()
+		registerCurrentPAndScanIdle()
+	}
+	schedWords := &runtimeSched
+	syncActivePPtrs(loadWord64(schedWords, 0))
+}
+
+func loadOrRegisterCurrentP(pid int) *[256]uint32 {
+	if curP := knownPPtrs[pid].Load(); curP != nil {
+		return curP
+	}
+	mp := runtimeGetm()
+	if mp == nil {
+		return nil
+	}
+	curP := loadWordPtr(mp, mPWordIdx)
+	if curP != nil {
+		registerKnownP(pid, curP)
+	}
+	return curP
+}
+
+func loadPTicks(pWords *[256]uint32, ptrWords int) uint64 {
+	schedTick := atomic.LoadUint32(&pWords[2+ptrWords])
+	sysTick := atomic.LoadUint32(&pWords[3+ptrWords])
+	return uint64(schedTick) | (uint64(sysTick) << 32)
+}
+
+func readHeadIdlePState(schedWords *[256]uint32, ptrWords int) (int32, uintptr, uint64, uint64) {
+	if schedPidleWordIdx < 0 {
+		return 0, 0, 0, 0
+	}
+	npidle := int32(atomic.LoadUint32(&schedWords[schedPidleWordIdx+ptrWords]))
+	headP := loadWordPtr(schedWords, schedPidleWordIdx)
+	pidleAddr := uintptr(unsafe.Pointer(headP))
+	if pidleAddr <= 4096 || pidleAddr%unsafe.Alignof(uintptr(0)) != 0 {
+		return npidle, 0, 0, 0
+	}
+	return npidle, pidleAddr, loadWord64(headP, pGoidcacheIdx), loadPTicks(headP, ptrWords)
+}
+
+func matchesHeadIdleP(s *goidFastSnap, schedWords *[256]uint32, ptrWords int) bool {
+	if s.procs == 1 {
+		return true
+	}
+	if s.pidleAddr == 0 {
+		return false
+	}
+	npidle := int32(atomic.LoadUint32(&schedWords[schedPidleWordIdx+ptrWords]))
+	headP := loadWordPtr(schedWords, schedPidleWordIdx)
+	if npidle != s.procs-1 || uintptr(unsafe.Pointer(headP)) != s.pidleAddr {
+		return false
+	}
+	return loadWord64(headP, pGoidcacheIdx) == s.headPGoid && loadPTicks(headP, ptrWords) == s.headTicks
+}
+
+func matchesGoidFastSnap(s *goidFastSnap) bool {
+	if s.procs <= 0 || mPWordIdx < 0 || pGoidcacheIdx < 0 || schedProcresizeWordIdx < 0 {
+		return false
+	}
+	pid := runtimeProcPin()
+	if int32(pid) != s.pid {
+		runtimeProcUnpin()
+		return false
+	}
+	curP := knownPPtrs[pid].Load()
+	schedWords := &runtimeSched
+	ptrWords := int(unsafe.Sizeof(uintptr(0)) / 4)
+	if curP == nil || loadWord64(schedWords, 0) != s.goidgen ||
+		loadWord64(schedWords, schedProcresizeWordIdx) != s.resizeTime ||
+		loadWord64(curP, pGoidcacheIdx) != s.curPGoid || loadPTicks(curP, ptrWords) != s.curPTicks {
+		runtimeProcUnpin()
+		return false
+	}
+	ok := matchesHeadIdleP(s, schedWords, ptrWords)
+	runtimeProcUnpin()
+	return ok
+}
+
+func sumActivePUnusedGoids(schedWords *[256]uint32, goidgen uint64) (uint64, bool) {
+	n := int(activePCount.Load())
+	var unused uint64
+	for i := range n {
+		pWords := activePPtrs[i].Load()
+		if pWords == nil {
+			continue
+		}
+		end := loadWord64(pWords, pGoidcacheIdx+2)
+		cache := loadWord64(pWords, pGoidcacheIdx)
+		if end != loadWord64(pWords, pGoidcacheIdx+2) || end < cache || end-cache > 15 {
+			return 0, false
+		}
+		unused += end - cache
+	}
+	if loadWord64(schedWords, 0) != goidgen || int(activePCount.Load()) != n || goidgen < unused {
+		return 0, false
+	}
+	return goidgen - unused, true
+}
+
+func loadSchedGoidAndResize(schedWords *[256]uint32) (uint64, uint64) {
+	goidgen := loadWord64(schedWords, 0)
+	var resizeTime uint64
+	if schedProcresizeWordIdx >= 0 {
+		resizeTime = loadWord64(schedWords, schedProcresizeWordIdx)
+	}
+	return goidgen, resizeTime
+}
+
+func isSyncedActiveGoidState(goidgen, resizeTime uint64) bool {
+	if goidgen != 0 && goidgen != lastActiveGoidgen.Load() {
+		return false
+	}
+	return schedProcresizeWordIdx < 0 || resizeTime == cachedResizeTime.Load()
+}
+
+func ensureSyncedActiveGoidState(schedWords *[256]uint32) (uint64, uint64, bool) {
+	goidgen, resizeTime := loadSchedGoidAndResize(schedWords)
+	if isSyncedActiveGoidState(goidgen, resizeTime) {
+		return goidgen, resizeTime, true
+	}
+	syncActivePPtrs(goidgen)
+	goidgen, resizeTime = loadSchedGoidAndResize(schedWords)
+	return goidgen, resizeTime, isSyncedActiveGoidState(goidgen, resizeTime)
+}
+
+func captureGoidFastSnap() (goidFastSnap, bool) {
+	if mPWordIdx < 0 || pGoidcacheIdx < 0 {
+		return goidFastSnap{}, false
+	}
+	pid := runtimeProcPin()
+	if pid < 0 || pid >= len(knownPPtrs) {
+		runtimeProcUnpin()
+		return goidFastSnap{}, false
+	}
+	curP := loadOrRegisterCurrentP(pid)
+	if curP == nil {
+		runtimeProcUnpin()
+		return goidFastSnap{}, false
+	}
+	schedWords := &runtimeSched
+	goidgen, resizeTime, synced := ensureSyncedActiveGoidState(schedWords)
+	if !synced {
+		runtimeProcUnpin()
+		return goidFastSnap{}, false
+	}
+	curPGoid := loadWord64(curP, pGoidcacheIdx)
+	sum, ok := sumActivePUnusedGoids(schedWords, goidgen)
+	if !ok {
+		runtimeProcUnpin()
+		return goidFastSnap{}, false
+	}
+	ptrWords := int(unsafe.Sizeof(uintptr(0)) / 4)
+	curPTicks := loadPTicks(curP, ptrWords)
+	procs := cachedProcs.Load()
+	npidle, pidleAddr, headPGoid, headTicks := readHeadIdlePState(schedWords, ptrWords)
+	if procs <= 0 || npidle != procs-1 {
+		pidleAddr = 0
+	}
+	runtimeProcUnpin()
+	return goidFastSnap{
+		goidgen:    goidgen,
+		resizeTime: resizeTime,
+		curPGoid:   curPGoid,
+		curPTicks:  curPTicks,
+		headPGoid:  headPGoid,
+		headTicks:  headTicks,
+		goidSum:    sum,
+		pidleAddr:  pidleAddr,
+		pid:        int32(pid),
+		procs:      procs,
+	}, true
+}
+
+func currentGoroutinesCreatedFast() (uint64, bool) {
+	snap, ok := captureGoidFastSnap()
+	return snap.goidSum, ok
+}
+
+const (
+	goroutinesCreatedMetric = "/sched/goroutines-created:goroutines"
+	evictLabelRingSize      = 1024
+	evictLabelRingMask      = evictLabelRingSize - 1
+)
+
+type evictTagCleanupArg struct {
+	addr uintptr
+	wp   weak.Pointer[byte]
+}
+
+var (
+	globalEvictTagsMu sync.RWMutex
+	globalEvictTags   = make(map[uintptr]weak.Pointer[byte])
+)
+
+func registerGlobalEvictTag(tag unsafe.Pointer) {
+	if tag == nil {
+		return
+	}
+	ptr := (*byte)(tag)
+	addr := uintptr(tag)
+	wp := weak.Make(ptr)
+	globalEvictTagsMu.Lock()
+	globalEvictTags[addr] = wp
+	globalEvictTagsMu.Unlock()
+	runtime.AddCleanup(ptr, unregisterGlobalEvictTag, evictTagCleanupArg{addr: addr, wp: wp})
+}
+
+func unregisterGlobalEvictTag(arg evictTagCleanupArg) {
+	globalEvictTagsMu.Lock()
+	if cur, ok := globalEvictTags[arg.addr]; ok && (cur == arg.wp || cur.Value() == nil) {
+		delete(globalEvictTags, arg.addr)
+	}
+	globalEvictTagsMu.Unlock()
+}
+
+func isAnyEvictRingTag(label unsafe.Pointer) bool {
+	if label == nil {
+		return false
+	}
+	globalEvictTagsMu.RLock()
+	wp, ok := globalEvictTags[uintptr(label)]
+	globalEvictTagsMu.RUnlock()
+	return ok && wp.Value() == (*byte)(label)
+}
+
+func newEvictLabelRing() *[evictLabelRingSize]unsafe.Pointer {
+	tags := new([evictLabelRingSize]unsafe.Pointer)
+	prev := runtimeGetProfLabel()
+	defer runtimeSetProfLabel(prev)
+	emptyLabels := pprof.Labels()
+	bg := context.Background()
+	for i := range tags {
+		pprof.SetGoroutineLabels(pprof.WithLabels(bg, emptyLabels))
+		tag := runtimeGetProfLabel()
+		tags[i] = tag
+		registerGlobalEvictTag(tag)
+	}
+	return tags
+}
 
 var (
 	goroutineStackBufPool = sync.Pool{
@@ -36,7 +689,30 @@ var (
 			return new([16384]byte)
 		},
 	}
+	goroutinesCreatedSamplePool = sync.Pool{
+		New: func() any {
+			return &[1]metrics.Sample{{Name: goroutinesCreatedMetric}}
+		},
+	}
 )
+
+func readGoroutinesCreatedInto(samplePtr *[1]metrics.Sample) uint64 {
+	if samplePtr[0].Name == "" {
+		samplePtr[0].Name = goroutinesCreatedMetric
+	}
+	metrics.Read(samplePtr[:])
+	if samplePtr[0].Value.Kind() == metrics.KindUint64 {
+		return samplePtr[0].Value.Uint64()
+	}
+	return 0
+}
+
+func readGoroutinesCreated() uint64 {
+	samplePtr := goroutinesCreatedSamplePool.Get().(*[1]metrics.Sample)
+	val := readGoroutinesCreatedInto(samplePtr)
+	goroutinesCreatedSamplePool.Put(samplePtr)
+	return val
+}
 
 func parseDecimalUint64(b []byte) (uint64, int) {
 	var id uint64
@@ -403,128 +1079,72 @@ func hasClosureOwnedBy(aboveHook, blk, owner []byte) bool {
 	return false
 }
 
-func matchChildStackFramesAboveHook(blk, aboveHook, belowHook, childStack []byte) (matchedAbove, sawBelowOwner bool) {
-	const createdBy = "\ncreated by "
-	end := bytes.LastIndex(childStack, []byte(createdBy))
-	if end <= 0 {
-		return false, false
-	}
-	rest := childStack[:end]
-	const maxBottomFrames = 8
-	for range maxBottomFrames {
-		var fn []byte
-		fn, rest = popBottomCallFrame(rest)
-		if len(fn) == 0 {
-			break
-		}
-		if bytes.Equal(fn, []byte("sync.(*WaitGroup).Go.func1")) {
-			continue
-		}
-		if containsCreatorCallFrame(aboveHook, fn) && !containsCreatorCallFrame(belowHook, fn) {
-			return true, false
-		}
-		if owner := findClosureOwnerInStack(blk, fn); len(owner) > 0 {
-			if containsCreatorCallFrame(aboveHook, owner) && !containsCreatorCallFrame(belowHook, owner) {
-				return true, false
-			}
-			if containsCreatorCallFrame(belowHook, owner) {
-				sawBelowOwner = true
-			}
-		}
-	}
-	return false, sawBelowOwner
-}
-
-func decideCreatorFromCallbackAboveHook(blk []byte, hookIdx int, currCreator, childStack []byte, requirePositiveMatch bool) (matched, decided bool) {
-	aboveHook := blk[:hookIdx]
-	if !hasCallFrameAboveHook(aboveHook) {
-		return false, true
-	}
-	belowHook := blk[hookIdx:]
-	matchedAbove, sawBelowOwner := matchChildStackFramesAboveHook(blk, aboveHook, belowHook, childStack)
-	if matchedAbove {
-		return true, true
-	}
-	if len(currCreator) > 0 {
-		if containsCreatorCallFrame(aboveHook, currCreator) && !containsCreatorCallFrame(belowHook, currCreator) {
-			return true, true
-		}
-		if owner := findClosureOwnerInStack(blk, currCreator); len(owner) > 0 {
-			if containsCreatorCallFrame(aboveHook, owner) && !containsCreatorCallFrame(belowHook, owner) {
-				return true, true
-			}
-			if containsCreatorCallFrame(belowHook, owner) && !hasClosureOwnedBy(aboveHook, blk, owner) {
-				return false, true
-			}
-		}
-		if containsCreatorCallFrame(belowHook, currCreator) {
-			return false, true
-		}
-	}
-	if sawBelowOwner {
-		return false, true
-	}
-	if len(currCreator) == 0 {
-		return false, false
-	}
-	if !requirePositiveMatch {
-		return true, true
-	}
-	return false, false
-}
-
-func isCreatorFromCallbackAboveHook(blk []byte, hookIdx int, currCreator, childStack []byte, requirePositiveMatch bool) bool {
-	matched, _ := decideCreatorFromCallbackAboveHook(blk, hookIdx, currCreator, childStack, requirePositiveMatch)
-	return matched
-}
-
-func matchAncestorBlockAboveHook(blk []byte, hookIdx int, currCreator, currChildStack, callerCreator, callerStack []byte, requirePositiveMatch bool) bool {
-	if hookIdx < 0 {
+func isInternalLRUInterfaceFrame(fn []byte) bool {
+	rest, ok := bytes.CutPrefix(fn, []byte("github.com/google/go-lru."))
+	if !ok {
 		return false
 	}
-	if matched, decided := decideCreatorFromCallbackAboveHook(blk, hookIdx, currCreator, currChildStack, requirePositiveMatch); decided {
-		return matched
-	}
-	if len(callerStack) > 0 && (len(currChildStack) == 0 || &callerStack[0] != &currChildStack[0]) {
-		matched, _ := decideCreatorFromCallbackAboveHook(blk, hookIdx, callerCreator, callerStack, true)
-		return matched
-	}
-	return false
+	return bytes.HasPrefix(rest, []byte("Cache[")) ||
+		bytes.HasPrefix(rest, []byte("PressureAwareCache[")) ||
+		bytes.HasPrefix(rest, []byte("StatsProvider.")) ||
+		bytes.HasPrefix(rest, []byte("shardEngine["))
 }
 
-func matchAncestorInAllStacks(allStacks, currCreator, childStack, hookName []byte, matchAncestor func(uint64) bool) (uint64, bool) {
-	for rem := allStacks; len(rem) > 0; {
-		var blk []byte
-		blk, rem = nextGoroutineBlock(rem)
-		gid, _ := parseStackGoroutineAndParentID(blk)
-		if gid == 0 || !matchAncestor(gid) {
-			continue
-		}
-		hookIdx := bytes.LastIndex(blk, hookName)
-		if hookIdx >= 0 && isCreatorFromCallbackAboveHook(blk, hookIdx, currCreator, childStack, true) {
-			return gid, true
-		}
+func isInternalLRUMethodFrame(fn []byte) bool {
+	if isInternalLRUInterfaceFrame(fn) {
+		return true
 	}
-	return 0, false
+	rest, ok := bytes.CutPrefix(fn, []byte("github.com/google/go-lru.(*"))
+	if !ok {
+		return false
+	}
+	return bytes.HasPrefix(rest, []byte("mapCache[")) ||
+		bytes.HasPrefix(rest, []byte("radixCache[")) ||
+		bytes.HasPrefix(rest, []byte("arenaRadix[")) ||
+		bytes.HasPrefix(rest, []byte("shardedCache[")) ||
+		bytes.HasPrefix(rest, []byte("evictCallbackQueue[")) ||
+		bytes.HasPrefix(rest, []byte("pressureState)"))
 }
 
-func matchAncestorFallbackInAllStacks(allStacks, currCreator, currChildStack, callerCreator, callerStack, hookName []byte, matchAncestor func(uint64) bool) (uint64, bool) {
-	if len(callerStack) == 0 || (len(currChildStack) > 0 && &callerStack[0] == &currChildStack[0]) {
-		return matchAncestorInAllStacks(allStacks, currCreator, currChildStack, hookName, matchAncestor)
+func isStdlibWaitGroupGoCreator(fn []byte) bool {
+	return bytes.Equal(trimClosureOffset(fn), []byte("sync.(*WaitGroup).Go"))
+}
+
+func isInternalCallbackDispatchFrame(fn []byte) bool {
+	if !bytes.HasPrefix(fn, []byte("github.com/google/go-lru.")) {
+		return false
 	}
-	for rem := allStacks; len(rem) > 0; {
-		var blk []byte
-		blk, rem = nextGoroutineBlock(rem)
-		gid, _ := parseStackGoroutineAndParentID(blk)
-		if gid == 0 || !matchAncestor(gid) {
-			continue
+	return bytes.Contains(fn, []byte("deliverCallbacks")) ||
+		bytes.Contains(fn, []byte("deliverMultiCallbacks")) ||
+		bytes.Contains(fn, []byte("tryEnqueuePendingCallback")) ||
+		bytes.Contains(fn, []byte("enqueuePendingCallback")) ||
+		bytes.Contains(fn, []byte("resolveOnEvict")) ||
+		bytes.Contains(fn, []byte("dispatchFastPrimaryPressure")) ||
+		bytes.Contains(fn, []byte("invokeFastPrimaryPressure"))
+}
+
+func isOnlyDirectCallbackEntryAboveHook(blk []byte, hookIdx int, currCreator []byte) bool {
+	creator := trimClosureOffset(currCreator)
+	if len(creator) == 0 || hookIdx <= 0 {
+		return false
+	}
+	rest := blk[:hookIdx]
+	var entryFn []byte
+	foundEntry := false
+	for range 8 {
+		entryFn, rest = popBottomCallFrame(rest)
+		if len(entryFn) == 0 {
+			return false
 		}
-		hookIdx := bytes.LastIndex(blk, hookName)
-		if matchAncestorBlockAboveHook(blk, hookIdx, currCreator, currChildStack, callerCreator, callerStack, true) {
-			return gid, true
+		if !isInternalCallbackDispatchFrame(entryFn) {
+			foundEntry = true
+			break
 		}
 	}
-	return 0, false
+	if !foundEntry || !sameFuncSymbolIgnoringTypeArgs(trimClosureOffset(entryFn), creator) {
+		return false
+	}
+	return !containsCreatorCallFrame(rest, creator)
 }
 
 func isClosureFuncName(fn []byte) bool {
@@ -549,7 +1169,7 @@ func isWrapperEntryFrame(fn, currCreator []byte) bool {
 }
 
 func blockOwnsExitedChild(blk, currCreator, currChildStack []byte) bool {
-	if len(currCreator) > 0 {
+	if len(currCreator) > 0 && !isInternalLRUMethodFrame(currCreator) && !isStdlibWaitGroupGoCreator(currCreator) {
 		if containsCreatorCallFrame(blk, currCreator) || len(findClosureOwnerInStack(blk, currCreator)) > 0 {
 			return true
 		}
@@ -563,7 +1183,7 @@ func blockOwnsExitedChild(blk, currCreator, currChildStack []byte) bool {
 	for i := range 2 {
 		var fn []byte
 		fn, rest = popBottomCallFrame(rest)
-		if len(fn) == 0 {
+		if len(fn) == 0 || isInternalLRUMethodFrame(fn) {
 			return false
 		}
 		if containsCreatorCallFrame(blk, fn) || len(findClosureOwnerInStack(blk, fn)) > 0 {
@@ -577,16 +1197,15 @@ func blockOwnsExitedChild(blk, currCreator, currChildStack []byte) bool {
 	return false
 }
 
-func findLiveIntermediateAncestorInAllStacks(allStacks, currCreator, currChildStack []byte, callerGID uint64, bridgedGIDs []uint64, matchAncestor func(uint64) bool) (bridgeGID, nextParentGID uint64, nextCreator, bridgeBlk []byte) {
+func findLiveIntermediateAncestorInAllStacks(allStacks, currCreator, currChildStack []byte, callerGID uint64, bridgedGIDs []uint64, matchAncestor, rejectGID func(uint64) bool) (bridgeGID, nextParentGID uint64, nextCreator, bridgeBlk []byte) {
 	for rem := allStacks; len(rem) > 0; {
 		var blk []byte
 		blk, rem = nextGoroutineBlock(rem)
 		gid, parentGID, creator := parseStackGoroutineParentAndCreator(blk)
-		if gid == 0 || gid == callerGID || parentGID == 0 || matchAncestor(gid) {
+		if gid == 0 || gid == callerGID || parentGID == 0 || matchAncestor(gid) || isRejectedAncestorGID(gid, rejectGID) {
 			continue
 		}
-		alreadyBridged := slices.Contains(bridgedGIDs, gid)
-		if alreadyBridged {
+		if slices.Contains(bridgedGIDs, gid) {
 			continue
 		}
 		if blockOwnsExitedChild(blk, currCreator, currChildStack) {
@@ -617,12 +1236,12 @@ type ancestorBridgeState struct {
 	bridgeCount      int
 }
 
-func (s *ancestorBridgeState) backtrack(allStacks []byte, matchAncestor func(uint64) bool) (nextParentGID uint64, nextCreator, bridgeBlk []byte, ok bool) {
+func (s *ancestorBridgeState) backtrack(allStacks []byte, matchAncestor, rejectGID func(uint64) bool) (nextParentGID uint64, nextCreator, bridgeBlk []byte, ok bool) {
 	if s.bridgeCount == 0 || s.bridgeCount >= maxBridgeHops {
 		return 0, nil, nil, false
 	}
 	bridgeGID, pGID, creator, blk := findLiveIntermediateAncestorInAllStacks(
-		allStacks, s.exitedCreator, s.exitedChildStack, s.callerGID, s.bridgedGIDs[:s.bridgeCount], matchAncestor,
+		allStacks, s.exitedCreator, s.exitedChildStack, s.callerGID, s.bridgedGIDs[:s.bridgeCount], matchAncestor, rejectGID,
 	)
 	if bridgeGID == 0 {
 		return 0, nil, nil, false
@@ -632,12 +1251,12 @@ func (s *ancestorBridgeState) backtrack(allStacks []byte, matchAncestor func(uin
 	return pGID, creator, blk, true
 }
 
-func (s *ancestorBridgeState) bridgeExited(allStacks, currCreator, currChildStack []byte, matchAncestor func(uint64) bool) (nextParentGID uint64, nextCreator, bridgeBlk []byte, ok bool) {
+func (s *ancestorBridgeState) bridgeExited(allStacks, currCreator, currChildStack []byte, matchAncestor, rejectGID func(uint64) bool) (nextParentGID uint64, nextCreator, bridgeBlk []byte, ok bool) {
 	if s.bridgeCount >= maxBridgeHops {
 		return 0, nil, nil, false
 	}
 	if bridgeGID, pGID, creator, blk := findLiveIntermediateAncestorInAllStacks(
-		allStacks, currCreator, currChildStack, s.callerGID, s.bridgedGIDs[:s.bridgeCount], matchAncestor,
+		allStacks, currCreator, currChildStack, s.callerGID, s.bridgedGIDs[:s.bridgeCount], matchAncestor, rejectGID,
 	); bridgeGID != 0 {
 		if s.bridgeCount == 0 {
 			s.exitedCreator = currCreator
@@ -647,10 +1266,37 @@ func (s *ancestorBridgeState) bridgeExited(allStacks, currCreator, currChildStac
 		s.bridgeCount++
 		return pGID, creator, blk, true
 	}
-	return s.backtrack(allStacks, matchAncestor)
+	return s.backtrack(allStacks, matchAncestor, rejectGID)
 }
 
 func findAncestorCreatorAboveHook(allStacks, callerStack []byte, parentGID uint64, creatorFunc, hookName []byte, matchAncestor func(uint64) bool) (uint64, bool) {
+	return findAncestorCreatorAboveHookOpts(allStacks, callerStack, parentGID, creatorFunc, hookName, matchAncestor, nil)
+}
+
+func isRejectedAncestorGID(currGID uint64, rejectGID func(uint64) bool) bool {
+	return rejectGID != nil && rejectGID(currGID)
+}
+
+func handleRejectedAncestorGID(bridge *ancestorBridgeState, allStacks []byte, matchAncestor, rejectGID func(uint64) bool) (uint64, []byte, []byte, bool) {
+	if bridge.bridgeCount == 0 {
+		return 0, nil, nil, false
+	}
+	return bridge.backtrack(allStacks, matchAncestor, rejectGID)
+}
+
+func stepBridgeOrRejectedAncestor(bridge *ancestorBridgeState, missingCurr bool, allStacks []byte, matchAncestor, rejectGID func(uint64) bool) (uint64, []byte, []byte, bool) {
+	if missingCurr {
+		return bridge.backtrack(allStacks, matchAncestor, rejectGID)
+	}
+	return handleRejectedAncestorGID(bridge, allStacks, matchAncestor, rejectGID)
+}
+
+func matchesTargetBlockAboveHook(blk, hookName []byte) bool {
+	hookIdx := bytes.LastIndex(blk, hookName)
+	return hookIdx >= 0 && hasCallFrameAboveHook(blk[:hookIdx])
+}
+
+func findAncestorCreatorAboveHookOpts(allStacks, callerStack []byte, parentGID uint64, creatorFunc, hookName []byte, matchAncestor, rejectGID func(uint64) bool) (uint64, bool) {
 	if parentGID == 0 {
 		return 0, false
 	}
@@ -660,9 +1306,7 @@ func findAncestorCreatorAboveHook(allStacks, callerStack []byte, parentGID uint6
 		defer releaseAllGoroutineStacks(bufPtr)
 	}
 	callerGID, _ := parseStackGoroutineAndParentID(callerStack)
-	currGID := parentGID
-	currCreator := creatorFunc
-	currChildStack := callerStack
+	currGID, currCreator, currChildStack := parentGID, creatorFunc, callerStack
 	bridge := ancestorBridgeState{
 		callerGID:        callerGID,
 		exitedCreator:    creatorFunc,
@@ -670,50 +1314,143 @@ func findAncestorCreatorAboveHook(allStacks, callerStack []byte, parentGID uint6
 	}
 	const maxAncestorHops = 4096
 	for range maxAncestorHops {
-		if currGID == 0 {
-			var ok bool
-			currGID, currCreator, currChildStack, ok = bridge.backtrack(allStacks, matchAncestor)
+		var ok bool
+		if currGID == 0 || isRejectedAncestorGID(currGID, rejectGID) {
+			currGID, currCreator, currChildStack, ok = stepBridgeOrRejectedAncestor(&bridge, currGID == 0, allStacks, matchAncestor, rejectGID)
 			if !ok {
 				return 0, false
 			}
+			continue
 		}
 		blk, nextParentGID, nextCreator, foundBlock := findGoroutineBlockByID(allStacks, currGID)
 		if !foundBlock {
-			if gid, ok := matchAncestorFallbackInAllStacks(allStacks, currCreator, currChildStack, creatorFunc, callerStack, hookName, matchAncestor); ok {
+			if gid, _, matched := matchAncestorFallbackForExactPostHook(allStacks, currCreator, currChildStack, creatorFunc, callerStack, hookName, matchAncestor, rejectGID); matched {
 				return gid, true
 			}
-			var ok bool
-			currGID, currCreator, currChildStack, ok = bridge.bridgeExited(allStacks, currCreator, currChildStack, matchAncestor)
+			currGID, currCreator, currChildStack, ok = bridge.bridgeExited(allStacks, currCreator, currChildStack, matchAncestor, rejectGID)
 			if !ok {
 				return 0, false
 			}
 			continue
 		}
 		if !matchAncestor(currGID) {
-			currGID = nextParentGID
-			currCreator = nextCreator
-			currChildStack = blk
+			currGID, currCreator, currChildStack = nextParentGID, nextCreator, blk
 			continue
 		}
-		hookIdx := bytes.LastIndex(blk, hookName)
-		if matchAncestorBlockAboveHook(blk, hookIdx, currCreator, currChildStack, creatorFunc, callerStack, false) {
+		if matchesTargetBlockAboveHook(blk, hookName) {
 			return currGID, true
 		}
-		var ok bool
-		currGID, currCreator, currChildStack, ok = bridge.backtrack(allStacks, matchAncestor)
+		currGID, currCreator, currChildStack, ok = bridge.backtrack(allStacks, matchAncestor, rejectGID)
 		if !ok {
 			return 0, false
 		}
 	}
-	return matchAncestorFallbackInAllStacks(allStacks, currCreator, currChildStack, creatorFunc, callerStack, hookName, matchAncestor)
+	gid, _, matched := matchAncestorFallbackForExactPostHook(allStacks, currCreator, currChildStack, creatorFunc, callerStack, hookName, matchAncestor, rejectGID)
+	return gid, matched
 }
 
-const numPressureHookTags = 8
+func sectionOwnsSymbol(section, sym []byte) bool {
+	if len(sym) == 0 {
+		return false
+	}
+	return containsCreatorCallFrame(section, sym) || len(findClosureOwnerInStack(section, sym)) > 0
+}
+
+func aboveHookOwnsSymbol(blk, aboveHook, sym []byte) bool {
+	if len(sym) == 0 {
+		return false
+	}
+	belowHook := blk[len(aboveHook):]
+	if containsCreatorCallFrame(aboveHook, sym) && !containsCreatorCallFrame(belowHook, sym) {
+		return true
+	}
+	if owner := findClosureOwnerInStack(aboveHook, sym); len(owner) > 0 && !containsCreatorCallFrame(belowHook, owner) {
+		return true
+	}
+	owner := findClosureOwnerInStack(blk, sym)
+	return len(owner) > 0 && !containsCreatorCallFrame(belowHook, owner) && hasClosureOwnedBy(aboveHook, blk, owner)
+}
+
+func aboveHookOwnsExitedChild(blk []byte, hookIdx int, currCreator, childStack []byte) bool {
+	aboveHook := blk[:hookIdx]
+	if !isInternalLRUMethodFrame(currCreator) && !isStdlibWaitGroupGoCreator(currCreator) && aboveHookOwnsSymbol(blk, aboveHook, currCreator) {
+		return true
+	}
+	end := bytes.LastIndex(childStack, []byte("\ncreated by "))
+	if end <= 0 {
+		return false
+	}
+	rest := childStack[:end]
+	const maxBottomFrames = 8
+	for range maxBottomFrames {
+		var fn []byte
+		fn, rest = popBottomCallFrame(rest)
+		if len(fn) == 0 || isInternalLRUMethodFrame(fn) {
+			return false
+		}
+		if bytes.Equal(fn, []byte("sync.(*WaitGroup).Go.func1")) {
+			continue
+		}
+		if aboveHookOwnsSymbol(blk, aboveHook, fn) {
+			return true
+		}
+	}
+	return false
+}
+
+func hasLiveRejectedCreatorInAllStacks(allStacks, creatorFunc []byte, rejectGID func(uint64) bool) bool {
+	if len(creatorFunc) == 0 || rejectGID == nil {
+		return false
+	}
+	for rem := allStacks; len(rem) > 0; {
+		var blk []byte
+		blk, rem = nextGoroutineBlock(rem)
+		gid, _ := parseStackGoroutineAndParentID(blk)
+		if gid != 0 && rejectGID(gid) && containsCreatorCallFrame(blk, creatorFunc) {
+			return true
+		}
+	}
+	return false
+}
+
+func matchAncestorFallbackForExactPostHook(allStacks, currCreator, currChildStack, callerCreator, callerStack, hookName []byte, matchAncestor, rejectGID func(uint64) bool) (uint64, []byte, bool) {
+	hasDistinctCaller := len(callerStack) > 0 && (len(currChildStack) == 0 || &callerStack[0] != &currChildStack[0])
+	rejectedCreatorLive := hasLiveRejectedCreatorInAllStacks(allStacks, currCreator, rejectGID)
+	for rem := allStacks; len(rem) > 0; {
+		var blk []byte
+		blk, rem = nextGoroutineBlock(rem)
+		gid, _ := parseStackGoroutineAndParentID(blk)
+		if gid == 0 || !matchAncestor(gid) {
+			continue
+		}
+		hookIdx := bytes.LastIndex(blk, hookName)
+		if hookIdx <= 0 || isOnlyDirectCallbackEntryAboveHook(blk, hookIdx, currCreator) {
+			continue
+		}
+		if rejectedCreatorLive && !containsCreatorCallFrame(blk[:hookIdx], currCreator) {
+			continue
+		}
+		if aboveHookOwnsExitedChild(blk, hookIdx, currCreator, currChildStack) || (hasDistinctCaller && aboveHookOwnsExitedChild(blk, hookIdx, callerCreator, callerStack)) {
+			return gid, blk, true
+		}
+	}
+	return 0, nil, false
+}
+
+const (
+	numPressureHookTags = 8
+	evictHoldActiveBit  = uint64(1)
+	evictHoldFastTagBit = uint64(2)
+	evictHoldTagShift   = 2
+	evictHoldTagMask    = uint64(numPressureHookTags - 1)
+	evictHoldIdxShift   = 5
+)
 
 var (
 	nextPressureHookID  atomic.Uint64
 	fastPrimaryTagOwner [numPressureHookTags]atomic.Uint64
-	fastEvictTagState   [numPressureHookTags]atomic.Uint64
+	fastEvictTagLeaseMu sync.Mutex
+	fastEvictTagOwners  [numPressureHookTags]weak.Pointer[pressureState]
 
 	fastPrimarySamplerMarkers = [numPressureHookTags][]byte{
 		[]byte("invokeFastPrimaryPressure0("),
@@ -736,12 +1473,24 @@ var (
 		[]byte("invokeFastEvictCallbacks6("),
 		[]byte("invokeFastEvictCallbacks7("),
 	}
+
+	fastEvictFuncSuffixes = [numPressureHookTags]string{
+		".invokeFastEvictCallbacks0",
+		".invokeFastEvictCallbacks1",
+		".invokeFastEvictCallbacks2",
+		".invokeFastEvictCallbacks3",
+		".invokeFastEvictCallbacks4",
+		".invokeFastEvictCallbacks5",
+		".invokeFastEvictCallbacks6",
+		".invokeFastEvictCallbacks7",
+	}
 )
 
 var (
 	byteStrings       [256]string
 	twoDigitStrings   [100]string
 	threeDigitStrings [1000]string
+	fourDigitsAll     string
 )
 
 func init() {
@@ -772,6 +1521,15 @@ func init() {
 	for i := range 1000 {
 		threeDigitStrings[i] = allThreeDigits[i*3 : i*3+3]
 	}
+	fourDigitsRaw := make([]byte, 40000)
+	for i := range 10000 {
+		fourDigitsRaw[i*4] = byte('0' + i/1000)
+		fourDigitsRaw[i*4+1] = byte('0' + (i/100)%10)
+		fourDigitsRaw[i*4+2] = byte('0' + (i/10)%10)
+		fourDigitsRaw[i*4+3] = byte('0' + i%10)
+	}
+	fourDigitsAll = string(fourDigitsRaw)
+	discoverRuntimeGoidOffsets()
 }
 
 func parseTwoASCIIDigits(c0, c1 byte) (int, bool) {
@@ -790,6 +1548,14 @@ func parseThreeASCIIDigits(c0, c1, c2 byte) (int, bool) {
 	return 0, false
 }
 
+func parseFourASCIIDigits(c0, c1, c2, c3 byte) (int, bool) {
+	d0, d1, d2, d3 := c0-'0', c1-'0', c2-'0', c3-'0'
+	if d0 < 10 && d1 < 10 && d2 < 10 && d3 < 10 {
+		return int(d0)*1000 + int(d1)*100 + int(d2)*10 + int(d3), true
+	}
+	return 0, false
+}
+
 func cloneMultiBytePrefix(s string) string {
 	switch len(s) {
 	case 2:
@@ -800,12 +1566,16 @@ func cloneMultiBytePrefix(s string) string {
 		if idx, ok := parseThreeASCIIDigits(s[0], s[1], s[2]); ok {
 			return threeDigitStrings[idx]
 		}
+	case 4:
+		if idx, ok := parseFourASCIIDigits(s[0], s[1], s[2], s[3]); ok {
+			return fourDigitsAll[idx*4 : idx*4+4]
+		}
 	}
 	return strings.Clone(s)
 }
 
 // clonePrefix returns an independent copy of s that never shares s's underlying backing array,
-// using preallocated 1-byte, 2-digit, and 3-digit strings to avoid heap allocations.
+// using preallocated 1-byte and 2..4-digit strings to avoid heap allocations.
 func clonePrefix(s string) string {
 	switch len(s) {
 	case 0:
@@ -817,20 +1587,42 @@ func clonePrefix(s string) string {
 	}
 }
 
+func concatFourDigitPrefix(a, b string) (string, bool) {
+	var c0, c1, c2, c3 byte
+	switch len(a) {
+	case 1:
+		c0, c1, c2, c3 = a[0], b[0], b[1], b[2]
+	case 2:
+		c0, c1, c2, c3 = a[0], a[1], b[0], b[1]
+	default:
+		c0, c1, c2, c3 = a[0], a[1], a[2], b[0]
+	}
+	if idx, ok := parseFourASCIIDigits(c0, c1, c2, c3); ok {
+		return fourDigitsAll[idx*4 : idx*4+4], true
+	}
+	return "", false
+}
+
 // concatPrefix concatenates two non-empty radix prefix edges, using preallocated
-// 2-digit and 3-digit strings when applicable to avoid heap allocations during path compression.
+// 2..4-digit strings when applicable to avoid heap allocations during path compression.
 func concatPrefix(a, b string) string {
-	if len(a) == 1 && len(b) == 1 {
+	n := len(a) + len(b)
+	switch {
+	case n == 2 && len(a) == 1:
 		if idx, ok := parseTwoASCIIDigits(a[0], b[0]); ok {
 			return twoDigitStrings[idx]
 		}
-	} else if len(a)+len(b) == 3 && len(a) > 0 && len(b) > 0 {
+	case n == 3 && len(a) > 0 && len(b) > 0:
 		c1 := b[0]
 		if len(a) == 2 {
 			c1 = a[1]
 		}
 		if idx, ok := parseThreeASCIIDigits(a[0], c1, b[len(b)-1]); ok {
 			return threeDigitStrings[idx]
+		}
+	case n == 4 && len(a) > 0 && len(b) > 0:
+		if s, ok := concatFourDigitPrefix(a, b); ok {
+			return s
 		}
 	}
 	return a + b
@@ -912,51 +1704,140 @@ type pressureState struct {
 	arenaHashFallbacks      atomic.Uint64
 	lastSampledPressureBits atomic.Uint64
 
-	pressureWriteMu          sync.Mutex
-	hookIDVal                atomic.Uint64
-	primaryTagHint           atomic.Uint32
-	evictTagHint             atomic.Uint32
-	samplingPressure         atomic.Bool
-	samplingActive           atomic.Bool
-	samplingContended        atomic.Bool
-	fallbackSampling         atomic.Bool
-	pressureInitialized      atomic.Bool
-	pressureNeedsRefresh     atomic.Bool
-	hasReentrantReclaimGIDs  atomic.Bool
-	overflowSamplingCount    atomic.Int32
-	samplingGID              atomic.Uint64
-	samplingParentGID        atomic.Uint64
-	fallbackGID              atomic.Uint64
-	fallbackParentGID        atomic.Uint64
-	lastReentrantGID         atomic.Uint64
-	nonDescendantParentGID   atomic.Uint64
-	nonDescendantSeq         atomic.Uint64
-	samplingReentrantReclaim atomic.Bool
-	fallbackReentrantReclaim atomic.Bool
-	overflowSamplingGIDs     sync.Map
-	reentrantReclaimGIDs     sync.Map
-	pressureSampleSeq        atomic.Uint64
-	pressureInvokeSeq        atomic.Uint64
-	pressureMaxStoredSeq     atomic.Uint64
-	lastSampledSeq           atomic.Uint64
-	cachedPressureBits       atomic.Uint64
-	cachedPressureEpoch      atomic.Uint64
-	reclaimEpoch             atomic.Uint64
-	externalReclaimEpoch     atomic.Uint64
-	evictCallbackMu          sync.Mutex
-	evictCallbackGID         atomic.Uint64
-	evictCallbackParentGID   atomic.Uint64
-	evictCallbackActive      atomic.Bool
-	evictCallbackContended   atomic.Bool
-	evictPendingEnqueues     atomic.Int32
-	evictCallbackResolveMu   sync.Mutex
-	pendingEvictCallbacks    []func()
-	samplingResolveMu        sync.Mutex
-	evictFastSlot            *atomic.Uint64
-	evictFastIdle            uint64
-	evictFastTag             uint32
-	evictNonDescendantParent atomic.Uint64
-	evictNonDescendantHolder atomic.Uint64
+	pressureWriteMu            sync.Mutex
+	hookIDVal                  atomic.Uint64
+	primaryTagHint             atomic.Uint32
+	evictTagHint               atomic.Uint32
+	samplingPressure           atomic.Bool
+	samplingActive             atomic.Bool
+	samplingContended          atomic.Bool
+	fallbackSampling           atomic.Bool
+	pressureInitialized        atomic.Bool
+	pressureNeedsRefresh       atomic.Bool
+	anyShardReentrantReclaim   atomic.Bool
+	reentrantReclaimCount      atomic.Int32
+	overflowSamplingCount      atomic.Int32
+	activeSnapSamplers         atomic.Int32
+	samplingGID                atomic.Uint64
+	samplingParentGID          atomic.Uint64
+	fallbackGID                atomic.Uint64
+	fallbackParentGID          atomic.Uint64
+	lastReentrantGID           atomic.Uint64
+	nonDescendantParentGID     atomic.Uint64
+	nonDescendantSeq           atomic.Uint64
+	samplingReentrantReclaim   atomic.Bool
+	fallbackReentrantReclaim   atomic.Bool
+	overflowSamplingGIDs       sync.Map
+	reentrantReclaimGIDs       sync.Map
+	pressureSampleSeq          atomic.Uint64
+	pressureInvokeSeq          atomic.Uint64
+	lastSampledSeq             atomic.Uint64
+	cachedPressureBits         atomic.Uint64
+	cachedPressureEpoch        atomic.Uint64
+	reclaimEpoch               atomic.Uint64
+	externalReclaimEpoch       atomic.Uint64
+	evictCallbackMu            sync.Mutex
+	evictCallbackGID           atomic.Uint64
+	evictCallbackParentGID     atomic.Uint64
+	evictCallbackActive        atomic.Bool
+	evictCallbackContended     atomic.Bool
+	evictPendingEnqueues       atomic.Int32
+	evictCallbackResolveMu     sync.Mutex
+	pendingEvictCallbacks      []func()
+	samplingResolveMu          sync.Mutex
+	primaryFastSlot            *atomic.Uint64
+	primaryFastIdle            uint64
+	primaryFastTag             uint32
+	primaryGCreatedSample      [1]metrics.Sample
+	evictCurHoldIdx            uint64
+	evictFastTag               uint32
+	evictFastOwned             bool
+	evictCallbackEverContended atomic.Bool
+	evictLabelTampered         atomic.Bool
+	evictExactSnap             atomic.Bool
+	evictHasActiveRingTag      atomic.Bool
+	evictFastMode              atomic.Bool
+	evictHeldTagAddr           uintptr
+	evictHoldSeq               atomic.Uint64
+	evictStartSnapSeq          atomic.Uint64
+	evictRingEpochGCreated     uint64
+	evictLabelRing             atomic.Pointer[[evictLabelRingSize]unsafe.Pointer]
+	evictNonDescendantParent   atomic.Uint64
+	evictNonDescendantHolder   atomic.Uint64
+	evictSlowWaiters           atomic.Int32
+	belowTier1Epoch            atomic.Uint64
+	belowTier2Epoch            atomic.Uint64
+	cachedBelowTier1Epoch      atomic.Uint64
+	cachedBelowTier2Epoch      atomic.Uint64
+	cachedPressureSeq          atomic.Uint64
+	cachedPublishSeq           atomic.Uint64
+	zeroWatermarkTier2Epoch    uint64
+	zeroWatermarkSeq           uint64
+	sampledCoordEpoch          uint64
+	sampledBelowTier1Epoch     uint64
+	sampledBelowTier2Epoch     uint64
+	sampledPressureSeq         uint64
+	lastSampledEpoch           uint64
+	childShards                []*pressureState
+	exitedSamplerSeq           atomic.Uint64
+	exitedSamplerGIDs          [64]atomic.Uint64
+	panickedSamplerEpoch       atomic.Uint64
+	panickedRootSeq            atomic.Uint64
+	panickedDescendantSeq      atomic.Uint64
+	primaryStartPanicEpoch     atomic.Uint64
+	fallbackStartPanicEpoch    atomic.Uint64
+	primaryStartSnapSeq        atomic.Uint64
+	fallbackStartSnapSeq       atomic.Uint64
+	preHookSnapSeq             atomic.Uint64
+	lastObservedGCreated       atomic.Uint64
+	preHookMu                  sync.Mutex
+	preHookPruning             atomic.Bool
+	preHookLiveGIDs            map[uint64]uint64
+	hasPanickedEntries         atomic.Bool
+	panickedMu                 sync.Mutex
+	panickedRootMap            map[uint64]uint64
+	panickedDescMap            map[uint64]uint64
+	prevEvictLabelRing         atomic.Pointer[[evictLabelRingSize]unsafe.Pointer]
+	evictConfirmedChildGID     atomic.Uint64
+	evictConfirmedChildHold    atomic.Uint64
+	evictGCreatedSample        [1]metrics.Sample
+	evictSnapGCreated          uint64
+	primarySnapGoidSum         uint64
+	evictGoidSnap              goidFastSnap
+	evictProbedUnlabeledHolds  uint32
+	evictSnapStale             bool
+}
+
+func (p *pressureState) pressureStatePtr() *pressureState {
+	return p
+}
+
+type pressureSample struct {
+	epoch         uint64
+	shardEpoch    uint64
+	shardExtEpoch uint64
+	extEpoch      uint64
+	invokeSeq     uint64
+	belowTier1    uint64
+	belowTier2    uint64
+	val           float64
+	valid         bool
+}
+
+type shardSample struct {
+	hasSample  bool
+	valid      bool
+	pressure   float64
+	coordEpoch uint64
+	belowTier1 uint64
+	belowTier2 uint64
+	seq        uint64
+}
+
+func (s *shardSample) advanceSelfReclaim(postShardEpoch, preShardEpoch uint64) {
+	if s.hasSample && s.valid && postShardEpoch > preShardEpoch {
+		s.coordEpoch += postShardEpoch - preShardEpoch
+	}
 }
 
 const (
@@ -970,6 +1851,20 @@ const (
 	minSingleSurvivorFreeNodes = 63
 	slackQuarterMultiplier     = 4
 )
+
+func (p *pressureState) coord() *pressureState {
+	if p.options.sharedPressure != nil {
+		return p.options.sharedPressure
+	}
+	return p
+}
+
+func (p *pressureState) tier2TargetSize(maxSize uint64) uint64 {
+	if p.options.hasShardTier2Target {
+		return p.options.shardTier2Target
+	}
+	return computeTargetSize(maxSize, p.options.EvictionRetentionRatio)
+}
 
 func (p *pressureState) hasOverflowSamplingGID(gid uint64) bool {
 	if gid == 0 || p.overflowSamplingCount.Load() <= 0 {
@@ -1015,19 +1910,55 @@ func (p *pressureState) setEvictTag(id uint64, tag uint32) {
 	p.evictTagHint.Store((tag - uint32(id-1)) & (numPressureHookTags - 1))
 }
 
-func (p *pressureState) claimFastPrimaryTag() (uint32, bool) {
-	id := p.hookID()
+func (p *pressureState) cacheFastPrimarySlot(id uint64, base, tag uint32, idleState uint64) (uint32, bool) {
+	if tag != base {
+		p.setPrimaryTag(id, tag)
+	}
+	p.primaryFastSlot = &fastPrimaryTagOwner[tag]
+	p.primaryFastIdle = idleState
+	p.primaryFastTag = tag
+	return tag, true
+}
+
+func (p *pressureState) claimFastPrimaryTagSlow() (uint32, bool) {
+	id := p.hookIDVal.Load()
+	if id == 0 {
+		id = p.hookID()
+	}
 	base := p.primaryTag(id)
+	idleState := id << 1
+	activeState := idleState | 1
 	for offset := range uint32(numPressureHookTags) {
 		tag := (base + offset) & (numPressureHookTags - 1)
-		if fastPrimaryTagOwner[tag].CompareAndSwap(0, id) {
-			if tag != base {
-				p.setPrimaryTag(id, tag)
-			}
-			return tag, true
+		cur := fastPrimaryTagOwner[tag].Load()
+		if (cur == 0 || cur == idleState) && fastPrimaryTagOwner[tag].CompareAndSwap(cur, activeState) {
+			return p.cacheFastPrimarySlot(id, base, tag, idleState)
+		}
+	}
+	for offset := range uint32(numPressureHookTags) {
+		tag := (base + offset) & (numPressureHookTags - 1)
+		cur := fastPrimaryTagOwner[tag].Load()
+		if cur&1 == 0 && fastPrimaryTagOwner[tag].CompareAndSwap(cur, activeState) {
+			return p.cacheFastPrimarySlot(id, base, tag, idleState)
 		}
 	}
 	return 0, false
+}
+
+func (p *pressureState) clearActiveFastPrimaryTag() {
+	if slot := p.primaryFastSlot; slot != nil {
+		slot.CompareAndSwap(p.primaryFastIdle|1, p.primaryFastIdle)
+		return
+	}
+	if id := p.hookIDVal.Load(); id != 0 {
+		activeState := (id << 1) | 1
+		idleState := id << 1
+		for tag := range uint32(numPressureHookTags) {
+			if fastPrimaryTagOwner[tag].CompareAndSwap(activeState, idleState) {
+				return
+			}
+		}
+	}
 }
 
 func (p *pressureState) activeFastPrimaryTag() (uint32, bool) {
@@ -1035,9 +1966,15 @@ func (p *pressureState) activeFastPrimaryTag() (uint32, bool) {
 	if id == 0 {
 		return 0, false
 	}
+	activeState := (id << 1) | 1
 	tag := p.primaryTag(id)
-	if fastPrimaryTagOwner[tag].Load() == id {
+	if fastPrimaryTagOwner[tag].Load() == activeState {
 		return tag, true
+	}
+	for t := range uint32(numPressureHookTags) {
+		if fastPrimaryTagOwner[t].Load() == activeState {
+			return t, true
+		}
 	}
 	return 0, false
 }
@@ -1140,6 +2077,23 @@ func canBeDescendantOf(gid, parentGID, ownerGID, ownerParentGID uint64) bool {
 	return parentGID > 1
 }
 
+type overflowSamplerInfo struct {
+	parentGID       uint64
+	startPanicEpoch uint64
+	startSnapSeq    uint64
+}
+
+func extractOverflowSamplerInfo(v any) overflowSamplerInfo {
+	switch val := v.(type) {
+	case overflowSamplerInfo:
+		return val
+	case uint64:
+		return overflowSamplerInfo{parentGID: val}
+	default:
+		return overflowSamplerInfo{}
+	}
+}
+
 func (p *pressureState) canBeDescendantOfActiveSampler(gid, parentGID uint64) bool {
 	if parentGID == 0 {
 		return false
@@ -1159,14 +2113,167 @@ func (p *pressureState) canBeDescendantOfActiveSampler(gid, parentGID uint64) bo
 	matched := false
 	p.overflowSamplingGIDs.Range(func(k, v any) bool {
 		oGID, _ := k.(uint64)
-		oParentGID, _ := v.(uint64)
-		if canBeDescendantOf(gid, parentGID, oGID, oParentGID) {
+		info := extractOverflowSamplerInfo(v)
+		if canBeDescendantOf(gid, parentGID, oGID, info.parentGID) {
 			matched = true
 			return false
 		}
 		return true
 	})
 	return matched
+}
+
+func (p *pressureState) initCoordinator(hasOnEvict bool) {
+	if p.options.sharedPressure != nil {
+		return
+	}
+	if hasOnEvict {
+		p.evictLabelRing.Store(newEvictLabelRing())
+	}
+	if p.options.hasCustomPressureFunc || hasOnEvict {
+		p.observePreHookLiveGIDs(false)
+		if hasOnEvict {
+			p.evictRingEpochGCreated = p.lastObservedGCreated.Load()
+			p.evictSnapGCreated = p.evictRingEpochGCreated
+			if snap, ok := captureGoidFastSnap(); ok {
+				p.evictGoidSnap = snap
+			} else {
+				p.evictGoidSnap = goidFastSnap{goidSum: math.MaxUint64}
+			}
+		}
+	}
+}
+
+func collectLiveAndParentGIDs(allStacks []byte, snap uint64, liveGIDs map[uint64]uint64, keep map[uint64]struct{}) {
+	for rem := allStacks; len(rem) > 0; {
+		var blk []byte
+		blk, rem = nextGoroutineBlock(rem)
+		gID, pGID := parseStackGoroutineAndParentID(blk)
+		if gID != 0 {
+			if _, exists := liveGIDs[gID]; !exists {
+				liveGIDs[gID] = snap
+			}
+			if keep != nil {
+				keep[gID] = struct{}{}
+			}
+		}
+		if pGID != 0 {
+			if _, exists := liveGIDs[pGID]; !exists {
+				liveGIDs[pGID] = snap
+			}
+			if keep != nil {
+				keep[pGID] = struct{}{}
+			}
+		}
+	}
+}
+
+func pruneUnreferencedKeys(m map[uint64]uint64, keep map[uint64]struct{}) {
+	for k := range m {
+		if _, ok := keep[k]; !ok {
+			delete(m, k)
+		}
+	}
+}
+
+func (p *pressureState) isEvictIdleForPrune(holdsEvictMu bool) bool {
+	if p.isEvictCallbackActive() || p.evictPendingEnqueues.Load() != 0 {
+		return false
+	}
+	return holdsEvictMu || !p.evictCallbackContended.Load()
+}
+
+func (p *pressureState) canPrunePreHookNow(holdsEvictMu bool) bool {
+	return p.activeSnapSamplers.Load() == 0 && p.isEvictIdleForPrune(holdsEvictMu)
+}
+
+func (p *pressureState) capturePreHookPruneGuard(canPrune, holdsEvictMu bool) (bool, uint64) {
+	if !canPrune || len(p.preHookLiveGIDs) <= 512 {
+		return false, 0
+	}
+	return p.canPrunePreHookNow(holdsEvictMu), p.evictHoldSeq.Load()
+}
+
+func (p *pressureState) confirmPreHookPruneGuard(holdsEvictMu, wasIdle bool, evictSeqBefore uint64) bool {
+	if !wasIdle || !p.canPrunePreHookNow(holdsEvictMu) {
+		return false
+	}
+	return holdsEvictMu || p.evictHoldSeq.Load() == evictSeqBefore
+}
+
+func (p *pressureState) tryFastPreHookSnap(acquireSamplerSnap bool, sampleBuf *[1]metrics.Sample) uint64 {
+	lastG := p.lastObservedGCreated.Load()
+	var curG uint64
+	if sampleBuf != nil {
+		curG = readGoroutinesCreatedInto(sampleBuf)
+	} else {
+		curG = readGoroutinesCreated()
+	}
+	snap := p.preHookSnapSeq.Load()
+	if snap == 0 || curG != lastG {
+		return 0
+	}
+	if !acquireSamplerSnap {
+		return snap
+	}
+	p.activeSnapSamplers.Add(1)
+	if p.preHookSnapSeq.Load() == snap && !p.preHookPruning.Load() {
+		return snap
+	}
+	p.activeSnapSamplers.Add(-1)
+	return 0
+}
+
+func (p *pressureState) observePreHookLiveGIDsWithSample(canPrune, holdsEvictMu, acquireSamplerSnap bool, sampleBuf *[1]metrics.Sample) uint64 {
+	if snap := p.tryFastPreHookSnap(acquireSamplerSnap, sampleBuf); snap != 0 {
+		return snap
+	}
+	p.preHookMu.Lock()
+	defer p.preHookMu.Unlock()
+	curG := readGoroutinesCreated()
+	if snap := p.preHookSnapSeq.Load(); snap != 0 && curG == p.lastObservedGCreated.Load() {
+		if acquireSamplerSnap {
+			p.activeSnapSamplers.Add(1)
+		}
+		return snap
+	}
+	if p.preHookLiveGIDs == nil {
+		p.preHookLiveGIDs = make(map[uint64]uint64, 64)
+	}
+	p.preHookPruning.Store(true)
+	defer p.preHookPruning.Store(false)
+	wasIdle, evictSeqBefore := p.capturePreHookPruneGuard(canPrune, holdsEvictMu)
+	allStacks, bufPtr := captureAllGoroutineStacks()
+	defer releaseAllGoroutineStacks(bufPtr)
+	newSnap := p.preHookSnapSeq.Load() + 1
+	var keep map[uint64]struct{}
+	if wasIdle {
+		keep = make(map[uint64]struct{}, 64)
+	}
+	collectLiveAndParentGIDs(allStacks, newSnap, p.preHookLiveGIDs, keep)
+	if keep != nil && p.confirmPreHookPruneGuard(holdsEvictMu, wasIdle, evictSeqBefore) {
+		pruneUnreferencedKeys(p.preHookLiveGIDs, keep)
+	}
+	p.preHookSnapSeq.Store(newSnap)
+	p.lastObservedGCreated.Store(curG)
+	if acquireSamplerSnap {
+		p.activeSnapSamplers.Add(1)
+	}
+	return newSnap
+}
+
+func (p *pressureState) observePreHookLiveGIDs(canPrune bool) uint64 {
+	return p.observePreHookLiveGIDsWithSample(canPrune, false, false, nil)
+}
+
+func (p *pressureState) wasLiveAtOrBeforeSnap(gid, snap uint64) bool {
+	if gid == 0 || snap == 0 {
+		return false
+	}
+	p.preHookMu.Lock()
+	seenSnap, ok := p.preHookLiveGIDs[gid]
+	p.preHookMu.Unlock()
+	return ok && seenSnap <= snap
 }
 
 func (p *pressureState) activeSamplerSig() uint64 {
@@ -1182,80 +2289,393 @@ func (p *pressureState) isCachedNonDescendantParent(parentGID, sig uint64) bool 
 		p.nonDescendantParentGID.Load() == parentGID
 }
 
+func (p *pressureState) recordExitedSamplerGID(gid uint64) {
+	if gid == 0 {
+		return
+	}
+	idx := p.exitedSamplerSeq.Add(1) & uint64(len(p.exitedSamplerGIDs)-1)
+	p.exitedSamplerGIDs[idx].Store(gid)
+}
+
+func recordPanickedMapEntryLocked(m map[uint64]uint64, seq *atomic.Uint64, gid, epoch uint64) bool {
+	if gid == 0 {
+		return false
+	}
+	if prev, exists := m[gid]; exists {
+		if epoch < prev {
+			m[gid] = epoch
+		}
+		return false
+	}
+	m[gid] = epoch
+	seq.Add(1)
+	return true
+}
+
+func (p *pressureState) prunePanickedMapsLocked(allStacks []byte) {
+	if len(p.panickedRootMap)+len(p.panickedDescMap) <= 64 {
+		return
+	}
+	keep := make(map[uint64]struct{}, 64)
+	for rem := allStacks; len(rem) > 0; {
+		var blk []byte
+		blk, rem = nextGoroutineBlock(rem)
+		gID, pGID := parseStackGoroutineAndParentID(blk)
+		if gID != 0 {
+			keep[gID] = struct{}{}
+		}
+		if pGID != 0 {
+			keep[pGID] = struct{}{}
+		}
+	}
+	pruneUnreferencedKeys(p.panickedRootMap, keep)
+	pruneUnreferencedKeys(p.panickedDescMap, keep)
+}
+
+func (p *pressureState) lookupPanickedEpoch(gid uint64) (rootEpoch uint64, inRoot bool, descEpoch uint64, inDesc bool) {
+	if gid == 0 || !p.hasPanickedEntries.Load() {
+		return 0, false, 0, false
+	}
+	p.panickedMu.Lock()
+	rootEpoch, inRoot = p.panickedRootMap[gid]
+	descEpoch, inDesc = p.panickedDescMap[gid]
+	p.panickedMu.Unlock()
+	return rootEpoch, inRoot, descEpoch, inDesc
+}
+
+func (p *pressureState) isPanickedDescendantForEpoch(gid, startPanicEpoch uint64) bool {
+	if gid == 0 || p.isCurrentGoroutineSampling(gid) {
+		return false
+	}
+	_, _, descEpoch, inDesc := p.lookupPanickedEpoch(gid)
+	return inDesc && descEpoch <= startPanicEpoch && !p.isCurrentGoroutineSampling(gid)
+}
+
+func (p *pressureState) isExitedOrPanickedForEpoch(gid, startPanicEpoch uint64) bool {
+	if gid == 0 || p.isCurrentGoroutineSampling(gid) {
+		return false
+	}
+	rootEpoch, inRoot, descEpoch, inDesc := p.lookupPanickedEpoch(gid)
+	if (inRoot && rootEpoch <= startPanicEpoch) || (inDesc && descEpoch <= startPanicEpoch) {
+		return !p.isCurrentGoroutineSampling(gid)
+	}
+	for i := range len(p.exitedSamplerGIDs) {
+		if p.exitedSamplerGIDs[i].Load() == gid {
+			return !p.isCurrentGoroutineSampling(gid)
+		}
+	}
+	return false
+}
+
+func (p *pressureState) slotStartSnapSeq(gid uint64, slot int) uint64 {
+	switch slot {
+	case samplerSlotPrimary:
+		return p.primaryStartSnapSeq.Load()
+	case samplerSlotFallback:
+		return p.fallbackStartSnapSeq.Load()
+	default:
+		if v, ok := p.overflowSamplingGIDs.Load(gid); ok {
+			return extractOverflowSamplerInfo(v).startSnapSeq
+		}
+		return 0
+	}
+}
+
+func (p *pressureState) seedDirectPanickedChildrenLocked(allStacks, callerStack []byte, hookIdx int, actualGID, startSnap uint64) bool {
+	if !hasCallFrameAboveHook(callerStack[:hookIdx]) {
+		return false
+	}
+	added := false
+	for rem := allStacks; len(rem) > 0; {
+		var blk []byte
+		blk, rem = nextGoroutineBlock(rem)
+		gID, pGID := parseStackGoroutineAndParentID(blk)
+		if gID == 0 || gID == actualGID || pGID != actualGID || p.isCurrentGoroutineSampling(gID) {
+			continue
+		}
+		if p.wasLiveAtOrBeforeSnap(gID, startSnap) {
+			continue
+		}
+		if recordPanickedMapEntryLocked(p.panickedDescMap, &p.panickedDescendantSeq, gID, 0) {
+			added = true
+		}
+	}
+	return added
+}
+
+func (p *pressureState) recordDeadParentOrphanLocked(allStacks, callerStack []byte, hookIdx int, gCreator, blk []byte, pGID, gID, startSnap, mapEpoch uint64) bool {
+	if pGID == 0 || p.wasLiveAtOrBeforeSnap(pGID, startSnap) {
+		return false
+	}
+	if _, _, _, found := findGoroutineBlockByID(allStacks, pGID); found || !aboveHookOwnsExitedChild(callerStack, hookIdx, gCreator, blk) {
+		return false
+	}
+	c1 := recordPanickedMapEntryLocked(p.panickedDescMap, &p.panickedDescendantSeq, pGID, mapEpoch)
+	c2 := recordPanickedMapEntryLocked(p.panickedDescMap, &p.panickedDescendantSeq, gID, mapEpoch)
+	return c1 || c2
+}
+
+func (p *pressureState) expandPanickedStepLocked(allStacks, callerStack []byte, hookIdx int, actualGID, startSnap, tagEpoch uint64, includeOrphans bool) bool {
+	added := false
+	for rem := allStacks; len(rem) > 0; {
+		var blk []byte
+		blk, rem = nextGoroutineBlock(rem)
+		gID, pGID, gCreator := parseStackGoroutineParentAndCreator(blk)
+		if gID == 0 || gID == actualGID || p.isCurrentGoroutineSampling(gID) || p.wasLiveAtOrBeforeSnap(gID, startSnap) {
+			continue
+		}
+		if pGID != 0 {
+			if parentEpoch, ok := p.panickedDescMap[pGID]; ok && (includeOrphans || parentEpoch == 0) {
+				if recordPanickedMapEntryLocked(p.panickedDescMap, &p.panickedDescendantSeq, gID, max(parentEpoch, tagEpoch)) {
+					added = true
+				}
+				continue
+			}
+		}
+		if includeOrphans && p.recordDeadParentOrphanLocked(allStacks, callerStack, hookIdx, gCreator, blk, pGID, gID, startSnap, tagEpoch) {
+			added = true
+		}
+	}
+	return added
+}
+
+func (p *pressureState) populatePanickedLineageLocked(allStacks, callerStack []byte, hookIdx int, actualGID, startSnap, mapEpoch uint64) {
+	if p.panickedRootMap == nil {
+		p.panickedRootMap = make(map[uint64]uint64, 8)
+		p.panickedDescMap = make(map[uint64]uint64, 16)
+	}
+	p.prunePanickedMapsLocked(allStacks)
+	recordPanickedMapEntryLocked(p.panickedRootMap, &p.panickedRootSeq, actualGID, 0)
+	if hookIdx < 0 {
+		return
+	}
+	if p.seedDirectPanickedChildrenLocked(allStacks, callerStack, hookIdx, actualGID, startSnap) {
+		for range 15 {
+			if !p.expandPanickedStepLocked(allStacks, callerStack, hookIdx, actualGID, startSnap, 0, false) {
+				break
+			}
+		}
+	}
+	for range 16 {
+		if !p.expandPanickedStepLocked(allStacks, callerStack, hookIdx, actualGID, startSnap, mapEpoch, true) {
+			break
+		}
+	}
+}
+
+func (p *pressureState) advancePanickedEpochAtLeast(target uint64) {
+	for {
+		cur := p.panickedSamplerEpoch.Load()
+		if cur >= target || p.panickedSamplerEpoch.CompareAndSwap(cur, target) {
+			return
+		}
+	}
+}
+
+func (p *pressureState) resolveExitingSamplerActualGID(callerStack []byte, gid uint64, slot int) uint64 {
+	actualGID, _ := parseStackGoroutineAndParentID(callerStack)
+	if actualGID == 0 {
+		actualGID = gid
+	}
+	if actualGID == 0 && slot == samplerSlotPrimary {
+		actualGID = p.samplingGID.Load()
+	}
+	return actualGID
+}
+
+func (p *pressureState) recordAbnormalSamplerExit(gid uint64, slot int) {
+	p.panickedSamplerEpoch.Add(1)
+	callerStack, callerBufPtr := captureCurrentGoroutineStack()
+	defer releaseCurrentGoroutineStack(callerBufPtr)
+	actualGID := p.resolveExitingSamplerActualGID(callerStack, gid, slot)
+	if actualGID == 0 {
+		return
+	}
+	startSnap := p.slotStartSnapSeq(actualGID, slot)
+	hookIdx := bytes.LastIndex(callerStack, []byte("invokeAndStorePressure"))
+	var allStacks []byte
+	var allBufPtr *[16384]byte
+	if hookIdx >= 0 {
+		allStacks, allBufPtr = captureAllGoroutineStacks()
+		defer releaseAllGoroutineStacks(allBufPtr)
+	}
+	p.panickedMu.Lock()
+	mapEpoch := p.panickedSamplerEpoch.Load() + 1
+	p.populatePanickedLineageLocked(allStacks, callerStack, hookIdx, actualGID, startSnap, mapEpoch)
+	p.hasPanickedEntries.Store(true)
+	p.advancePanickedEpochAtLeast(mapEpoch)
+	p.panickedMu.Unlock()
+}
+
+func (p *pressureState) preRejectSamplerSlot(gid, parentGID, sGID, sParentGID, sig, panicEpoch, snapSeq uint64) bool {
+	if sGID == 0 || !canBeDescendantOf(gid, parentGID, sGID, sParentGID) {
+		return true
+	}
+	if p.isPanickedDescendantForEpoch(gid, panicEpoch) || p.wasLiveAtOrBeforeSnap(gid, snapSeq) {
+		return true
+	}
+	if parentGID == sGID {
+		return false
+	}
+	return p.isCachedNonDescendantParent(parentGID, sig) || p.wasLiveAtOrBeforeSnap(parentGID, snapSeq)
+}
+
+func (p *pressureState) isDescendantOfSamplerSlot(gid, parentGID uint64, creatorFunc, callerStack []byte, allStacks *[]byte, allBufPtr **([16384]byte), sGID, sParentGID, sig, panicEpoch, snapSeq uint64) bool {
+	if p.preRejectSamplerSlot(gid, parentGID, sGID, sParentGID, sig, panicEpoch, snapSeq) {
+		return false
+	}
+	if len(*allStacks) == 0 {
+		*allStacks, *allBufPtr = captureAllGoroutineStacks()
+	}
+	rejectFn := func(ancGID uint64) bool {
+		if ancGID == sGID {
+			return false
+		}
+		if p.wasLiveAtOrBeforeSnap(ancGID, snapSeq) {
+			return true
+		}
+		return p.isExitedOrPanickedForEpoch(ancGID, panicEpoch)
+	}
+	if _, ok := findAncestorCreatorAboveHookOpts(*allStacks, callerStack, parentGID, creatorFunc, []byte("invokeAndStorePressure"), func(ancGID uint64) bool {
+		return ancGID == sGID
+	}, rejectFn); ok {
+		return true
+	}
+	if parentGID != sGID && sig != 0 && p.activeSamplerSig() == sig {
+		p.nonDescendantParentGID.Store(parentGID)
+		p.nonDescendantSeq.Store(sig)
+	}
+	return false
+}
+
+func (p *pressureState) checkOverflowSamplerSlots(gid, parentGID uint64, creatorFunc, callerStack []byte, allStacks *[]byte, allBufPtr **([16384]byte)) (uint64, bool) {
+	if p.overflowSamplingCount.Load() <= 0 {
+		return 0, false
+	}
+	var matchedGID uint64
+	p.overflowSamplingGIDs.Range(func(k, v any) bool {
+		oGID, _ := k.(uint64)
+		info := extractOverflowSamplerInfo(v)
+		if p.isDescendantOfSamplerSlot(gid, parentGID, creatorFunc, callerStack, allStacks, allBufPtr, oGID, info.parentGID, 0, info.startPanicEpoch, info.startSnapSeq) {
+			matchedGID = oGID
+			return false
+		}
+		return true
+	})
+	return matchedGID, matchedGID != 0
+}
+
 func (p *pressureState) checkSamplingGoroutineOrChildSlow() (bool, uint64, uint64) {
 	if !p.hasActiveSampler() {
 		return false, 0, 0
 	}
 	gid, parentGID, creatorFunc, callerStack, callerBufPtr, allStacks, allBufPtr := p.inspectCurrentAndResolvePrimary()
 	defer releaseCurrentGoroutineStack(callerBufPtr)
-	defer releaseAllGoroutineStacks(allBufPtr)
+	defer func() { releaseAllGoroutineStacks(allBufPtr) }()
 	if p.isCurrentGoroutineSampling(gid) {
 		return true, gid, parentGID
 	}
-	if p.canBeDescendantOfActiveSampler(gid, parentGID) {
-		sig := p.activeSamplerSig()
-		isDirectSamplerParent := p.isCurrentGoroutineSampling(parentGID)
-		if !isDirectSamplerParent && p.isCachedNonDescendantParent(parentGID, sig) {
-			return false, gid, parentGID
+	if !p.canBeDescendantOfActiveSampler(gid, parentGID) {
+		return false, gid, parentGID
+	}
+	sig := p.activeSamplerSig()
+	if sGID := p.samplingGID.Load(); sGID != 0 {
+		if p.isDescendantOfSamplerSlot(gid, parentGID, creatorFunc, callerStack, &allStacks, &allBufPtr, sGID, p.samplingParentGID.Load(), sig, p.primaryStartPanicEpoch.Load(), p.primaryStartSnapSeq.Load()) {
+			return true, sGID, parentGID
 		}
-		if ancestorGID, ok := findAncestorCreatorAboveHook(allStacks, callerStack, parentGID, creatorFunc, []byte("invokeAndStorePressure"), p.isCurrentGoroutineSampling); ok {
-			return true, ancestorGID, parentGID
+	}
+	if fGID := p.fallbackGID.Load(); fGID != 0 {
+		if p.isDescendantOfSamplerSlot(gid, parentGID, creatorFunc, callerStack, &allStacks, &allBufPtr, fGID, p.fallbackParentGID.Load(), 0, p.fallbackStartPanicEpoch.Load(), p.fallbackStartSnapSeq.Load()) {
+			return true, fGID, parentGID
 		}
-		if !isDirectSamplerParent && parentGID != 0 && sig != 0 && p.activeSamplerSig() == sig {
-			p.nonDescendantParentGID.Store(parentGID)
-			p.nonDescendantSeq.Store(sig)
-		}
+	}
+	if oGID, ok := p.checkOverflowSamplerSlots(gid, parentGID, creatorFunc, callerStack, &allStacks, &allBufPtr); ok {
+		return true, oGID, parentGID
 	}
 	return false, gid, parentGID
 }
 
 func (p *pressureState) checkSamplingGoroutineOrChild() (sampling bool, rootGID, parentGID uint64) {
-	if p.options.hasCustomPressureFunc {
-		return p.checkSamplingGoroutineOrChildSlow()
+	coord := p.coord()
+	if coord.options.hasCustomPressureFunc && coord.hasActiveSampler() {
+		return coord.checkSamplingGoroutineOrChildSlow()
 	}
 	return
 }
 
 func (p *pressureState) isSamplingGoroutine() bool {
-	if p.options.hasCustomPressureFunc {
-		sampling, _, _ := p.checkSamplingGoroutineOrChildSlow()
-		return sampling
-	}
-	return false
+	coord := p.coord()
+	return coord.options.hasCustomPressureFunc && coord.hasActiveSampler() && coord.isSamplingGoroutineActiveSlow()
 }
 
-func (p *pressureState) recordChildSamplerReclaim() {
+func (p *pressureState) isSamplingGoroutineActiveSlow() bool {
+	sampling, _, _ := p.checkSamplingGoroutineOrChildSlow()
+	return sampling
+}
+
+func (p *pressureState) storeReentrantGID(gid uint64) {
+	if _, loaded := p.reentrantReclaimGIDs.LoadOrStore(gid, struct{}{}); !loaded {
+		p.reentrantReclaimCount.Add(1)
+	}
+}
+
+func (p *pressureState) recordChildSamplerReclaimOn(coord *pressureState) {
 	p.lastReentrantGID.Store(0)
-	if p.samplingPressure.Load() {
+	if coord.samplingPressure.Load() {
 		p.samplingReentrantReclaim.Store(true)
 	}
-	if p.fallbackSampling.Load() {
+	if coord.fallbackSampling.Load() {
 		p.fallbackReentrantReclaim.Store(true)
 	}
-	if p.overflowSamplingCount.Load() > 0 {
-		p.overflowSamplingGIDs.Range(func(k, _ any) bool {
+	if coord.overflowSamplingCount.Load() > 0 {
+		coord.overflowSamplingGIDs.Range(func(k, _ any) bool {
 			if oGID, ok := k.(uint64); ok && oGID != 0 {
-				p.reentrantReclaimGIDs.Store(oGID, struct{}{})
-				p.hasReentrantReclaimGIDs.Store(true)
+				p.storeReentrantGID(oGID)
 			}
 			return true
 		})
 	}
 }
 
-func (p *pressureState) recordReentrantReclaimGID(gid uint64) {
+func (p *pressureState) recordReentrantReclaimGIDOn(coord *pressureState, gid uint64) bool {
 	switch {
 	case gid == 0:
-		p.recordChildSamplerReclaim()
-	case p.samplingGID.Load() == gid:
+		if !coord.hasActiveSampler() {
+			return false
+		}
+		p.recordChildSamplerReclaimOn(coord)
+		return true
+	case coord.samplingGID.Load() == gid:
 		p.samplingReentrantReclaim.Store(true)
-	case p.fallbackGID.Load() == gid:
+		return true
+	case coord.fallbackGID.Load() == gid:
 		p.fallbackReentrantReclaim.Store(true)
-	case p.hasOverflowSamplingGID(gid):
-		p.reentrantReclaimGIDs.Store(gid, struct{}{})
-		p.hasReentrantReclaimGIDs.Store(true)
+		return true
+	case coord.hasOverflowSamplingGID(gid):
+		p.storeReentrantGID(gid)
+		return true
 	default:
-		p.recordChildSamplerReclaim()
+		return false
+	}
+}
+
+func (p *pressureState) clearAllReentrantReclaims() {
+	if p.lastReentrantGID.Load() != 0 {
+		p.lastReentrantGID.Store(0)
+	}
+	if p.samplingReentrantReclaim.Load() {
+		p.samplingReentrantReclaim.Store(false)
+	}
+	if p.fallbackReentrantReclaim.Load() {
+		p.fallbackReentrantReclaim.Store(false)
+	}
+	if p.reentrantReclaimCount.Load() > 0 {
+		p.reentrantReclaimGIDs.Range(func(k, _ any) bool {
+			if _, loaded := p.reentrantReclaimGIDs.LoadAndDelete(k); loaded {
+				p.reentrantReclaimCount.Add(-1)
+			}
+			return true
+		})
 	}
 }
 
@@ -1266,121 +2686,413 @@ func (p *pressureState) clearReentrantSlot(gid uint64, slot int) bool {
 	case samplerSlotFallback:
 		return p.fallbackReentrantReclaim.Load() && p.fallbackReentrantReclaim.Swap(false)
 	default:
-		if gid == 0 || !p.hasReentrantReclaimGIDs.Load() {
+		if gid == 0 || p.reentrantReclaimCount.Load() <= 0 {
 			return false
 		}
 		_, reentrant := p.reentrantReclaimGIDs.LoadAndDelete(gid)
+		if reentrant {
+			p.reentrantReclaimCount.Add(-1)
+		}
 		return reentrant
+	}
+}
+
+func (p *pressureState) clearChildShardsReentrantSlot(excludeShard *pressureState, gid uint64, slot int) {
+	if len(p.childShards) == 0 || !p.anyShardReentrantReclaim.Load() {
+		return
+	}
+	for _, s := range p.childShards {
+		if s != excludeShard {
+			s.clearReentrantSlot(gid, slot)
+		}
 	}
 }
 
 // markReclaimedLocked invalidates cached pre-reclamation pressure and increments reclaimEpoch.
 // Caller MUST hold the cache's write lock.
 func (p *pressureState) markReclaimedLocked() {
+	p.coord().markReclaimedFromShard(p)
+}
+
+func (p *pressureState) invalidateCachedFieldsOnReclaimLocked() {
+	seq := p.cachedPublishSeq.Load()
+	if seq&1 == 0 {
+		p.cachedPublishSeq.Store(seq + 1)
+	}
+	if !p.pressureNeedsRefresh.Load() {
+		p.pressureNeedsRefresh.Store(true)
+	}
+	if p.pressureInitialized.Load() {
+		p.pressureInitialized.Store(false)
+	}
+	if p.cachedPressureBits.Load() != 0 {
+		p.cachedPressureBits.Store(0)
+	}
+}
+
+func (p *pressureState) markReclaimedFromShard(shard *pressureState) {
 	p.pressureWriteMu.Lock()
-	defer p.pressureWriteMu.Unlock()
-	sampling, gid := p.checkSamplingGoroutine()
-	if sampling {
+	var sampling bool
+	var gid uint64
+	if p.options.hasCustomPressureFunc && p.hasActiveSampler() {
+		sampling, gid = p.checkSamplingGoroutine()
+	}
+	if sampling && p.recordReentrantReclaimGIDOn(p, gid) {
 		p.lastReentrantGID.Store(gid)
-		p.recordReentrantReclaimGID(gid)
 	} else {
-		p.lastReentrantGID.Store(0)
-		if p.samplingReentrantReclaim.Load() {
-			p.samplingReentrantReclaim.Store(false)
-		}
-		if p.fallbackReentrantReclaim.Load() {
-			p.fallbackReentrantReclaim.Store(false)
-		}
-		if p.hasReentrantReclaimGIDs.Load() && p.hasReentrantReclaimGIDs.CompareAndSwap(true, false) {
-			p.reentrantReclaimGIDs.Clear()
+		sampling = false
+		p.clearAllReentrantReclaims()
+	}
+	p.invalidateCachedFieldsOnReclaimLocked()
+	if shard != p {
+		shard.reclaimEpoch.Add(1)
+		if sampling {
+			p.anyShardReentrantReclaim.Store(true)
+			shard.lastReentrantGID.Store(gid)
+			_ = shard.recordReentrantReclaimGIDOn(p, gid)
+		} else {
+			shard.clearAllReentrantReclaims()
+			shard.externalReclaimEpoch.Add(1)
 		}
 	}
-	p.pressureNeedsRefresh.Store(true)
-	p.pressureInitialized.Store(false)
-	p.cachedPressureBits.Store(0)
-	p.pressureMaxStoredSeq.Store(0)
-	p.lastSampledSeq.Store(0)
 	p.reclaimEpoch.Add(1)
 	if !sampling {
 		p.externalReclaimEpoch.Add(1)
 	}
+	p.pressureWriteMu.Unlock()
 }
 
 func (p *pressureState) hasElevatedPressureToInvalidate(pressure float64) bool {
-	thresh := p.options.CompactionThreshold
+	coord := p.coord()
+	thresh := coord.options.CompactionThreshold
 	if pressure >= thresh ||
-		math.Float64frombits(p.cachedPressureBits.Load()) >= thresh ||
-		p.pressureNeedsRefresh.Load() {
+		math.Float64frombits(coord.cachedPressureBits.Load()) >= thresh ||
+		coord.pressureNeedsRefresh.Load() {
 		return true
 	}
-	if !p.hasActiveSampler() {
+	if !coord.hasActiveSampler() {
 		return false
 	}
-	return !p.isSamplingGoroutine()
+	return !coord.isSamplingGoroutine()
 }
 
 func (p *pressureState) shouldInvalidatePressureOnReclaim(pressure float64) bool {
-	thresh := p.options.CompactionThreshold
+	coord := p.coord()
+	thresh := coord.options.CompactionThreshold
 	return pressure >= thresh ||
-		math.Float64frombits(p.cachedPressureBits.Load()) >= thresh ||
-		p.pressureNeedsRefresh.Load() ||
-		p.hasActiveSampler()
+		math.Float64frombits(coord.cachedPressureBits.Load()) >= thresh ||
+		coord.pressureNeedsRefresh.Load() ||
+		coord.hasActiveSampler()
 }
 
-func (p *pressureState) resolvePostRetryPressureLocked(sampledEpoch uint64, pressure float64, validSample bool) (uint64, float64) {
-	currentEpoch := p.reclaimEpoch.Load()
-	var resolvedEpoch uint64
-	var resolvedPressure float64
-	switch {
-	case sampledEpoch == currentEpoch:
-		p.hasValidSample = validSample
-		resolvedEpoch = sampledEpoch
-		resolvedPressure = pressure
-	case p.pressureInitialized.Load() && !p.pressureNeedsRefresh.Load() && p.cachedPressureEpoch.Load() == currentEpoch:
-		p.hasValidSample = true
-		resolvedEpoch = currentEpoch
-		resolvedPressure = math.Float64frombits(p.cachedPressureBits.Load())
-	default:
+const (
+	sampleStoreNormal = iota
+	sampleStoreAdoptedCached
+	sampleStoreAdoptedLast
+)
+
+func (p *pressureState) publishCachedPressureLocked(epoch, belowTier1, belowTier2, invokeSeq uint64, val float64, needsRefresh bool) {
+	seq := p.cachedPublishSeq.Load()
+	if seq&1 == 0 {
+		seq++
+		p.cachedPublishSeq.Store(seq)
+	}
+	p.cachedPressureEpoch.Store(epoch)
+	if p.cachedBelowTier1Epoch.Load() != belowTier1 {
+		p.cachedBelowTier1Epoch.Store(belowTier1)
+	}
+	if p.cachedBelowTier2Epoch.Load() != belowTier2 {
+		p.cachedBelowTier2Epoch.Store(belowTier2)
+	}
+	p.cachedPressureSeq.Store(invokeSeq)
+	bits := math.Float64bits(val)
+	if p.cachedPressureBits.Load() != bits {
+		p.cachedPressureBits.Store(bits)
+	}
+	if !p.pressureInitialized.Load() {
+		p.pressureInitialized.Store(true)
+	}
+	if p.pressureNeedsRefresh.Load() != needsRefresh {
+		p.pressureNeedsRefresh.Store(needsRefresh)
+	}
+	p.cachedPublishSeq.Store(seq + 1)
+}
+
+func (p *pressureState) invalidateCachedPressureLocked() {
+	seq := p.cachedPublishSeq.Load()
+	if seq&1 == 0 {
+		seq++
+		p.cachedPublishSeq.Store(seq)
+	}
+	p.pressureNeedsRefresh.Store(true)
+	p.cachedPublishSeq.Store(seq + 1)
+}
+
+func (p *pressureState) republishCachedRecoveryEpochsLocked(belowTier1, belowTier2 uint64) {
+	oldTier1 := p.cachedBelowTier1Epoch.Load()
+	oldTier2 := p.cachedBelowTier2Epoch.Load()
+	if belowTier1 <= oldTier1 && belowTier2 <= oldTier2 {
+		return
+	}
+	seq := p.cachedPublishSeq.Load()
+	if seq&1 == 0 {
+		seq++
+		p.cachedPublishSeq.Store(seq)
+	}
+	if belowTier1 > oldTier1 {
+		p.cachedBelowTier1Epoch.Store(belowTier1)
+	}
+	if belowTier2 > oldTier2 {
+		p.cachedBelowTier2Epoch.Store(belowTier2)
+	}
+	p.cachedPublishSeq.Store(seq + 1)
+}
+
+func (p *pressureState) syncCachedRecoveryEpochsLocked(belowTier1, belowTier2 uint64) {
+	if !p.pressureInitialized.Load() || p.pressureNeedsRefresh.Load() {
+		return
+	}
+	cachedVal := math.Float64frombits(p.cachedPressureBits.Load())
+	if (belowTier2 > p.cachedBelowTier2Epoch.Load() && cachedVal >= p.options.EvictionThreshold) ||
+		(belowTier1 > p.cachedBelowTier1Epoch.Load() && cachedVal >= p.options.CompactionThreshold) {
+		p.invalidateCachedPressureLocked()
+		return
+	}
+	p.republishCachedRecoveryEpochsLocked(belowTier1, belowTier2)
+}
+
+func (p *pressureState) readValidCachedSampleForEpoch(epoch uint64) (float64, uint64, uint64, uint64, bool) {
+	seq1 := p.cachedPublishSeq.Load()
+	if seq1 == 0 || seq1&1 != 0 || !p.pressureInitialized.Load() || p.pressureNeedsRefresh.Load() {
+		return 0.0, 0, 0, 0, false
+	}
+	if p.cachedPressureEpoch.Load() != epoch {
+		return 0.0, 0, 0, 0, false
+	}
+	bits := p.cachedPressureBits.Load()
+	belowTier1 := p.cachedBelowTier1Epoch.Load()
+	belowTier2 := p.cachedBelowTier2Epoch.Load()
+	sampleSeq := p.cachedPressureSeq.Load()
+	if p.cachedPublishSeq.Load() != seq1 || !p.isCachedSampleStillValid(epoch) {
+		return 0.0, 0, 0, 0, false
+	}
+	return math.Float64frombits(bits), belowTier1, belowTier2, sampleSeq, true
+}
+
+func (p *pressureState) advanceRecoveryEpochsForValLocked(val float64, preBelowTier1, preBelowTier2 uint64) (uint64, uint64) {
+	belowTier1 := preBelowTier1
+	if val < p.options.CompactionThreshold {
+		belowTier1 = p.belowTier1Epoch.Add(1)
+	}
+	belowTier2 := preBelowTier2
+	if val < p.options.EvictionThreshold {
+		belowTier2 = p.belowTier2Epoch.Add(1)
+	}
+	return belowTier1, belowTier2
+}
+
+func (p *pressureState) isPreSampleElevatedCausallyStaleLocked(val float64, preBelowTier1, preBelowTier2 uint64) bool {
+	if val >= p.options.EvictionThreshold {
+		return preBelowTier2 < p.belowTier2Epoch.Load()
+	}
+	if val >= p.options.CompactionThreshold {
+		return preBelowTier1 < p.belowTier1Epoch.Load()
+	}
+	return false
+}
+
+func (p *pressureState) recordAcceptedFallbackSample(sampleEpoch, invokeSeq, preBelowTier1, preBelowTier2 uint64, val float64) (uint64, uint64) {
+	p.pressureWriteMu.Lock()
+	defer p.pressureWriteMu.Unlock()
+	if p.isPreSampleElevatedCausallyStaleLocked(val, preBelowTier1, preBelowTier2) {
+		return preBelowTier1, preBelowTier2
+	}
+	if invokeSeq != 0 {
+		lastSeq := p.lastSampledSeq.Load()
+		if invokeSeq > lastSeq {
+			p.lastSampledSeq.Store(invokeSeq)
+			p.lastSampledEpoch = sampleEpoch
+			p.lastSampledPressureBits.Store(math.Float64bits(val))
+			belowTier1, belowTier2 := p.advanceRecoveryEpochsForValLocked(val, preBelowTier1, preBelowTier2)
+			p.syncCachedRecoveryEpochsLocked(belowTier1, belowTier2)
+			return belowTier1, belowTier2
+		}
+		if invokeSeq == lastSeq {
+			p.syncCachedRecoveryEpochsLocked(preBelowTier1, preBelowTier2)
+		}
+	}
+	return preBelowTier1, preBelowTier2
+}
+
+func (p *pressureState) isSampleRecoveryStale(val float64, belowTier1, belowTier2 uint64) bool {
+	coord := p.coord()
+	if val >= p.options.EvictionThreshold {
+		return belowTier2 < coord.belowTier2Epoch.Load()
+	}
+	if val >= p.options.CompactionThreshold {
+		return belowTier1 < coord.belowTier1Epoch.Load()
+	}
+	return false
+}
+
+func (p *pressureState) isSampleCausallyStaleLocked(val float64, belowTier1, belowTier2, sampleSeq uint64) bool {
+	coord := p.coord()
+	if sampleSeq != 0 && (sampleSeq < p.sampledPressureSeq || sampleSeq < coord.lastSampledSeq.Load() || sampleSeq < coord.cachedPressureSeq.Load()) {
+		return true
+	}
+	return p.isSampleRecoveryStale(val, belowTier1, belowTier2)
+}
+
+func (p *pressureState) isElevatedSampleStaleLocked(val float64, belowTier1, belowTier2, sampleSeq uint64) bool {
+	return p.isSampleCausallyStaleLocked(val, belowTier1, belowTier2, sampleSeq)
+}
+
+func (p *pressureState) adoptNewerCachedSampleLocked(minSeq uint64) (float64, uint64, uint64, uint64, bool) {
+	coord := p.coord()
+	val, belowTier1, belowTier2, seq, ok := coord.readValidCachedSampleForEpoch(coord.reclaimEpoch.Load())
+	if !ok || seq <= minSeq || seq < p.sampledPressureSeq {
+		return 0, 0, 0, 0, false
+	}
+	if p.isSampleRecoveryStale(val, belowTier1, belowTier2) {
+		return 0, 0, 0, 0, false
+	}
+	return val, belowTier1, belowTier2, seq, true
+}
+
+func (p *pressureState) canAdoptPostRetryCachedSampleLocked(currentEpoch uint64, shardUnreclaimed bool, minSeq uint64) (float64, uint64, uint64, uint64, bool) {
+	val, belowTier1, belowTier2, seq, ok := p.coord().readValidCachedSampleForEpoch(currentEpoch)
+	if !ok || (shardUnreclaimed && seq < minSeq) || seq < p.sampledPressureSeq {
+		return 0, 0, 0, 0, false
+	}
+	if p.isSampleRecoveryStale(val, belowTier1, belowTier2) {
+		return 0, 0, 0, 0, false
+	}
+	return val, belowTier1, belowTier2, seq, true
+}
+
+func (p *pressureState) canAcceptUnreclaimedShardFallbackLocked(s pressureSample, currentEpoch uint64, shardUnreclaimed bool) bool {
+	return shardUnreclaimed && s.epoch != currentEpoch && s.invokeSeq >= p.sampledPressureSeq && !p.isSampleRecoveryStale(s.val, s.belowTier1, s.belowTier2)
+}
+
+func (p *pressureState) resolvePostRetryPressureLocked(s pressureSample) (uint64, float64) {
+	if !s.valid && p.isSamplingGoroutine() {
 		p.hasValidSample = false
-		resolvedEpoch = currentEpoch
+		return p.reclaimEpoch.Load(), 0.0
+	}
+	coord := p.coord()
+	currentEpoch := coord.reclaimEpoch.Load()
+	acceptedCoordEpoch := currentEpoch
+	belowTier1 := s.belowTier1
+	belowTier2 := s.belowTier2
+	sampleSeq := s.invokeSeq
+	var resolvedPressure float64
+	shardUnreclaimed := s.valid && p.reclaimEpoch.Load() == s.shardEpoch
+	if s.valid && s.epoch == currentEpoch && !p.isElevatedSampleStaleLocked(s.val, s.belowTier1, s.belowTier2, s.invokeSeq) {
+		p.hasValidSample = true
+		resolvedPressure = s.val
+	} else if cachedVal, cachedBelowTier1, cachedBelowTier2, cachedSeq, ok := p.canAdoptPostRetryCachedSampleLocked(currentEpoch, shardUnreclaimed, s.invokeSeq); ok {
+		p.hasValidSample = true
+		belowTier1 = cachedBelowTier1
+		belowTier2 = cachedBelowTier2
+		sampleSeq = cachedSeq
+		resolvedPressure = cachedVal
+	} else if p.canAcceptUnreclaimedShardFallbackLocked(s, currentEpoch, shardUnreclaimed) {
+		p.hasValidSample = true
+		acceptedCoordEpoch = s.epoch
+		belowTier1, belowTier2 = coord.recordAcceptedFallbackSample(s.epoch, s.invokeSeq, s.belowTier1, s.belowTier2, s.val)
+		resolvedPressure = s.val
+	} else {
+		p.hasValidSample = false
 		resolvedPressure = 0.0
 	}
-	p.resetZeroWatermarkBelowTier2(resolvedPressure)
-	return resolvedEpoch, resolvedPressure
+	p.sampledCoordEpoch = acceptedCoordEpoch
+	p.syncZeroWatermarkLocked(belowTier1, belowTier2, sampleSeq, resolvedPressure)
+	return p.reclaimEpoch.Load(), resolvedPressure
 }
 
-func (p *pressureState) sampleForLock(fresh bool) (sampledEpoch, extEpoch uint64, pressure float64, validSample bool) {
+func (p *pressureState) sampleForLock(fresh bool) pressureSample {
 	if fresh {
-		return p.samplePressureFreshWithEpoch()
+		return p.coord().samplePressureFreshForShard(p)
 	}
 	return p.samplePressureWithEpoch()
 }
 
-func (p *pressureState) tryFastForwardSampledEpochLocked(sampledEpoch, extEpoch uint64, pressure float64, validSample bool) uint64 {
-	if !validSample || !p.options.hasCustomPressureFunc || p.externalReclaimEpoch.Load() != extEpoch {
-		return sampledEpoch
+func (p *pressureState) tryFastForwardSampledEpochLocked(targetShard *pressureState, s pressureSample) pressureSample {
+	if !s.valid || !p.options.hasCustomPressureFunc {
+		return s
+	}
+	coordCanFF := p.externalReclaimEpoch.Load() == s.extEpoch
+	shardNeedsFF := targetShard != p && targetShard.reclaimEpoch.Load() != s.shardEpoch && targetShard.externalReclaimEpoch.Load() == s.shardExtEpoch
+	if !coordCanFF && !shardNeedsFF {
+		return s
 	}
 	p.pressureWriteMu.Lock()
 	defer p.pressureWriteMu.Unlock()
-	if p.externalReclaimEpoch.Load() == extEpoch && p.canFastForwardLowPressureEpochLocked(pressure) {
-		return p.reclaimEpoch.Load()
+	if p.canFastForwardLowPressureEpochLocked(s.val) {
+		if p.externalReclaimEpoch.Load() == s.extEpoch {
+			s.epoch = p.reclaimEpoch.Load()
+			s.shardEpoch = targetShard.reclaimEpoch.Load()
+		} else if targetShard != p && targetShard.externalReclaimEpoch.Load() == s.shardExtEpoch {
+			s.shardEpoch = targetShard.reclaimEpoch.Load()
+		}
 	}
-	return sampledEpoch
+	return s
+}
+
+func (p *pressureState) advanceLockRetryBudgetLocked(sampledShardEpoch uint64, sameShardRetries, crossShardRetries *int) bool {
+	if p.reclaimEpoch.Load() != sampledShardEpoch {
+		*sameShardRetries++
+	} else {
+		*crossShardRetries++
+	}
+	return *sameShardRetries <= 2 && *crossShardRetries <= 4
+}
+
+func (p *pressureState) resolveLockLoopStepLocked(s pressureSample, sameShardRetries, crossShardRetries *int) (pressureSample, bool) {
+	coord := p.coord()
+	if s.epoch != coord.reclaimEpoch.Load() {
+		s = coord.tryFastForwardSampledEpochLocked(p, s)
+	}
+	if s.epoch == coord.reclaimEpoch.Load() {
+		if !s.valid || !p.isElevatedSampleStaleLocked(s.val, s.belowTier1, s.belowTier2, s.invokeSeq) {
+			return s, false
+		}
+		if val, belowTier1, belowTier2, seq, ok := p.adoptNewerCachedSampleLocked(s.invokeSeq); ok {
+			s.val = val
+			s.belowTier1 = belowTier1
+			s.belowTier2 = belowTier2
+			s.invokeSeq = seq
+			return s, false
+		}
+	}
+	if !p.advanceLockRetryBudgetLocked(s.shardEpoch, sameShardRetries, crossShardRetries) {
+		return s, false
+	}
+	return s, true
 }
 
 func (p *pressureState) lockWithPressureSlow(mu *sync.RWMutex, fresh bool) (uint64, float64) {
-	sampledEpoch, extEpoch, pressure, validSample := p.sampleForLock(fresh)
+	s := p.sampleForLock(fresh)
 	mu.Lock()
-	for retries := 0; sampledEpoch != p.reclaimEpoch.Load(); retries++ {
-		sampledEpoch = p.tryFastForwardSampledEpochLocked(sampledEpoch, extEpoch, pressure, validSample)
-		if sampledEpoch == p.reclaimEpoch.Load() || retries >= 2 {
+	coord := p.coord()
+	if s.valid && s.epoch == coord.reclaimEpoch.Load() && !p.isElevatedSampleStaleLocked(s.val, s.belowTier1, s.belowTier2, s.invokeSeq) {
+		p.hasValidSample = true
+		p.sampledCoordEpoch = s.epoch
+		p.syncZeroWatermarkLocked(s.belowTier1, s.belowTier2, s.invokeSeq, s.val)
+		return p.reclaimEpoch.Load(), s.val
+	}
+	var sameShardRetries, crossShardRetries int
+	for {
+		var retry bool
+		s, retry = p.resolveLockLoopStepLocked(s, &sameShardRetries, &crossShardRetries)
+		if !retry {
 			break
 		}
 		mu.Unlock()
-		sampledEpoch, extEpoch, pressure, validSample = p.sampleForLock(fresh)
+		s = p.sampleForLock(fresh)
 		mu.Lock()
 	}
-	return p.resolvePostRetryPressureLocked(sampledEpoch, pressure, validSample)
+	return p.resolvePostRetryPressureLocked(s)
 }
 
 func (p *pressureState) canUseCachedSampleForEpoch(epoch, seq uint64) bool {
@@ -1398,29 +3110,35 @@ func (p *pressureState) isCachedSampleStillValid(epoch uint64) bool {
 }
 
 func (p *pressureState) lockWithPressureFastMiss(mu *sync.RWMutex) (uint64, float64) {
-	epoch, _, pressure, valid := p.samplePressureFreshWithEpoch()
+	coord := p.coord()
+	s := coord.samplePressureFreshForShard(p)
 	mu.Lock()
-	if epoch == p.reclaimEpoch.Load() {
-		p.hasValidSample = valid
-		p.resetZeroWatermarkBelowTier2(pressure)
-		return epoch, pressure
+	if s.epoch == coord.reclaimEpoch.Load() && !(s.valid && p.isElevatedSampleStaleLocked(s.val, s.belowTier1, s.belowTier2, s.invokeSeq)) {
+		if !s.valid && p.isSamplingGoroutine() {
+			p.hasValidSample = false
+			return p.reclaimEpoch.Load(), 0.0
+		}
+		p.hasValidSample = s.valid
+		p.sampledCoordEpoch = s.epoch
+		p.syncZeroWatermarkLocked(s.belowTier1, s.belowTier2, s.invokeSeq, s.val)
+		return p.reclaimEpoch.Load(), s.val
 	}
 	mu.Unlock()
 	return p.lockWithPressureSlow(mu, false)
 }
 
 func (p *pressureState) lockWithPressure(mu *sync.RWMutex, fresh bool) (uint64, float64) {
-	if !fresh && !p.options.hasCustomPressureFunc {
-		epoch := p.reclaimEpoch.Load()
-		if p.canUseCachedSampleForEpoch(epoch, p.pressureSampleSeq.Add(1)) {
-			bits := p.cachedPressureBits.Load()
-			if p.isCachedSampleStillValid(epoch) {
+	coord := p.coord()
+	if !fresh && !coord.options.hasCustomPressureFunc {
+		epoch := coord.reclaimEpoch.Load()
+		if coord.canUseCachedSampleForEpoch(epoch, p.pressureSampleSeq.Add(1)) {
+			if pressure, belowTier1, belowTier2, sampleSeq, ok := coord.readValidCachedSampleForEpoch(epoch); ok {
 				mu.Lock()
-				if epoch == p.reclaimEpoch.Load() {
+				if epoch == coord.reclaimEpoch.Load() && !p.isElevatedSampleStaleLocked(pressure, belowTier1, belowTier2, sampleSeq) {
 					p.hasValidSample = true
-					pressure := math.Float64frombits(bits)
-					p.resetZeroWatermarkBelowTier2(pressure)
-					return epoch, pressure
+					p.sampledCoordEpoch = epoch
+					p.syncZeroWatermarkLocked(belowTier1, belowTier2, sampleSeq, pressure)
+					return p.reclaimEpoch.Load(), pressure
 				}
 				mu.Unlock()
 				return p.lockWithPressureSlow(mu, false)
@@ -1431,42 +3149,115 @@ func (p *pressureState) lockWithPressure(mu *sync.RWMutex, fresh bool) (uint64, 
 	return p.lockWithPressureSlow(mu, fresh)
 }
 
-func (p *pressureState) updateCachedPressureLocked(epoch, invokeSeq uint64, val float64) (float64, bool) {
-	if p.reclaimEpoch.Load() != epoch {
-		if !p.pressureInitialized.Load() || p.cachedPressureEpoch.Load() != p.reclaimEpoch.Load() {
-			p.pressureNeedsRefresh.Store(true)
-		}
-		return val, false
-	}
-	if invokeSeq != 0 && invokeSeq < p.pressureMaxStoredSeq.Load() {
-		if p.pressureInitialized.Load() && !p.pressureNeedsRefresh.Load() && p.cachedPressureEpoch.Load() == epoch {
-			val = math.Float64frombits(p.cachedPressureBits.Load())
-		}
-		return val, false
-	}
-	if invokeSeq > p.pressureMaxStoredSeq.Load() {
-		p.pressureMaxStoredSeq.Store(invokeSeq)
-	}
-	bits := math.Float64bits(val)
-	p.pressureInitialized.Store(false)
-	p.cachedPressureEpoch.Store(epoch)
-	p.cachedPressureBits.Store(bits)
-	p.pressureInitialized.Store(true)
-	p.pressureNeedsRefresh.Store(false)
-	return val, true
+func (p *pressureState) canReuseShardSample(validSample bool) bool {
+	return validSample || p.isSamplingGoroutine()
 }
 
-func (p *pressureState) recordLastSampledTelemetryLocked(invokeSeq uint64, val float64, stored bool) {
-	if !stored && p.pressureInitialized.Load() && p.cachedPressureEpoch.Load() == p.reclaimEpoch.Load() {
-		return
+func (p *pressureState) adoptCachedShardSampleLocked(minSeq uint64, sample *shardSample) bool {
+	coord := p.coord()
+	curCoordEpoch := coord.reclaimEpoch.Load()
+	val, belowTier1, belowTier2, seq, ok := coord.readValidCachedSampleForEpoch(curCoordEpoch)
+	if !ok || seq < minSeq || seq < p.sampledPressureSeq {
+		return false
+	}
+	if p.isSampleRecoveryStale(val, belowTier1, belowTier2) {
+		return false
+	}
+	*sample = shardSample{
+		hasSample:  true,
+		valid:      true,
+		pressure:   val,
+		coordEpoch: curCoordEpoch,
+		belowTier1: belowTier1,
+		belowTier2: belowTier2,
+		seq:        seq,
+	}
+	p.hasValidSample = true
+	p.sampledCoordEpoch = curCoordEpoch
+	p.syncZeroWatermarkLocked(sample.belowTier1, sample.belowTier2, sample.seq, sample.pressure)
+	return true
+}
+
+func (p *pressureState) tryApplyShardSampleLocked(fresh bool, sample *shardSample) bool {
+	if !sample.hasSample {
+		return false
+	}
+	if !sample.valid {
+		if !p.isSamplingGoroutine() {
+			return false
+		}
+		p.hasValidSample = false
+		return true
+	}
+	coord := p.coord()
+	epochMismatch := coord.reclaimEpoch.Load() != sample.coordEpoch
+	causallyStale := p.isSampleCausallyStaleLocked(sample.pressure, sample.belowTier1, sample.belowTier2, sample.seq)
+	if epochMismatch || causallyStale {
+		if !fresh || !epochMismatch {
+			minSeq := sample.seq
+			if !epochMismatch {
+				minSeq++
+			}
+			if p.adoptCachedShardSampleLocked(minSeq, sample) {
+				return true
+			}
+		}
+		return false
+	}
+	p.hasValidSample = true
+	p.sampledCoordEpoch = sample.coordEpoch
+	p.syncZeroWatermarkLocked(sample.belowTier1, sample.belowTier2, sample.seq, sample.pressure)
+	return true
+}
+
+func (p *pressureState) lockShardWithSample(mu *sync.RWMutex, fresh bool, sample shardSample) (uint64, shardSample) {
+	if sample.hasSample {
+		mu.Lock()
+		if p.tryApplyShardSampleLocked(fresh, &sample) {
+			return p.reclaimEpoch.Load(), sample
+		}
+		mu.Unlock()
+	}
+	sampledEpoch, resolvedPressure := p.lockWithPressure(mu, fresh)
+	valid := p.hasValidSample
+	var coordEpoch, belowTier1, belowTier2, seq uint64
+	if valid {
+		coordEpoch = p.sampledCoordEpoch
+		belowTier1 = p.sampledBelowTier1Epoch
+		belowTier2 = p.sampledBelowTier2Epoch
+		seq = p.sampledPressureSeq
+	}
+	return sampledEpoch, shardSample{
+		hasSample:  p.canReuseShardSample(valid),
+		valid:      valid,
+		pressure:   resolvedPressure,
+		coordEpoch: coordEpoch,
+		belowTier1: belowTier1,
+		belowTier2: belowTier2,
+		seq:        seq,
+	}
+}
+
+func (p *pressureState) recordLastSampledTelemetryLocked(originalEpoch, epoch, invokeSeq uint64, val float64, willStore, elevatedStale bool) bool {
+	if elevatedStale {
+		return false
+	}
+	if !willStore && p.reclaimEpoch.Load() != epoch {
+		return false
+	}
+	if !willStore && p.pressureInitialized.Load() && p.cachedPressureEpoch.Load() == p.reclaimEpoch.Load() {
+		return false
 	}
 	lastSeq := p.lastSampledSeq.Load()
-	if stored || invokeSeq >= lastSeq {
+	if invokeSeq >= lastSeq || (willStore && originalEpoch > p.lastSampledEpoch) {
 		if invokeSeq > lastSeq {
 			p.lastSampledSeq.Store(invokeSeq)
 		}
+		p.lastSampledEpoch = epoch
 		p.lastSampledPressureBits.Store(math.Float64bits(val))
+		return true
 	}
+	return false
 }
 
 func (p *pressureState) canFastForwardLowPressureEpochLocked(val float64) bool {
@@ -1479,91 +3270,243 @@ func (p *pressureState) canFastForwardLowPressureEpochLocked(val float64) bool {
 		math.Float64frombits(p.cachedPressureBits.Load()) < p.options.CompactionThreshold
 }
 
-func (p *pressureState) storeSampledPressureWithSeq(epoch, extEpoch, invokeSeq uint64, val float64, gid uint64, slot int) (uint64, float64, bool) {
-	p.pressureWriteMu.Lock()
-	defer p.pressureWriteMu.Unlock()
+func (p *pressureState) isSoleReentrantReclaimerLocked(reentrant, noPeerPanic bool, resolvedGID uint64) bool {
+	if !reentrant || !noPeerPanic {
+		return false
+	}
+	lastGID := p.lastReentrantGID.Load()
+	return lastGID == 0 || lastGID == resolvedGID
+}
 
-	val, stored := p.updateCachedPressureLocked(epoch, invokeSeq, val)
-	if p.options.hasCustomPressureFunc {
-		reentrant := p.clearReentrantSlot(gid, slot)
-		if !stored && p.externalReclaimEpoch.Load() == extEpoch {
-			resolvedGID := gid
-			if resolvedGID == 0 && slot == samplerSlotPrimary {
-				resolvedGID = p.samplingGID.Load()
-			}
-			lastGID := p.lastReentrantGID.Load()
-			if reentrant && (lastGID == 0 || lastGID == resolvedGID) {
-				epoch = p.reclaimEpoch.Load()
-				val, stored = p.updateCachedPressureLocked(epoch, invokeSeq, val)
-			} else if p.canFastForwardLowPressureEpochLocked(val) {
-				epoch = p.reclaimEpoch.Load()
-			}
+func (p *pressureState) resolveTargetShardEpochLocked(targetShard *pressureState, shardEpoch, shardExtEpoch uint64, shardReentrant, noPeerPanic bool, resolvedGID uint64, val float64) uint64 {
+	if targetShard == p || targetShard.reclaimEpoch.Load() == shardEpoch || targetShard.externalReclaimEpoch.Load() != shardExtEpoch {
+		return shardEpoch
+	}
+	if targetShard.isSoleReentrantReclaimerLocked(shardReentrant, noPeerPanic, resolvedGID) || p.canFastForwardLowPressureEpochLocked(val) {
+		return targetShard.reclaimEpoch.Load()
+	}
+	return shardEpoch
+}
+
+func (p *pressureState) resolveSampleEpochsLocked(targetShard *pressureState, shardEpoch, shardExtEpoch, epoch, extEpoch uint64, val float64, gid uint64, slot int, noPeerPanic bool) (uint64, uint64, bool) {
+	curEpoch := p.reclaimEpoch.Load()
+	allowStore := curEpoch == epoch
+	if !p.options.hasCustomPressureFunc {
+		return epoch, shardEpoch, allowStore
+	}
+
+	reentrant := p.clearReentrantSlot(gid, slot)
+	shardReentrant := targetShard != p && targetShard.clearReentrantSlot(gid, slot)
+	p.clearChildShardsReentrantSlot(targetShard, gid, slot)
+	resolvedGID := gid
+	if resolvedGID == 0 && slot == samplerSlotPrimary {
+		resolvedGID = p.samplingGID.Load()
+	}
+
+	if !allowStore && p.externalReclaimEpoch.Load() == extEpoch {
+		switch {
+		case p.isSoleReentrantReclaimerLocked(reentrant, noPeerPanic, resolvedGID):
+			epoch = curEpoch
+			shardEpoch = targetShard.reclaimEpoch.Load()
+			allowStore = true
+		case p.canFastForwardLowPressureEpochLocked(val):
+			epoch = curEpoch
+			shardEpoch = targetShard.reclaimEpoch.Load()
 		}
 	}
+	shardEpoch = p.resolveTargetShardEpochLocked(targetShard, shardEpoch, shardExtEpoch, shardReentrant, noPeerPanic, resolvedGID, val)
+	return epoch, shardEpoch, allowStore
+}
 
-	p.recordLastSampledTelemetryLocked(invokeSeq, val, stored)
-	return epoch, val, stored
+func (p *pressureState) decideOlderInvokeSeqLocked(originalEpoch, epoch, invokeSeq uint64, val float64, hasCachedAtEpoch bool) (uint64, float64, bool, int) {
+	if p.lastSampledEpoch == epoch {
+		if !hasCachedAtEpoch {
+			p.pressureNeedsRefresh.Store(true)
+		}
+		return p.lastSampledSeq.Load(), math.Float64frombits(p.lastSampledPressureBits.Load()), false, sampleStoreAdoptedLast
+	}
+	if epoch > originalEpoch && epoch > p.lastSampledEpoch {
+		return p.pressureInvokeSeq.Add(1), val, true, sampleStoreNormal
+	}
+	if originalEpoch <= p.lastSampledEpoch {
+		if !hasCachedAtEpoch {
+			p.pressureNeedsRefresh.Store(true)
+		}
+		return invokeSeq, val, false, sampleStoreNormal
+	}
+	return invokeSeq, val, true, sampleStoreNormal
+}
+
+func (p *pressureState) decideSampleStoreLocked(originalEpoch, epoch, curEpoch, invokeSeq uint64, val float64, allowStore bool) (uint64, float64, bool, int) {
+	if !allowStore {
+		if !p.pressureInitialized.Load() || p.cachedPressureEpoch.Load() != curEpoch {
+			p.pressureNeedsRefresh.Store(true)
+		}
+		return invokeSeq, val, false, sampleStoreNormal
+	}
+	hasCachedAtEpoch := p.pressureInitialized.Load() && !p.pressureNeedsRefresh.Load() && p.cachedPressureEpoch.Load() == epoch
+	if hasCachedAtEpoch && invokeSeq != 0 && invokeSeq < p.cachedPressureSeq.Load() {
+		return p.cachedPressureSeq.Load(), math.Float64frombits(p.cachedPressureBits.Load()), false, sampleStoreAdoptedCached
+	}
+	if invokeSeq != 0 && invokeSeq < p.lastSampledSeq.Load() {
+		return p.decideOlderInvokeSeqLocked(originalEpoch, epoch, invokeSeq, val, hasCachedAtEpoch)
+	}
+	return invokeSeq, val, true, sampleStoreNormal
+}
+
+func (p *pressureState) finishFastPrimaryLocked() {
+	exitingGID := p.resolveExitingPrimaryGID(0, true)
+	p.recordExitedSamplerGID(exitingGID)
+	p.samplingActive.Store(false)
+	p.clearActiveFastPrimaryTag()
+	if p.samplingContended.Load() || p.samplingGID.Load() != 0 {
+		p.samplingResolveMu.Lock()
+		if lateGID := p.samplingGID.Load(); lateGID != 0 && lateGID != exitingGID {
+			p.recordExitedSamplerGID(lateGID)
+		}
+		p.samplingGID.Store(0)
+		p.samplingParentGID.Store(0)
+		p.nonDescendantSeq.Store(0)
+		p.samplingContended.Store(false)
+		p.samplingResolveMu.Unlock()
+	}
+	p.samplingPressure.Store(false)
+}
+
+func (p *pressureState) storeSampledPressureWithSeq(targetShard *pressureState, shardEpoch, shardExtEpoch, epoch, extEpoch, preBelowTier1, preBelowTier2, invokeSeq uint64, val float64, gid uint64, slot int, noPeerPanic, releaseFastPrimary bool) (uint64, uint64, uint64, uint64, uint64, float64) {
+	p.pressureWriteMu.Lock()
+
+	originalEpoch := epoch
+	curEpoch := p.reclaimEpoch.Load()
+	elevatedStale := p.isPreSampleElevatedCausallyStaleLocked(val, preBelowTier1, preBelowTier2)
+	epoch, shardEpoch, allowStore := p.resolveSampleEpochsLocked(targetShard, shardEpoch, shardExtEpoch, epoch, extEpoch, val, gid, slot, noPeerPanic)
+	invokeSeq, val, willStore, storeMode := p.decideSampleStoreLocked(originalEpoch, epoch, curEpoch, invokeSeq, val, allowStore)
+
+	var belowTier1, belowTier2 uint64
+	switch {
+	case storeMode == sampleStoreAdoptedCached:
+		belowTier1 = p.cachedBelowTier1Epoch.Load()
+		belowTier2 = p.cachedBelowTier2Epoch.Load()
+	case storeMode == sampleStoreAdoptedLast:
+		belowTier1 = p.belowTier1Epoch.Load()
+		belowTier2 = p.belowTier2Epoch.Load()
+	case p.recordLastSampledTelemetryLocked(originalEpoch, epoch, invokeSeq, val, willStore, elevatedStale):
+		belowTier1, belowTier2 = p.advanceRecoveryEpochsForValLocked(val, preBelowTier1, preBelowTier2)
+	default:
+		belowTier1 = preBelowTier1
+		belowTier2 = preBelowTier2
+	}
+
+	if willStore {
+		p.publishCachedPressureLocked(epoch, belowTier1, belowTier2, invokeSeq, val, elevatedStale)
+	}
+	if releaseFastPrimary {
+		p.finishFastPrimaryLocked()
+	}
+	p.pressureWriteMu.Unlock()
+	return epoch, shardEpoch, belowTier1, belowTier2, invokeSeq, val
+}
+
+func (p *pressureState) sanitizePressureValue(val float64) float64 {
+	if math.IsNaN(val) || val < 0.0 {
+		return 0.0
+	}
+	if math.IsInf(val, 1) {
+		return max(1.0, p.options.CompactionThreshold, p.options.EvictionThreshold)
+	}
+	return val
 }
 
 //go:noinline
-func (p *pressureState) invokeAndStorePressure(gid uint64, slot int) (uint64, uint64, float64, bool) {
+func (p *pressureState) invokeAndStorePressure(targetShard *pressureState, gid uint64, slot int, fastPrimary bool, tag uint32) pressureSample {
+	completed := false
+	releasedPrimary := false
+	prePanicEpoch := p.panickedSamplerEpoch.Load()
 	if p.options.hasCustomPressureFunc {
 		p.clearReentrantSlot(gid, slot)
+		p.clearChildShardsReentrantSlot(nil, gid, slot)
+		defer func() {
+			if !completed {
+				p.recordAbnormalSamplerExit(gid, slot)
+			}
+			if fastPrimary && !releasedPrimary {
+				p.releasePrimarySamplerSlot(gid, true, completed)
+			}
+		}()
 	}
+	shardExtEpoch := targetShard.externalReclaimEpoch.Load()
+	shardEpoch := targetShard.reclaimEpoch.Load()
 	extEpoch := p.externalReclaimEpoch.Load()
 	epoch := p.reclaimEpoch.Load()
+	preBelowTier1 := p.belowTier1Epoch.Load()
+	preBelowTier2 := p.belowTier2Epoch.Load()
 	invokeSeq := p.pressureInvokeSeq.Add(1)
-	val := p.options.PressureFunc()
-	if math.IsNaN(val) || val < 0.0 {
-		val = 0.0
-	} else if math.IsInf(val, 1) {
-		val = max(1.0, p.options.CompactionThreshold, p.options.EvictionThreshold)
+	var val float64
+	if fastPrimary {
+		val = p.dispatchFastPrimaryPressure(tag)
+	} else {
+		val = p.options.PressureFunc()
 	}
-	epoch, val, _ = p.storeSampledPressureWithSeq(epoch, extEpoch, invokeSeq, val, gid, slot)
-	return epoch, extEpoch, val, true
+	completed = true
+	val = p.sanitizePressureValue(val)
+	noPeerPanic := p.panickedSamplerEpoch.Load() == prePanicEpoch
+	var belowTier1, belowTier2 uint64
+	epoch, shardEpoch, belowTier1, belowTier2, invokeSeq, val = p.storeSampledPressureWithSeq(targetShard, shardEpoch, shardExtEpoch, epoch, extEpoch, preBelowTier1, preBelowTier2, invokeSeq, val, gid, slot, noPeerPanic, fastPrimary)
+	releasedPrimary = fastPrimary
+	return pressureSample{
+		epoch:         epoch,
+		shardEpoch:    shardEpoch,
+		shardExtEpoch: shardExtEpoch,
+		extEpoch:      extEpoch,
+		invokeSeq:     invokeSeq,
+		belowTier1:    belowTier1,
+		belowTier2:    belowTier2,
+		val:           val,
+		valid:         true,
+	}
 }
 
 //go:noinline
-func (p *pressureState) invokeFastPrimaryPressure0() (uint64, uint64, float64, bool) {
-	return p.invokeAndStorePressure(0, samplerSlotPrimary)
+func (p *pressureState) invokeFastPrimaryPressure0() float64 {
+	return p.options.PressureFunc()
 }
 
 //go:noinline
-func (p *pressureState) invokeFastPrimaryPressure1() (uint64, uint64, float64, bool) {
-	return p.invokeAndStorePressure(0, samplerSlotPrimary)
+func (p *pressureState) invokeFastPrimaryPressure1() float64 {
+	return p.options.PressureFunc()
 }
 
 //go:noinline
-func (p *pressureState) invokeFastPrimaryPressure2() (uint64, uint64, float64, bool) {
-	return p.invokeAndStorePressure(0, samplerSlotPrimary)
+func (p *pressureState) invokeFastPrimaryPressure2() float64 {
+	return p.options.PressureFunc()
 }
 
 //go:noinline
-func (p *pressureState) invokeFastPrimaryPressure3() (uint64, uint64, float64, bool) {
-	return p.invokeAndStorePressure(0, samplerSlotPrimary)
+func (p *pressureState) invokeFastPrimaryPressure3() float64 {
+	return p.options.PressureFunc()
 }
 
 //go:noinline
-func (p *pressureState) invokeFastPrimaryPressure4() (uint64, uint64, float64, bool) {
-	return p.invokeAndStorePressure(0, samplerSlotPrimary)
+func (p *pressureState) invokeFastPrimaryPressure4() float64 {
+	return p.options.PressureFunc()
 }
 
 //go:noinline
-func (p *pressureState) invokeFastPrimaryPressure5() (uint64, uint64, float64, bool) {
-	return p.invokeAndStorePressure(0, samplerSlotPrimary)
+func (p *pressureState) invokeFastPrimaryPressure5() float64 {
+	return p.options.PressureFunc()
 }
 
 //go:noinline
-func (p *pressureState) invokeFastPrimaryPressure6() (uint64, uint64, float64, bool) {
-	return p.invokeAndStorePressure(0, samplerSlotPrimary)
+func (p *pressureState) invokeFastPrimaryPressure6() float64 {
+	return p.options.PressureFunc()
 }
 
 //go:noinline
-func (p *pressureState) invokeFastPrimaryPressure7() (uint64, uint64, float64, bool) {
-	return p.invokeAndStorePressure(0, samplerSlotPrimary)
+func (p *pressureState) invokeFastPrimaryPressure7() float64 {
+	return p.options.PressureFunc()
 }
 
-func (p *pressureState) dispatchFastPrimaryPressure(tag uint32) (uint64, uint64, float64, bool) {
+func (p *pressureState) dispatchFastPrimaryPressure(tag uint32) float64 {
 	switch tag {
 	case 0:
 		return p.invokeFastPrimaryPressure0()
@@ -1593,11 +3536,25 @@ func (p *pressureState) ensureSamplingGID(gid, parentGID uint64) (uint64, uint64
 	return gid, parentGID
 }
 
-func (p *pressureState) releasePrimarySamplerSlot(tag uint32, gid uint64, fastPrimary bool) {
-	p.clearReentrantSlot(gid, samplerSlotPrimary)
+func (p *pressureState) resolveExitingPrimaryGID(gid uint64, completed bool) uint64 {
+	if gid == 0 {
+		gid = p.samplingGID.Load()
+	}
+	if gid == 0 && (!completed || p.fallbackSampling.Load() || p.overflowSamplingCount.Load() > 0) {
+		gid, _ = p.ensureSamplingGID(0, 0)
+	}
+	return gid
+}
+
+func (p *pressureState) releasePrimarySamplerSlot(gid uint64, fastPrimary, completed bool) {
+	p.pressureWriteMu.Lock()
+	exitingGID := p.resolveExitingPrimaryGID(gid, completed)
+	p.recordExitedSamplerGID(exitingGID)
+	p.clearReentrantSlot(exitingGID, samplerSlotPrimary)
+	p.clearChildShardsReentrantSlot(nil, exitingGID, samplerSlotPrimary)
 	p.samplingActive.Store(false)
 	if fastPrimary {
-		fastPrimaryTagOwner[tag].Store(0)
+		p.clearActiveFastPrimaryTag()
 	}
 	if !fastPrimary || p.samplingContended.Load() || p.samplingGID.Load() != 0 {
 		p.samplingResolveMu.Lock()
@@ -1608,117 +3565,222 @@ func (p *pressureState) releasePrimarySamplerSlot(tag uint32, gid uint64, fastPr
 		p.samplingResolveMu.Unlock()
 	}
 	p.samplingPressure.Store(false)
+	p.pressureWriteMu.Unlock()
+}
+
+func (p *pressureState) prepareSamplerLineage(canPrune bool) (uint64, uint64) {
+	return p.panickedSamplerEpoch.Load(), p.observePreHookLiveGIDsWithSample(canPrune, false, true, nil)
+}
+
+func (p *pressureState) canSkipPrimaryPreHookProbe() bool {
+	if p.primaryStartSnapSeq.Load() == 0 || p.fallbackSampling.Load() || p.overflowSamplingCount.Load() > 0 {
+		return false
+	}
+	sum, ok := currentGoroutinesCreatedFast()
+	return ok && sum == p.primarySnapGoidSum &&
+		p.primaryStartSnapSeq.Load() == p.preHookSnapSeq.Load() && !p.preHookPruning.Load()
+}
+
+func (p *pressureState) preparePrimarySamplerLineage(canPrune bool) {
+	panicEpoch := p.panickedSamplerEpoch.Load()
+	if p.primaryStartPanicEpoch.Load() != panicEpoch {
+		p.primaryStartPanicEpoch.Store(panicEpoch)
+	}
+	if p.canSkipPrimaryPreHookProbe() {
+		p.activeSnapSamplers.Add(1)
+		if p.primaryStartSnapSeq.Load() == p.preHookSnapSeq.Load() && !p.preHookPruning.Load() {
+			return
+		}
+		p.activeSnapSamplers.Add(-1)
+	}
+	snapSeq := p.observePreHookLiveGIDsWithSample(canPrune, false, true, &p.primaryGCreatedSample)
+	if p.primaryStartSnapSeq.Load() != snapSeq {
+		p.primaryStartSnapSeq.Store(snapSeq)
+	}
+	if snap, ok := captureGoidFastSnap(); ok {
+		p.primarySnapGoidSum = snap.goidSum
+	} else {
+		p.primarySnapGoidSum = math.MaxUint64
+	}
 }
 
 //go:noinline
-func (p *pressureState) sampleWithSlot(gid, parentGID uint64) (uint64, uint64, float64, bool) {
+func (p *pressureState) sampleWithSlot(targetShard *pressureState, gid, parentGID uint64, canPrune bool) pressureSample {
 	if !p.options.hasCustomPressureFunc {
 		defer p.samplingPressure.Store(false)
-		return p.invokeAndStorePressure(0, samplerSlotPrimary)
+		return p.invokeAndStorePressure(targetShard, 0, samplerSlotPrimary, false, 0)
 	}
-	var tag uint32
-	fastPrimary := false
+	p.preparePrimarySamplerLineage(canPrune)
+	defer p.activeSnapSamplers.Add(-1)
 	if gid == 0 {
-		tag, fastPrimary = p.claimFastPrimaryTag()
+		if slot := p.primaryFastSlot; slot != nil && slot.CompareAndSwap(p.primaryFastIdle, p.primaryFastIdle|1) {
+			p.samplingActive.Store(true)
+			return p.invokeAndStorePressure(targetShard, 0, samplerSlotPrimary, true, p.primaryFastTag)
+		}
+		if tag, ok := p.claimFastPrimaryTagSlow(); ok {
+			p.samplingActive.Store(true)
+			return p.invokeAndStorePressure(targetShard, 0, samplerSlotPrimary, true, tag)
+		}
 	}
-	if fastPrimary {
-		p.samplingActive.Store(true)
-	} else {
-		gid, parentGID = p.ensureSamplingGID(gid, parentGID)
-		p.samplingResolveMu.Lock()
-		p.samplingParentGID.Store(parentGID)
-		p.samplingGID.Store(gid)
-		p.samplingActive.Store(true)
-		p.samplingResolveMu.Unlock()
-	}
-	defer p.releasePrimarySamplerSlot(tag, gid, fastPrimary)
-	if fastPrimary {
-		return p.dispatchFastPrimaryPressure(tag)
-	}
-	return p.invokeAndStorePressure(gid, samplerSlotPrimary)
+	gid, parentGID = p.ensureSamplingGID(gid, parentGID)
+	p.samplingResolveMu.Lock()
+	p.samplingParentGID.Store(parentGID)
+	p.samplingGID.Store(gid)
+	p.samplingActive.Store(true)
+	p.samplingResolveMu.Unlock()
+	completed := false
+	defer func() {
+		p.releasePrimarySamplerSlot(gid, false, completed)
+	}()
+	s := p.invokeAndStorePressure(targetShard, gid, samplerSlotPrimary, false, 0)
+	completed = true
+	return s
 }
 
 //go:noinline
-func (p *pressureState) sampleWithFallbackSlot(gid, parentGID uint64) (uint64, uint64, float64, bool) {
+func (p *pressureState) sampleWithFallbackSlot(targetShard *pressureState, gid, parentGID uint64) pressureSample {
 	if p.options.hasCustomPressureFunc {
 		gid, parentGID = p.ensureSamplingGID(gid, parentGID)
-		p.fallbackParentGID.Store(parentGID)
-		p.fallbackGID.Store(gid)
+		panicEpoch, snapSeq := p.prepareSamplerLineage(true)
 		defer func() {
+			p.pressureWriteMu.Lock()
+			p.recordExitedSamplerGID(gid)
 			p.clearReentrantSlot(gid, samplerSlotFallback)
+			p.clearChildShardsReentrantSlot(nil, gid, samplerSlotFallback)
 			p.fallbackGID.Store(0)
 			p.fallbackParentGID.Store(0)
 			p.fallbackSampling.Store(false)
+			p.activeSnapSamplers.Add(-1)
+			p.pressureWriteMu.Unlock()
 		}()
+		p.fallbackStartPanicEpoch.Store(panicEpoch)
+		p.fallbackStartSnapSeq.Store(snapSeq)
+		p.fallbackParentGID.Store(parentGID)
+		p.fallbackGID.Store(gid)
 	} else {
 		defer p.fallbackSampling.Store(false)
 	}
-	return p.invokeAndStorePressure(gid, samplerSlotFallback)
+	return p.invokeAndStorePressure(targetShard, gid, samplerSlotFallback, false, 0)
 }
 
-func (p *pressureState) sampleWithOverflowSlot(gid, parentGID uint64) (uint64, uint64, float64, bool) {
-	if p.options.hasCustomPressureFunc {
-		gid, parentGID = p.ensureSamplingGID(gid, parentGID)
-		p.overflowSamplingGIDs.Store(gid, parentGID)
-	}
+func (p *pressureState) sampleWithOverflowSlot(targetShard *pressureState, gid, parentGID uint64) pressureSample {
 	p.overflowSamplingCount.Add(1)
+	var storedGID uint64
+	acquiredSnap := false
 	defer func() {
 		if p.options.hasCustomPressureFunc {
-			p.clearReentrantSlot(gid, samplerSlotOverflow)
-			p.overflowSamplingGIDs.Delete(gid)
+			p.pressureWriteMu.Lock()
+			p.recordExitedSamplerGID(storedGID)
+			if storedGID != 0 {
+				p.overflowSamplingGIDs.Delete(storedGID)
+			}
+			p.overflowSamplingCount.Add(-1)
+			if acquiredSnap {
+				p.activeSnapSamplers.Add(-1)
+			}
+			p.clearReentrantSlot(storedGID, samplerSlotOverflow)
+			p.clearChildShardsReentrantSlot(nil, storedGID, samplerSlotOverflow)
+			p.pressureWriteMu.Unlock()
+			return
 		}
 		p.overflowSamplingCount.Add(-1)
 	}()
-	return p.invokeAndStorePressure(gid, samplerSlotOverflow)
+	if p.options.hasCustomPressureFunc {
+		gid, parentGID = p.ensureSamplingGID(gid, parentGID)
+		panicEpoch, snapSeq := p.prepareSamplerLineage(true)
+		acquiredSnap = true
+		storedGID = gid
+		p.overflowSamplingGIDs.Store(gid, overflowSamplerInfo{
+			parentGID:       parentGID,
+			startPanicEpoch: panicEpoch,
+			startSnapSeq:    snapSeq,
+		})
+	}
+	return p.invokeAndStorePressure(targetShard, gid, samplerSlotOverflow, false, 0)
 }
 
-// samplePressureFreshWithEpoch evaluates p.options.PressureFunc lock-free outside the cache lock
-// with a goroutine-aware re-entrancy guard and cold-start fallback.
-func (p *pressureState) samplePressureFreshWithEpoch() (uint64, uint64, float64, bool) {
+func (p *pressureState) reentrantFallbackPressureSample(targetShard *pressureState) pressureSample {
+	shardEpoch := targetShard.reclaimEpoch.Load()
+	return pressureSample{
+		epoch:      p.reclaimEpoch.Load(),
+		shardEpoch: shardEpoch,
+		belowTier1: p.belowTier1Epoch.Load(),
+		belowTier2: p.belowTier2Epoch.Load(),
+	}
+}
+
+func (p *pressureState) samplePressureFreshOnCoord(targetShard *pressureState) pressureSample {
 	if p.options.PressureFunc == nil {
+		shardEpoch := targetShard.reclaimEpoch.Load()
 		extEpoch := p.externalReclaimEpoch.Load()
-		return p.reclaimEpoch.Load(), extEpoch, 0.0, true
+		return pressureSample{
+			epoch:      p.reclaimEpoch.Load(),
+			shardEpoch: shardEpoch,
+			extEpoch:   extEpoch,
+			belowTier1: p.belowTier1Epoch.Load(),
+			belowTier2: p.belowTier2Epoch.Load(),
+			valid:      true,
+		}
 	}
 	hadActive := p.hasActiveSampler()
-	sampling, gid, parentGID := p.checkSamplingGoroutineOrChild()
-	if sampling {
-		return p.reclaimEpoch.Load(), 0, 0.0, false
+	var sampling bool
+	var gid, parentGID uint64
+	if p.options.hasCustomPressureFunc {
+		sampling, gid, parentGID = p.checkSamplingGoroutineOrChildSlow()
+		if sampling {
+			return p.reentrantFallbackPressureSample(targetShard)
+		}
 	}
 	if p.samplingPressure.CompareAndSwap(false, true) {
-		return p.sampleWithSlot(gid, parentGID)
+		return p.sampleWithSlot(targetShard, gid, parentGID, true)
 	}
 	if p.options.hasCustomPressureFunc {
 		if !hadActive {
-			sampling, gid, parentGID = p.checkSamplingGoroutineOrChild()
+			sampling, gid, parentGID = p.checkSamplingGoroutineOrChildSlow()
 			if sampling {
-				return p.reclaimEpoch.Load(), 0, 0.0, false
+				return p.reentrantFallbackPressureSample(targetShard)
 			}
 		}
 		gid, parentGID = p.ensureSamplingGID(gid, parentGID)
 	}
 	if p.fallbackSampling.CompareAndSwap(false, true) {
-		return p.sampleWithFallbackSlot(gid, parentGID)
+		return p.sampleWithFallbackSlot(targetShard, gid, parentGID)
 	}
-	return p.sampleWithOverflowSlot(gid, parentGID)
+	return p.sampleWithOverflowSlot(targetShard, gid, parentGID)
+}
+
+// samplePressureFreshForShard evaluates p.options.PressureFunc lock-free outside the cache lock
+// with a goroutine-aware re-entrancy guard and cold-start fallback.
+func (p *pressureState) samplePressureFreshForShard(targetShard *pressureState) pressureSample {
+	return p.coord().samplePressureFreshOnCoord(targetShard)
 }
 
 // samplePressureWithEpoch returns the current memory pressure and epoch for foreground cache operations.
 // Custom PressureFunc callbacks are invoked on every call; the default runtime/metrics probe is amortized
 // across a 256-operation window (and immediately refreshed after any reclamation/compaction cycle).
-func (p *pressureState) samplePressureWithEpoch() (uint64, uint64, float64, bool) {
-	if p.options.hasCustomPressureFunc {
-		return p.samplePressureFreshWithEpoch()
+func (p *pressureState) samplePressureWithEpoch() pressureSample {
+	coord := p.coord()
+	if coord.options.hasCustomPressureFunc {
+		return coord.samplePressureFreshOnCoord(p)
 	}
-	epoch := p.reclaimEpoch.Load()
-	seq := p.pressureSampleSeq.Add(1)
-	if (seq&pressureSampleWindowMask) == 1 || !p.pressureInitialized.Load() || p.pressureNeedsRefresh.Load() || p.cachedPressureEpoch.Load() != epoch {
-		return p.samplePressureFreshWithEpoch()
+	epoch := coord.reclaimEpoch.Load()
+	if !coord.canUseCachedSampleForEpoch(epoch, p.pressureSampleSeq.Add(1)) {
+		return coord.samplePressureFreshOnCoord(p)
 	}
-	bits := p.cachedPressureBits.Load()
-	if !p.pressureInitialized.Load() || p.pressureNeedsRefresh.Load() || p.cachedPressureEpoch.Load() != epoch || p.reclaimEpoch.Load() != epoch {
-		return p.samplePressureFreshWithEpoch()
+	shardEpoch := p.reclaimEpoch.Load()
+	val, belowTier1, belowTier2, sampleSeq, ok := coord.readValidCachedSampleForEpoch(epoch)
+	if !ok {
+		return coord.samplePressureFreshOnCoord(p)
 	}
-	return epoch, 0, math.Float64frombits(bits), true
+	return pressureSample{
+		epoch:      epoch,
+		shardEpoch: shardEpoch,
+		invokeSeq:  sampleSeq,
+		belowTier1: belowTier1,
+		belowTier2: belowTier2,
+		val:        val,
+		valid:      true,
+	}
 }
 
 func (p *pressureState) onEntryPut(newLen int, size uint64) {
@@ -1858,13 +3920,15 @@ func (p *pressureState) computeShedTargets(targetSize uint64, retention float64,
 	if hasProtected && protectedSize > effectiveTarget {
 		effectiveTarget = protectedSize
 	}
-	if currentLen > 0 {
-		targetLen = int(float64(currentLen) * retention)
-		if (!hasProtected || protectedSize <= targetSize) && p.lastReclaimedLen > targetLen {
-			targetLen = p.lastReclaimedLen
+	if p.zeroSizeCount > 0 {
+		if currentLen > 0 {
+			targetLen = int(float64(currentLen) * retention)
+			if (!hasProtected || protectedSize <= targetSize) && p.lastReclaimedLen > targetLen {
+				targetLen = p.lastReclaimedLen
+			}
 		}
+		targetZeroCount, unprotectedZeroTarget = p.computeZeroShedTargets(retention, hasProtected, protectedSize)
 	}
-	targetZeroCount, unprotectedZeroTarget = p.computeZeroShedTargets(retention, hasProtected, protectedSize)
 	return effectiveTarget, targetLen, targetZeroCount, unprotectedZeroTarget
 }
 
@@ -1876,6 +3940,8 @@ func (p *pressureState) updateZeroWatermarkAfterShed(retention float64, currentL
 		} else {
 			p.lastReclaimedLen = 0
 		}
+		p.zeroWatermarkTier2Epoch = p.sampledBelowTier2Epoch
+		p.zeroWatermarkSeq = p.sampledPressureSeq
 	} else {
 		p.lastReclaimedZeroCount = 0
 		p.lastReclaimedLen = 0
@@ -1956,9 +4022,10 @@ type evictEvent[V any] struct {
 // so user OnEvictValue / OnEvictEntry callbacks execute only after all internal
 // structural invariants are restored and c.mu.Unlock() has completed.
 type evictCallbackQueue[V any] struct {
-	buf      [2]evictEvent[V]
-	overflow []evictEvent[V]
-	n        int
+	buf       [2]evictEvent[V]
+	overflow  []evictEvent[V]
+	n         int
+	exactSnap bool
 }
 
 func (q *evictCallbackQueue[V]) enqueue(key string, value V, reason EvictionReason) {
@@ -1972,13 +4039,9 @@ func (q *evictCallbackQueue[V]) enqueue(key string, value V, reason EvictionReas
 }
 
 func (p *pressureState) activeFastEvictTag() (uint32, bool) {
-	id := p.hookIDVal.Load()
-	if id == 0 {
-		return 0, false
-	}
-	tag := p.evictTag(id)
-	if fastEvictTagState[tag].Load() == (id<<1)|1 {
-		return tag, true
+	seq := p.evictHoldSeq.Load()
+	if (seq&(evictHoldActiveBit|evictHoldFastTagBit)) == (evictHoldActiveBit|evictHoldFastTagBit) && !p.evictCallbackActive.Load() {
+		return uint32((seq >> evictHoldTagShift) & evictHoldTagMask), true
 	}
 	return 0, false
 }
@@ -2082,47 +4145,601 @@ func (p *pressureState) resolveActiveEvictCallbackHolder(gid, parentGID uint64, 
 	return 0
 }
 
-func (p *pressureState) isCachedNonDescendantEvictParent(parentGID, holder uint64) bool {
-	return parentGID != 0 && holder != 0 &&
-		p.evictNonDescendantHolder.Load() == holder &&
+func (p *pressureState) isCachedNonDescendantEvictParent(parentGID, holdSeq uint64) bool {
+	return parentGID != 0 && holdSeq != 0 &&
+		p.evictNonDescendantHolder.Load() == holdSeq &&
 		p.evictNonDescendantParent.Load() == parentGID
 }
 
-func (p *pressureState) isDescendantOfEvictHolder(stack []byte, gid, parentGID uint64, creatorFunc []byte, holder uint64) bool {
-	if !canBeDescendantOf(gid, parentGID, holder, p.evictCallbackParentGID.Load()) {
+func (p *pressureState) isCachedConfirmedEvictChild(gid, holdSeq uint64) bool {
+	return gid != 0 && holdSeq != 0 &&
+		p.evictConfirmedChildHold.Load() == holdSeq &&
+		p.evictConfirmedChildGID.Load() == gid
+}
+
+func (p *pressureState) cacheConfirmedEvictChild(gid, holder, holdSeq uint64) {
+	if gid != 0 && p.isSameActiveEvictHold(holder, holdSeq) {
+		p.evictConfirmedChildGID.Store(gid)
+		p.evictConfirmedChildHold.Store(holdSeq)
+	}
+}
+
+func (p *pressureState) isSameActiveEvictHold(holder, holdSeq uint64) bool {
+	return holdSeq != 0 && p.evictHoldSeq.Load() == holdSeq && p.evictCallbackGID.Load() == holder
+}
+
+func (p *pressureState) hasGoroutinesCreatedSinceEvictSnap() bool {
+	return readGoroutinesCreatedInto(&p.evictGCreatedSample) != p.evictSnapGCreated
+}
+
+func (p *pressureState) refreshEvictSnapLocked() {
+	if p.evictFastMode.Load() {
+		p.evictFastMode.Store(false)
+	}
+	snap := p.observePreHookLiveGIDsWithSample(true, true, false, &p.evictGCreatedSample)
+	p.evictStartSnapSeq.Store(snap)
+	p.evictSnapGCreated = p.lastObservedGCreated.Load()
+	if fastSnap, ok := captureGoidFastSnap(); ok {
+		p.evictGoidSnap = fastSnap
+	} else {
+		p.evictGoidSnap = goidFastSnap{goidSum: math.MaxUint64}
+	}
+	p.evictSnapStale = false
+	if !p.evictExactSnap.Load() {
+		p.evictExactSnap.Store(true)
+	}
+}
+
+func (p *pressureState) refreshFastEvictSnapLocked() {
+	snap := p.observePreHookLiveGIDsWithSample(true, true, false, &p.evictGCreatedSample)
+	p.evictStartSnapSeq.Store(snap)
+	p.evictSnapGCreated = p.lastObservedGCreated.Load()
+	if fastSnap, ok := captureGoidFastSnap(); ok {
+		p.evictGoidSnap = fastSnap
+	} else {
+		p.evictGoidSnap = goidFastSnap{goidSum: math.MaxUint64}
+	}
+	p.evictSnapStale = false
+}
+
+func (p *pressureState) hasEvictSnapGoroutinesCreated() bool {
+	if matchesGoidFastSnap(&p.evictGoidSnap) {
 		return false
 	}
-	if parentGID != holder && p.isCachedNonDescendantEvictParent(parentGID, holder) {
+	if snap, ok := captureGoidFastSnap(); ok && snap.goidSum == p.evictGoidSnap.goidSum {
+		p.evictGoidSnap = snap
 		return false
 	}
-	if _, ok := findAncestorCreatorAboveHook(nil, stack, parentGID, creatorFunc, []byte("deliverCallbacks"), func(ancGID uint64) bool {
-		return ancGID == holder
-	}); ok {
+	if p.hasGoroutinesCreatedSinceEvictSnap() {
+		p.evictSnapStale = true
 		return true
 	}
-	if parentGID != holder && p.evictCallbackGID.Load() == holder {
-		p.evictNonDescendantParent.Store(parentGID)
-		p.evictNonDescendantHolder.Store(holder)
+	if snap, ok := captureGoidFastSnap(); ok {
+		p.evictGoidSnap = snap
 	}
 	return false
 }
 
+func (p *pressureState) canEnterFastEvictHold(exact bool, holdIdx uint64) bool {
+	if exact || p.evictSnapStale || (holdIdx&evictLabelRingMask) == 0 ||
+		!p.evictFastMode.Load() || runtimeGetProfLabel() != nil {
+		return false
+	}
+	return !p.hasEvictSnapGoroutinesCreated()
+}
+
+func (p *pressureState) maybeRotateEvictLabelRingLocked(ring *[evictLabelRingSize]unsafe.Pointer) (*[evictLabelRingSize]unsafe.Pointer, bool) {
+	if ring == nil {
+		return nil, true
+	}
+	if readGoroutinesCreated() != p.evictRingEpochGCreated {
+		p.prevEvictLabelRing.Store(ring)
+		ring = newEvictLabelRing()
+		p.evictLabelRing.Store(ring)
+		p.evictRingEpochGCreated = readGoroutinesCreated()
+		return ring, true
+	}
+	return ring, false
+}
+
+func nextEvictHoldIdx(prev uint64) uint64 {
+	return (prev >> evictHoldIdxShift) + (prev & evictHoldActiveBit)
+}
+
+func makeSlowActiveEvictHoldSeq(holdIdx uint64) uint64 {
+	return (holdIdx << evictHoldIdxShift) | evictHoldActiveBit
+}
+
+func makeFastActiveEvictHoldSeq(holdIdx uint64, tag uint32) uint64 {
+	return (holdIdx << evictHoldIdxShift) | (uint64(tag) << evictHoldTagShift) | evictHoldFastTagBit | evictHoldActiveBit
+}
+
+func makeIdleEvictHoldSeq(holdIdx uint64) uint64 {
+	return (holdIdx + 1) << evictHoldIdxShift
+}
+
+func (p *pressureState) needsExactEvictSnap(exact, ringRotated, hasCallerLabel bool, ring *[evictLabelRingSize]unsafe.Pointer) bool {
+	return exact || ringRotated || p.evictProbedUnlabeledHolds < 4 ||
+		hasCallerLabel || ring == nil ||
+		p.evictLabelTampered.Load() || p.evictCallbackEverContended.Load()
+}
+
+func (p *pressureState) resolveSlowHoldSeqLocked(wantFastTag bool, holdIdx uint64) (uint64, bool) {
+	p.evictCurHoldIdx = holdIdx
+	if wantFastTag && !p.evictFastOwned {
+		p.tryAcquireFastEvictLeaseLocked()
+	}
+	if wantFastTag && p.evictFastOwned {
+		return makeFastActiveEvictHoldSeq(holdIdx, p.evictFastTag), true
+	}
+	return makeSlowActiveEvictHoldSeq(holdIdx), false
+}
+
+//go:noinline
+func (p *pressureState) beginEvictCallbackHoldSlow(exact, wantFastTag bool, holdIdx uint64, hasCallerLabel bool) bool {
+	seq, useFastTag := p.resolveSlowHoldSeqLocked(wantFastTag, holdIdx)
+	ring := p.evictLabelRing.Load()
+	ringRotated := false
+	if holdIdx == 0 {
+		p.evictRingEpochGCreated = readGoroutinesCreated()
+	} else if (holdIdx & evictLabelRingMask) == 0 {
+		ring, ringRotated = p.maybeRotateEvictLabelRingLocked(ring)
+	}
+	exactSnap := p.needsExactEvictSnap(exact, ringRotated, hasCallerLabel, ring)
+	if exactSnap {
+		p.refreshEvictSnapLocked()
+	} else {
+		if p.evictSnapStale || p.hasGoroutinesCreatedSinceEvictSnap() {
+			p.refreshFastEvictSnapLocked()
+		}
+		if p.evictExactSnap.Load() {
+			p.evictExactSnap.Store(false)
+		}
+	}
+	if !hasCallerLabel && ring != nil {
+		if p.evictProbedUnlabeledHolds < 4 {
+			p.evictProbedUnlabeledHolds++
+		}
+		tag := ring[holdIdx&evictLabelRingMask]
+		p.evictHeldTagAddr = uintptr(tag)
+		if !p.evictHasActiveRingTag.Load() {
+			p.evictHasActiveRingTag.Store(true)
+		}
+		if !exactSnap && !p.evictFastMode.Load() {
+			p.evictFastMode.Store(true)
+		}
+		runtimeSetProfLabel(tag)
+		p.evictHoldSeq.Store(seq)
+		return useFastTag
+	}
+	p.evictHeldTagAddr = 0
+	if p.evictFastMode.Load() {
+		p.evictFastMode.Store(false)
+	}
+	if p.evictHasActiveRingTag.Load() {
+		p.evictHasActiveRingTag.Store(false)
+	}
+	p.evictHoldSeq.Store(seq)
+	return useFastTag
+}
+
+func (p *pressureState) beginEvictCallbackHold(exact bool) {
+	holdIdx := nextEvictHoldIdx(p.evictHoldSeq.Load())
+	p.evictCurHoldIdx = holdIdx
+	if p.canEnterFastEvictHold(exact, holdIdx) {
+		tag := p.evictLabelRing.Load()[holdIdx&evictLabelRingMask]
+		p.evictHeldTagAddr = uintptr(tag)
+		runtimeSetProfLabel(tag)
+		p.evictHoldSeq.Store(makeSlowActiveEvictHoldSeq(holdIdx))
+		return
+	}
+	p.beginEvictCallbackHoldSlow(exact, false, holdIdx, runtimeGetProfLabel() != nil)
+}
+
+func (p *pressureState) latchEvictLabelTampered() {
+	if !p.evictLabelTampered.Load() {
+		p.evictLabelTampered.Store(true)
+	}
+	if p.evictFastMode.Load() {
+		p.evictFastMode.Store(false)
+	}
+}
+
+func (p *pressureState) isEvictRingTag(label unsafe.Pointer) bool {
+	if label == nil {
+		return false
+	}
+	if ring := p.evictLabelRing.Load(); ring != nil && slices.Contains(ring[:], label) {
+		return true
+	}
+	prev := p.prevEvictLabelRing.Load()
+	return prev != nil && slices.Contains(prev[:], label)
+}
+
+func (p *pressureState) clearHeldEvictLabelLocked() {
+	if !p.evictSnapStale {
+		_ = p.hasEvictSnapGoroutinesCreated()
+	}
+	tagAddr := p.evictHeldTagAddr
+	if tagAddr == 0 {
+		return
+	}
+	p.evictHeldTagAddr = 0
+	if uintptr(runtimeGetProfLabel()) == tagAddr {
+		runtimeSetProfLabel(nil)
+		return
+	}
+	p.latchEvictLabelTampered()
+}
+
+func (p *pressureState) preRejectEvictDescendant(gid, parentGID, holder, holdSeq, startSnap uint64) bool {
+	if !canBeDescendantOf(gid, parentGID, holder, p.evictCallbackParentGID.Load()) {
+		return true
+	}
+	if p.wasLiveAtOrBeforeSnap(gid, startSnap) {
+		return true
+	}
+	if parentGID == holder {
+		return false
+	}
+	return p.isCachedNonDescendantEvictParent(parentGID, holdSeq) || p.wasLiveAtOrBeforeSnap(parentGID, startSnap)
+}
+
+func (p *pressureState) cacheNonDescendantEvictParent(parentGID, holder, holdSeq uint64) {
+	if parentGID != holder && p.isSameActiveEvictHold(holder, holdSeq) {
+		p.evictNonDescendantParent.Store(parentGID)
+		p.evictNonDescendantHolder.Store(holdSeq)
+	}
+}
+
+func (p *pressureState) findExactEvictHolder(allStacks, stack []byte, parentGID uint64, creatorFunc []byte, holder, holdSeq, startSnap uint64) bool {
+	rejectFn := func(ancGID uint64) bool {
+		return ancGID != holder && p.wasLiveAtOrBeforeSnap(ancGID, startSnap)
+	}
+	_, ok := findAncestorCreatorAboveHookOpts(allStacks, stack, parentGID, creatorFunc, []byte("deliverCallbacks"), func(ancGID uint64) bool {
+		return ancGID == holder
+	}, rejectFn)
+	if ok {
+		return true
+	}
+	p.cacheNonDescendantEvictParent(parentGID, holder, holdSeq)
+	return false
+}
+
+func (p *pressureState) resolveHolderEvictHookIdx(holderBlk []byte) int {
+	if fastTag, ok := p.activeFastEvictTag(); ok {
+		if mIdx := bytes.Index(holderBlk, fastEvictCallbackMarkers[fastTag]); mIdx > 0 {
+			return bytes.LastIndex(holderBlk[:mIdx], []byte("deliverCallbacks"))
+		}
+	}
+	if pIdx := bytes.LastIndex(holderBlk, []byte("deliverCallbacksPendingBatch")); pIdx > 0 {
+		return pIdx
+	}
+	return bytes.LastIndex(holderBlk, []byte("deliverCallbacks"))
+}
+
+func extractHolderTopFileLine(holderBlk []byte) (string, int) {
+	_, after, ok := bytes.Cut(holderBlk, []byte("\n\t"))
+	if !ok {
+		return "", 0
+	}
+	lineBytes, _, _ := bytes.Cut(after, []byte{'\n'})
+	if sp := bytes.LastIndexByte(lineBytes, ' '); sp > 0 {
+		lineBytes = lineBytes[:sp]
+	}
+	colon := bytes.LastIndexByte(lineBytes, ':')
+	if colon <= 0 {
+		return "", 0
+	}
+	lineNum, consumed := parseDecimalUint64(lineBytes[colon+1:])
+	if consumed == 0 {
+		return "", 0
+	}
+	return string(lineBytes[:colon]), int(lineNum)
+}
+
+func fetchPprofGoroutineProfile() ([]pprofStackRecord, []unsafe.Pointer) {
+	n, _ := pprofGoroutineProfileWithLabels(nil, nil)
+	for {
+		size := n + 16
+		recs := make([]pprofStackRecord, size)
+		labels := make([]unsafe.Pointer, size)
+		got, ok := pprofGoroutineProfileWithLabels(recs, labels)
+		if ok {
+			return recs[:got], labels[:got]
+		}
+		n = got
+	}
+}
+
+func matchPprofRecordFrame(fr runtime.Frame, fastFuncSuffix, topFile string, topLine int) (bool, bool, bool) {
+	hasFast := fastFuncSuffix != "" && strings.HasSuffix(fr.Function, fastFuncSuffix)
+	hasDeliver := strings.Contains(fr.Function, "deliverCallbacks")
+	hasTop := topLine > 0 && fr.Line == topLine && fr.File == topFile
+	return hasFast, hasDeliver, hasTop
+}
+
+func scanPprofRecordFlags(pcs []uintptr, fastFuncSuffix, topFile string, topLine int) (bool, bool, bool) {
+	if len(pcs) == 0 {
+		return false, false, false
+	}
+	var hasFast, hasDeliver, hasTopLoc bool
+	frames := runtime.CallersFrames(pcs)
+	for {
+		fr, more := frames.Next()
+		f, d, t := matchPprofRecordFrame(fr, fastFuncSuffix, topFile, topLine)
+		if f {
+			hasFast = true
+		}
+		if d {
+			hasDeliver = true
+		}
+		if t {
+			hasTopLoc = true
+		}
+		if !more {
+			return hasFast, hasDeliver, hasTopLoc
+		}
+	}
+}
+
+func isActiveTagHolderRecord(recLabel, activeTag unsafe.Pointer, topLine int, hasTop bool) bool {
+	return activeTag != nil && recLabel == activeTag && (topLine == 0 || hasTop)
+}
+
+func lookupHolderPprofLabel(holderBlk []byte, activeTag unsafe.Pointer, fastTag uint32, hasFastTag bool) (unsafe.Pointer, bool) {
+	topFile, topLine := extractHolderTopFileLine(holderBlk)
+	var fastSuffix string
+	if hasFastTag && fastTag < numPressureHookTags {
+		fastSuffix = fastEvictFuncSuffixes[fastTag]
+	}
+	recs, labels := fetchPprofGoroutineProfile()
+	var fbLabel unsafe.Pointer
+	var fbMatches int
+	for i := range recs {
+		hasFast, hasDeliver, hasTop := scanPprofRecordFlags(recs[i].Stack, fastSuffix, topFile, topLine)
+		if hasFast {
+			return labels[i], true
+		}
+		if !hasDeliver {
+			continue
+		}
+		if isActiveTagHolderRecord(labels[i], activeTag, topLine, hasTop) {
+			return labels[i], true
+		}
+		if hasTop {
+			fbLabel = labels[i]
+			fbMatches++
+		}
+	}
+	if fbMatches == 1 {
+		return fbLabel, true
+	}
+	return nil, false
+}
+
+func findDirectHopForHolder(allStacks, callerStack []byte, parentGID uint64, creatorFunc []byte, holder uint64) ([]byte, []byte, bool) {
+	if parentGID == holder {
+		return creatorFunc, callerStack, true
+	}
+	currGID, lastCreator, lastStack := parentGID, creatorFunc, callerStack
+	const maxHops = 64
+	for range maxHops {
+		if currGID == 0 {
+			return lastCreator, lastStack, false
+		}
+		blk, nextParent, nextCreator, found := findGoroutineBlockByID(allStacks, currGID)
+		if !found {
+			return lastCreator, lastStack, false
+		}
+		if nextParent == holder {
+			return nextCreator, blk, true
+		}
+		currGID, lastCreator, lastStack = nextParent, nextCreator, blk
+	}
+	return lastCreator, lastStack, false
+}
+
+func isCreatorStrictlyBelowHook(holderBlk, aboveHook, belowHook, rootCreator []byte) bool {
+	if len(rootCreator) == 0 || isStdlibWaitGroupGoCreator(rootCreator) || isInternalLRUMethodFrame(rootCreator) {
+		return false
+	}
+	return sectionOwnsSymbol(belowHook, rootCreator) &&
+		!aboveHookOwnsSymbol(holderBlk, aboveHook, rootCreator)
+}
+
+func classifyChildFrameOwnership(holderBlk, aboveHook, belowHook, fn []byte) (matchedAbove, isBelowOwner bool) {
+	if aboveHookOwnsSymbol(holderBlk, aboveHook, fn) {
+		return true, false
+	}
+	if sectionOwnsSymbol(belowHook, fn) {
+		return false, true
+	}
+	owner := findClosureOwnerInStack(holderBlk, fn)
+	if len(owner) > 0 && containsCreatorCallFrame(belowHook, owner) {
+		return false, true
+	}
+	return false, false
+}
+
+func matchChildStackFramesAboveHook(holderBlk, aboveHook, belowHook, childStack []byte) (matchedAbove, sawBelowOwner bool) {
+	end := bytes.LastIndex(childStack, []byte("\ncreated by "))
+	if end <= 0 {
+		return false, false
+	}
+	rest := childStack[:end]
+	const maxBottomFrames = 8
+	for range maxBottomFrames {
+		var fn []byte
+		fn, rest = popBottomCallFrame(rest)
+		if len(fn) == 0 || isInternalLRUMethodFrame(fn) {
+			return false, sawBelowOwner
+		}
+		if bytes.Equal(fn, []byte("sync.(*WaitGroup).Go.func1")) {
+			continue
+		}
+		above, below := classifyChildFrameOwnership(holderBlk, aboveHook, belowHook, fn)
+		if above {
+			return true, false
+		}
+		if below {
+			sawBelowOwner = true
+		}
+	}
+	return false, sawBelowOwner
+}
+
+func (p *pressureState) matchesHolderPprofLabel(holderBlk []byte, activeTag, callerLabel unsafe.Pointer) bool {
+	if callerLabel == nil || isAnyEvictRingTag(callerLabel) {
+		return false
+	}
+	fastTag, hasFastTag := p.activeFastEvictTag()
+	holderLabel, found := lookupHolderPprofLabel(holderBlk, activeTag, fastTag, hasFastTag)
+	return found && holderLabel == callerLabel
+}
+
+func (p *pressureState) verifyLiveHopFromHolderAboveHook(holderBlk, aboveHook, belowHook, hopCreator, hopChildStack []byte, activeTag, callerLabel unsafe.Pointer) bool {
+	if isCreatorStrictlyBelowHook(holderBlk, aboveHook, belowHook, hopCreator) {
+		return false
+	}
+	matchedAbove, sawBelowOwner := matchChildStackFramesAboveHook(holderBlk, aboveHook, belowHook, hopChildStack)
+	if matchedAbove || p.matchesHolderPprofLabel(holderBlk, activeTag, callerLabel) {
+		return true
+	}
+	return !sawBelowOwner
+}
+
+func (p *pressureState) verifyFastMismatchLayer1(allStacks, stack []byte, parentGID uint64, creatorFunc []byte, holder, startSnap uint64, activeTag, callerLabel unsafe.Pointer) bool {
+	rejectFn := func(ancGID uint64) bool {
+		return ancGID != holder && p.wasLiveAtOrBeforeSnap(ancGID, startSnap)
+	}
+	if _, matched := findAncestorCreatorAboveHookOpts(allStacks, stack, parentGID, creatorFunc, []byte("deliverCallbacks"), func(ancGID uint64) bool {
+		return ancGID == holder
+	}, rejectFn); !matched {
+		return false
+	}
+	holderBlk, _, _, found := findGoroutineBlockByID(allStacks, holder)
+	if !found {
+		return false
+	}
+	hookIdx := p.resolveHolderEvictHookIdx(holderBlk)
+	if hookIdx <= 0 || !hasCallFrameAboveHook(holderBlk[:hookIdx]) {
+		return false
+	}
+	aboveHook, belowHook := holderBlk[:hookIdx], holderBlk[hookIdx:]
+	if isAnyEvictRingTag(callerLabel) && !bytes.Contains(aboveHook, []byte("deliverCallbacks")) {
+		return false
+	}
+	hopCreator, hopChildStack, foundHop := findDirectHopForHolder(allStacks, stack, parentGID, creatorFunc, holder)
+	if !foundHop {
+		return true
+	}
+	return p.verifyLiveHopFromHolderAboveHook(holderBlk, aboveHook, belowHook, hopCreator, hopChildStack, activeTag, callerLabel)
+}
+
+//go:noinline
+func (p *pressureState) resolveFastModeEvictMismatch(stack []byte, gid, parentGID uint64, creatorFunc []byte, holder, holdSeq, startSnap uint64, activeTag, callerLabel unsafe.Pointer) bool {
+	if !isAnyEvictRingTag(callerLabel) {
+		p.latchEvictLabelTampered()
+	}
+	allStacks, bufPtr := captureAllGoroutineStacks()
+	ok := p.verifyFastMismatchLayer1(allStacks, stack, parentGID, creatorFunc, holder, startSnap, activeTag, callerLabel)
+	releaseAllGoroutineStacks(bufPtr)
+	if ok {
+		p.cacheConfirmedEvictChild(gid, holder, holdSeq)
+		return true
+	}
+	p.cacheNonDescendantEvictParent(parentGID, holder, holdSeq)
+	return false
+}
+
+//go:noinline
+func (p *pressureState) isDescendantOfEvictHolder(stack []byte, gid, parentGID uint64, creatorFunc []byte, holder, holdSeq, startSnap uint64, exactSnap bool, activeTag, callerLabel unsafe.Pointer) bool {
+	if p.isCachedConfirmedEvictChild(gid, holdSeq) {
+		return true
+	}
+	if p.preRejectEvictDescendant(gid, parentGID, holder, holdSeq, startSnap) {
+		return false
+	}
+	if !exactSnap {
+		if activeTag != nil && callerLabel == activeTag {
+			return true
+		}
+		if callerLabel != nil && p.isEvictRingTag(callerLabel) {
+			p.cacheNonDescendantEvictParent(parentGID, holder, holdSeq)
+			return false
+		}
+		return p.resolveFastModeEvictMismatch(stack, gid, parentGID, creatorFunc, holder, holdSeq, startSnap, activeTag, callerLabel)
+	}
+	allStacks, bufPtr := captureAllGoroutineStacks()
+	ok := p.findExactEvictHolder(allStacks, stack, parentGID, creatorFunc, holder, holdSeq, startSnap)
+	releaseAllGoroutineStacks(bufPtr)
+	return ok
+}
+
+func (p *pressureState) activeEvictRingTagForSeq(holdSeq uint64) unsafe.Pointer {
+	if !p.evictHasActiveRingTag.Load() {
+		return nil
+	}
+	ring := p.evictLabelRing.Load()
+	if ring == nil {
+		return nil
+	}
+	return ring[(holdSeq>>evictHoldIdxShift)&evictLabelRingMask]
+}
+
+func (p *pressureState) isContendedCallerEvictChild(stack []byte, gid, parentGID uint64, creatorFunc []byte, holder uint64) (bool, uint64) {
+	if holder == 0 {
+		return false, 0
+	}
+	holdSeq := p.evictHoldSeq.Load()
+	if (holdSeq & 1) == 0 {
+		return false, 0
+	}
+	if holder == gid {
+		if p.evictHoldSeq.Load() == holdSeq {
+			return true, holdSeq
+		}
+		return false, 0
+	}
+	activeTag := p.activeEvictRingTagForSeq(holdSeq)
+	exactSnap := p.evictExactSnap.Load()
+	startSnap := p.evictStartSnapSeq.Load()
+	if p.evictCallbackGID.Load() != holder || p.evictHoldSeq.Load() != holdSeq {
+		return false, 0
+	}
+	if p.isDescendantOfEvictHolder(stack, gid, parentGID, creatorFunc, holder, holdSeq, startSnap, exactSnap, activeTag, runtimeGetProfLabel()) &&
+		p.evictHoldSeq.Load() == holdSeq {
+		return true, holdSeq
+	}
+	return false, 0
+}
+
 //go:noinline
 func (p *pressureState) lockEvictCallbackSlow() (bool, uint64) {
+	p.evictCallbackEverContended.Store(true)
+	if p.evictFastMode.Load() {
+		p.evictFastMode.Store(false)
+	}
 	stack, bufPtr := captureCurrentGoroutineStack()
 	gid, parentGID, creatorFunc := parseStackGoroutineParentAndCreator(stack)
 	fastTag, hasFastTag := p.activeFastEvictTag()
 	isMyTagFrame := hasFastTag && bytes.Contains(stack, fastEvictCallbackMarkers[fastTag])
 
 	holder := p.resolveActiveEvictCallbackHolder(gid, parentGID, isMyTagFrame)
-	if holder != 0 && (holder == gid || p.isDescendantOfEvictHolder(stack, gid, parentGID, creatorFunc, holder)) {
-		releaseCurrentGoroutineStack(bufPtr)
-		return false, 0
-	}
+	isChild, matchedHoldSeq := p.isContendedCallerEvictChild(stack, gid, parentGID, creatorFunc, holder)
 	releaseCurrentGoroutineStack(bufPtr)
 
+	if isChild {
+		return false, matchedHoldSeq
+	}
+
+	p.evictSlowWaiters.Add(1)
 	p.evictCallbackMu.Lock()
-	return true, p.registerSlowEvictHolder(gid, parentGID)
+	p.evictSlowWaiters.Add(-1)
+	p.beginEvictCallbackHold(true)
+	p.registerSlowEvictHolder(gid, parentGID)
+	return true, 0
 }
 
 //go:noinline
@@ -2147,108 +4764,152 @@ func (p *pressureState) drainPendingEvictCallbacks() {
 	}
 }
 
-func (p *pressureState) cacheFastEvictSlot(id uint64, base, tag uint32, idleState uint64) (uint32, bool) {
+func (p *pressureState) assignFastEvictTagLocked(id uint64, base, tag uint32) {
 	if tag != base {
 		p.setEvictTag(id, tag)
 	}
-	p.evictFastSlot = &fastEvictTagState[tag]
-	p.evictFastIdle = idleState
+	fastEvictTagOwners[tag] = weak.Make(p)
 	p.evictFastTag = tag
-	return tag, true
+	p.evictFastOwned = true
 }
 
-func (p *pressureState) claimFastEvictTagSlow() (uint32, bool) {
+func (p *pressureState) tryAcquireFastEvictLeaseLocked() bool {
+	if p.evictFastOwned {
+		return true
+	}
 	id := p.hookIDVal.Load()
 	if id == 0 {
 		id = p.hookID()
 	}
 	base := p.evictTag(id)
-	idleState := id << 1
-	activeState := idleState | 1
+	fastEvictTagLeaseMu.Lock()
+	defer fastEvictTagLeaseMu.Unlock()
 	for offset := range uint32(numPressureHookTags) {
 		tag := (base + offset) & (numPressureHookTags - 1)
-		cur := fastEvictTagState[tag].Load()
-		if (cur == 0 || cur == idleState) && fastEvictTagState[tag].CompareAndSwap(cur, activeState) {
-			return p.cacheFastEvictSlot(id, base, tag, idleState)
+		owner := fastEvictTagOwners[tag].Value()
+		if owner == nil || owner == p {
+			p.assignFastEvictTagLocked(id, base, tag)
+			return true
 		}
 	}
 	for offset := range uint32(numPressureHookTags) {
 		tag := (base + offset) & (numPressureHookTags - 1)
-		cur := fastEvictTagState[tag].Load()
-		if cur&1 == 0 && fastEvictTagState[tag].CompareAndSwap(cur, activeState) {
-			return p.cacheFastEvictSlot(id, base, tag, idleState)
+		owner := fastEvictTagOwners[tag].Value()
+		if owner == nil {
+			p.assignFastEvictTagLocked(id, base, tag)
+			return true
+		}
+		if owner != p && owner.evictCallbackMu.TryLock() {
+			owner.evictFastOwned = false
+			owner.evictCallbackMu.Unlock()
+			p.assignFastEvictTagLocked(id, base, tag)
+			return true
 		}
 	}
-	return 0, false
-}
-
-func (p *pressureState) clearActiveFastEvictTag() {
-	if slot := p.evictFastSlot; slot != nil {
-		slot.CompareAndSwap(p.evictFastIdle|1, p.evictFastIdle)
-		return
-	}
-	if id := p.hookIDVal.Load(); id != 0 {
-		tag := p.evictTag(id)
-		fastEvictTagState[tag].CompareAndSwap((id<<1)|1, id<<1)
-	}
+	return false
 }
 
 //go:noinline
 func (p *pressureState) drainPendingEvictCallbacksSlow() {
-	p.clearActiveFastEvictTag()
 	p.unlockEvictCallbackSlow(true)
 }
 
 func (p *pressureState) tryDrainPostUnlock() {
 	if p.evictPendingEnqueues.Load() != 0 && p.evictCallbackMu.TryLock() {
+		p.beginEvictCallbackHold(true)
 		p.drainPendingEvictCallbacksSlow()
 	}
 }
 
 func (p *pressureState) prepareSlowEvictDrain() {
-	if p.evictPendingEnqueues.Load() != 0 {
-		if p.evictCallbackGID.Load() == 0 {
-			p.registerSlowEvictHolder(0, 0)
-		} else {
-			p.evictCallbackResolveMu.Lock()
-			p.evictCallbackActive.Store(true)
-			p.evictCallbackResolveMu.Unlock()
-		}
+	p.evictCallbackEverContended.Store(true)
+	if p.evictFastMode.Load() {
+		p.evictFastMode.Store(false)
 	}
+	if (p.evictHoldSeq.Load() & evictHoldActiveBit) == 0 {
+		p.evictHoldSeq.Store(makeSlowActiveEvictHoldSeq(p.evictCurHoldIdx))
+	}
+	if p.evictCallbackGID.Load() == 0 {
+		p.registerSlowEvictHolder(0, 0)
+		return
+	}
+	p.evictCallbackResolveMu.Lock()
+	p.evictCallbackActive.Store(true)
+	p.evictCallbackResolveMu.Unlock()
+}
+
+func (p *pressureState) resetEvictHolderStateLocked() {
+	p.evictCallbackActive.Store(false)
+	p.evictCallbackGID.Store(0)
+	p.evictCallbackParentGID.Store(0)
+	p.evictNonDescendantHolder.Store(0)
+	p.evictConfirmedChildHold.Store(0)
+	p.evictCallbackContended.Store(false)
+}
+
+func (p *pressureState) advanceEvictHoldSeqToIdleLocked() {
+	if cur := p.evictHoldSeq.Load(); (cur & evictHoldActiveBit) != 0 {
+		p.evictHoldSeq.Store(makeIdleEvictHoldSeq(cur >> evictHoldIdxShift))
+	}
+}
+
+func (p *pressureState) ensureSlowEvictDrainReady() {
+	p.evictCallbackEverContended.Store(true)
+	if p.evictFastMode.Load() {
+		p.evictFastMode.Store(false)
+	}
+	if p.evictCallbackGID.Load() == 0 {
+		p.registerSlowEvictHolder(0, 0)
+		return
+	}
+	if !p.evictCallbackActive.Load() {
+		p.evictCallbackResolveMu.Lock()
+		p.evictCallbackActive.Store(true)
+		p.evictCallbackResolveMu.Unlock()
+	}
+}
+
+func (p *pressureState) drainAndFinalizeEvictCallbackSlow() {
+	for {
+		if p.evictPendingEnqueues.Load() != 0 {
+			p.ensureSlowEvictDrainReady()
+			p.drainPendingEvictCallbacks()
+		}
+		p.evictCallbackResolveMu.Lock()
+		if p.evictPendingEnqueues.Load() == 0 && len(p.pendingEvictCallbacks) == 0 {
+			p.advanceEvictHoldSeqToIdleLocked()
+			p.resetEvictHolderStateLocked()
+			p.evictCallbackResolveMu.Unlock()
+			return
+		}
+		p.evictCallbackResolveMu.Unlock()
+	}
+}
+
+func (p *pressureState) finishEvictCallbackUnlock(panicked bool) {
+	if panicked {
+		p.evictCallbackResolveMu.Lock()
+		clear(p.pendingEvictCallbacks)
+		p.pendingEvictCallbacks = nil
+		p.evictPendingEnqueues.Store(0)
+		p.advanceEvictHoldSeqToIdleLocked()
+		p.resetEvictHolderStateLocked()
+		p.evictCallbackResolveMu.Unlock()
+	}
+	p.clearHeldEvictLabelLocked()
+	p.evictCallbackMu.Unlock()
+	p.tryDrainPostUnlock()
 }
 
 func (p *pressureState) unlockEvictCallbackSlow(completed bool) {
 	panicked := true
 	defer func() {
-		p.clearActiveFastEvictTag()
-		p.evictCallbackResolveMu.Lock()
-		if panicked {
-			clear(p.pendingEvictCallbacks)
-			p.pendingEvictCallbacks = nil
-			p.evictPendingEnqueues.Store(0)
-		}
-		p.evictCallbackActive.Store(false)
-		p.evictCallbackGID.Store(0)
-		p.evictCallbackParentGID.Store(0)
-		p.evictNonDescendantHolder.Store(0)
-		p.evictCallbackContended.Store(false)
-		p.evictCallbackResolveMu.Unlock()
-		p.evictCallbackMu.Unlock()
-		if !panicked {
-			p.tryDrainPostUnlock()
-		}
+		p.finishEvictCallbackUnlock(panicked)
 	}()
 	if !completed {
 		return
 	}
-	if p.evictPendingEnqueues.Load() != 0 {
-		if p.evictCallbackGID.Load() == 0 {
-			p.registerSlowEvictHolder(0, 0)
-		} else if !p.evictCallbackActive.Load() {
-			p.evictCallbackActive.Store(true)
-		}
-		p.drainPendingEvictCallbacks()
-	}
+	p.drainAndFinalizeEvictCallbackSlow()
 	panicked = false
 }
 
@@ -2263,8 +4924,7 @@ func (q *evictCallbackQueue[V]) reset() {
 	}
 }
 
-//go:noinline
-func (q *evictCallbackQueue[V]) enqueuePendingCallback(p *pressureState, onVal func(V, EvictionReason), onEntry func(string, V, EvictionReason)) {
+func (q *evictCallbackQueue[V]) takeEvents() []evictEvent[V] {
 	events := make([]evictEvent[V], 0, q.n)
 	inlineCount := min(q.n, len(q.buf))
 	for i := range inlineCount {
@@ -2272,8 +4932,20 @@ func (q *evictCallbackQueue[V]) enqueuePendingCallback(p *pressureState, onVal f
 	}
 	events = append(events, q.overflow...)
 	q.reset()
+	return events
+}
 
+//go:noinline
+func (q *evictCallbackQueue[V]) tryEnqueuePendingCallback(p *pressureState, matchedHoldSeq uint64, onVal func(V, EvictionReason), onEntry func(string, V, EvictionReason)) bool {
+	if matchedHoldSeq != 0 && ((matchedHoldSeq&1) == 0 || p.evictHoldSeq.Load() != matchedHoldSeq) {
+		return false
+	}
 	p.evictCallbackResolveMu.Lock()
+	if matchedHoldSeq != 0 && ((matchedHoldSeq&1) == 0 || p.evictHoldSeq.Load() != matchedHoldSeq) {
+		p.evictCallbackResolveMu.Unlock()
+		return false
+	}
+	events := q.takeEvents()
 	p.pendingEvictCallbacks = append(p.pendingEvictCallbacks, func() {
 		defer clear(events)
 		for i := range events {
@@ -2290,9 +4962,15 @@ func (q *evictCallbackQueue[V]) enqueuePendingCallback(p *pressureState, onVal f
 	p.evictPendingEnqueues.Store(1)
 	p.evictCallbackResolveMu.Unlock()
 
-	if p.evictPendingEnqueues.Load() != 0 && p.evictCallbackMu.TryLock() {
+	if matchedHoldSeq == 0 && p.evictPendingEnqueues.Load() != 0 && p.evictCallbackMu.TryLock() {
+		p.beginEvictCallbackHold(true)
 		p.drainPendingEvictCallbacksSlow()
 	}
+	return true
+}
+
+func (q *evictCallbackQueue[V]) enqueuePendingCallback(p *pressureState, onVal func(V, EvictionReason), onEntry func(string, V, EvictionReason)) {
+	_ = q.tryEnqueuePendingCallback(p, 0, onVal, onEntry)
 }
 
 func (q *evictCallbackQueue[V]) deliverMultiCallbacks(onVal func(V, EvictionReason), onEntry func(string, V, EvictionReason)) {
@@ -2324,22 +5002,33 @@ func (q *evictCallbackQueue[V]) deliverMultiCallbacks(onVal func(V, EvictionReas
 	q.n = 0
 }
 
-func (p *pressureState) finishFastEvictDelivery() bool {
-	if p.evictPendingEnqueues.Load() != 0 {
-		p.prepareSlowEvictDrain()
-		return true
-	}
-	p.evictFastSlot.Store(p.evictFastIdle)
-	if p.evictCallbackContended.Load() || p.evictPendingEnqueues.Load() != 0 {
-		p.prepareSlowEvictDrain()
-		return true
-	}
-	p.evictCallbackMu.Unlock()
+//go:noinline
+func (p *pressureState) tryPostFastUnlockDrain() bool {
 	if p.evictPendingEnqueues.Load() != 0 && p.evictCallbackMu.TryLock() {
+		p.beginEvictCallbackHold(true)
 		p.prepareSlowEvictDrain()
 		return true
 	}
 	return false
+}
+
+//go:noinline
+func (p *pressureState) finishFastEvictDeliverySlow() bool {
+	p.clearHeldEvictLabelLocked()
+	p.advanceEvictHoldSeqToIdleLocked()
+	p.evictCallbackMu.Unlock()
+	return p.tryPostFastUnlockDrain()
+}
+
+func (p *pressureState) tryFastUnlockEvictSlot() (uncontended, fastReady bool) {
+	if p.evictCallbackContended.Load() || p.evictPendingEnqueues.Load() != 0 {
+		return false, false
+	}
+	p.evictHoldSeq.Store(makeIdleEvictHoldSeq(p.evictCurHoldIdx))
+	if p.evictCallbackContended.Load() || p.evictPendingEnqueues.Load() != 0 {
+		return false, false
+	}
+	return true, p.evictHeldTagAddr != 0 && p.evictFastMode.Load()
 }
 
 //go:noinline
@@ -2411,6 +5100,18 @@ func (q *evictCallbackQueue[V]) invokeFastEvictCallbacks7(onVal func(V, Eviction
 	q.deliverCallbacks(onVal, onEntry)
 }
 
+//go:noinline
+func (p *pressureState) finishNonFastEvictDelivery(uncontended bool) {
+	if !uncontended {
+		p.prepareSlowEvictDrain()
+		p.drainPendingEvictCallbacksSlow()
+		return
+	}
+	if p.finishFastEvictDeliverySlow() {
+		p.drainPendingEvictCallbacksSlow()
+	}
+}
+
 func (q *evictCallbackQueue[V]) dispatchFastCallbacks(p *pressureState, tag uint32, onVal func(V, EvictionReason), onEntry func(string, V, EvictionReason)) {
 	panicked := true
 	defer func() {
@@ -2437,52 +5138,75 @@ func (q *evictCallbackQueue[V]) dispatchFastCallbacks(p *pressureState, tag uint
 		q.invokeFastEvictCallbacks7(onVal, onEntry)
 	}
 	panicked = false
-	if p.finishFastEvictDelivery() {
-		p.drainPendingEvictCallbacksSlow()
+	uncontended, fastReady := p.tryFastUnlockEvictSlot()
+	if fastReady && uintptr(runtimeGetProfLabel()) == p.evictHeldTagAddr {
+		p.evictHeldTagAddr = 0
+		runtimeSetProfLabel(nil)
+		p.evictCallbackMu.Unlock()
+		if p.evictPendingEnqueues.Load() != 0 && p.tryPostFastUnlockDrain() {
+			p.drainPendingEvictCallbacksSlow()
+		}
+		return
 	}
+	p.finishNonFastEvictDelivery(uncontended)
 }
 
-func (q *evictCallbackQueue[V]) invokeLockedSlow(p *pressureState, onVal func(V, EvictionReason), onEntry func(string, V, EvictionReason)) {
-	if tag, ok := p.claimFastEvictTagSlow(); ok {
-		q.dispatchFastCallbacks(p, tag, onVal, onEntry)
-		return
+//go:noinline
+func (q *evictCallbackQueue[V]) invokeLockedNoFastTagSlow(p *pressureState, onVal func(V, EvictionReason), onEntry func(string, V, EvictionReason)) {
+	if !p.evictExactSnap.Load() {
+		p.refreshEvictSnapLocked()
 	}
 	p.registerSlowEvictHolder(0, 0)
 	q.deliverCallbacksSlow(p, onVal, onEntry)
 	p.unlockEvictCallbackSlow(true)
 }
 
+//go:noinline
 func (q *evictCallbackQueue[V]) invokeSlow(p *pressureState, onVal func(V, EvictionReason), onEntry func(string, V, EvictionReason)) {
 	if onVal == nil && onEntry == nil {
 		q.reset()
 		return
 	}
-	locked, _ := p.lockEvictCallbackSlow()
-	if !locked {
-		q.enqueuePendingCallback(p, onVal, onEntry)
-		return
+	for {
+		locked, matchedHoldSeq := p.lockEvictCallbackSlow()
+		if locked {
+			q.deliverCallbacksSlow(p, onVal, onEntry)
+			p.unlockEvictCallbackSlow(true)
+			return
+		}
+		if q.tryEnqueuePendingCallback(p, matchedHoldSeq, onVal, onEntry) {
+			return
+		}
 	}
-	q.deliverCallbacksSlow(p, onVal, onEntry)
-	p.unlockEvictCallbackSlow(true)
 }
 
 func (q *evictCallbackQueue[V]) invokeNonEmpty(p *pressureState, onVal func(V, EvictionReason), onEntry func(string, V, EvictionReason)) {
+	p = p.coord()
 	if (onVal != nil || onEntry != nil) && p.evictCallbackMu.TryLock() {
-		if slot := p.evictFastSlot; slot != nil && slot.CompareAndSwap(p.evictFastIdle, p.evictFastIdle|1) {
+		holdIdx := nextEvictHoldIdx(p.evictHoldSeq.Load())
+		p.evictCurHoldIdx = holdIdx
+		if p.evictFastOwned && p.canEnterFastEvictHold(q.exactSnap, holdIdx) {
+			tag := p.evictLabelRing.Load()[holdIdx&evictLabelRingMask]
+			p.evictHeldTagAddr = uintptr(tag)
+			runtimeSetProfLabel(tag)
+			p.evictHoldSeq.Store(makeFastActiveEvictHoldSeq(holdIdx, p.evictFastTag))
 			q.dispatchFastCallbacks(p, p.evictFastTag, onVal, onEntry)
 			return
 		}
-		q.invokeLockedSlow(p, onVal, onEntry)
+		if p.beginEvictCallbackHoldSlow(q.exactSnap, true, holdIdx, runtimeGetProfLabel() != nil) {
+			q.dispatchFastCallbacks(p, p.evictFastTag, onVal, onEntry)
+			return
+		}
+		q.invokeLockedNoFastTagSlow(p, onVal, onEntry)
 		return
 	}
 	q.invokeSlow(p, onVal, onEntry)
 }
 
 func (q *evictCallbackQueue[V]) invoke(p *pressureState, onVal func(V, EvictionReason), onEntry func(string, V, EvictionReason)) {
-	if q.n == 0 {
-		return
+	if q.n != 0 {
+		q.invokeNonEmpty(p, onVal, onEntry)
 	}
-	q.invokeNonEmpty(p, onVal, onEntry)
 }
 
 func appendEvicted[V any](base, extra []V) []V {
@@ -2496,7 +5220,11 @@ func appendEvicted[V any](base, extra []V) []V {
 }
 
 func (p *pressureState) resetZeroWatermarkBelowTier2Slow(pressure float64) {
-	if p.options.PressureFunc == nil || (p.hasValidSample && pressure < p.options.EvictionThreshold && !p.isSamplingGoroutine()) {
+	if p.options.PressureFunc == nil ||
+		(p.hasValidSample &&
+			pressure < p.options.EvictionThreshold &&
+			p.sampledPressureSeq >= p.zeroWatermarkSeq &&
+			!p.isSamplingGoroutine()) {
 		p.lastReclaimedZeroCount = 0
 		p.lastReclaimedLen = 0
 	}
@@ -2506,6 +5234,25 @@ func (p *pressureState) resetZeroWatermarkBelowTier2(pressure float64) {
 	if p.lastReclaimedZeroCount != 0 || p.lastReclaimedLen != 0 {
 		p.resetZeroWatermarkBelowTier2Slow(pressure)
 	}
+}
+
+func (p *pressureState) syncZeroWatermarkLocked(belowTier1, belowTier2, sampleSeq uint64, pressure float64) {
+	if !p.hasValidSample || p.isSamplingGoroutine() {
+		return
+	}
+	if sampleSeq != 0 && sampleSeq < p.sampledPressureSeq {
+		p.hasValidSample = false
+		return
+	}
+	p.sampledBelowTier1Epoch = max(p.sampledBelowTier1Epoch, belowTier1)
+	p.sampledBelowTier2Epoch = max(p.sampledBelowTier2Epoch, belowTier2)
+	p.sampledPressureSeq = sampleSeq
+	if (p.lastReclaimedZeroCount != 0 || p.lastReclaimedLen != 0) && belowTier2 > p.zeroWatermarkTier2Epoch {
+		p.zeroWatermarkTier2Epoch = belowTier2
+		p.lastReclaimedZeroCount = 0
+		p.lastReclaimedLen = 0
+	}
+	p.resetZeroWatermarkBelowTier2(pressure)
 }
 
 func (p *pressureState) recordEviction(reason EvictionReason, weight uint64) {
@@ -2537,6 +5284,7 @@ func (p *pressureState) recordCompactionByPressure(pressure float64) {
 }
 
 func (p *pressureState) snapshotBaseStats(backend Backend, currentSize, maxSize uint64, entryLen int) Stats {
+	coord := p.coord()
 	return Stats{
 		Backend:                  backend,
 		GetHits:                  p.getHits,
@@ -2564,14 +5312,14 @@ func (p *pressureState) snapshotBaseStats(backend Backend, currentSize, maxSize 
 		DeleteDeleted:            p.deleteDeleted,
 		DeleteNotFound:           p.deleteNotFound,
 		DeletePrefixExecuted:     p.deletePrefixExecuted,
-		MemoryPressure:           math.Float64frombits(p.lastSampledPressureBits.Load()),
+		MemoryPressure:           math.Float64frombits(coord.lastSampledPressureBits.Load()),
 		CompactionsExplicit:      p.compactionsExplicit,
 		CompactionsPressureTier1: p.compactionsPressureTier1,
 		CompactionsPressureTier2: p.compactionsPressureTier2,
 		CompactionsAutoSlack:     p.compactionsAutoSlack,
 		PressureShedsInline:      p.pressureShedsInline,
 		PressureShedsExplicit:    p.pressureShedsExplicit,
-		ReclaimEpoch:             p.reclaimEpoch.Load(),
+		ReclaimEpoch:             coord.reclaimEpoch.Load(),
 		DeletedSinceCompact:      p.deletedSinceCompact,
 		PeakEntryLen:             p.peakEntryLen,
 	}
@@ -2590,7 +5338,7 @@ func (p *pressureState) checkWatermarkInvariants(currentLen int) {
 	if p.putInserted > 0 && currentLen > p.peakEntryLen {
 		panic(fmt.Sprintf("lru invariant violation: currentLen %d exceeds peakEntryLen %d", currentLen, p.peakEntryLen))
 	}
-	lastPressure := math.Float64frombits(p.lastSampledPressureBits.Load())
+	lastPressure := math.Float64frombits(p.coord().lastSampledPressureBits.Load())
 	if math.IsNaN(lastPressure) || math.IsInf(lastPressure, 0) || lastPressure < 0.0 {
 		panic(fmt.Sprintf("lru invariant violation: invalid lastSampledPressure %v", lastPressure))
 	}

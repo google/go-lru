@@ -91,13 +91,17 @@ Select an engine via `lru.New[V](maxSize, lru.WithBackend(...))` or call its ded
 
 All three backends (`MapCache`, `RadixCache`, and `ArenaRadixCache`) also implement `lru.PressureAwareCache[V]` (exposing `Compact()` and `EvaluateMemoryPressure()`), expose `Stats() Stats` (`0 allocs/op` point-in-time telemetry snapshot), and provide Go 1.23+ range-over-function iterators (`All() iter.Seq2[string, V]`, `Keys() iter.Seq[string]`, and `Values() iter.Seq[V]`) that traverse live entries in deterministic MRU-to-LRU order under `RLock` without modifying recency (with `0 allocs/op` on `Values()` across all backends). Callers must not invoke write-locking methods on the same `Cache` instance from inside an iterator loop body.
 
+For high-contention multi-core workloads, any backend can be partitioned across `N` independent LRU shards via `lru.NewShardedCache[V](maxSize, shards, shardFn, opts...)` or `lru.WithShards(shards)` / `lru.WithShardFunc(shardFn)` (defaulting to zero-allocation 64-bit FNV-1a routing via `lru.DefaultShardFunc`, or accepting a custom `ShardFunc` such as prefix/tenant routing).
+
 ---
 
 ## Configuration Options
 
 | Option | Default | Applies To | Description |
 | :--- | :--- | :--- | :--- |
-| `WithBackend(backend)` | `BackendMap` | `lru.New` | Selects underlying cache engine (`BackendMap`, `BackendRadix`, `BackendArenaRadix`) |
+| `WithBackend(backend)` | `BackendMap` | `lru.New`, `lru.NewShardedCache` | Selects underlying cache engine (`BackendMap`, `BackendRadix`, `BackendArenaRadix`) |
+| `WithShards(shards)` | unsharded | `lru.New`, `lru.NewMapCache`, `lru.NewRadixCache`, `lru.NewArenaRadixCache` | Partitions `maxSize` across `shards` (`1 <= shards <= maxSize`) independent LRU instances (`NewShardedCache` uses its explicit `shards` parameter) |
+| `WithShardFunc(fn)` | `DefaultShardFunc` | Sharded caches | Custom key-to-shard router `func(key string, numShards int) int` returning `[0, numShards)` |
 | `WithWeigher(fn)` | `1` per entry | All engines | Custom entry-weight callback `func(key string, value V) uint64` for byte/resource-bounded eviction |
 | `WithOnEvictValue(fn)` | `nil` | All engines | Value-only eviction/removal callback `func(value V, reason EvictionReason)` (zero key-reconstruction overhead on radix backends) |
 | `WithOnEvictEntry(fn)` | `nil` | All engines | Full key+value eviction/removal callback `func(key string, value V, reason EvictionReason)` |
@@ -108,7 +112,7 @@ All three backends (`MapCache`, `RadixCache`, and `ArenaRadixCache`) also implem
 | `WithEvictionThreshold(float64)` | `0.90` (`DefaultEvictionThreshold`) | All engines | Tier 2 Critical Pressure threshold triggering proactive LRU tail shedding + compaction |
 | `WithEvictionRetentionRatio(float64)` | `0.50` (`DefaultEvictionRetentionRatio`) | All engines | Target fraction `[0.0, 1.0]` of `maxSize` retained during Tier 2 Critical Pressure shedding |
 
-Eviction callbacks receive an `EvictionReason` (`EvictionReasonCapacity`, `EvictionReasonPressure`, `EvictionReasonDeleted`, or `EvictionReasonReplaced`) and run synchronously inside the mutating operation after the cache's write lock is released (serialized per cache via `evictCallbackMu`, safely supporting re-entrant calls into the same or other `Cache` instances).
+Eviction callbacks receive an `EvictionReason` (`EvictionReasonCapacity`, `EvictionReasonPressure`, `EvictionReasonDeleted`, or `EvictionReasonReplaced`) and run synchronously inside the mutating operation after the cache's write lock is released (serialized per cache via `evictCallbackMu`, safely supporting re-entrant calls into the same or other `Cache` instances from the callback goroutine or awaited child goroutines, while detached goroutines that outlive the callback serialize as independent callers).
 
 ---
 

@@ -22,17 +22,26 @@ import (
 )
 
 // NewArenaRadixCache returns a new arena-backed radix LRU Cache[V] bounded by maxSize.
-// Optional configuration parameters can be passed via opts (e.g. WithWeigher, WithInvariantChecking).
+// Optional configuration parameters can be passed via opts (e.g. WithWeigher, WithShards, WithInvariantChecking).
 //
 // maxSize must be greater than zero; otherwise NewArenaRadixCache panics.
 func NewArenaRadixCache[V any](maxSize uint64, opts ...Option) Cache[V] {
 	if maxSize == 0 {
 		panic("maxSize must be greater than zero")
 	}
-	return newArenaRadixCacheWithOptions[V](maxSize, ApplyOptions(opts...))
+	options := ApplyOptions(opts...)
+	options.Backend = BackendArenaRadix
+	if options.shouldShard() {
+		return newShardedCacheWithOptions[V](maxSize, options.Shards, options)
+	}
+	return newArenaRadixCacheWithOptions[V](maxSize, options)
 }
 
-func newArenaRadixCacheWithOptions[V any](maxSize uint64, options Options) Cache[V] {
+func newArenaRadixCacheWithOptions[V any](maxSize uint64, options Options) *arenaRadix[V] {
+	if !options.hasShardTier2Target {
+		options.hasShardTier2Target = true
+		options.shardTier2Target = computeTargetSize(maxSize, options.EvictionRetentionRatio)
+	}
 	c := &arenaRadix[V]{
 		maxSize:       maxSize,
 		weigher:       resolveWeigher[V](options),
@@ -40,6 +49,7 @@ func newArenaRadixCacheWithOptions[V any](maxSize uint64, options Options) Cache
 		onEvictEntry:  resolveOnEvictEntry[V](options),
 		pressureState: pressureState{options: options},
 	}
+	c.initCoordinator(c.onEvictValue != nil || c.onEvictEntry != nil)
 
 	c.clearEmptyArenaStateLocked()
 
@@ -406,15 +416,21 @@ func (c *arenaRadix[V]) Compact() {
 	c.unlock()
 }
 
+func (c *arenaRadix[V]) evaluateShardPressure(evictQ *evictCallbackQueue[V], sample shardSample) ([]V, shardSample) {
+	sampledEpoch, out := c.lockShardWithSample(&c.mu, true, sample)
+	evicted := c.maybeReclaimUnderPressureLocked(evictQ, out.pressure, nilNode)
+	out.advanceSelfReclaim(c.reclaimEpoch.Load(), sampledEpoch)
+	c.unlock()
+	return evicted, out
+}
+
 // EvaluateMemoryPressure samples the configured memory-pressure probe lock-free,
 // then acquires the exclusive write lock to execute Tier 2 (LRU tail shedding + compaction)
 // or Tier 1 (lossless compaction) if pressure meets or exceeds the configured thresholds.
 // Returns any values evicted during Tier 2 critical-pressure shedding.
 func (c *arenaRadix[V]) EvaluateMemoryPressure() []V {
-	var evictQ evictCallbackQueue[V]
-	_, pressure := c.lockWithPressure(&c.mu, true)
-	evicted := c.maybeReclaimUnderPressureLocked(&evictQ, pressure, nilNode)
-	c.unlock()
+	evictQ := evictCallbackQueue[V]{exactSnap: true}
+	evicted, _ := c.evaluateShardPressure(&evictQ, shardSample{})
 	evictQ.invoke(&c.pressureState, c.onEvictValue, c.onEvictEntry)
 	return evicted
 }
@@ -488,7 +504,7 @@ func (c *arenaRadix[V]) updateExistingOnPutLocked(evictQ *evictCallbackQueue[V],
 	return evictedValues, reclaimedPrePut
 }
 
-func (c *arenaRadix[V]) insertNewOnPutLocked(evictQ *evictCallbackQueue[V], key string, keyHash uint64, value V, valueSize, sizeBefore uint64, pressure float64) (uint32, []V, bool, bool) {
+func (c *arenaRadix[V]) insertNewOnPutLocked(evictQ *evictCallbackQueue[V], key string, keyHash uint64, value V, valueSize, sizeBefore uint64, pressure float64, verifiedMapMiss bool) (uint32, []V, bool, bool) {
 	var evictedValues []V
 	evictedPrePut := false
 	reclaimedPrePut := false
@@ -526,7 +542,11 @@ func (c *arenaRadix[V]) insertNewOnPutLocked(evictQ *evictCallbackQueue[V], key 
 	c.putInserted++
 	c.onEntryPut(c.len, valueSize)
 	c.currentSize += valueSize
-	c.recordNodeMapInsertLocked(keyHash, nodeID)
+	if verifiedMapMiss && !evictedPrePut && !reclaimedPrePut && c.collisionPeers == nil {
+		c.nodeMap[keyHash] = nodeID
+	} else {
+		c.recordNodeMapInsertLocked(keyHash, nodeID)
+	}
 	return nodeID, evictedValues, reclaimedPrePut, compactedPrePut
 }
 
@@ -551,14 +571,14 @@ func (c *arenaRadix[V]) Put(key string, value V) ([]V, error) {
 	reclaimedPrePut := false
 	compactedPrePut := false
 
-	nodeID, exists := c.getNodeKeyWithHash(key, keyHash)
+	nodeID, exists, mapMiss := c.getNodeKeyForPut(key, keyHash)
 	if exists {
 		evictedValues, reclaimedPrePut = c.updateExistingOnPutLocked(&evictQ, nodeID, key, keyHash, value, valueSize, sizeBefore, pressure)
 	} else {
-		nodeID, evictedValues, reclaimedPrePut, compactedPrePut = c.insertNewOnPutLocked(&evictQ, key, keyHash, value, valueSize, sizeBefore, pressure)
+		nodeID, evictedValues, reclaimedPrePut, compactedPrePut = c.insertNewOnPutLocked(&evictQ, key, keyHash, value, valueSize, sizeBefore, pressure, mapMiss)
 	}
 
-	if c.needsMutationReclaim(reclaimedPrePut, c.currentSize, sizeBefore, pressure) {
+	if c.needsArenaPutReclaimLocked(reclaimedPrePut, sizeBefore, pressure) {
 		evictedValues = c.finishMutationReclaimLocked(&evictQ, evictedValues, nodeID, reclaimedPrePut, compactedPrePut, sizeBefore, sampledEpoch, pressure)
 	}
 	if c.options.EnableInvariantChecking {
@@ -570,10 +590,30 @@ func (c *arenaRadix[V]) Put(key string, value V) ([]V, error) {
 	return evictedValues, nil
 }
 
+func (c *arenaRadix[V]) canSkipElevatedPutReclaimLocked(pressure float64) bool {
+	if c.isDirtyLocked() || c.zeroSizeCount > 0 || c.lastReclaimedZeroCount != 0 || c.lastReclaimedLen != 0 {
+		return false
+	}
+	if pressure < c.options.EvictionThreshold {
+		return true
+	}
+	return c.currentSize <= c.tier2TargetSize(c.maxSize) && c.options.EvictionRetentionRatio > 0.0
+}
+
+func (c *arenaRadix[V]) needsArenaPutReclaimLocked(reclaimedPre bool, sizeBefore uint64, pressure float64) bool {
+	if reclaimedPre || c.currentSize < sizeBefore {
+		return true
+	}
+	if pressure < c.options.CompactionThreshold && pressure < c.options.EvictionThreshold {
+		return false
+	}
+	return !c.canSkipElevatedPutReclaimLocked(pressure)
+}
+
 // Delete removes the entry associated with key from the cache, returning its value and true (or the zero value of V and false if not found).
 func (c *arenaRadix[V]) Delete(key string) (value V, ok bool) {
 	keyHash := hashString(key)
-	var evictQ evictCallbackQueue[V]
+	evictQ := evictCallbackQueue[V]{exactSnap: true}
 	sampledEpoch, pressure := c.lockWithPressure(&c.mu, false)
 
 	nodeID, found := c.lookupNodeKeyWithHash(key, keyHash)
@@ -778,13 +818,18 @@ func (c *arenaRadix[V]) evictAllForClearLocked(evictQ *evictCallbackQueue[V]) {
 	}
 }
 
-func (c *arenaRadix[V]) deleteAllPrefixLocked(evictQ *evictCallbackQueue[V], sampledEpoch uint64, pressure float64) {
-	c.deletePrefixExecuted++
+func (c *arenaRadix[V]) isCleanEmptyLocked() bool {
 	hadEntries := c.len > 0
 	hadDirtySlack := c.freeCount > 0 || c.nodeMapDirty || c.peakEntryLen > minPeakSlackEntries || c.deletedSinceCompact > 0 || (c.len == 0 && cap(c.nodes) > 1)
-	if !hadEntries && !hadDirtySlack && c.peakEntryLen == 0 && len(c.nodes) <= 1 {
+	return !hadEntries && !hadDirtySlack && c.peakEntryLen == 0 && len(c.nodes) <= 1
+}
+
+func (c *arenaRadix[V]) deleteAllPrefixLocked(evictQ *evictCallbackQueue[V], sampledEpoch uint64, pressure float64) {
+	c.deletePrefixExecuted++
+	if c.isCleanEmptyLocked() {
 		return
 	}
+	hadDirtySlack := c.freeCount > 0 || c.nodeMapDirty || c.peakEntryLen > minPeakSlackEntries || c.deletedSinceCompact > 0 || (c.len == 0 && cap(c.nodes) > 1)
 	hadReclaimable := c.currentSize > 0 || hadDirtySlack
 	c.deletedSinceCompact += c.len
 	hadCompactionSlack := c.hasEmptyDeleteSlack(len(c.nodes)-1 >= minChurnCompactDeletes)
@@ -793,34 +838,7 @@ func (c *arenaRadix[V]) deleteAllPrefixLocked(evictQ *evictCallbackQueue[V], sam
 	c.finishClearAllLocked(hadCompactionSlack, hadReclaimable, sampledEpoch, pressure)
 }
 
-// DeletePrefix deletes all entries whose keys begin with prefix.
-// It severs the matching subtree in O(1) and iteratively reclaims all nodes into the free-list.
-func (c *arenaRadix[V]) DeletePrefix(prefix string) {
-	if prefix == "" {
-		c.mu.Lock()
-		hadEntries := c.len > 0
-		hadDirtySlack := c.freeCount > 0 || c.nodeMapDirty || c.peakEntryLen > minPeakSlackEntries || c.deletedSinceCompact > 0 || (c.len == 0 && cap(c.nodes) > 1)
-		if !hadEntries && !hadDirtySlack && c.peakEntryLen == 0 && len(c.nodes) <= 1 {
-			c.deletePrefixExecuted++
-			c.unlock()
-			return
-		}
-		c.mu.Unlock()
-
-		var evictQ evictCallbackQueue[V]
-		sampledEpoch, pressure := c.lockWithPressure(&c.mu, false)
-		c.deleteAllPrefixLocked(&evictQ, sampledEpoch, pressure)
-		c.unlock()
-		evictQ.invoke(&c.pressureState, c.onEvictValue, c.onEvictEntry)
-		return
-	}
-
-	var evictQ evictCallbackQueue[V]
-	defer evictQ.invoke(&c.pressureState, c.onEvictValue, c.onEvictEntry)
-
-	sampledEpoch, pressure := c.lockWithPressure(&c.mu, false)
-	defer c.unlock()
-
+func (c *arenaRadix[V]) deleteNonEmptyPrefixLocked(evictQ *evictCallbackQueue[V], prefix string, sampledEpoch uint64, pressure float64) {
 	c.deletePrefixExecuted++
 	nodeID := c.root
 	search := prefix
@@ -843,9 +861,9 @@ func (c *arenaRadix[V]) DeletePrefix(prefix string) {
 			c.nodes[childID].parent = nodeID
 
 			// Now sweep the detached subtree to fix LRU, nodeMap, and currentSize
-			c.freeSubtree(&evictQ, childID)
+			c.freeSubtree(evictQ, childID)
 			c.compressPathUpwards(nodeID)
-			c.finishDeleteReclaimLocked(&evictQ, sizeBefore, sampledEpoch, pressure)
+			c.finishDeleteReclaimLocked(evictQ, sizeBefore, sampledEpoch, pressure)
 			return
 		}
 
@@ -857,6 +875,44 @@ func (c *arenaRadix[V]) DeletePrefix(prefix string) {
 
 		return
 	}
+}
+
+func (c *arenaRadix[V]) deletePrefixShard(evictQ *evictCallbackQueue[V], prefix string, sample shardSample) (shardSample, bool) {
+	if prefix == "" {
+		c.mu.Lock()
+		if c.isCleanEmptyLocked() {
+			c.deletePrefixExecuted++
+			c.unlock()
+			return sample, sample.hasSample
+		}
+		if sample.hasSample && c.tryApplyShardSampleLocked(false, &sample) {
+			preEpoch := c.reclaimEpoch.Load()
+			c.deleteAllPrefixLocked(evictQ, preEpoch, sample.pressure)
+			sample.advanceSelfReclaim(c.reclaimEpoch.Load(), preEpoch)
+			c.unlock()
+			return sample, true
+		}
+		c.mu.Unlock()
+		sampledEpoch, out := c.lockShardWithSample(&c.mu, false, sample)
+		c.deleteAllPrefixLocked(evictQ, sampledEpoch, out.pressure)
+		out.advanceSelfReclaim(c.reclaimEpoch.Load(), sampledEpoch)
+		c.unlock()
+		return out, true
+	}
+
+	sampledEpoch, out := c.lockShardWithSample(&c.mu, false, sample)
+	c.deleteNonEmptyPrefixLocked(evictQ, prefix, sampledEpoch, out.pressure)
+	out.advanceSelfReclaim(c.reclaimEpoch.Load(), sampledEpoch)
+	c.unlock()
+	return out, true
+}
+
+// DeletePrefix deletes all entries whose keys begin with prefix.
+// It severs the matching subtree in O(1) and iteratively reclaims all nodes into the free-list.
+func (c *arenaRadix[V]) DeletePrefix(prefix string) {
+	evictQ := evictCallbackQueue[V]{exactSnap: true}
+	_, _ = c.deletePrefixShard(&evictQ, prefix, shardSample{})
+	evictQ.invoke(&c.pressureState, c.onEvictValue, c.onEvictEntry)
 }
 
 func (c *arenaRadix[V]) evictSubtreeValueNodeLocked(evictQ *evictCallbackQueue[V], currID uint32, currHash uint64) {
@@ -929,14 +985,19 @@ func (c *arenaRadix[V]) All() iter.Seq2[string, V] {
 }
 
 func (c *arenaRadix[V]) all(yield func(string, V) bool) {
+	c.iterateAll(yield)
+}
+
+func (c *arenaRadix[V]) iterateAll(yield func(string, V) bool) bool {
 	c.mu.RLock()
 	defer c.rUnlock()
 
 	for currID := c.head; currID != nilNode; currID = c.nodes[currID].next {
 		if !yield(c.reconstructKey(currID), c.nodes[currID].value) {
-			return
+			return false
 		}
 	}
+	return true
 }
 
 // Keys returns an iterator over all keys in MRU-to-LRU order without modifying recency.
@@ -945,14 +1006,19 @@ func (c *arenaRadix[V]) Keys() iter.Seq[string] {
 }
 
 func (c *arenaRadix[V]) keys(yield func(string) bool) {
+	c.iterateKeys(yield)
+}
+
+func (c *arenaRadix[V]) iterateKeys(yield func(string) bool) bool {
 	c.mu.RLock()
 	defer c.rUnlock()
 
 	for currID := c.head; currID != nilNode; currID = c.nodes[currID].next {
 		if !yield(c.reconstructKey(currID)) {
-			return
+			return false
 		}
 	}
+	return true
 }
 
 // Values returns an iterator over all values in MRU-to-LRU order without modifying recency.
@@ -962,14 +1028,19 @@ func (c *arenaRadix[V]) Values() iter.Seq[V] {
 }
 
 func (c *arenaRadix[V]) values(yield func(V) bool) {
+	c.iterateValues(yield)
+}
+
+func (c *arenaRadix[V]) iterateValues(yield func(V) bool) bool {
 	c.mu.RLock()
 	defer c.rUnlock()
 
 	for currID := c.head; currID != nilNode; currID = c.nodes[currID].next {
 		if !yield(c.nodes[currID].value) {
-			return
+			return false
 		}
 	}
+	return true
 }
 
 // Stats returns a point-in-time, zero-allocation telemetry snapshot of the cache's

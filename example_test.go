@@ -16,6 +16,7 @@ package lru_test
 
 import (
 	"fmt"
+	"strings"
 
 	"github.com/google/go-lru"
 )
@@ -219,4 +220,33 @@ func ExampleNew_stats() {
 	// backend=MapCache len=2 size=8/10
 	// hits=1 misses=1
 	// capacity_evictions=1 capacity_evicted_weight=4
+}
+
+// ExampleNewShardedCache demonstrates creating a sharded RadixCache with a custom
+// prefix-locality ShardFunc that routes keys sharing a top-level bucket to the same shard.
+func ExampleNewShardedCache() {
+	bucketShardFn := func(key string, numShards int) int {
+		bucket, _, _ := strings.Cut(key, "/")
+		return lru.DefaultShardFunc(bucket, numShards)
+	}
+
+	cache := lru.NewShardedCache[string](
+		1024,
+		4,
+		bucketShardFn,
+		lru.WithBackend(lru.BackendRadix),
+	)
+
+	_, _ = cache.Put("bucketA/dir/f1.txt", "alpha")
+	_, _ = cache.Put("bucketA/dir/f2.txt", "beta")
+	_, _ = cache.Put("bucketB/dir/f3.txt", "gamma")
+
+	cache.DeletePrefix("bucketA/")
+
+	vB, okB := cache.Get("bucketB/dir/f3.txt")
+	st := cache.Stats()
+	fmt.Printf("bucketB=%s (%v), len=%d, max=%d, prefix_deletes=%d\n",
+		vB, okB, st.Len, st.MaxSize, st.DeletePrefixExecuted)
+	// Output:
+	// bucketB=gamma (true), len=1, max=1024, prefix_deletes=1
 }
