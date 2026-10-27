@@ -9902,6 +9902,195 @@ func TestShardedCache_R21Post1024LineageAndEvictCallbackIsolation(t *testing.T) 
 	}
 }
 
+//go:noinline
+func spawnR22PeerViaOtherM(fn func()) {
+	done := make(chan struct{})
+	go func() {
+		runtime.LockOSThread()
+		defer runtime.UnlockOSThread()
+		go fn()
+		close(done)
+	}()
+	<-done
+}
+
+func runR22CrossMSamplerPeerCase(t *testing.T, backend Backend, migrateCaller bool) {
+	t.Helper()
+	var (
+		armed        atomic.Bool
+		firstBlocked atomic.Bool
+		inSampler    = make(chan struct{})
+		releaseH     = make(chan struct{})
+		peerEvicted  atomic.Int32
+	)
+	peerDone := make(chan struct{})
+
+	c := NewShardedCache[int](60, 2, explicitTagShardFunc,
+		WithBackend(backend),
+		WithCompactionThreshold(0.70),
+		WithEvictionThreshold(0.90),
+		WithEvictionRetentionRatio(0.50),
+		WithPressureFunc(func() float64 {
+			if armed.Load() {
+				if firstBlocked.CompareAndSwap(false, true) {
+					close(inSampler)
+					<-releaseH
+				}
+				return 0.95
+			}
+			return 0.10
+		}),
+	)
+	pa := c.(PressureAwareCache[int])
+
+	for i := range 24 {
+		_, err := c.Put(fmt.Sprintf("s0/k%02d", i), i)
+		require.NoError(t, err)
+	}
+
+	runtime.LockOSThread()
+	unlocked := false
+	defer func() {
+		if !unlocked {
+			runtime.UnlockOSThread()
+		}
+	}()
+
+	// Sample 1 on M1.
+	_, _ = c.Delete("s0/absent")
+
+	peerTask := func() {
+		<-inSampler
+		evicted := pa.EvaluateMemoryPressure()
+		peerEvicted.Store(int32(len(evicted)))
+		close(peerDone)
+		close(releaseH)
+	}
+	if migrateCaller {
+		runtime.UnlockOSThread()
+		unlocked = true
+		spawnR22PeerViaOtherM(peerTask)
+		runtime.LockOSThread()
+		unlocked = false
+	} else {
+		spawnR22PeerViaOtherM(peerTask)
+	}
+
+	for range 255 {
+		_, _ = c.Delete("s0/absent")
+	}
+
+	armed.Store(true)
+	_, _ = c.Delete("s0/absent")
+	<-peerDone
+	assert.Positive(t, peerEvicted.Load(),
+		"cross-M spawned peer must not be misclassified as a child of the active sampler")
+	assert.LessOrEqual(t, c.Stats().CurrentSize, uint64(15))
+}
+
+func runR22CrossMEvictPeerCase(t *testing.T, backend Backend, migrateCaller bool) {
+	t.Helper()
+	var (
+		holdCount         atomic.Int64
+		hStillInEvict     atomic.Bool
+		peerReturnedEarly atomic.Bool
+		peerEvicted       atomic.Bool
+		inPanickingHold   = make(chan struct{})
+		releasePanicHold  = make(chan struct{})
+	)
+	peerDone := make(chan struct{})
+	c := NewShardedCache[int](60, 2, explicitTagShardFunc,
+		WithBackend(backend),
+		WithOnEvictEntry(func(k string, _ int, r EvictionReason) {
+			switch {
+			case k == "s0/fg" && r == EvictionReasonReplaced:
+				if holdCount.Add(1) == 70 {
+					hStillInEvict.Store(true)
+					defer hStillInEvict.Store(false)
+					close(inPanickingHold)
+					<-releasePanicHold
+					panic("boom-r22-cross-m-evict")
+				}
+			case k == "s1/peer" && r == EvictionReasonDeleted:
+				peerEvicted.Store(true)
+			}
+		}),
+	)
+	_, err := c.Put("s0/fg", 0)
+	require.NoError(t, err)
+	_, err = c.Put("s1/peer", 999)
+	require.NoError(t, err)
+
+	runtime.LockOSThread()
+	unlocked := false
+	defer func() {
+		if !unlocked {
+			runtime.UnlockOSThread()
+		}
+	}()
+
+	// Warm up fast evict mode on M1.
+	for i := 1; i <= 69; i++ {
+		require.NoError(t, c.Replace("s0/fg", i))
+	}
+
+	peerTask := func() {
+		defer close(peerDone)
+		pprof.Do(context.Background(), pprof.Labels("r22", "cross-m-peer"), func(context.Context) {
+			<-inPanickingHold
+			_, _ = c.Delete("s1/peer")
+			if hStillInEvict.Load() {
+				peerReturnedEarly.Store(true)
+			}
+		})
+	}
+	if migrateCaller {
+		runtime.UnlockOSThread()
+		unlocked = true
+		spawnR22PeerViaOtherM(peerTask)
+		runtime.LockOSThread()
+		unlocked = false
+	} else {
+		spawnR22PeerViaOtherM(peerTask)
+	}
+
+	go func() {
+		<-inPanickingHold
+		time.Sleep(10 * time.Millisecond)
+		close(releasePanicHold)
+	}()
+
+	assert.PanicsWithValue(t, "boom-r22-cross-m-evict", func() {
+		_ = c.Replace("s0/fg", 70)
+	})
+	<-peerDone
+	require.Eventually(t, peerEvicted.Load, 2*time.Second, time.Millisecond,
+		"cross-M spawned peer OnEvict callback must not be dropped when Hold 70 panics")
+	assert.False(t, peerReturnedEarly.Load(),
+		"cross-M spawned peer Delete must serialize behind Hold 70 OnEvict")
+}
+
+func TestShardedCache_R22CrossMGoroutineCreationLineageIsolation(t *testing.T) {
+	s0, ok0 := currentGoroutinesCreatedFast()
+	require.True(t, ok0, "currentGoroutinesCreatedFast must discover runtime offsets")
+	spawnR22PeerViaOtherM(func() {})
+	s1, ok1 := currentGoroutinesCreatedFast()
+	require.True(t, ok1)
+	assert.Greater(t, s1, s0, "currentGoroutinesCreatedFast must strictly advance on cross-M goroutine creation")
+
+	for _, backend := range []Backend{BackendMap, BackendRadix, BackendArenaRadix} {
+		bName := backend.String()
+		t.Run("CrossMSamplerPeer/"+bName, func(t *testing.T) {
+			runR22CrossMSamplerPeerCase(t, backend, false)
+			runR22CrossMSamplerPeerCase(t, backend, true)
+		})
+		t.Run("CrossMEvictPeer/"+bName, func(t *testing.T) {
+			runR22CrossMEvictPeerCase(t, backend, false)
+			runR22CrossMEvictPeerCase(t, backend, true)
+		})
+	}
+}
+
 func BenchmarkShardedParallelThroughput(b *testing.B) {
 	const capTotal = 16384
 	keys := make([]string, capTotal*2)

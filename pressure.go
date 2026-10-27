@@ -46,73 +46,438 @@ func pprofGoroutineProfileWithLabels(p []pprofStackRecord, labels []unsafe.Point
 //go:linkname runtimeGetm runtime.getm
 func runtimeGetm() *[512]uint32
 
-//go:linkname runtimeCheaprand runtime.cheaprand
-func runtimeCheaprand() uint32
-
 //go:linkname runtimeProcPin runtime.procPin
 func runtimeProcPin() int
 
 //go:linkname runtimeProcUnpin runtime.procUnpin
 func runtimeProcUnpin()
 
-var mCheaprandIdx = -1
+//go:linkname runtimeSched runtime.sched
+var runtimeSched [256]uint32
 
-func loadMWord64(mp *[512]uint32, idx int) uint64 {
-	lo := atomic.LoadUint32(&mp[idx])
-	hi := atomic.LoadUint32(&mp[idx+1])
-	return uint64(lo) | (uint64(hi) << 32)
+var (
+	mPWordIdx         = -1
+	pGoidcacheIdx     = -1
+	schedPidleWordIdx = -1
+	knownPPtrs        [256]atomic.Pointer[[512]uint32]
+	knownPCount       atomic.Int32
+	maxKnownPID       atomic.Int32
+	activePPtrs       [256]atomic.Pointer[[512]uint32]
+	activePCount      atomic.Int32
+	activePMask       [4]atomic.Uint64
+	lastActiveGoidgen atomic.Uint64
+)
+
+type goidFastSnap struct {
+	goidgen   uint64
+	curPGoid  uint64
+	curPTicks uint64
+	headPGoid uint64
+	headTicks uint64
+	goidSum   uint64
+	pidleAddr uintptr
+	pid       int32
+	procs     int32
 }
 
-func discoverMCheaprandIdx() {
-	runtimeProcPin()
-	defer runtimeProcUnpin()
-	mp := runtimeGetm()
-	if mp == nil {
-		return
+func loadWord64(words *[512]uint32, idx int) uint64 {
+	if uintptr(unsafe.Pointer(&words[idx]))&7 == 0 {
+		return atomic.LoadUint64((*uint64)(unsafe.Pointer(&words[idx])))
 	}
-	var snap0, snap1 [512]uint32
+	for {
+		hi1 := atomic.LoadUint32(&words[idx+1])
+		lo := atomic.LoadUint32(&words[idx])
+		hi2 := atomic.LoadUint32(&words[idx+1])
+		if hi1 == hi2 {
+			return uint64(lo) | (uint64(hi1) << 32)
+		}
+	}
+}
+
+func loadPtrUintptr(words *[512]uint32, idx int) uintptr {
+	if unsafe.Sizeof(uintptr(0)) == 8 {
+		return uintptr(loadWord64(words, idx))
+	}
+	return uintptr(atomic.LoadUint32(&words[idx]))
+}
+
+func loadWordPtr(words *[512]uint32, idx int) *[512]uint32 {
+	ptr := atomic.LoadPointer((*unsafe.Pointer)(unsafe.Pointer(&words[idx])))
+	return (*[512]uint32)(ptr)
+}
+
+func discoverMLocksWordIdx(mp *[512]uint32) int {
+	var snap0, snap1, snap2 [512]uint32
 	for i := range snap0 {
 		snap0[i] = atomic.LoadUint32(&mp[i])
 	}
-	_ = runtimeCheaprand()
+	runtimeProcPin()
 	for i := range snap1 {
 		snap1[i] = atomic.LoadUint32(&mp[i])
 	}
-	_ = runtimeCheaprand()
-	const wyhashAdd = uint64(0xa0761d6478bd642f)
-	for i := range 511 {
-		v0 := uint64(snap0[i]) | (uint64(snap0[i+1]) << 32)
-		v1 := uint64(snap1[i]) | (uint64(snap1[i+1]) << 32)
-		v2 := loadMWord64(mp, i)
-		if v1-v0 == wyhashAdd && v2-v1 == wyhashAdd {
-			mCheaprandIdx = i
-			return
+	runtimeProcPin()
+	for i := range snap2 {
+		snap2[i] = atomic.LoadUint32(&mp[i])
+	}
+	runtimeProcUnpin()
+	runtimeProcUnpin()
+	for i := range snap0 {
+		v3 := atomic.LoadUint32(&mp[i])
+		if snap0[i] >= 1 && snap1[i] == snap0[i]+1 && snap2[i] == snap0[i]+2 && v3 == snap0[i] {
+			return i
 		}
 	}
-	for i := range 511 {
-		v2Lo := atomic.LoadUint32(&mp[i])
-		v2Hi := atomic.LoadUint32(&mp[i+1])
-		if snap0[i] != snap1[i] && snap1[i] != v2Lo && snap1[i] == snap0[i+1] && v2Lo == snap1[i+1] && v2Hi != snap1[i+1] {
-			mCheaprandIdx = i
+	return -1
+}
+
+func isValidMPWordCandidate(mp *[512]uint32, pid, candIdx, ptrWords int) bool {
+	if candIdx < 0 || candIdx+ptrWords >= len(mp) {
+		return false
+	}
+	if loadPtrUintptr(mp, candIdx+ptrWords) != 0 {
+		return false
+	}
+	pAddr := loadPtrUintptr(mp, candIdx)
+	if pAddr <= 4096 || pAddr%unsafe.Alignof(uintptr(0)) != 0 {
+		return false
+	}
+	pWords := loadWordPtr(mp, candIdx)
+	return pWords != nil &&
+		int(int32(atomic.LoadUint32(&pWords[0]))) == pid &&
+		atomic.LoadUint32(&pWords[1]) == 1
+}
+
+func discoverMPWordIdx() int {
+	pid := runtimeProcPin()
+	defer runtimeProcUnpin()
+	mp := runtimeGetm()
+	if mp == nil {
+		return -1
+	}
+	locksIdx := discoverMLocksWordIdx(mp)
+	if locksIdx < 0 {
+		return -1
+	}
+	ptrWords := int(unsafe.Sizeof(uintptr(0)) / 4)
+	for _, delta := range [2]int{5*ptrWords + 4, 5*ptrWords + 5} {
+		cand := locksIdx - delta
+		if isValidMPWordCandidate(mp, pid, cand, ptrWords) {
+			return cand
+		}
+	}
+	return -1
+}
+
+func isValidPGoidcacheCandidate(snaps *[4][128]uint32, idx int, maxEnd uint64) bool {
+	read64 := func(s int, w int) uint64 {
+		return uint64(snaps[s][w]) | (uint64(snaps[s][w+1]) << 32)
+	}
+	v0 := read64(0, idx)
+	v3, end3 := read64(3, idx), read64(3, idx+2)
+	if v0 == 0 || v3 > end3 || end3 > v3+16 || end3 > maxEnd {
+		return false
+	}
+	for k := range 3 {
+		vk, endk := read64(k, idx), read64(k, idx+2)
+		vk1, endk1 := read64(k+1, idx), read64(k+1, idx+2)
+		stepOK := (vk1 == vk+1 && endk1 == endk) || (vk1 > vk && endk1 == vk1+15)
+		if !stepOK {
+			return false
+		}
+	}
+	return true
+}
+
+func discoverPGoidcacheWordIdx(mPIdx int) int {
+	if mPIdx < 0 {
+		return -1
+	}
+	ch := make(chan struct{})
+	runtimeProcPin()
+	mp := runtimeGetm()
+	if mp == nil {
+		runtimeProcUnpin()
+		close(ch)
+		return -1
+	}
+	pWords := loadWordPtr(mp, mPIdx)
+	if pWords == nil {
+		runtimeProcUnpin()
+		close(ch)
+		return -1
+	}
+	var snaps [4][128]uint32
+	for s := range 4 {
+		go func() { <-ch }()
+		for i := range snaps[s] {
+			snaps[s][i] = atomic.LoadUint32(&pWords[i])
+		}
+	}
+	runtimeProcUnpin()
+	close(ch)
+
+	schedWords := (*[512]uint32)(unsafe.Pointer(&runtimeSched[0]))
+	maxEnd := loadWord64(schedWords, 0) + 1
+	for i := range 124 {
+		if isValidPGoidcacheCandidate(&snaps, i, maxEnd) {
+			return i
+		}
+	}
+	return -1
+}
+
+func discoverSchedPidleWordIdx() int {
+	for i := 0; i+8 < len(runtimeSched); i++ {
+		if atomic.LoadUint32(&runtimeSched[i]) == 10000 {
+			return i + 6
+		}
+	}
+	return -1
+}
+
+func registerKnownP(pid int, pWords *[512]uint32) {
+	if pid < 0 || pid >= len(knownPPtrs) || pWords == nil {
+		return
+	}
+	if knownPPtrs[pid].Load() == nil && knownPPtrs[pid].CompareAndSwap(nil, pWords) {
+		knownPCount.Add(1)
+	}
+	for {
+		curMax := maxKnownPID.Load()
+		if int32(pid) <= curMax || maxKnownPID.CompareAndSwap(curMax, int32(pid)) {
+			break
+		}
+	}
+}
+
+func scanIdlePsFromSched() {
+	if schedPidleWordIdx < 0 {
+		return
+	}
+	schedWords := (*[512]uint32)(unsafe.Pointer(&runtimeSched[0]))
+	pAddr := loadPtrUintptr(schedWords, schedPidleWordIdx)
+	if pAddr <= 4096 || pAddr%unsafe.Alignof(uintptr(0)) != 0 {
+		return
+	}
+	pWords := loadWordPtr(schedWords, schedPidleWordIdx)
+	for range len(knownPPtrs) {
+		if pWords == nil {
+			break
+		}
+		id := int(int32(atomic.LoadUint32(&pWords[0])))
+		status := atomic.LoadUint32(&pWords[1])
+		if id < 0 || id >= len(knownPPtrs) || status > 4 {
+			break
+		}
+		registerKnownP(id, pWords)
+		nextAddr := loadPtrUintptr(pWords, 2)
+		if nextAddr <= 4096 || nextAddr%unsafe.Alignof(uintptr(0)) != 0 {
+			break
+		}
+		pWords = loadWordPtr(pWords, 2)
+	}
+}
+
+func registerCurrentPAndScanIdle() {
+	if mPWordIdx < 0 {
+		return
+	}
+	pid := runtimeProcPin()
+	if mp := runtimeGetm(); mp != nil && pid >= 0 && pid < len(knownPPtrs) {
+		if pWords := loadWordPtr(mp, mPWordIdx); pWords != nil {
+			registerKnownP(pid, pWords)
+		}
+	}
+	scanIdlePsFromSched()
+	runtimeProcUnpin()
+}
+
+func markActiveP(pid int, pWords *[512]uint32) {
+	if pid < 0 || pid >= len(activePPtrs) || pWords == nil {
+		return
+	}
+	word, bit := pid/64, uint64(1)<<(uint(pid)%64)
+	for {
+		old := activePMask[word].Load()
+		if old&bit != 0 {
+			return
+		}
+		if activePMask[word].CompareAndSwap(old, old|bit) {
+			idx := int(activePCount.Add(1) - 1)
+			activePPtrs[idx].Store(pWords)
 			return
 		}
 	}
 }
 
-func currentMAndCheaprand() (uintptr, uint64, bool) {
-	if mCheaprandIdx < 0 {
-		return 0, 0, false
+func syncActivePPtrs(goidgen uint64) {
+	scanIdlePsFromSched()
+	maxPID := int(maxKnownPID.Load())
+	allKnown := true
+	for i := 0; i <= maxPID; i++ {
+		pWords := knownPPtrs[i].Load()
+		if pWords == nil {
+			allKnown = false
+			continue
+		}
+		if loadWord64(pWords, pGoidcacheIdx) != 0 {
+			markActiveP(i, pWords)
+		}
 	}
-	pid := runtimeProcPin()
+	if allKnown && maxPID >= 0 {
+		lastActiveGoidgen.Store(goidgen)
+	}
+}
+
+func discoverRuntimeGoidOffsets() {
+	mPWordIdx = discoverMPWordIdx()
+	schedPidleWordIdx = discoverSchedPidleWordIdx()
+	if mPWordIdx >= 0 {
+		registerCurrentPAndScanIdle()
+	}
+	pGoidcacheIdx = discoverPGoidcacheWordIdx(mPWordIdx)
+	if mPWordIdx < 0 || pGoidcacheIdx < 0 {
+		return
+	}
+	registerCurrentPAndScanIdle()
+	procs := runtime.GOMAXPROCS(0)
+	if int(knownPCount.Load()) < procs {
+		var wg sync.WaitGroup
+		release := make(chan struct{})
+		for range procs {
+			wg.Go(func() {
+				registerCurrentPAndScanIdle()
+				<-release
+			})
+		}
+		close(release)
+		wg.Wait()
+	}
+	schedWords := (*[512]uint32)(unsafe.Pointer(&runtimeSched[0]))
+	syncActivePPtrs(loadWord64(schedWords, 0))
+}
+
+func loadOrRegisterCurrentP(pid int) *[512]uint32 {
+	if curP := knownPPtrs[pid].Load(); curP != nil {
+		return curP
+	}
 	mp := runtimeGetm()
 	if mp == nil {
-		runtimeProcUnpin()
-		return 0, 0, false
+		return nil
 	}
-	r := loadMWord64(mp, mCheaprandIdx)
-	m := uintptr(unsafe.Pointer(mp)) ^ (uintptr(uint(pid)) << 20)
+	curP := loadWordPtr(mp, mPWordIdx)
+	if curP != nil {
+		registerKnownP(pid, curP)
+	}
+	return curP
+}
+
+func loadPTicks(pWords *[512]uint32, ptrWords int) uint64 {
+	schedTick := atomic.LoadUint32(&pWords[2+ptrWords])
+	sysTick := atomic.LoadUint32(&pWords[3+ptrWords])
+	return uint64(schedTick) | (uint64(sysTick) << 32)
+}
+
+func readHeadIdlePState(schedWords *[512]uint32, ptrWords int) (int32, uintptr, uint64, uint64) {
+	if schedPidleWordIdx < 0 {
+		return 0, 0, 0, 0
+	}
+	npidle := int32(atomic.LoadUint32(&schedWords[schedPidleWordIdx+ptrWords]))
+	headP := loadWordPtr(schedWords, schedPidleWordIdx)
+	pidleAddr := uintptr(unsafe.Pointer(headP))
+	if pidleAddr <= 4096 || pidleAddr%unsafe.Alignof(uintptr(0)) != 0 {
+		return npidle, 0, 0, 0
+	}
+	return npidle, pidleAddr, loadWord64(headP, pGoidcacheIdx), loadPTicks(headP, ptrWords)
+}
+
+func matchesGoidFastSnap(s *goidFastSnap) bool {
+	if s.procs <= 0 || mPWordIdx < 0 || pGoidcacheIdx < 0 {
+		return false
+	}
+	pid := runtimeProcPin()
+	if int32(pid) != s.pid {
+		runtimeProcUnpin()
+		return false
+	}
+	curP := knownPPtrs[pid].Load()
+	schedWords := (*[512]uint32)(unsafe.Pointer(&runtimeSched[0]))
+	ptrWords := int(unsafe.Sizeof(uintptr(0)) / 4)
+	if curP == nil || loadWord64(schedWords, 0) != s.goidgen ||
+		loadWord64(curP, pGoidcacheIdx) != s.curPGoid || loadPTicks(curP, ptrWords) != s.curPTicks {
+		runtimeProcUnpin()
+		return false
+	}
+	if s.procs == 1 {
+		runtimeProcUnpin()
+		return true
+	}
+	if s.pidleAddr == 0 {
+		runtimeProcUnpin()
+		return false
+	}
+	npidle := int32(atomic.LoadUint32(&schedWords[schedPidleWordIdx+ptrWords]))
+	headP := loadWordPtr(schedWords, schedPidleWordIdx)
+	if npidle != s.procs-1 || uintptr(unsafe.Pointer(headP)) != s.pidleAddr {
+		runtimeProcUnpin()
+		return false
+	}
+	ok := loadWord64(headP, pGoidcacheIdx) == s.headPGoid && loadPTicks(headP, ptrWords) == s.headTicks
 	runtimeProcUnpin()
-	return m, r, true
+	return ok
+}
+
+func captureGoidFastSnap() (goidFastSnap, bool) {
+	if mPWordIdx < 0 || pGoidcacheIdx < 0 {
+		return goidFastSnap{}, false
+	}
+	pid := runtimeProcPin()
+	if pid < 0 || pid >= len(knownPPtrs) {
+		runtimeProcUnpin()
+		return goidFastSnap{}, false
+	}
+	curP := loadOrRegisterCurrentP(pid)
+	if curP == nil {
+		runtimeProcUnpin()
+		return goidFastSnap{}, false
+	}
+	schedWords := (*[512]uint32)(unsafe.Pointer(&runtimeSched[0]))
+	goidgen := loadWord64(schedWords, 0)
+	if goidgen != lastActiveGoidgen.Load() {
+		syncActivePPtrs(goidgen)
+	}
+	ptrWords := int(unsafe.Sizeof(uintptr(0)) / 4)
+	curPGoid := loadWord64(curP, pGoidcacheIdx)
+	curPTicks := loadPTicks(curP, ptrWords)
+	sum := goidgen
+	n := int(activePCount.Load())
+	for i := range n {
+		if pWords := activePPtrs[i].Load(); pWords != nil {
+			sum += loadWord64(pWords, pGoidcacheIdx)
+		}
+	}
+	procs := knownPCount.Load()
+	npidle, pidleAddr, headPGoid, headTicks := readHeadIdlePState(schedWords, ptrWords)
+	if npidle != procs-1 {
+		pidleAddr = 0
+	}
+	runtimeProcUnpin()
+	return goidFastSnap{
+		goidgen:   goidgen,
+		curPGoid:  curPGoid,
+		curPTicks: curPTicks,
+		headPGoid: headPGoid,
+		headTicks: headTicks,
+		goidSum:   sum,
+		pidleAddr: pidleAddr,
+		pid:       int32(pid),
+		procs:     procs,
+	}, true
+}
+
+func currentGoroutinesCreatedFast() (uint64, bool) {
+	snap, ok := captureGoidFastSnap()
+	return snap.goidSum, ok
 }
 
 const (
@@ -1028,7 +1393,7 @@ func init() {
 		fourDigitsRaw[i*4+3] = byte('0' + i%10)
 	}
 	fourDigitsAll = string(fourDigitsRaw)
-	discoverMCheaprandIdx()
+	discoverRuntimeGoidOffsets()
 }
 
 func parseTwoASCIIDigits(c0, c1 byte) (int, bool) {
@@ -1301,10 +1666,8 @@ type pressureState struct {
 	evictConfirmedChildHold    atomic.Uint64
 	evictGCreatedSample        [1]metrics.Sample
 	evictSnapGCreated          uint64
-	evictSnapCheaprand         uint64
-	primarySnapCheaprand       uint64
-	evictSnapM                 uintptr
-	primarySnapM               uintptr
+	primarySnapGoidSum         uint64
+	evictGoidSnap              goidFastSnap
 	evictProbedUnlabeledHolds  uint32
 	evictSnapStale             bool
 }
@@ -1636,7 +1999,7 @@ func (p *pressureState) initCoordinator(hasOnEvict bool) {
 		if hasOnEvict {
 			p.evictRingEpochGCreated = p.lastObservedGCreated.Load()
 			p.evictSnapGCreated = p.evictRingEpochGCreated
-			p.evictSnapM, p.evictSnapCheaprand, _ = currentMAndCheaprand()
+			p.evictGoidSnap, _ = captureGoidFastSnap()
 		}
 	}
 }
@@ -3073,8 +3436,8 @@ func (p *pressureState) canSkipPrimaryPreHookProbe() bool {
 	if p.primaryStartSnapSeq.Load() == 0 || p.fallbackSampling.Load() || p.overflowSamplingCount.Load() > 0 {
 		return false
 	}
-	m, r, ok := currentMAndCheaprand()
-	return ok && m == p.primarySnapM && r == p.primarySnapCheaprand &&
+	sum, ok := currentGoroutinesCreatedFast()
+	return ok && sum == p.primarySnapGoidSum &&
 		p.primaryStartSnapSeq.Load() == p.preHookSnapSeq.Load() && !p.preHookPruning.Load()
 }
 
@@ -3094,7 +3457,7 @@ func (p *pressureState) preparePrimarySamplerLineage(canPrune bool) {
 	if p.primaryStartSnapSeq.Load() != snapSeq {
 		p.primaryStartSnapSeq.Store(snapSeq)
 	}
-	p.primarySnapM, p.primarySnapCheaprand, _ = currentMAndCheaprand()
+	p.primarySnapGoidSum, _ = currentGoroutinesCreatedFast()
 }
 
 //go:noinline
@@ -3672,7 +4035,7 @@ func (p *pressureState) refreshEvictSnapLocked() {
 	snap := p.observePreHookLiveGIDsWithSample(true, true, false, &p.evictGCreatedSample)
 	p.evictStartSnapSeq.Store(snap)
 	p.evictSnapGCreated = p.lastObservedGCreated.Load()
-	p.evictSnapM, p.evictSnapCheaprand, _ = currentMAndCheaprand()
+	p.evictGoidSnap, _ = captureGoidFastSnap()
 	p.evictSnapStale = false
 	if !p.evictExactSnap.Load() {
 		p.evictExactSnap.Store(true)
@@ -3683,22 +4046,26 @@ func (p *pressureState) refreshFastEvictSnapLocked() {
 	snap := p.observePreHookLiveGIDsWithSample(true, true, false, &p.evictGCreatedSample)
 	p.evictStartSnapSeq.Store(snap)
 	p.evictSnapGCreated = p.lastObservedGCreated.Load()
-	p.evictSnapM, p.evictSnapCheaprand, _ = currentMAndCheaprand()
+	p.evictGoidSnap, _ = captureGoidFastSnap()
 	p.evictSnapStale = false
 }
 
 func (p *pressureState) hasEvictSnapGoroutinesCreated() bool {
-	m, r, ok := currentMAndCheaprand()
-	if ok && m == p.evictSnapM && r == p.evictSnapCheaprand {
+	if matchesGoidFastSnap(&p.evictGoidSnap) {
 		return false
 	}
+	snap, ok := captureGoidFastSnap()
+	if ok && snap.goidSum == p.evictGoidSnap.goidSum {
+		p.evictGoidSnap = snap
+		return false
+	}
+	scanIdlePsFromSched()
 	if p.hasGoroutinesCreatedSinceEvictSnap() {
 		p.evictSnapStale = true
 		return true
 	}
-	if ok {
-		p.evictSnapM = m
-		p.evictSnapCheaprand = r
+	if snap, ok = captureGoidFastSnap(); ok {
+		p.evictGoidSnap = snap
 	}
 	return false
 }
