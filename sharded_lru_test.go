@@ -9429,6 +9429,263 @@ func TestShardedCache_R18EvictFastModePprofAndGlobalTagLifecycle(t *testing.T) {
 	}
 }
 
+func holdShardRLockViaAll[V any](t *testing.T, shard shardEngine[V]) func() {
+	t.Helper()
+	locked := make(chan struct{})
+	release := make(chan struct{})
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		for range shard.All() {
+			close(locked)
+			<-release
+			break
+		}
+	}()
+	<-locked
+	return func() {
+		close(release)
+		<-done
+	}
+}
+
+func runR19C1CrossShardSpikeCase(t *testing.T, backend Backend, useEvaluate bool, initialTier1, forceRefresh bool) {
+	t.Helper()
+	var pressureBits atomic.Uint64
+	pressureBits.Store(math.Float64bits(0.10))
+	if initialTier1 {
+		pressureBits.Store(math.Float64bits(0.80))
+	}
+
+	c := NewShardedCache[int](90, 3, explicitTagShardFunc,
+		WithBackend(backend),
+		WithWeigher(func(key string, _ int) uint64 {
+			if strings.HasSuffix(key, "/match") {
+				return 0
+			}
+			return 1
+		}),
+		WithCompactionThreshold(0.70),
+		WithEvictionThreshold(0.90),
+		WithEvictionRetentionRatio(0.50),
+		WithPressureFunc(func() float64 {
+			return math.Float64frombits(pressureBits.Load())
+		}),
+	)
+	pa := c.(PressureAwareCache[int])
+
+	// Populate shard 2 above its Tier 2 target (target = 15) and create compaction slack.
+	for i := range 30 {
+		_, err := c.Put(fmt.Sprintf("s2/k%02d", i), i)
+		require.NoError(t, err)
+	}
+	for i := range 6 {
+		_, _ = c.Delete(fmt.Sprintf("s2/k%02d", i))
+	}
+	_, err := c.Put("s2/match", 1)
+	require.NoError(t, err)
+	// Shard 2 now has 24 weighted entries (> target 15), 1 zero-weight match key, and deletion slack.
+	_, err = c.Put("s0/hold", 1)
+	require.NoError(t, err)
+	_, err = c.Put("s1/hold", 1)
+	require.NoError(t, err)
+
+	sc := c.(*shardedCache[int])
+	s0PS := sc.shards[0].pressureStatePtr()
+	var baselineS0Seq uint64
+	for range sc.shards[0].All() {
+		baselineS0Seq = s0PS.sampledPressureSeq
+		break
+	}
+	unlockS1 := holdShardRLockViaAll(t, sc.shards[1])
+
+	opDone := make(chan struct{})
+	go func() {
+		defer close(opDone)
+		if useEvaluate {
+			_ = pa.EvaluateMemoryPressure()
+		} else {
+			c.DeletePrefix("s2/match")
+		}
+	}()
+
+	// Wait until Shard 0 has applied the initial sample and released s0.mu.Lock(), blocking on Shard 1.
+	require.Eventually(t, func() bool {
+		var seq uint64
+		for range sc.shards[0].All() {
+			seq = s0PS.sampledPressureSeq
+			break
+		}
+		return seq > baselineS0Seq
+	}, 2*time.Second, time.Millisecond)
+
+	// Spike pressure to Tier 2 (0.95) and run a non-reclaiming operation on Shard 2.
+	pressureBits.Store(math.Float64bits(0.95))
+	_, _ = c.Delete("s2/absent")
+	if forceRefresh {
+		sc.coord.pressureNeedsRefresh.Store(true)
+	}
+
+	unlockS1()
+	<-opDone
+
+	s2Stats := sc.shards[2].Stats()
+	assert.LessOrEqual(t, s2Stats.CurrentSize, uint64(15),
+		"Shard 2 must shed down to its Tier 2 retention target (<= 15) after observing a newer Tier 2 spike")
+	assert.Positive(t, s2Stats.EvictionsPressure,
+		"Shard 2 must record Tier 2 pressure evictions")
+}
+
+func runR19C2OutOfOrderLockAcquisitionCase(t *testing.T, backend Backend, initialTier1 bool) {
+	t.Helper()
+	var (
+		pressureBits atomic.Uint64
+		probeCount   atomic.Int32
+	)
+	initialVal := 0.10
+	if initialTier1 {
+		initialVal = 0.80
+	}
+	pressureBits.Store(math.Float64bits(initialVal))
+
+	c := NewShardedCache[int](60, 2, explicitTagShardFunc,
+		WithBackend(backend),
+		WithCompactionThreshold(0.70),
+		WithEvictionThreshold(0.90),
+		WithEvictionRetentionRatio(0.50),
+		WithPressureFunc(func() float64 {
+			probeCount.Add(1)
+			return math.Float64frombits(pressureBits.Load())
+		}),
+	)
+	pa := c.(PressureAwareCache[int])
+
+	for i := range 24 {
+		_, err := c.Put(fmt.Sprintf("s0/k%02d", i), i)
+		require.NoError(t, err)
+		_, err = c.Put(fmt.Sprintf("s1/k%02d", i), i)
+		require.NoError(t, err)
+	}
+
+	sc := c.(*shardedCache[int])
+	s0PS := sc.shards[0].pressureStatePtr()
+
+	// Hold s0 RLock so G1 finishes sampleForLock on s0 (seq = N) and waits before acquiring s0.mu.Lock().
+	probeBefore := probeCount.Load()
+	unlockS0 := holdShardRLockViaAll(t, sc.shards[0])
+	evalDone := make(chan struct{})
+	go func() {
+		defer close(evalDone)
+		_ = pa.EvaluateMemoryPressure()
+	}()
+
+	require.Eventually(t, func() bool {
+		return probeCount.Load() == probeBefore+1 && !sc.coord.samplingPressure.Load()
+	}, 2*time.Second, time.Millisecond)
+
+	// Simulate G2 having sampled a newer Tier 2 spike (0.95, seq = N+1) and acquired s0.mu.Lock() before G1.
+	newSeq := sc.coord.pressureInvokeSeq.Add(1)
+	sc.coord.lastSampledSeq.Store(newSeq)
+	sc.coord.lastSampledPressureBits.Store(math.Float64bits(0.95))
+	sc.coord.cachedPressureBits.Store(math.Float64bits(0.95))
+	sc.coord.cachedPressureSeq.Store(newSeq)
+	sc.coord.cachedPressureEpoch.Store(sc.coord.reclaimEpoch.Load())
+	sc.coord.pressureInitialized.Store(true)
+	sc.coord.pressureNeedsRefresh.Store(false)
+	s0PS.sampledPressureSeq = newSeq
+	pressureBits.Store(math.Float64bits(0.95))
+
+	unlockS0()
+	<-evalDone
+
+	assert.LessOrEqual(t, sc.shards[0].Stats().CurrentSize, uint64(15),
+		"Shard 0 must adopt the newer Tier 2 sample and shed to <= 15")
+	assert.LessOrEqual(t, sc.shards[1].Stats().CurrentSize, uint64(15),
+		"Shard 1 must reuse the adopted Tier 2 sample and shed to <= 15")
+	assert.Equal(t, probeBefore+1, probeCount.Load(),
+		"Shard 1 must reuse the adopted valid sample without invoking PressureFunc a second time")
+}
+
+func runR19C2ReentrantEpochFastForwardCase(t *testing.T, backend Backend) {
+	t.Helper()
+	var (
+		c          Cache[int]
+		armed      atomic.Bool
+		evalProbes atomic.Int32
+	)
+	c = NewShardedCache[int](60, 2, explicitTagShardFunc,
+		WithBackend(backend),
+		WithCompactionThreshold(0.70),
+		WithEvictionThreshold(0.90),
+		WithEvictionRetentionRatio(0.50),
+		WithPressureFunc(func() float64 {
+			if !armed.Load() {
+				return 0.10
+			}
+			n := evalProbes.Add(1)
+			if n == 1 {
+				// Simulate a concurrent non-reclaiming operation on s0 having recorded a higher invokeSeq
+				// at originalEpoch before this sampler performs a sole re-entrant reclamation on s1.
+				sc := c.(*shardedCache[int])
+				s0PS := sc.shards[0].pressureStatePtr()
+				higherSeq := sc.coord.pressureInvokeSeq.Add(1)
+				sc.coord.lastSampledSeq.Store(higherSeq)
+				sc.coord.lastSampledEpoch = sc.coord.reclaimEpoch.Load()
+				sc.coord.lastSampledPressureBits.Store(math.Float64bits(0.10))
+				s0PS.sampledPressureSeq = higherSeq
+
+				// Re-entrantly reclaim on s1 so coord.reclaimEpoch advances via sole re-entrant reclamation.
+				_, _ = c.Delete("s1/reentrant-victim")
+			}
+			return 0.95
+		}),
+	)
+	pa := c.(PressureAwareCache[int])
+
+	for i := range 24 {
+		_, err := c.Put(fmt.Sprintf("s0/k%02d", i), i)
+		require.NoError(t, err)
+		_, err = c.Put(fmt.Sprintf("s1/k%02d", i), i)
+		require.NoError(t, err)
+	}
+	_, err := c.Put("s1/reentrant-victim", 99)
+	require.NoError(t, err)
+
+	armed.Store(true)
+	evicted := pa.EvaluateMemoryPressure()
+	assert.NotEmpty(t, evicted)
+
+	sc := c.(*shardedCache[int])
+	assert.LessOrEqual(t, sc.shards[0].Stats().CurrentSize, uint64(15),
+		"Shard 0 must shed under Tier 2 after re-entrant epoch fast-forward")
+	assert.LessOrEqual(t, sc.shards[1].Stats().CurrentSize, uint64(15),
+		"Shard 1 must shed under Tier 2 after re-entrant epoch fast-forward")
+	assert.Equal(t, int32(1), evalProbes.Load(),
+		"EvaluateMemoryPressure must reuse the fast-forwarded valid sample on Shard 1 without a second probe")
+}
+
+func TestShardedCache_R19CrossShardAndOutOfOrderSampleSeqOrdering(t *testing.T) {
+	for _, backend := range []Backend{BackendMap, BackendRadix, BackendArenaRadix} {
+		bName := backend.String()
+		t.Run("C1_CrossShardSpike/"+bName, func(t *testing.T) {
+			for _, useEval := range []bool{true, false} {
+				for _, tier1 := range []bool{false, true} {
+					for _, forceRefresh := range []bool{false, true} {
+						runR19C1CrossShardSpikeCase(t, backend, useEval, tier1, forceRefresh)
+					}
+				}
+			}
+		})
+		t.Run("C2_OutOfOrderLock/"+bName, func(t *testing.T) {
+			runR19C2OutOfOrderLockAcquisitionCase(t, backend, false)
+			runR19C2OutOfOrderLockAcquisitionCase(t, backend, true)
+		})
+		t.Run("C2_ReentrantEpochFastForward/"+bName, func(t *testing.T) {
+			runR19C2ReentrantEpochFastForwardCase(t, backend)
+		})
+	}
+}
+
 func BenchmarkShardedParallelThroughput(b *testing.B) {
 	const capTotal = 16384
 	keys := make([]string, capTotal*2)
