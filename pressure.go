@@ -43,6 +43,78 @@ func runtimeSetProfLabel(labels unsafe.Pointer)
 //go:linkname pprofGoroutineProfileWithLabels runtime.pprof_goroutineProfileWithLabels
 func pprofGoroutineProfileWithLabels(p []pprofStackRecord, labels []unsafe.Pointer) (n int, ok bool)
 
+//go:linkname runtimeGetm runtime.getm
+func runtimeGetm() *[512]uint32
+
+//go:linkname runtimeCheaprand runtime.cheaprand
+func runtimeCheaprand() uint32
+
+//go:linkname runtimeProcPin runtime.procPin
+func runtimeProcPin() int
+
+//go:linkname runtimeProcUnpin runtime.procUnpin
+func runtimeProcUnpin()
+
+var mCheaprandIdx = -1
+
+func loadMWord64(mp *[512]uint32, idx int) uint64 {
+	lo := atomic.LoadUint32(&mp[idx])
+	hi := atomic.LoadUint32(&mp[idx+1])
+	return uint64(lo) | (uint64(hi) << 32)
+}
+
+func discoverMCheaprandIdx() {
+	runtimeProcPin()
+	defer runtimeProcUnpin()
+	mp := runtimeGetm()
+	if mp == nil {
+		return
+	}
+	var snap0, snap1 [512]uint32
+	for i := range snap0 {
+		snap0[i] = atomic.LoadUint32(&mp[i])
+	}
+	_ = runtimeCheaprand()
+	for i := range snap1 {
+		snap1[i] = atomic.LoadUint32(&mp[i])
+	}
+	_ = runtimeCheaprand()
+	const wyhashAdd = uint64(0xa0761d6478bd642f)
+	for i := range 511 {
+		v0 := uint64(snap0[i]) | (uint64(snap0[i+1]) << 32)
+		v1 := uint64(snap1[i]) | (uint64(snap1[i+1]) << 32)
+		v2 := loadMWord64(mp, i)
+		if v1-v0 == wyhashAdd && v2-v1 == wyhashAdd {
+			mCheaprandIdx = i
+			return
+		}
+	}
+	for i := range 511 {
+		v2Lo := atomic.LoadUint32(&mp[i])
+		v2Hi := atomic.LoadUint32(&mp[i+1])
+		if snap0[i] != snap1[i] && snap1[i] != v2Lo && snap1[i] == snap0[i+1] && v2Lo == snap1[i+1] && v2Hi != snap1[i+1] {
+			mCheaprandIdx = i
+			return
+		}
+	}
+}
+
+func currentMAndCheaprand() (uintptr, uint64, bool) {
+	if mCheaprandIdx < 0 {
+		return 0, 0, false
+	}
+	pid := runtimeProcPin()
+	mp := runtimeGetm()
+	if mp == nil {
+		runtimeProcUnpin()
+		return 0, 0, false
+	}
+	r := loadMWord64(mp, mCheaprandIdx)
+	m := uintptr(unsafe.Pointer(mp)) ^ (uintptr(uint(pid)) << 20)
+	runtimeProcUnpin()
+	return m, r, true
+}
+
 const (
 	goroutinesCreatedMetric = "/sched/goroutines-created:goroutines"
 	evictLabelRingSize      = 1024
@@ -956,6 +1028,7 @@ func init() {
 		fourDigitsRaw[i*4+3] = byte('0' + i%10)
 	}
 	fourDigitsAll = string(fourDigitsRaw)
+	discoverMCheaprandIdx()
 }
 
 func parseTwoASCIIDigits(c0, c1 byte) (int, bool) {
@@ -1228,9 +1301,11 @@ type pressureState struct {
 	evictConfirmedChildHold    atomic.Uint64
 	evictGCreatedSample        [1]metrics.Sample
 	evictSnapGCreated          uint64
+	evictSnapCheaprand         uint64
+	primarySnapCheaprand       uint64
+	evictSnapM                 uintptr
+	primarySnapM               uintptr
 	evictProbedUnlabeledHolds  uint32
-	evictFastQuietHolds        uint32
-	primaryFastQuietSamples    uint32
 	evictSnapStale             bool
 }
 
@@ -1561,6 +1636,7 @@ func (p *pressureState) initCoordinator(hasOnEvict bool) {
 		if hasOnEvict {
 			p.evictRingEpochGCreated = p.lastObservedGCreated.Load()
 			p.evictSnapGCreated = p.evictRingEpochGCreated
+			p.evictSnapM, p.evictSnapCheaprand, _ = currentMAndCheaprand()
 		}
 	}
 }
@@ -2345,10 +2421,7 @@ func (p *pressureState) recordAcceptedFallbackSample(sampleEpoch, invokeSeq, pre
 	return preBelowTier1, preBelowTier2
 }
 
-func (p *pressureState) isSampleCausallyStaleLocked(val float64, belowTier1, belowTier2, sampleSeq uint64) bool {
-	if sampleSeq != 0 && sampleSeq < p.sampledPressureSeq {
-		return true
-	}
+func (p *pressureState) isSampleRecoveryStale(val float64, belowTier1, belowTier2 uint64) bool {
 	coord := p.coord()
 	if val >= p.options.EvictionThreshold {
 		return belowTier2 < coord.belowTier2Epoch.Load()
@@ -2357,6 +2430,14 @@ func (p *pressureState) isSampleCausallyStaleLocked(val float64, belowTier1, bel
 		return belowTier1 < coord.belowTier1Epoch.Load()
 	}
 	return false
+}
+
+func (p *pressureState) isSampleCausallyStaleLocked(val float64, belowTier1, belowTier2, sampleSeq uint64) bool {
+	coord := p.coord()
+	if sampleSeq != 0 && (sampleSeq < p.sampledPressureSeq || sampleSeq < coord.lastSampledSeq.Load() || sampleSeq < coord.cachedPressureSeq.Load()) {
+		return true
+	}
+	return p.isSampleRecoveryStale(val, belowTier1, belowTier2)
 }
 
 func (p *pressureState) isElevatedSampleStaleLocked(val float64, belowTier1, belowTier2, sampleSeq uint64) bool {
@@ -2369,10 +2450,25 @@ func (p *pressureState) adoptNewerCachedSampleLocked(minSeq uint64) (float64, ui
 	if !ok || seq <= minSeq || seq < p.sampledPressureSeq {
 		return 0, 0, 0, 0, false
 	}
-	if p.isSampleCausallyStaleLocked(val, belowTier1, belowTier2, seq) {
+	if p.isSampleRecoveryStale(val, belowTier1, belowTier2) {
 		return 0, 0, 0, 0, false
 	}
 	return val, belowTier1, belowTier2, seq, true
+}
+
+func (p *pressureState) canAdoptPostRetryCachedSampleLocked(currentEpoch uint64, shardUnreclaimed bool, minSeq uint64) (float64, uint64, uint64, uint64, bool) {
+	val, belowTier1, belowTier2, seq, ok := p.coord().readValidCachedSampleForEpoch(currentEpoch)
+	if !ok || (shardUnreclaimed && seq < minSeq) || seq < p.sampledPressureSeq {
+		return 0, 0, 0, 0, false
+	}
+	if p.isSampleRecoveryStale(val, belowTier1, belowTier2) {
+		return 0, 0, 0, 0, false
+	}
+	return val, belowTier1, belowTier2, seq, true
+}
+
+func (p *pressureState) canAcceptUnreclaimedShardFallbackLocked(s pressureSample, currentEpoch uint64, shardUnreclaimed bool) bool {
+	return shardUnreclaimed && s.epoch != currentEpoch && s.invokeSeq >= p.sampledPressureSeq && !p.isSampleRecoveryStale(s.val, s.belowTier1, s.belowTier2)
 }
 
 func (p *pressureState) resolvePostRetryPressureLocked(s pressureSample) (uint64, float64) {
@@ -2391,22 +2487,18 @@ func (p *pressureState) resolvePostRetryPressureLocked(s pressureSample) (uint64
 	if s.valid && s.epoch == currentEpoch && !p.isElevatedSampleStaleLocked(s.val, s.belowTier1, s.belowTier2, s.invokeSeq) {
 		p.hasValidSample = true
 		resolvedPressure = s.val
-	} else if cachedVal, cachedBelowTier1, cachedBelowTier2, cachedSeq, ok := coord.readValidCachedSampleForEpoch(currentEpoch); ok && (!shardUnreclaimed || cachedSeq >= s.invokeSeq) && !p.isElevatedSampleStaleLocked(cachedVal, cachedBelowTier1, cachedBelowTier2, cachedSeq) {
+	} else if cachedVal, cachedBelowTier1, cachedBelowTier2, cachedSeq, ok := p.canAdoptPostRetryCachedSampleLocked(currentEpoch, shardUnreclaimed, s.invokeSeq); ok {
 		p.hasValidSample = true
 		belowTier1 = cachedBelowTier1
 		belowTier2 = cachedBelowTier2
 		sampleSeq = cachedSeq
 		resolvedPressure = cachedVal
-	} else if shardUnreclaimed && !p.isElevatedSampleStaleLocked(s.val, s.belowTier1, s.belowTier2, s.invokeSeq) {
+	} else if p.canAcceptUnreclaimedShardFallbackLocked(s, currentEpoch, shardUnreclaimed) {
 		p.hasValidSample = true
 		acceptedCoordEpoch = s.epoch
 		belowTier1, belowTier2 = coord.recordAcceptedFallbackSample(s.epoch, s.invokeSeq, s.belowTier1, s.belowTier2, s.val)
 		resolvedPressure = s.val
 	} else {
-		p.hasValidSample = false
-		resolvedPressure = 0.0
-	}
-	if p.hasValidSample && p.isElevatedSampleStaleLocked(resolvedPressure, belowTier1, belowTier2, sampleSeq) {
 		p.hasValidSample = false
 		resolvedPressure = 0.0
 	}
@@ -2565,7 +2657,7 @@ func (p *pressureState) adoptCachedShardSampleLocked(minSeq uint64, sample *shar
 	if !ok || seq < minSeq || seq < p.sampledPressureSeq {
 		return false
 	}
-	if p.isElevatedSampleStaleLocked(val, belowTier1, belowTier2, seq) {
+	if p.isSampleRecoveryStale(val, belowTier1, belowTier2) {
 		return false
 	}
 	*sample = shardSample{
@@ -2765,7 +2857,6 @@ func (p *pressureState) finishFastPrimaryLocked() {
 	p.samplingActive.Store(false)
 	p.clearActiveFastPrimaryTag()
 	if p.samplingContended.Load() || p.samplingGID.Load() != 0 {
-		p.primaryFastQuietSamples = 0
 		p.samplingResolveMu.Lock()
 		if lateGID := p.samplingGID.Load(); lateGID != 0 && lateGID != exitingGID {
 			p.recordExitedSamplerGID(lateGID)
@@ -2963,7 +3054,6 @@ func (p *pressureState) releasePrimarySamplerSlot(gid uint64, fastPrimary, compl
 		p.clearActiveFastPrimaryTag()
 	}
 	if !fastPrimary || p.samplingContended.Load() || p.samplingGID.Load() != 0 {
-		p.primaryFastQuietSamples = 0
 		p.samplingResolveMu.Lock()
 		p.samplingGID.Store(0)
 		p.samplingParentGID.Store(0)
@@ -2980,41 +3070,31 @@ func (p *pressureState) prepareSamplerLineage(canPrune bool) (uint64, uint64) {
 }
 
 func (p *pressureState) canSkipPrimaryPreHookProbe() bool {
-	return p.primaryFastQuietSamples >= evictLabelRingSize &&
-		(p.pressureInvokeSeq.Load()&63) != 0 &&
-		!p.samplingContended.Load() &&
-		!p.fallbackSampling.Load() &&
-		p.overflowSamplingCount.Load() == 0 &&
-		!p.preHookPruning.Load() &&
-		p.preHookSnapSeq.Load() != 0 &&
-		p.primaryStartSnapSeq.Load() == p.preHookSnapSeq.Load()
+	if p.primaryStartSnapSeq.Load() == 0 || p.fallbackSampling.Load() || p.overflowSamplingCount.Load() > 0 {
+		return false
+	}
+	m, r, ok := currentMAndCheaprand()
+	return ok && m == p.primarySnapM && r == p.primarySnapCheaprand &&
+		p.primaryStartSnapSeq.Load() == p.preHookSnapSeq.Load() && !p.preHookPruning.Load()
 }
 
 func (p *pressureState) preparePrimarySamplerLineage(canPrune bool) {
 	panicEpoch := p.panickedSamplerEpoch.Load()
 	if p.primaryStartPanicEpoch.Load() != panicEpoch {
 		p.primaryStartPanicEpoch.Store(panicEpoch)
-		p.primaryFastQuietSamples = 0
 	}
 	if p.canSkipPrimaryPreHookProbe() {
 		p.activeSnapSamplers.Add(1)
-		if !p.preHookPruning.Load() && p.primaryStartSnapSeq.Load() == p.preHookSnapSeq.Load() {
+		if p.primaryStartSnapSeq.Load() == p.preHookSnapSeq.Load() && !p.preHookPruning.Load() {
 			return
 		}
 		p.activeSnapSamplers.Add(-1)
 	}
-	prevSnap := p.preHookSnapSeq.Load()
 	snapSeq := p.observePreHookLiveGIDsWithSample(canPrune, false, true, &p.primaryGCreatedSample)
-	if prevSnap != 0 && snapSeq == prevSnap && !p.samplingContended.Load() {
-		if p.primaryFastQuietSamples < evictLabelRingSize {
-			p.primaryFastQuietSamples++
-		}
-	} else {
-		p.primaryFastQuietSamples = 0
-	}
 	if p.primaryStartSnapSeq.Load() != snapSeq {
 		p.primaryStartSnapSeq.Store(snapSeq)
 	}
+	p.primarySnapM, p.primarySnapCheaprand, _ = currentMAndCheaprand()
 }
 
 //go:noinline
@@ -3592,7 +3672,7 @@ func (p *pressureState) refreshEvictSnapLocked() {
 	snap := p.observePreHookLiveGIDsWithSample(true, true, false, &p.evictGCreatedSample)
 	p.evictStartSnapSeq.Store(snap)
 	p.evictSnapGCreated = p.lastObservedGCreated.Load()
-	p.evictFastQuietHolds = 0
+	p.evictSnapM, p.evictSnapCheaprand, _ = currentMAndCheaprand()
 	p.evictSnapStale = false
 	if !p.evictExactSnap.Load() {
 		p.evictExactSnap.Store(true)
@@ -3603,8 +3683,24 @@ func (p *pressureState) refreshFastEvictSnapLocked() {
 	snap := p.observePreHookLiveGIDsWithSample(true, true, false, &p.evictGCreatedSample)
 	p.evictStartSnapSeq.Store(snap)
 	p.evictSnapGCreated = p.lastObservedGCreated.Load()
-	p.evictFastQuietHolds = 0
+	p.evictSnapM, p.evictSnapCheaprand, _ = currentMAndCheaprand()
 	p.evictSnapStale = false
+}
+
+func (p *pressureState) hasEvictSnapGoroutinesCreated() bool {
+	m, r, ok := currentMAndCheaprand()
+	if ok && m == p.evictSnapM && r == p.evictSnapCheaprand {
+		return false
+	}
+	if p.hasGoroutinesCreatedSinceEvictSnap() {
+		p.evictSnapStale = true
+		return true
+	}
+	if ok {
+		p.evictSnapM = m
+		p.evictSnapCheaprand = r
+	}
+	return false
 }
 
 func (p *pressureState) canEnterFastEvictHold(exact bool, holdIdx uint64) bool {
@@ -3612,13 +3708,7 @@ func (p *pressureState) canEnterFastEvictHold(exact bool, holdIdx uint64) bool {
 		!p.evictFastMode.Load() || runtimeGetProfLabel() != nil {
 		return false
 	}
-	if p.evictFastQuietHolds < evictLabelRingSize {
-		if p.hasGoroutinesCreatedSinceEvictSnap() {
-			return false
-		}
-		p.evictFastQuietHolds++
-	}
-	return true
+	return !p.hasEvictSnapGoroutinesCreated()
 }
 
 func (p *pressureState) maybeRotateEvictLabelRingLocked(ring *[evictLabelRingSize]unsafe.Pointer) (*[evictLabelRingSize]unsafe.Pointer, bool) {
@@ -3750,8 +3840,8 @@ func (p *pressureState) isEvictRingTag(label unsafe.Pointer) bool {
 }
 
 func (p *pressureState) clearHeldEvictLabelLocked() {
-	if !p.evictSnapStale && p.hasGoroutinesCreatedSinceEvictSnap() {
-		p.evictSnapStale = true
+	if !p.evictSnapStale {
+		_ = p.hasEvictSnapGoroutinesCreated()
 	}
 	tagAddr := p.evictHeldTagAddr
 	if tagAddr == 0 {

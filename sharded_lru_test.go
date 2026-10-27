@@ -9474,20 +9474,21 @@ func runR19C1CrossShardSpikeCase(t *testing.T, backend Backend, useEvaluate bool
 	)
 	pa := c.(PressureAwareCache[int])
 
-	// Populate shard 2 above its Tier 2 target (target = 15) and create compaction slack.
+	// Populate shards 1 and 2 above their Tier 2 target (target = 15) and create compaction slack.
 	for i := range 30 {
-		_, err := c.Put(fmt.Sprintf("s2/k%02d", i), i)
+		_, err := c.Put(fmt.Sprintf("s1/k%02d", i), i)
+		require.NoError(t, err)
+		_, err = c.Put(fmt.Sprintf("s2/k%02d", i), i)
 		require.NoError(t, err)
 	}
 	for i := range 6 {
+		_, _ = c.Delete(fmt.Sprintf("s1/k%02d", i))
 		_, _ = c.Delete(fmt.Sprintf("s2/k%02d", i))
 	}
 	_, err := c.Put("s2/match", 1)
 	require.NoError(t, err)
-	// Shard 2 now has 24 weighted entries (> target 15), 1 zero-weight match key, and deletion slack.
+	// Shards 1 and 2 now have 24 weighted entries each (> target 15).
 	_, err = c.Put("s0/hold", 1)
-	require.NoError(t, err)
-	_, err = c.Put("s1/hold", 1)
 	require.NoError(t, err)
 
 	sc := c.(*shardedCache[int])
@@ -9519,9 +9520,10 @@ func runR19C1CrossShardSpikeCase(t *testing.T, backend Backend, useEvaluate bool
 		return seq > baselineS0Seq
 	}, 2*time.Second, time.Millisecond)
 
-	// Spike pressure to Tier 2 (0.95) and run a non-reclaiming operation on Shard 2.
+	// Spike pressure to Tier 2 (0.95) and run a non-reclaiming operation on Shard 0
+	// so s1.sampledPressureSeq and s2.sampledPressureSeq remain < sample.seq while coord advances.
 	pressureBits.Store(math.Float64bits(0.95))
-	_, _ = c.Delete("s2/absent")
+	_, _ = c.Delete("s0/absent")
 	if forceRefresh {
 		sc.coord.pressureNeedsRefresh.Store(true)
 	}
@@ -9529,9 +9531,16 @@ func runR19C1CrossShardSpikeCase(t *testing.T, backend Backend, useEvaluate bool
 	unlockS1()
 	<-opDone
 
+	if useEvaluate {
+		s1Stats := sc.shards[1].Stats()
+		assert.LessOrEqual(t, s1Stats.CurrentSize, uint64(15),
+			"Shard 1 must shed down to its Tier 2 retention target (<= 15) after observing a newer cross-shard Tier 2 spike")
+		assert.Positive(t, s1Stats.EvictionsPressure,
+			"Shard 1 must record Tier 2 pressure evictions")
+	}
 	s2Stats := sc.shards[2].Stats()
 	assert.LessOrEqual(t, s2Stats.CurrentSize, uint64(15),
-		"Shard 2 must shed down to its Tier 2 retention target (<= 15) after observing a newer Tier 2 spike")
+		"Shard 2 must shed down to its Tier 2 retention target (<= 15) after observing a newer cross-shard Tier 2 spike")
 	assert.Positive(t, s2Stats.EvictionsPressure,
 		"Shard 2 must record Tier 2 pressure evictions")
 }
@@ -9568,7 +9577,6 @@ func runR19C2OutOfOrderLockAcquisitionCase(t *testing.T, backend Backend, initia
 	}
 
 	sc := c.(*shardedCache[int])
-	s0PS := sc.shards[0].pressureStatePtr()
 
 	// Hold s0 RLock so G1 finishes sampleForLock on s0 (seq = N) and waits before acquiring s0.mu.Lock().
 	probeBefore := probeCount.Load()
@@ -9583,27 +9591,20 @@ func runR19C2OutOfOrderLockAcquisitionCase(t *testing.T, backend Backend, initia
 		return probeCount.Load() == probeBefore+1 && !sc.coord.samplingPressure.Load()
 	}, 2*time.Second, time.Millisecond)
 
-	// Simulate G2 having sampled a newer Tier 2 spike (0.95, seq = N+1) and acquired s0.mu.Lock() before G1.
-	newSeq := sc.coord.pressureInvokeSeq.Add(1)
-	sc.coord.lastSampledSeq.Store(newSeq)
-	sc.coord.lastSampledPressureBits.Store(math.Float64bits(0.95))
-	sc.coord.cachedPressureBits.Store(math.Float64bits(0.95))
-	sc.coord.cachedPressureSeq.Store(newSeq)
-	sc.coord.cachedPressureEpoch.Store(sc.coord.reclaimEpoch.Load())
-	sc.coord.pressureInitialized.Store(true)
-	sc.coord.pressureNeedsRefresh.Store(false)
-	s0PS.sampledPressureSeq = newSeq
+	// Spike pressure to Tier 2 (0.95) and execute a non-reclaiming operation on Shard 1 (seq = N+1)
+	// while Shard 0's sampledPressureSeq remains < N.
 	pressureBits.Store(math.Float64bits(0.95))
+	_, _ = c.Delete("s1/absent")
 
 	unlockS0()
 	<-evalDone
 
 	assert.LessOrEqual(t, sc.shards[0].Stats().CurrentSize, uint64(15),
-		"Shard 0 must adopt the newer Tier 2 sample and shed to <= 15")
+		"Shard 0 must adopt the newer cross-shard Tier 2 sample and shed to <= 15")
 	assert.LessOrEqual(t, sc.shards[1].Stats().CurrentSize, uint64(15),
 		"Shard 1 must reuse the adopted Tier 2 sample and shed to <= 15")
-	assert.Equal(t, probeBefore+1, probeCount.Load(),
-		"Shard 1 must reuse the adopted valid sample without invoking PressureFunc a second time")
+	assert.Equal(t, probeBefore+2, probeCount.Load(),
+		"Shard 1 must reuse the adopted valid sample without invoking PressureFunc a third time")
 }
 
 func runR19C2ReentrantEpochFastForwardCase(t *testing.T, backend Backend) {
@@ -9682,6 +9683,221 @@ func TestShardedCache_R19CrossShardAndOutOfOrderSampleSeqOrdering(t *testing.T) 
 		})
 		t.Run("C2_ReentrantEpochFastForward/"+bName, func(t *testing.T) {
 			runR19C2ReentrantEpochFastForwardCase(t, backend)
+		})
+	}
+}
+
+func runR21C2Post1024SamplerPeerCase(t *testing.T, backend Backend, sharded bool) {
+	t.Helper()
+	var (
+		armed        atomic.Bool
+		firstBlocked atomic.Bool
+		inSampler    = make(chan struct{})
+		releaseH     = make(chan struct{})
+	)
+	opts := []Option{
+		WithBackend(backend),
+		WithCompactionThreshold(0.70),
+		WithEvictionThreshold(0.90),
+		WithEvictionRetentionRatio(0.50),
+		WithPressureFunc(func() float64 {
+			if armed.Load() {
+				if firstBlocked.CompareAndSwap(false, true) {
+					close(inSampler)
+					<-releaseH
+				}
+				return 0.95
+			}
+			return 0.10
+		}),
+	}
+	var c Cache[int]
+	if sharded {
+		c = NewShardedCache[int](60, 2, explicitTagShardFunc, opts...)
+	} else {
+		c = New[int](30, opts...)
+	}
+	pa := c.(PressureAwareCache[int])
+
+	for i := range 24 {
+		_, err := c.Put(fmt.Sprintf("s0/k%02d", i), i)
+		require.NoError(t, err)
+	}
+	for range 1030 {
+		_, _ = c.Delete("s0/absent")
+	}
+
+	peerDone := make(chan struct{})
+	var evictedCount atomic.Int32
+	spawnR21PeerViaReturnedHelper(func() {
+		<-inSampler
+		evicted := pa.EvaluateMemoryPressure()
+		evictedCount.Store(int32(len(evicted)))
+		close(peerDone)
+		close(releaseH)
+	})
+
+	armed.Store(true)
+	_, _ = c.Delete("s0/absent")
+	<-peerDone
+
+	assert.Positive(t, evictedCount.Load(), "peer goroutine must not be misclassified as re-entrant child after 1,030 quiet samples")
+	assert.LessOrEqual(t, c.Stats().CurrentSize, uint64(15), "cache must shed down to Tier 2 retention target")
+}
+
+func runR21C2DirectParentPeerCase(t *testing.T, backend Backend) {
+	t.Helper()
+	var (
+		armed        atomic.Bool
+		firstBlocked atomic.Bool
+		inSampler    = make(chan struct{})
+		releaseH     = make(chan struct{})
+	)
+	c := New[int](30,
+		WithBackend(backend),
+		WithCompactionThreshold(0.70),
+		WithEvictionThreshold(0.90),
+		WithEvictionRetentionRatio(0.50),
+		WithPressureFunc(func() float64 {
+			if armed.Load() {
+				if firstBlocked.CompareAndSwap(false, true) {
+					close(inSampler)
+					<-releaseH
+				}
+				return 0.95
+			}
+			return 0.10
+		}),
+	)
+	pa := c.(PressureAwareCache[int])
+	for i := range 24 {
+		_, err := c.Put(fmt.Sprintf("k%02d", i), i)
+		require.NoError(t, err)
+	}
+	for range 1030 {
+		_, _ = c.Delete("absent")
+	}
+
+	peerDone := make(chan struct{})
+	var evictedCount atomic.Int32
+	go func() {
+		<-inSampler
+		evicted := pa.EvaluateMemoryPressure()
+		evictedCount.Store(int32(len(evicted)))
+		close(peerDone)
+		close(releaseH)
+	}()
+
+	armed.Store(true)
+	_, _ = c.Delete("absent")
+	<-peerDone
+
+	assert.Positive(t, evictedCount.Load(), "peer spawned directly by H after 1,030 quiet samples must shed under Tier 2")
+	assert.LessOrEqual(t, c.Stats().CurrentSize, uint64(15))
+}
+
+//go:noinline
+func spawnR21PeerViaReturnedHelper(fn func()) {
+	go fn()
+}
+
+func runR21C3Post1024EvictCase(t *testing.T, backend Backend, fromPriorHold bool) {
+	t.Helper()
+	var (
+		holdCount         atomic.Int32
+		inPanickingHold   = make(chan struct{})
+		releasePanicHold  = make(chan struct{})
+		startDetachedPeer = make(chan struct{})
+		peerEvicted       atomic.Bool
+		peerReturnedEarly atomic.Bool
+		hStillInEvict     atomic.Bool
+	)
+	peerDone := make(chan struct{})
+	var c Cache[int]
+	c = NewShardedCache[int](60, 2, explicitTagShardFunc,
+		WithBackend(backend),
+		WithOnEvictEntry(func(key string, _ int, _ EvictionReason) {
+			if key == "s1/peer" {
+				peerEvicted.Store(true)
+				return
+			}
+			n := holdCount.Add(1)
+			if fromPriorHold && n == 1030 {
+				go func() {
+					defer close(peerDone)
+					pprof.Do(context.Background(), pprof.Labels("r21", "detached-prior"), func(context.Context) {
+						<-startDetachedPeer
+						_, _ = c.Delete("s1/peer")
+						if hStillInEvict.Load() {
+							peerReturnedEarly.Store(true)
+						}
+					})
+				}()
+				return
+			}
+			if n == 1031 {
+				hStillInEvict.Store(true)
+				close(inPanickingHold)
+				<-releasePanicHold
+				hStillInEvict.Store(false)
+				panic("boom-r21-hold-1031")
+			}
+		}),
+	)
+
+	_, err := c.Put("s0/fg", 0)
+	require.NoError(t, err)
+	_, err = c.Put("s1/peer", 999)
+	require.NoError(t, err)
+	for i := 1; i <= 1030; i++ {
+		require.NoError(t, c.Replace("s0/fg", i))
+	}
+
+	if !fromPriorHold {
+		spawnR21PeerViaReturnedHelper(func() {
+			defer close(peerDone)
+			pprof.Do(context.Background(), pprof.Labels("r21", "helper-peer"), func(context.Context) {
+				<-inPanickingHold
+				_, _ = c.Delete("s1/peer")
+				if hStillInEvict.Load() {
+					peerReturnedEarly.Store(true)
+				}
+			})
+		})
+	} else {
+		go func() {
+			<-inPanickingHold
+			close(startDetachedPeer)
+		}()
+	}
+
+	go func() {
+		<-inPanickingHold
+		time.Sleep(10 * time.Millisecond)
+		close(releasePanicHold)
+	}()
+
+	assert.PanicsWithValue(t, "boom-r21-hold-1031", func() {
+		_ = c.Replace("s0/fg", 1031)
+	})
+	<-peerDone
+	require.Eventually(t, peerEvicted.Load, 2*time.Second, time.Millisecond,
+		"independent peer OnEvict callback must not be dropped when Hold 1031 panics")
+	assert.False(t, peerReturnedEarly.Load(),
+		"independent peer Delete must serialize behind Hold 1031 OnEvict")
+}
+
+func TestShardedCache_R21Post1024LineageAndEvictCallbackIsolation(t *testing.T) {
+	for _, backend := range []Backend{BackendMap, BackendRadix, BackendArenaRadix} {
+		bName := backend.String()
+		t.Run("C2_Post1024SamplerPeer/"+bName, func(t *testing.T) {
+			runR21C2Post1024SamplerPeerCase(t, backend, false)
+			runR21C2Post1024SamplerPeerCase(t, backend, true)
+			runR21C2DirectParentPeerCase(t, backend)
+		})
+		t.Run("C3_Post1024EvictIsolation/"+bName, func(t *testing.T) {
+			runR21C3Post1024EvictCase(t, backend, false)
+			runR21C3Post1024EvictCase(t, backend, true)
 		})
 	}
 }
