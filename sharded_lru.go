@@ -16,10 +16,13 @@ package lru
 
 import (
 	"fmt"
+	"hash/maphash"
 	"iter"
 	"math"
 	"sync/atomic"
 )
+
+var defaultShardSeed = maphash.MakeSeed()
 
 // shardEngine is implemented by all concrete single-shard backends (*mapCache[V],
 // *radixCache[V], and *arenaRadix[V]), enabling zero-allocation cross-shard
@@ -34,8 +37,8 @@ type shardEngine[V any] interface {
 	evaluateShardPressure(evictQ *evictCallbackQueue[V], sample shardSample) ([]V, shardSample)
 }
 
-// DefaultShardFunc computes a zero-allocation 64-bit FNV-1a hash of key and maps it
-// into [0, numShards).
+// DefaultShardFunc computes a zero-allocation 64-bit hash of key using hash/maphash
+// and maps it into [0, numShards).
 //
 // numShards must be greater than zero; otherwise DefaultShardFunc panics.
 func DefaultShardFunc(key string, numShards int) int {
@@ -45,7 +48,7 @@ func DefaultShardFunc(key string, numShards int) int {
 	if numShards == 1 {
 		return 0
 	}
-	h := hashString(key)
+	h := maphash.String(defaultShardSeed, key)
 	if (numShards & (numShards - 1)) == 0 {
 		return int(h & uint64(numShards-1))
 	}
