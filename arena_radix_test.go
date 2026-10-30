@@ -805,7 +805,7 @@ func TestArenaRadixCache_CheckInvariants_PanicScenarios(t *testing.T) {
 		_, err = c.Put("ac", testData{value: 2, dataSize: 10})
 		require.NoError(t, err)
 		childID := c.nodes[c.root].child
-		if childID != nilNode && !c.nodes[childID].hasValue {
+		if childID != nilNode && !c.nodes[childID].hasValue() {
 			firstGrandchild := c.nodes[childID].child
 			if firstGrandchild != nilNode {
 				c.nodes[firstGrandchild].sibling = nilNode
@@ -908,7 +908,7 @@ func TestArenaRadixCache_CheckInvariants_PanicScenarios(t *testing.T) {
 		require.NoError(t, err)
 		routingID := c.nodes[c.root].child
 		require.NotEqual(t, nilNode, routingID)
-		require.False(t, c.nodes[routingID].hasValue)
+		require.False(t, c.nodes[routingID].hasValue())
 
 		// Act
 		c.nodes[routingID].value = testData{value: 99, dataSize: 10}
@@ -937,6 +937,81 @@ func TestArenaRadixCache_CheckInvariants_PanicScenarios(t *testing.T) {
 		assert.Panics(t, func() {
 			c.checkInvariants()
 		})
+	})
+
+	t.Run("RootNonZeroEdgeStart", func(t *testing.T) {
+		c := NewArenaRadixCache[testData](50, testDataWeigher).(*arenaRadix[testData])
+		c.nodes[c.root].setEdgeStart(1)
+		assert.Panics(t, func() {
+			c.checkInvariants()
+		})
+	})
+
+	t.Run("ChildInvalidEdgeStart", func(t *testing.T) {
+		c := NewArenaRadixCache[testData](50, testDataWeigher).(*arenaRadix[testData])
+		_, err := c.Put("a/b", testData{value: 1, dataSize: 10})
+		require.NoError(t, err)
+		childID := c.nodes[c.root].child
+		require.NotEqual(t, nilNode, childID)
+		c.nodes[childID].setEdgeStart(1)
+		assert.Panics(t, func() {
+			c.checkInvariants()
+		})
+	})
+
+	t.Run("FreeListNodeNonZeroEdgeStart", func(t *testing.T) {
+		c := NewArenaRadixCache[testData](50, testDataWeigher).(*arenaRadix[testData])
+		_, _ = c.Put("k1", testData{value: 1, dataSize: 10})
+		_, _ = c.Put("k2", testData{value: 2, dataSize: 10})
+		_, _ = c.Delete("k1")
+		require.NotEqual(t, nilNode, c.freeHead)
+		c.nodes[c.freeHead].setEdgeStart(2)
+		assert.Panics(t, func() {
+			c.checkInvariants()
+		})
+	})
+
+	t.Run("CollisionPeerBucketInvariantPanics", func(t *testing.T) {
+		c := NewArenaRadixCache[testData](50, testDataWeigher).(*arenaRadix[testData])
+		_, _ = c.Put("k1", testData{value: 1, dataSize: 10})
+		_, _ = c.Put("k2", testData{value: 2, dataSize: 10})
+		h1 := c.hashKey("k1")
+		h2 := c.hashKey("k2")
+		id1 := c.nodeMap[h1]
+		id2 := c.nodeMap[h2]
+
+		// 1. Empty slice in collisionPeers[h1]
+		c.collisionPeers = map[uint64][]uint32{h1: {}}
+		assert.Panics(t, func() { c.checkNodeMapInvariants() })
+
+		// 2. collisionPeers bucket without corresponding nodeMap entry
+		c.collisionPeers = map[uint64][]uint32{99999: {id1}}
+		assert.Panics(t, func() { c.checkNodeMapInvariants() })
+
+		// 3. Peer hash mismatch (hashNodeKey(id2) != h1)
+		c.collisionPeers = map[uint64][]uint32{h1: {id2}}
+		assert.Panics(t, func() { c.checkNodeMapInvariants() })
+
+		// 4. Peer duplicates mappedID in nodeMap[h1]
+		c.collisionPeers = map[uint64][]uint32{h1: {id1}}
+		assert.Panics(t, func() { c.checkNodeMapInvariants() })
+
+		// 5. Duplicate peer IDs in collisionPeers[h1]
+		delete(c.nodeMap, h2)
+		c.nodes[id2].fullKey = "k1"
+		c.collisionPeers = map[uint64][]uint32{h1: {id2, id2}}
+		c.collisionCount = 2
+		assert.Panics(t, func() { c.checkNodeMapInvariants() })
+
+		// 6. collisionCount != totalPeers
+		c.collisionPeers = map[uint64][]uint32{h1: {id2}}
+		c.collisionCount = 5
+		assert.Panics(t, func() { c.checkNodeMapInvariants() })
+
+		// 7. len(nodeMap) + collisionCount > c.len
+		c.collisionCount = 1
+		c.len = 1
+		assert.Panics(t, func() { c.checkNodeMapInvariants() })
 	})
 }
 
@@ -1405,23 +1480,23 @@ func TestArenaRadixCache_ReplaceGrowAtMRUHeadUnderCriticalPressure(t *testing.T)
 	assert.True(t, ok)
 }
 
-// TestArenaRadixCache_FNV1aHashCollisionAndNodeMapHealing verifies that ArenaRadixCache preserves key
-// reachability, LRU invariants, and compaction guarantees when 64-bit FNV-1a hash collisions displace
+// TestArenaRadixCache_HashCollisionAndNodeMapHealing verifies that ArenaRadixCache preserves key
+// reachability, LRU invariants, and compaction guarantees when 64-bit maphash collisions displace
 // entries in the O(1) c.nodeMap accelerator.
 //
 // White-box testing rationale:
-//  1. ArenaRadixCache hashes keys internally using unseeded 64-bit FNV-1a (hashString). By the birthday bound,
-//     finding two distinct variable-length strings with the exact same 64-bit FNV-1a hash in a 2^64 hash space
+//  1. ArenaRadixCache hashes keys internally using seeded 64-bit hash/maphash (c.hashKey). By the birthday bound,
+//     finding two distinct variable-length strings with the exact same 64-bit maphash in a 2^64 hash space
 //     requires ~2^32 (~4.29 billion) evaluations, which is computationally infeasible at unit-test runtime even
 //     though collisions can occur in production across billions of cumulative keys.
 //  2. Furthermore, c.nodeMap is an internal O(1) hash accelerator backed by an exact O(K) radix-trie walk fallback
 //     (findNodeByTrieWalk). If Delete(K1) or a self-evicting/failing Replace(K1, ...) erroneously overwrites
 //     c.nodeMap[h] = idK1 before eraseInternalWithHash deletes c.nodeMap[h], public Get / Peek
 //     calls still return functionally identical values via the slow-path trie walk while silently evicting the
-//     surviving colliding peer K2 from c.nodeMap and breaking the len(c.nodeMap) == c.len Pigeonhole Principle O(1)
+//     surviving colliding peer K2 from c.nodeMap and breaking the len(c.nodeMap)+c.collisionCount == c.len Pigeonhole Principle O(1)
 //     cache-miss fast-path across the entire cache.
 //     These subtests therefore seed a synthetic collision/displacement in c.nodeMap in setup and inspect c.nodeMap
-//     in assertions alongside public API Get/ Peek/Put/Replace/Delete/Compact calls.
+//     in assertions alongside public API Get/Peek/Put/Replace/Delete/Compact calls.
 func TestArenaRadixCache_HashCollisionAndNodeMapHealing(t *testing.T) {
 	const keyA = "prefix/key-alpha"
 	const keyB = "prefix/key-beta"
@@ -1655,6 +1730,169 @@ func TestArenaRadixCache_HashCollisionAndNodeMapHealing(t *testing.T) {
 		assert.Equal(t, "root_val", erased)
 		assert.Len(t, ac.nodeMap, 1)
 	})
+
+	t.Run("ActiveCollisionPeerPromotionPopAndRemoveHelpers", func(t *testing.T) {
+		c := NewArenaRadixCache[testData](1000, testDataWeigher).(*arenaRadix[testData])
+		_, err := c.Put("k1", testData{value: 1, dataSize: 10})
+		require.NoError(t, err)
+		_, err = c.Put("k2", testData{value: 2, dataSize: 10})
+		require.NoError(t, err)
+		_, err = c.Put("k3", testData{value: 3, dataSize: 10})
+		require.NoError(t, err)
+
+		h1 := c.hashKey("k1")
+		h2 := c.hashKey("k2")
+		h3 := c.hashKey("k3")
+		id1 := c.nodeMap[h1]
+		id2 := c.nodeMap[h2]
+		id3 := c.nodeMap[h3]
+		delete(c.nodeMap, h2)
+		delete(c.nodeMap, h3)
+		c.nodes[id2].fullKey = "k1"
+		c.nodes[id3].fullKey = "k1"
+
+		// Promote id2 and id3 into h1's bucket so id1 and id2 become active collisionPeers[h1].
+		c.promoteCollisionPeerLocked(h1, id2)
+		c.promoteCollisionPeerLocked(h1, id2) // no-op when prevID == nodeID
+		c.promoteCollisionPeerLocked(h1, id3)
+		assert.Equal(t, id3, c.nodeMap[h1])
+		assert.Equal(t, 2, c.collisionCount)
+		assert.Equal(t, []uint32{id1, id2}, c.collisionPeers[h1])
+		c.checkNodeMapInvariants()
+
+		// Inserting a new key while c.collisionPeers != nil exercises the recordNodeMapInsertLocked path in insertNewOnPutLocked.
+		_, err = c.Put("k4", testData{value: 4, dataSize: 10})
+		require.NoError(t, err)
+		c.checkNodeMapInvariants()
+
+		// Promoting an existing peer (id1 at idx 0) while prevValid swaps prevID (id3) into peers[0].
+		c.promoteCollisionPeerLocked(h1, id1)
+		assert.Equal(t, id1, c.nodeMap[h1])
+		assert.Equal(t, []uint32{id3, id2}, c.collisionPeers[h1])
+
+		// Removing non-primary peer id2 shrinks peers to [id3] without emptying the bucket.
+		c.removeOrPromoteNodeMapLocked(h1, id2)
+		assert.Equal(t, []uint32{id3}, c.collisionPeers[h1])
+		assert.Equal(t, 1, c.collisionCount)
+
+		// Re-promote id2 so peers has 2 elements [id3, id1], then pop primary id2 (leaving [id3]).
+		c.promoteCollisionPeerLocked(h1, id2)
+		assert.Equal(t, 2, c.collisionCount)
+		c.removeOrPromoteNodeMapLocked(h1, id2)
+		assert.Equal(t, id1, c.nodeMap[h1])
+		assert.Equal(t, []uint32{id3}, c.collisionPeers[h1])
+		assert.Equal(t, 1, c.collisionCount)
+
+		// Popping primary id1 promotes the last peer id3 and clears collisionPeers to nil.
+		c.removeOrPromoteNodeMapLocked(h1, id1)
+		assert.Equal(t, id3, c.nodeMap[h1])
+		assert.Zero(t, c.collisionCount)
+		assert.Nil(t, c.collisionPeers)
+
+		// Promoting peer id1 when current nodeMap[h1] holds an invalid node ID removes id1 from collisionPeers.
+		c.nodeMap[h1] = 999
+		c.collisionPeers = map[uint64][]uint32{h1: {id1}}
+		c.collisionCount = 1
+		c.promoteCollisionPeerLocked(h1, id1)
+		assert.Equal(t, id1, c.nodeMap[h1])
+		assert.Zero(t, c.collisionCount)
+		assert.Nil(t, c.collisionPeers)
+
+		// Exhausting an invalid/excluded peer bucket during removeOrPromoteNodeMapLocked deletes nodeMap[h1].
+		c.collisionPeers = map[uint64][]uint32{h1: {id1}}
+		c.collisionCount = 1
+		c.removeOrPromoteNodeMapLocked(h1, id1)
+		_, exists := c.nodeMap[h1]
+		assert.False(t, exists)
+		assert.Zero(t, c.collisionCount)
+		assert.Nil(t, c.collisionPeers)
+
+		// Calling removeOrPromoteNodeMapLocked when hash is absent from nodeMap is a safe no-op.
+		c.removeOrPromoteNodeMapLocked(h1, id1)
+	})
+
+	t.Run("CompactionRebuildsCollisionPeersInContiguousAndFragmentedModes", func(t *testing.T) {
+		c := NewArenaRadixCache[testData](1000, testDataWeigher).(*arenaRadix[testData])
+		_, err := c.Put("k1", testData{value: 1, dataSize: 10})
+		require.NoError(t, err)
+		_, err = c.Put("k2", testData{value: 2, dataSize: 10})
+		require.NoError(t, err)
+		_, err = c.Put("k3", testData{value: 3, dataSize: 10})
+		require.NoError(t, err)
+
+		h1 := c.hashKey("k1")
+		h2 := c.hashKey("k2")
+		id1 := c.nodeMap[h1]
+		id2 := c.nodeMap[h2]
+		delete(c.nodeMap, h2)
+		c.nodes[id2].fullKey = "k1"
+		c.nodeMapDirty = true
+
+		// 1. Contiguous compaction (c.freeHead == nilNode) rebuilds collisionPeers and collisionCount.
+		c.Compact()
+		assert.Equal(t, 1, c.collisionCount)
+		assert.Equal(t, []uint32{id1}, c.collisionPeers[h1])
+		assert.Equal(t, id2, c.nodeMap[h1])
+		c.checkNodeMapInvariants()
+
+		// 2. Fragmented compaction (c.freeHead != nilNode) remaps node IDs and rebuilds collisionPeers.
+		_, ok := c.Delete("k3")
+		require.True(t, ok)
+		require.NotEqual(t, nilNode, c.freeHead)
+		c.Compact()
+		assert.Equal(t, nilNode, c.freeHead)
+		assert.Equal(t, 1, c.collisionCount)
+		require.Len(t, c.collisionPeers[h1], 1)
+		c.checkNodeMapInvariants()
+	})
+
+	t.Run("ReplaceTier2SheddingRestoresCollidingPeerInNodeMap", func(t *testing.T) {
+		pressure := 0.10
+		c := NewArenaRadixCache[testData](
+			1000,
+			testDataWeigher,
+			WithPressureFunc(func() float64 { return pressure }),
+			WithCompactionThreshold(0.75),
+			WithEvictionThreshold(0.90),
+			WithEvictionRetentionRatio(0.50),
+		).(*arenaRadix[testData])
+
+		_, err := c.Put("tail-coll", testData{value: 1, dataSize: 100})
+		require.NoError(t, err)
+		for i := range 3 {
+			_, err = c.Put(fmt.Sprintf("mid-%d", i), testData{value: int64(10 + i), dataSize: 115})
+			require.NoError(t, err)
+		}
+		_, err = c.Put("head-coll", testData{value: 2, dataSize: 115})
+		require.NoError(t, err)
+
+		hTail := c.hashKey("tail-coll")
+		hColl := c.hashKey("head-coll")
+		idTail := c.nodeMap[hTail]
+		idHead := c.nodeMap[hColl]
+		delete(c.nodeMap, hTail)
+		c.nodes[idTail].fullKey = "head-coll"
+		c.promoteCollisionPeerLocked(hColl, idTail)
+		require.Equal(t, idTail, c.nodeMap[hColl])
+		require.Equal(t, []uint32{idHead}, c.collisionPeers[hColl])
+		require.Equal(t, 1, c.collisionCount)
+		c.checkNodeMapInvariants()
+
+		// Trigger Tier 2 pressure shedding during Replace("mid-0"): sheds LRU tail idTail and promotes idHead.
+		pressure = 0.95
+		err = c.Replace("mid-0", testData{value: 110, dataSize: 115})
+		require.NoError(t, err)
+
+		assert.Equal(t, idHead, c.nodeMap[hColl])
+		assert.Zero(t, c.collisionCount)
+		assert.Nil(t, c.collisionPeers)
+		c.checkInvariants()
+		vHead, ok := c.Peek("head-coll")
+		require.True(t, ok)
+		assert.Equal(t, int64(2), vHead.value)
+		_, ok = c.Peek("missing-key")
+		assert.False(t, ok)
+	})
 }
 
 func TestArenaRadixCache_DeepHierarchyOver64LevelsAndRoutingPrefixCloning(t *testing.T) {
@@ -1700,36 +1938,123 @@ func TestArenaRadixCache_DeepHierarchyOver64LevelsAndRoutingPrefixCloning(t *tes
 	})
 
 	t.Run("RoutingPrefixDoesNotPinLargeKeyBackingArray", func(t *testing.T) {
-		// Arrange: Put a 64 KiB key ("dir/" + 64 KiB suffix), then split the edge
-		// with two sibling keys ("dir/a" and "dir/b") and erase the 64 KiB key so
-		// the "dir/" intermediate routing node survives.
+		// Arrange: Put two 64 KiB keys ("dir/A" + 64 KiB suffix and "dir/B" + 64 KiB suffix)
+		// so splitting at "dir/" invokes slicePrefix with both candidate strings having > 64 bytes
+		// of trailing capacity (exercising clonePrefix(src[:end])), then insert short sibling keys
+		// ("dir/a" and "dir/b") and erase both 64 KiB keys so the "dir/" routing node survives.
 		//
 		// White-box testing rationale: String backing-array aliasing on internal routing nodes is
 		// invisible to public Get results, so verifying that the 4-byte "dir/" routing prefix does not pin
-		// the 64 KiB key buffer requires inspecting unsafe.StringData on the internal routing node.
+		// either 64 KiB key buffer requires inspecting unsafe.StringData on the internal routing node.
 		c := NewArenaRadixCache[string](1<<20, WithInvariantChecking(true)).(*arenaRadix[string])
-		largeKey := strings.Clone("dir/" + strings.Repeat("X", 1<<16))
+		largeKeyA := strings.Clone("dir/A" + strings.Repeat("X", 1<<16))
+		largeKeyB := strings.Clone("dir/B" + strings.Repeat("Y", 1<<16))
+		largeStartA := uintptr(unsafe.Pointer(unsafe.StringData(largeKeyA)))
+		largeEndA := largeStartA + uintptr(len(largeKeyA))
+		largeStartB := uintptr(unsafe.Pointer(unsafe.StringData(largeKeyB)))
+		largeEndB := largeStartB + uintptr(len(largeKeyB))
 
-		_, err := c.Put(largeKey, "v")
+		_, err := c.Put(largeKeyA, "va_large")
 		require.NoError(t, err)
-		pinnedInitialPrefix := c.nodes[1].fullKey
-		largeStart := uintptr(unsafe.Pointer(unsafe.StringData(pinnedInitialPrefix)))
-		largeEnd := largeStart + uintptr(len(pinnedInitialPrefix))
+		_, err = c.Put(largeKeyB, "vb_large")
+		require.NoError(t, err)
 
-		// Act: Split the edge and erase the 64 KiB key.
+		// Act: Insert short sibling keys and erase both 64 KiB keys.
 		_, err = c.Put("dir/a", "va")
 		require.NoError(t, err)
 		_, err = c.Put("dir/b", "vb")
 		require.NoError(t, err)
-		_, _ = c.Delete(largeKey)
+		_, _ = c.Delete(largeKeyA)
+		_, _ = c.Delete(largeKeyB)
 
-		// Assert: Routing node fullKey "dir/" does not alias pinnedInitialPrefix's 64 KiB backing array.
+		// Assert: Routing node fullKey "dir/" does not alias either 64 KiB key's backing array.
 		routingID := c.nodes[c.root].child
 		require.NotEqual(t, nilNode, routingID)
 		assert.Equal(t, "dir/", c.nodes[routingID].fullKey)
 		prefixPtr := uintptr(unsafe.Pointer(unsafe.StringData(c.nodes[routingID].fullKey)))
-		assert.True(t, prefixPtr < largeStart || prefixPtr >= largeEnd, "routing node prefix must not pin 64 KiB backing array")
-		runtime.KeepAlive(pinnedInitialPrefix)
+		assert.True(t, prefixPtr < largeStartA || prefixPtr >= largeEndA, "routing node prefix must not pin largeKeyA backing array")
+		assert.True(t, prefixPtr < largeStartB || prefixPtr >= largeEndB, "routing node prefix must not pin largeKeyB backing array")
+		runtime.KeepAlive(largeKeyA)
+		runtime.KeepAlive(largeKeyB)
+	})
+}
+
+func TestArenaRadixCache_LargeKeysAndSharedPrefixesOver64KiB(t *testing.T) {
+	t.Run("Exact64KiBSharedPrefixAtRoot", func(t *testing.T) {
+		c := NewArenaRadixCache[testData](1000, WithInvariantChecking(true), testDataWeigher).(PressureAwareCache[testData])
+		prefix64K := strings.Repeat("p", 1<<16) // 65,536 bytes (previously wrapped uint16 to 0)
+		k1 := prefix64K + "alpha"
+		k2 := prefix64K + "beta"
+
+		_, err := c.Put(k1, testData{value: 1, dataSize: 10})
+		require.NoError(t, err)
+		_, err = c.Put(k2, testData{value: 2, dataSize: 10})
+		require.NoError(t, err)
+		_, err = c.Put(prefix64K, testData{value: 3, dataSize: 10})
+		require.NoError(t, err)
+
+		v1, ok := c.Get(k1)
+		require.True(t, ok)
+		assert.Equal(t, int64(1), v1.value)
+		v2, ok := c.Peek(k2)
+		require.True(t, ok)
+		assert.Equal(t, int64(2), v2.value)
+		vExact, ok := c.Get(prefix64K)
+		require.True(t, ok)
+		assert.Equal(t, int64(3), vExact.value)
+		_, ok = c.Peek(prefix64K + "gamma")
+		assert.False(t, ok)
+
+		_, ok = c.Delete(prefix64K)
+		require.True(t, ok)
+		c.Compact()
+
+		// Deleting k1 merges the 65,536-byte routing node with k2 via compressPathUpwards.
+		_, ok = c.Delete(k1)
+		require.True(t, ok)
+		v2After, ok := c.Get(k2)
+		require.True(t, ok)
+		assert.Equal(t, int64(2), v2After.value)
+
+		c.DeletePrefix(prefix64K)
+		_, ok = c.Peek(k2)
+		assert.False(t, ok)
+	})
+
+	t.Run("GreaterThan64KiBSharedPrefixAndMultiLevelSplitsPast64KiB", func(t *testing.T) {
+		c := NewArenaRadixCache[testData](1000, WithInvariantChecking(true), testDataWeigher).(*arenaRadix[testData])
+		base70K := strings.Repeat("a", 70000)
+		mid135K := base70K + "/" + strings.Repeat("b", 1<<16) // second edge is 65,537 bytes
+		kA := base70K + "/leafA"
+		kB1 := mid135K + "/sub1/x"
+		kB2 := mid135K + "/sub1/y"
+		kB3 := mid135K + "/sub2/z"
+
+		for i, k := range []string{kA, kB1, kB2, kB3} {
+			_, err := c.Put(k, testData{value: int64(i + 10), dataSize: 10})
+			require.NoError(t, err)
+		}
+
+		// Force trie-walk fallback across >64 KiB edges for kB2.
+		delete(c.nodeMap, c.hashKey(kB2))
+		vB2, ok := c.Get(kB2)
+		require.True(t, ok)
+		assert.Equal(t, int64(12), vB2.value)
+
+		c.Compact()
+		_, ok = c.Delete(kB1)
+		require.True(t, ok)
+		_, ok = c.Peek(kB2)
+		require.True(t, ok)
+
+		c.DeletePrefix(mid135K + "/sub")
+		_, ok = c.Peek(kB2)
+		assert.False(t, ok)
+		_, ok = c.Peek(kB3)
+		assert.False(t, ok)
+		vA, ok := c.Get(kA)
+		require.True(t, ok)
+		assert.Equal(t, int64(10), vA.value)
 	})
 }
 
@@ -1882,8 +2207,16 @@ func TestArenaRadixCache_Iterators(t *testing.T) {
 			require.NoError(t, err)
 		}
 		ac := cNoInv.(*arenaRadix[testData])
+		allSeq := cNoInv.All()
+		keySeq := cNoInv.Keys()
 		valSeq := cNoInv.Values()
 		allocs := testing.AllocsPerRun(100, func() {
+			allSeq(func(k string, v testData) bool {
+				return k != "" && v.value >= 0
+			})
+			keySeq(func(k string) bool {
+				return k != ""
+			})
 			valSeq(func(v testData) bool {
 				return v.value >= 0
 			})
@@ -1893,7 +2226,7 @@ func TestArenaRadixCache_Iterators(t *testing.T) {
 				}
 			}
 		})
-		assert.Zero(t, allocs, "ArenaRadixCache.Values() must allocate 0 heap objects")
+		assert.Zero(t, allocs, "ArenaRadixCache All(), Keys(), and Values() must allocate 0 heap objects")
 
 		// Confirm iteration did not mutate LRU eviction order: inserting k5 (10B) evicts oldest entry k0 (value 1).
 		evicted, err := c.Put("arena/k5", testData{value: 6, dataSize: 10})
@@ -2122,11 +2455,12 @@ func TestArenaRadix_CacheLineLayoutAndStructAlignment(t *testing.T) {
 		unsafe.Offsetof(rc.root), unsafe.Offsetof(rc.mu),
 		unsafe.Offsetof(ac.nodes), acMuOffset)
 
-	// Act & Assert 3: arenaRadixNode[uint64] embeds `fullKey string` at offset 0 and `edgeStart uint16` at offset 46.
+	// Act & Assert 3: arenaRadixNode[uint64] embeds `fullKey string` at offset 0 and `edgeStartAndFlags uint32` at offset 44.
 	var node arenaRadixNode[uint64]
 	assert.Equal(t, uintptr(0), unsafe.Offsetof(node.fullKey))
 	assert.Equal(t, uintptr(16), unsafe.Sizeof(node.fullKey))
-	assert.Equal(t, uintptr(46), unsafe.Offsetof(node.edgeStart))
+	assert.Equal(t, uintptr(44), unsafe.Offsetof(node.edgeStartAndFlags))
+	assert.Equal(t, uintptr(4), unsafe.Sizeof(node.edgeStartAndFlags))
 	assert.Equal(t, uintptr(56), unsafe.Sizeof(node))
 	nodeType := reflect.TypeFor[arenaRadixNode[uint64]]()
 	assert.Equal(t, reflect.String, nodeType.Field(0).Type.Kind())
@@ -2139,6 +2473,8 @@ func TestArenaRadix_AllocationCharacterization_PathCompressionAndDeepKeys(t *tes
 			c := New[uint64](100, WithBackend(b))
 			_, _ = c.Put("dir/sub/k1", 1)
 			_, _ = c.Put("dir/sub/k2", 2)
+			allSeq := c.All()
+			keySeq := c.Keys()
 			valSeq := c.Values()
 
 			// Act & Assert
@@ -2160,6 +2496,14 @@ func TestArenaRadix_AllocationCharacterization_PathCompressionAndDeepKeys(t *tes
 			assert.Zero(t, testing.AllocsPerRun(50, func() {
 				valSeq(func(v uint64) bool { return v > 0 })
 			}), "backend %v Values must be 0 allocs/op", b)
+			if b != BackendRadix {
+				assert.Zero(t, testing.AllocsPerRun(50, func() {
+					allSeq(func(k string, v uint64) bool { return k != "" && v > 0 })
+				}), "backend %v All must be 0 allocs/op", b)
+				assert.Zero(t, testing.AllocsPerRun(50, func() {
+					keySeq(func(k string) bool { return k != "" })
+				}), "backend %v Keys must be 0 allocs/op", b)
+			}
 		}
 	})
 

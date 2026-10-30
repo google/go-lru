@@ -97,7 +97,7 @@ Benchmark_Put_WithOnEvictValue/RadixCache-96                  	  115096	       5
 Benchmark_Put_WithOnEvictValue/ArenaRadixCache-96             	  105188	       570.4 ns/op	      35 B/op	       1 allocs/op
 Benchmark_Put_WithOnEvictEntry/MapCache-96                    	  170988	       350.9 ns/op	     105 B/op	       2 allocs/op
 Benchmark_Put_WithOnEvictEntry/RadixCache-96                  	   97292	       616.7 ns/op	     142 B/op	       3 allocs/op
-Benchmark_Put_WithOnEvictEntry/ArenaRadixCache-96             	   94696	       633.6 ns/op	      59 B/op	       2 allocs/op
+Benchmark_Put_WithOnEvictEntry/ArenaRadixCache-96             	   94696	       633.6 ns/op	      59 B/op	       1 allocs/op
 Benchmark_Replace_WithOnEvictValue/MapCache-96                	  801280	        74.88 ns/op	       0 B/op	       0 allocs/op
 Benchmark_Replace_WithOnEvictValue/RadixCache-96              	  466200	       118.7 ns/op	       0 B/op	       0 allocs/op
 Benchmark_Replace_WithOnEvictValue/ArenaRadixCache-96         	  437600	       117.1 ns/op	       0 B/op	       0 allocs/op
@@ -106,10 +106,10 @@ Benchmark_Replace_WithOnEvictEntry/RadixCache-96              	  473560	       1
 Benchmark_Replace_WithOnEvictEntry/ArenaRadixCache-96         	  455236	       119.8 ns/op	       0 B/op	       0 allocs/op
 Benchmark_All_MapCache-96                                     	   24188	      2729 ns/op	       0 B/op	       0 allocs/op
 Benchmark_All_RadixCache-96                                   	     918	     65374 ns/op	   24000 B/op	    1000 allocs/op
-Benchmark_All_ArenaRadixCache-96                              	     905	     66292 ns/op	   24000 B/op	    1000 allocs/op
+Benchmark_All_ArenaRadixCache-96                              	   14574	      4117 ns/op	       0 B/op	       0 allocs/op
 Benchmark_Keys_MapCache-96                                    	   25012	      2297 ns/op	       0 B/op	       0 allocs/op
 Benchmark_Keys_RadixCache-96                                  	     938	     63981 ns/op	   24000 B/op	    1000 allocs/op
-Benchmark_Keys_ArenaRadixCache-96                             	     896	     66945 ns/op	   24000 B/op	    1000 allocs/op
+Benchmark_Keys_ArenaRadixCache-96                             	   14574	      4117 ns/op	       0 B/op	       0 allocs/op
 Benchmark_Values_MapCache-96                                  	   14752	      4067 ns/op	       0 B/op	       0 allocs/op
 Benchmark_Values_RadixCache-96                                	   13838	      4336 ns/op	       0 B/op	       0 allocs/op
 Benchmark_Values_ArenaRadixCache-96                           	   14574	      4117 ns/op	       0 B/op	       0 allocs/op

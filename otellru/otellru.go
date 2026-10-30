@@ -403,7 +403,7 @@ func (inst *cacheInstruments) initArenaInstruments(meter metric.Meter, isArena b
 	if inst.arenaNodesGauge, err = newInt64Gauge(meter, "lru.cache.arena.nodes", "{node}", "Current number of arena radix tree nodes by allocation state."); err != nil {
 		return err
 	}
-	if inst.arenaHashFallbacksCounter, err = newInt64Counter(meter, "lru.cache.arena.hash_fallbacks", "{lookup}", "Total number of FNV-1a hash-index lookups that fell back to radix trie traversal."); err != nil {
+	if inst.arenaHashFallbacksCounter, err = newInt64Counter(meter, "lru.cache.arena.hash_fallbacks", "{lookup}", "Total number of maphash index lookups that fell back to radix trie traversal."); err != nil {
 		return err
 	}
 	inst.observables = append(inst.observables, inst.arenaNodesGauge, inst.arenaHashFallbacksCounter)
