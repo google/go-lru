@@ -37,10 +37,10 @@ All reference benchmarks were collected on an **Intel Xeon CPU @ 2.60GHz (96 vCP
 
 | Prefix Topology | `MapCache` (`O(N)` Scan) | `RadixCache` (`O(P + S)` Subtree) | `ArenaRadixCache` (`O(P + S)` Subtree) | Speedup vs `MapCache` |
 | :--- | :--- | :--- | :--- | :--- |
-| **Flat Prefix (100 items)** | 160.6 µs/op | **2.25 µs/op** | ~7.5 µs/op | **71.3x (`Radix`) / ~21.4x (`Arena`) faster** |
-| **Nested Prefix (100 items)** | 151.2 µs/op | **2.30 µs/op** | ~7.5 µs/op | **65.7x (`Radix`) / ~20.2x (`Arena`) faster** |
-| **Deeply Nested (100 items)** | 219.9 µs/op | **2.50 µs/op** | ~7.6 µs/op | **88.0x (`Radix`) / ~28.9x (`Arena`) faster** |
-| **100K Scale (50,000 purged items)** | 21.6 ms/op | **1.05 ms/op** | ~5.1 ms/op | **20.5x (`Radix`) / ~4.2x (`Arena`) faster** |
+| **Flat Prefix (100 items)** | 160.6 µs/op | **2.25 µs/op** | ~4.7 µs/op | **71.3x (`Radix`) / ~34.2x (`Arena`) faster** |
+| **Nested Prefix (100 items)** | 151.2 µs/op | **2.30 µs/op** | ~4.7 µs/op | **65.7x (`Radix`) / ~32.2x (`Arena`) faster** |
+| **Deeply Nested (100 items)** | 219.9 µs/op | **2.50 µs/op** | ~4.8 µs/op | **88.0x (`Radix`) / ~45.8x (`Arena`) faster** |
+| **100K Scale (50,000 purged items)** | 21.6 ms/op | **1.05 ms/op** | ~3.45 ms/op | **20.5x (`Radix`) / ~6.3x (`Arena`) faster** |
 
 ---
 
@@ -50,7 +50,7 @@ Measured via `runtime.ReadMemStats` (`HeapAlloc`) after an isolated garbage coll
 
 | Scale & Key Topology | `MapCache` Heap | `RadixCache` Heap | `ArenaRadixCache` Heap | Memory Reduction vs `MapCache` |
 | :--- | :--- | :--- | :--- | :--- |
-| **100K Nested (`Benchmark_LargeScale_Put_100K`)** | ~16.3 MB (~163.0 `heap-B/entry`) | **~9.6 MB** (~96.0 `heap-B/entry`) | ~11.1 MB (~111.2 `heap-B/entry`) | **41.1% less (`Radix`) / 31.8% less (`Arena`)** |
+| **100K Nested (`Benchmark_LargeScale_Put_100K`)** | ~11.5 MB (~115.0 `heap-B/entry`) | ~9.6 MB (~96.0 `heap-B/entry`) | **~7.9 MB** (~78.9 `heap-B/entry`) | **16.5% less (`Radix`) / 31.4% less (`Arena`)** |
 | **1M Flat** (`file_%d.txt`) | 129.6 MB (135.9 B/entry) | **89.8 MB** (94.2 B/entry) | 102.0 MB (106.9 B/entry) | **30.7% less (`Radix`) / 21.4% less (`Arena`)** |
 | **1M Nested** (`dir_%04d/file_%04d.txt`) | 129.6 MB (135.9 B/entry) | **90.5 MB** (94.9 B/entry) | 101.9 MB (106.9 B/entry) | **30.2% less (`Radix`) / 21.4% less (`Arena`)** |
 | **1M Deeply Nested** (`projects/...`) | 129.6 MB (135.9 B/entry) | **90.9 MB** (95.4 B/entry) | 101.9 MB (106.9 B/entry) | **29.9% less (`Radix`) / 21.4% less (`Arena`)** |

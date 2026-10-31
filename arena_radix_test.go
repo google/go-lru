@@ -1862,7 +1862,7 @@ func TestArenaRadixCache_HashCollisionAndNodeMapHealing(t *testing.T) {
 		assert.Equal(t, []uint32{id1, id2}, c.collisionPeers[h1])
 		c.checkNodeMapInvariants()
 
-		// Inserting a new key while c.collisionPeers != nil exercises the recordNodeMapInsertLocked path in insertNewOnPutLocked.
+		// Inserting a new key while c.collisionPeers != nil exercises putWithHash under active hash collisions.
 		_, err = c.Put("k4", testData{value: 4, dataSize: 10})
 		require.NoError(t, err)
 		c.checkNodeMapInvariants()
@@ -3410,8 +3410,8 @@ func TestArenaRadix_DeleteFromHashSlotsFast_ZeroTag21Fallback(t *testing.T) {
 	assert.False(t, exists)
 	assert.Equal(t, 2, cEvict.hashCount)
 
-	// 2. Multi-node subtree DeletePrefix when !bufValid (onEvictEntry == nil, collisionCount == 0,
-	// hashMask <= hashTag21Mask) and subtree value nodes have hashTag21() == 0.
+	// 2. Multi-node subtree DeletePrefix via freeSubtreeFastLocked / evictSubtreeValueNodeFastLocked
+	// (onEvictEntry == nil, collisionCount == 0, hashMask <= hashTag21Mask) when subtree value nodes have hashTag21() == 0.
 	cSubtree := NewArenaRadixCache[testData](100, WithInvariantChecking(true), testDataWeigher).(*arenaRadix[testData])
 	for i, k := range []string{"dir/sub/alpha", "dir/sub/bravo", "other/keep"} {
 		_, err := cSubtree.Put(k, testData{value: int64(i + 10), dataSize: 10})
@@ -3434,4 +3434,59 @@ func TestArenaRadix_DeleteFromHashSlotsFast_ZeroTag21Fallback(t *testing.T) {
 	vKeep, ok := cSubtree.Get("other/keep")
 	require.True(t, ok)
 	assert.Equal(t, int64(12), vKeep.value)
+
+	// 3. Single-leaf DeletePrefix (c.nodes[nodeID].child == nilNode) with hashTag21() == 0
+	// exercises evictSubtreeValueNodeLocked's !fastDeleted && !hasKeyBytes fallback.
+	cLeaf := NewArenaRadixCache[testData](100, WithInvariantChecking(true), testDataWeigher).(*arenaRadix[testData])
+	_, err = cLeaf.Put("leaf_only", testData{value: 21, dataSize: 10})
+	require.NoError(t, err)
+	_, err = cLeaf.Put("survivor", testData{value: 22, dataSize: 10})
+	require.NoError(t, err)
+	leafID, ok := cLeaf.nodeMapGet(cLeaf.hashKey("leaf_only"))
+	require.True(t, ok)
+	cLeaf.nodes[leafID].setHashTag21(0)
+	cLeaf.DeletePrefix("leaf_only")
+	assert.Equal(t, 1, cLeaf.len)
+
+	// 4. Multi-node subtree DeletePrefix via the general freeSubtree path (collisionCount > 0)
+	// exercises evictSubtreeValueNodeLocked's !fastDeleted branch for both hasKeyBytes (<= 512B)
+	// and !hasKeyBytes (> 512B) keys.
+	cColl := NewArenaRadixCache[testData](200, testDataWeigher).(*arenaRadix[testData])
+	longSuffix := strings.Repeat("x", 520)
+	for i, k := range []string{"pfx/short_a", "pfx/" + longSuffix, "keep_1"} {
+		_, err := cColl.Put(k, testData{value: int64(i + 30), dataSize: 10})
+		require.NoError(t, err)
+	}
+	cColl.collisionCount = 1
+	cColl.DeletePrefix("pfx/")
+	cColl.collisionCount = 0
+	assert.Equal(t, 1, cColl.len)
+	cColl.checkInvariants()
+
+	// 5. freeSubtreeNodeLocked with > 32 non-adjacent freed prefix spans, a large (>= 65,535B)
+	// prefix span, and a tail-abutting span, followed by Compact() reclaiming dead prefix slack.
+	cBulk := NewArenaRadixCache[testData](2000, WithInvariantChecking(true), testDataWeigher).(*arenaRadix[testData])
+	for i := range 40 {
+		_, err = cBulk.Put(fmt.Sprintf("bulk/%c_leaf", byte(33+i)), testData{value: int64(i + 2), dataSize: 10})
+		require.NoError(t, err)
+		_, err = cBulk.Put(fmt.Sprintf("keep/sep_%02d", i), testData{value: int64(i + 100), dataSize: 10})
+		require.NoError(t, err)
+	}
+	largeKey := "bulk/" + strings.Repeat("~", int(largePrefixSentinel)+16)
+	_, err = cBulk.Put(largeKey, testData{value: 1, dataSize: 10})
+	require.NoError(t, err)
+	_, err = cBulk.Put("keep/sep_after_large", testData{value: 500, dataSize: 10})
+	require.NoError(t, err)
+	// Add one final "bulk/{_tail" key at the very end of prefixArena to exercise tail trimming in freeSubtreeNodeLocked.
+	_, err = cBulk.Put("bulk/{_tail", testData{value: 999, dataSize: 10})
+	require.NoError(t, err)
+
+	cBulk.DeletePrefix("bulk/")
+	assert.Equal(t, 41, cBulk.len)
+	assert.Equal(t, len(cBulk.freePrefixSpans), cBulk.freePrefixCount)
+	assert.Less(t, cBulk.livePrefixBytes, len(cBulk.prefixArena))
+
+	cBulk.Compact()
+	assert.Len(t, cBulk.prefixArena, cBulk.livePrefixBytes)
+	assert.Zero(t, cBulk.freePrefixCount)
 }

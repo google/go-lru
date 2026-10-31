@@ -2043,7 +2043,7 @@ func runBinaryKeysDifferentialTest(t *testing.T) {
 	}
 	assertParity("after-256-single-byte-keys")
 
-	// 2. Insert an 80-level deep prefix chain (exceeding the [64] stack buffer in RadixCache reconstructKey/freeSubtree).
+	// 2. Insert an 80-level deep prefix chain (exceeding the [64] stack buffer in ArenaRadixCache hashNodeKeyLarge).
 	for depth := 1; depth <= 80; depth++ {
 		k := strings.Repeat("x", depth)
 		val := (depth % 7) + 1

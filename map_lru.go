@@ -398,6 +398,8 @@ func (c *mapCache[V]) updateExistingOnPutLocked(
 	return evictedValues, reclaimedPrePut
 }
 
+// allocOrRecycleEntry reuses a detached entry evicted during pre-insert capacity eviction
+// or allocates a new entry when no victim was evicted.
 func allocOrRecycleEntry[V any](recycledEntry *entry[V], key string, value V, valueSize uint64) *entry[V] {
 	if recycledEntry != nil {
 		recycledEntry.key = key

@@ -808,6 +808,7 @@ func (c *radixCache[V]) updateExistingOnPutLocked(
 	return evictedValues, reclaimedPrePut
 }
 
+// clearRecycleNodes zeroes any unconsumed node pointers in c.recycleNodes after insertNode completes.
 func (c *radixCache[V]) clearRecycleNodes() {
 	for c.recycleLen > 0 {
 		c.recycleLen--

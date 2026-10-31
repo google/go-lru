@@ -582,6 +582,9 @@ func (c *arenaRadix[V]) updateExistingOnPutLocked(evictQ *evictCallbackQueue[V],
 	return evictedValues, reclaimedPrePut
 }
 
+// needsPreInsertEvictOrReclaimLocked reports whether a new-key Put may require pre-insert
+// eviction or empty/single-survivor reclamation before inserting into the radix tree.
+// When it returns false, evictAndReclaimPrePutLocked is guaranteed to be a no-op.
 func (c *arenaRadix[V]) needsPreInsertEvictOrReclaimLocked(keyLen int, valueSize uint64) bool {
 	return valueSize > c.maxSize-c.currentSize ||
 		valueSize == 0 ||
@@ -591,6 +594,8 @@ func (c *arenaRadix[V]) needsPreInsertEvictOrReclaimLocked(keyLen int, valueSize
 		uint64(c.livePrefixBytes)+uint64(keyLen)+12 > uint64(maxPrefixArenaBytes)
 }
 
+// evictAndReclaimPrePutLocked executes pre-insert physical-limit and capacity evictions
+// and checks whether empty-cache or single-survivor reclamation applies before inserting a new key.
 func (c *arenaRadix[V]) evictAndReclaimPrePutLocked(evictQ *evictCallbackQueue[V], keyLen int, valueSize, sizeBefore uint64, pressure float64) ([]V, bool, bool) {
 	var evictedValues []V
 	evictedPrePut := false
@@ -1099,6 +1104,8 @@ func (c *arenaRadix[V]) evictSubtreeValueNodeFastLocked(evictQ *evictCallbackQue
 	c.notifyEvict(evictQ, "", evictedVal, evictedSize, EvictionReasonDeleted)
 }
 
+// freeSubtreeFastLocked reclaims a multi-node detached subtree without keyBuf or per-node
+// prefix length tracking when c.onEvictEntry == nil, c.collisionCount == 0, and c.hashMask <= hashTag21Mask.
 func (c *arenaRadix[V]) freeSubtreeFastLocked(evictQ *evictCallbackQueue[V], nodeID uint32) {
 	currID := nodeID
 	for currID != nilNode {
