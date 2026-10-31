@@ -88,7 +88,7 @@ Enabling `WithInvariantChecking(true)` validates structural integrity across eve
 1. **Capacity Bounds**: `maxSize > 0` and `currentSize <= maxSize`.
 2. **Iterative Tree Walk**: Uses parent/sibling pointers (`radixCache`) or `uint32` index links (`ArenaRadixCache`) to traverse the entire LCRS tree in `O(1)` auxiliary space without recursion, verifying parent-child symmetry and absence of cycles.
 3. **LRU List Bijection**: Verifies that every value-bearing tree node appears in the doubly-linked `head`/`tail` list with matching forward and reverse traversal counts and exact `currentSize` sum parity.
-4. **Free-List & Hash Index Integrity (`ArenaRadixCache`)**: Confirms `len(nodes) - freeCount == treeNodeCount`, verifies zero overlap between free-list slots and live tree nodes, and checks `hashSlots []arenaHashSlot` index bounds, `arenaHashTag` consistency, `collisionPeers` parity, and `hashCount + collisionCount == len` (when `!nodeMapDirty`).
+4. **Free-List & Hash Index Integrity (`ArenaRadixCache`)**: Confirms `len(nodes) - freeCount == treeNodeCount`, verifies zero overlap between free-list slots and live tree nodes, and checks `hashSlots []arenaHashSlot` index bounds, `arenaHashTag` consistency, `collisionPeers` parity, and `hashCount + collisionCount <= len`.
 5. **Telemetry & Watermark Parity**: Verifies `deletedSinceCompact >= 0`, `peakEntryLen >= len`, and counter-to-entry-balance parity (`PutInserted - EvictionsCapacity - EvictionsPressure - EvictionsDeleted == len`, `EvictionsDeleted >= DeleteDeleted`, `EvictionsReplaced == PutUpdated + ReplaceUpdated`).
 
 ---

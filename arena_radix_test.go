@@ -3174,7 +3174,7 @@ func TestArenaRadix_PrefixArenaFreeSpansCompactionAndLargePrefixChurn(t *testing
 	t.Run("EnsurePrefixArenaCapAutoCompactionAndPrefixExposedReset", func(t *testing.T) {
 		c := NewArenaRadixCache[int](100, WithInvariantChecking(true)).(*arenaRadix[int])
 
-		// Insert 4 keys of 350 bytes each -> len(prefixArena) == 1400 >= 1024.
+		// Insert 4 keys of 350 bytes each -> len(prefixArena) == 1400.
 		k1 := "1_" + strings.Repeat("a", 348)
 		k2 := "2_" + strings.Repeat("b", 348)
 		k3 := "3_" + strings.Repeat("c", 348)
@@ -3184,7 +3184,7 @@ func TestArenaRadix_PrefixArenaFreeSpansCompactionAndLargePrefixChurn(t *testing
 			require.NoError(t, err)
 		}
 
-		// 1. Non-exposed >= 1024 auto-compaction branch:
+		// 1. Non-exposed <= 50% live-bytes auto-compaction branch:
 		// Delete k1 and k3 (leaving two 350B non-adjacent free spans; livePrefixBytes == 700 <= 1400/2).
 		_, ok := c.Delete(k1)
 		require.True(t, ok)

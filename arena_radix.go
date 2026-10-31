@@ -376,8 +376,9 @@ func (c *arenaRadix[V]) clearNodePrefix(nodeID uint32) {
 	c.releasePrefixSpanLocked(off, pLen, isLarge, flags)
 }
 
-// ensurePrefixArenaCap enforces the uint32 maxPrefixArenaBytes limit and triggers prefixArena
-// compaction prior to slice reallocation when dead bytes can be reclaimed or prefixExposed is set.
+// ensurePrefixArenaCap ensures c.prefixArena can accommodate needed additional bytes without
+// exceeding maxPrefixArenaBytes, compacting dead spans when beneficial or reallocating via
+// growPrefixArenaNoCompactLocked so cap(c.prefixArena) >= len(c.prefixArena)+needed on return.
 func (c *arenaRadix[V]) ensurePrefixArenaCap(needed int) {
 	if uint64(len(c.prefixArena))+uint64(needed) > uint64(maxPrefixArenaBytes) {
 		if c.livePrefixBytes < len(c.prefixArena) {
@@ -390,24 +391,17 @@ func (c *arenaRadix[V]) ensurePrefixArenaCap(needed int) {
 	if len(c.prefixArena)+needed <= cap(c.prefixArena) {
 		return
 	}
-	if c.prefixExposed.Load() ||
-		(c.livePrefixBytes < len(c.prefixArena) &&
-			(c.livePrefixBytes*2 <= len(c.prefixArena) || (c.livePrefixBytes+needed)*2 <= cap(c.prefixArena))) {
+	if c.livePrefixBytes < len(c.prefixArena) && (c.prefixExposed.Load() || c.livePrefixBytes*2 <= len(c.prefixArena)) {
 		c.compactPrefixArenaLocked(needed)
-	}
-}
-
-// growPrefixArenaNoCompactLocked grows c.prefixArena to accommodate needed additional bytes
-// without compacting or relocating existing offsets, preserving caller-held offsets across the growth.
-func (c *arenaRadix[V]) growPrefixArenaNoCompactLocked(needed int) {
-	minCap := uint64(len(c.prefixArena)) + uint64(needed)
-	if minCap > uint64(maxPrefixArenaBytes) {
-		panic("arena radix prefix capacity exceeded limit")
-	}
-	if int(minCap) <= cap(c.prefixArena) {
 		return
 	}
-	newCap := max(cap(c.prefixArena)*2, int(minCap), 64)
+	c.growPrefixArenaNoCompactLocked(needed)
+}
+
+// growPrefixArenaNoCompactLocked reallocates c.prefixArena to accommodate needed additional bytes
+// without compacting or relocating existing offsets.
+func (c *arenaRadix[V]) growPrefixArenaNoCompactLocked(needed int) {
+	newCap := max(cap(c.prefixArena)*2, len(c.prefixArena)+needed, 64)
 	if uint64(newCap) > uint64(maxPrefixArenaBytes) {
 		newCap = int(maxPrefixArenaBytes)
 	}
@@ -491,8 +485,8 @@ func (c *arenaRadix[V]) setNodePrefix(nodeID uint32, s string) {
 }
 
 // setNodePrefixFromArenaSliceLocked copies c.prefixArena[srcOff:srcOff+sLen] into a newly
-// allocated span (either recycled from c.freePrefixSpans or appended via growPrefixArenaNoCompactLocked
-// so srcOff is never invalidated by compaction).
+// allocated span (either recycled from c.freePrefixSpans or appended to c.prefixArena after
+// the caller has pre-sized capacity via ensurePrefixArenaCap so srcOff is never invalidated).
 func (c *arenaRadix[V]) setNodePrefixFromArenaSliceLocked(nodeID, srcOff uint32, sLen int) {
 	needed := sLen
 	if sLen >= int(largePrefixSentinel) {
@@ -502,7 +496,6 @@ func (c *arenaRadix[V]) setNodePrefixFromArenaSliceLocked(nodeID, srcOff uint32,
 	if ok {
 		copy(c.prefixArena[dstOff:int(dstOff)+sLen], c.prefixArena[srcOff:int(srcOff)+sLen])
 	} else {
-		c.growPrefixArenaNoCompactLocked(needed)
 		if sLen >= int(largePrefixSentinel) {
 			var hdr [4]byte
 			binary.LittleEndian.PutUint32(hdr[:], uint32(sLen))
@@ -589,8 +582,8 @@ func (c *arenaRadix[V]) splitNodePrefixLocked(childID, splitNodeID uint32, lcp i
 	c.releasePrefixSpanLocked(oldOff, oldLen, wasLarge, oldFlags)
 }
 
-// copyMergedPrefixBytesLocked allocates a span of size needed (from freePrefixSpans or by growing
-// prefixArena without invalidating existing offsets) and copies currID's and onlyChildID's prefixes into it.
+// copyMergedPrefixBytesLocked allocates a span of size needed (from freePrefixSpans or by ensuring
+// prefixArena capacity first) and copies currID's and onlyChildID's post-compaction prefixes into it.
 func (c *arenaRadix[V]) copyMergedPrefixBytesLocked(currID, onlyChildID uint32, len1, len2, totalLen, needed int) uint32 {
 	if newOff, ok := c.tryTakeFreePrefixPayloadSpanLocked(totalLen, needed); ok {
 		off1 := c.nodes[currID].prefixOff
@@ -600,7 +593,6 @@ func (c *arenaRadix[V]) copyMergedPrefixBytesLocked(currID, onlyChildID uint32, 
 		return newOff
 	}
 	c.ensurePrefixArenaCap(needed)
-	c.growPrefixArenaNoCompactLocked(needed)
 	off1 := c.nodes[currID].prefixOff
 	off2 := c.nodes[onlyChildID].prefixOff
 	if totalLen >= int(largePrefixSentinel) {

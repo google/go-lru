@@ -403,13 +403,13 @@ func (c *arenaRadix[V]) checkFreeListInvariants(treeNodeCount int) {
 }
 
 // checkInvariants performs full-tree iterative invariant validation:
-// 1. maxSize > 0 and currentSize <= maxSize
-// 2. Bidirectional LRU list pointer integrity and size sum parity
-// 3. Root structure validity
-// 4. LCRS tree hierarchy (parent-child links, prefix non-emptiness, sorted siblings, compactness) and prefixArena accounting
-// 5. Value-bearing node reachability and tree-to-LRU bijection
-// 6. Flat hash table (hashSlots) and collisionPeers consistency
-// 7. Free-list integrity and total node accounting
+// 1. maxSize > 0
+// 2. currentSize <= maxSize
+// 3. Bidirectional LRU list pointer integrity, entry count, and size sum parity
+// 4. Root structure validity
+// 5. LCRS tree hierarchy, prefixArena span bounds, and value-bearing node bijection with the LRU list
+// 6. Open-addressed hashSlots and collisionPeers consistency
+// 7. Node and prefix arena free-list integrity
 // Uses non-recursive O(1)-space pre-order tree traversal to prevent stack overflows.
 func (c *arenaRadix[V]) checkInvariants() {
 	// INVARIANT 1: maxSize > 0
