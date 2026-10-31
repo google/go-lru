@@ -1726,7 +1726,7 @@ func TestCompaction_ArenaRadixContiguousCompactRequiresTrueSlack(t *testing.T) {
 		require.False(t, c.shouldAutoCompactLocked(nilNode))
 
 		nodesPtrBefore := unsafe.SliceData(c.nodes)
-		mapPtrBefore := reflect.ValueOf(c.nodeMap).Pointer()
+		mapPtrBefore := unsafe.SliceData(c.hashSlots)
 
 		// Act: Evaluate Tier 1 pressure (0.80) and call explicit Compact().
 		pressureBits.Store(math.Float64bits(0.80))
@@ -1739,7 +1739,7 @@ func TestCompaction_ArenaRadixContiguousCompactRequiresTrueSlack(t *testing.T) {
 		// Assert
 		st := c.Stats()
 		assert.Same(t, nodesPtrBefore, unsafe.SliceData(c.nodes), "c.nodes must not be reallocated when contiguous slack is absent")
-		assert.Equal(t, mapPtrBefore, reflect.ValueOf(c.nodeMap).Pointer(), "c.nodeMap must not be reallocated when map slack is absent")
+		assert.Same(t, mapPtrBefore, unsafe.SliceData(c.hashSlots), "c.hashSlots must not be reallocated when map slack is absent")
 		assert.Zero(t, compactAllocs, "Compact() without contiguous slack must perform 0 allocations")
 		assert.Zero(t, st.CompactionsPressureTier1)
 		assert.Zero(t, st.CompactionsExplicit)

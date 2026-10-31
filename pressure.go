@@ -19,6 +19,7 @@ import (
 	"context"
 	"fmt"
 	"math"
+	"math/bits"
 	"runtime"
 	"runtime/metrics"
 	"runtime/pprof"
@@ -1631,7 +1632,17 @@ func concatPrefix(a, b string) string {
 // longestCommonPrefix finds the length of the longest common prefix of a and b.
 func longestCommonPrefix(a, b string) int {
 	n := min(len(a), len(b))
-	for i := range n {
+	i := 0
+	if n >= 8 {
+		pa := unsafe.Pointer(unsafe.StringData(a))
+		pb := unsafe.Pointer(unsafe.StringData(b))
+		for ; i <= n-8; i += 8 {
+			if diff := *(*uint64)(unsafe.Add(pa, i)) ^ *(*uint64)(unsafe.Add(pb, i)); diff != 0 {
+				return i + (bits.TrailingZeros64(diff) >> 3)
+			}
+		}
+	}
+	for ; i < n; i++ {
 		if a[i] != b[i] {
 			return i
 		}

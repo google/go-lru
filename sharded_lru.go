@@ -19,6 +19,7 @@ import (
 	"hash/maphash"
 	"iter"
 	"math"
+	"reflect"
 	"sync/atomic"
 )
 
@@ -37,6 +38,17 @@ type shardEngine[V any] interface {
 	evaluateShardPressure(evictQ *evictCallbackQueue[V], sample shardSample) ([]V, shardSample)
 }
 
+func shardIndexFromHash(h uint64, numShards int) int {
+	if (numShards & (numShards - 1)) == 0 {
+		return int(h & uint64(numShards-1))
+	}
+	return int(h % uint64(numShards))
+}
+
+func isDefaultShardFunc(shardFn ShardFunc) bool {
+	return shardFn == nil || reflect.ValueOf(shardFn).Pointer() == reflect.ValueOf(DefaultShardFunc).Pointer()
+}
+
 // DefaultShardFunc computes a zero-allocation 64-bit hash of key using hash/maphash
 // and maps it into [0, numShards).
 //
@@ -48,11 +60,7 @@ func DefaultShardFunc(key string, numShards int) int {
 	if numShards == 1 {
 		return 0
 	}
-	h := maphash.String(defaultShardSeed, key)
-	if (numShards & (numShards - 1)) == 0 {
-		return int(h & uint64(numShards-1))
-	}
-	return int(h % uint64(numShards))
+	return shardIndexFromHash(maphash.String(defaultShardSeed, key), numShards)
 }
 
 // shardedCache partitions keys and capacity across N independent single-backend
@@ -63,6 +71,7 @@ func DefaultShardFunc(key string, numShards int) int {
 // sampling, reclamation epochs, and serialized eviction callback delivery.
 type shardedCache[V any] struct {
 	shards                  []shardEngine[V]
+	arenaShards             []*arenaRadix[V]
 	shardFn                 ShardFunc
 	onEvictValue            func(value V, reason EvictionReason)
 	onEvictEntry            func(key string, value V, reason EvictionReason)
@@ -166,6 +175,9 @@ func newShardedCacheWithOptions[V any](maxSize uint64, shards int, options Optio
 	shardOpts := coordOpts
 	shardOpts.sharedPressure = &c.coord
 	shardOpts.hasShardTier2Target = true
+	if isDefaultShardFunc(shardFn) && options.Backend == BackendArenaRadix {
+		c.arenaShards = make([]*arenaRadix[V], shards)
+	}
 
 	globalTarget := computeTargetSize(maxSize, options.EvictionRetentionRatio)
 	baseTarget := globalTarget / uint64(shards)
@@ -186,6 +198,11 @@ func newShardedCacheWithOptions[V any](maxSize uint64, shards int, options Optio
 		shardOpts.shardTier2Target = shardTarget
 		s := newSingleShardEngine[V](shardMax, shardOpts)
 		c.shards[i] = s
+		if c.arenaShards != nil {
+			ar := s.(*arenaRadix[V])
+			ar.seed = defaultShardSeed
+			c.arenaShards[i] = ar
+		}
 		c.coord.childShards[i] = s.pressureStatePtr()
 	}
 
@@ -203,28 +220,56 @@ func (c *shardedCache[V]) shardFor(key string) shardEngine[V] {
 	return c.shards[idx]
 }
 
+func (c *shardedCache[V]) arenaShardAndHash(key string) (*arenaRadix[V], uint64) {
+	h := maphash.String(defaultShardSeed, key)
+	if len(c.arenaShards) == 1 {
+		return c.arenaShards[0], h
+	}
+	return c.arenaShards[shardIndexFromHash(h, len(c.arenaShards))], h
+}
+
 // Put inserts or updates key and value in the target shard determined by ShardFunc.
 func (c *shardedCache[V]) Put(key string, value V) ([]V, error) {
+	if c.arenaShards != nil {
+		s, h := c.arenaShardAndHash(key)
+		return s.putWithHash(key, h, value)
+	}
 	return c.shardFor(key).Put(key, value)
 }
 
 // Delete removes key from its target shard.
 func (c *shardedCache[V]) Delete(key string) (V, bool) {
+	if c.arenaShards != nil {
+		s, h := c.arenaShardAndHash(key)
+		return s.deleteWithHash(key, h)
+	}
 	return c.shardFor(key).Delete(key)
 }
 
 // Get retrieves key from its target shard and promotes it to MRU within that shard.
 func (c *shardedCache[V]) Get(key string) (V, bool) {
+	if c.arenaShards != nil {
+		s, h := c.arenaShardAndHash(key)
+		return s.getWithHash(key, h)
+	}
 	return c.shardFor(key).Get(key)
 }
 
 // Peek retrieves key from its target shard without modifying its LRU recency order.
 func (c *shardedCache[V]) Peek(key string) (V, bool) {
+	if c.arenaShards != nil {
+		s, h := c.arenaShardAndHash(key)
+		return s.peekWithHash(key, h)
+	}
 	return c.shardFor(key).Peek(key)
 }
 
 // Replace updates an existing key's value and weight in its target shard without modifying recency.
 func (c *shardedCache[V]) Replace(key string, value V) error {
+	if c.arenaShards != nil {
+		s, h := c.arenaShardAndHash(key)
+		return s.replaceWithHash(key, h, value)
+	}
 	return c.shardFor(key).Replace(key, value)
 }
 
