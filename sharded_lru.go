@@ -200,6 +200,8 @@ func newShardedCacheWithOptions[V any](maxSize uint64, shards int, options Optio
 		c.shards[i] = s
 		if c.arenaShards != nil {
 			ar := s.(*arenaRadix[V])
+			// arenaShardAndHash hashes keys once with defaultShardSeed and passes that hash
+			// to *WithHash point operations, so each shard's internal seed must match defaultShardSeed.
 			ar.seed = defaultShardSeed
 			c.arenaShards[i] = ar
 		}

@@ -2831,7 +2831,7 @@ func TestArenaRadix_OnEvictEntry_Depth1KeyImmutabilityAndDepth2SpanReuse(t *test
 			}),
 		).(*arenaRadix[testData])
 
-		// 1. Small combined <= 64 non-contiguous merge branch:
+		// 1. Small combined <= 512 non-contiguous merge branch:
 		// Insert parent first, then an unrelated key, then child so parent.prefixOff + parent.prefixLen != child.prefixOff.
 		_, err := c.Put("root_prefix", testData{value: 1, dataSize: 10})
 		require.NoError(t, err)
@@ -2841,16 +2841,16 @@ func TestArenaRadix_OnEvictEntry_Depth1KeyImmutabilityAndDepth2SpanReuse(t *test
 		require.NoError(t, err)
 
 		// Inserting "other" evicts "root_prefix" (pinning its old span) and merges "root_prefix" + "/child_suffix"
-		// via the non-contiguous combined <= 64 branch into a newly allocated span on the surviving child node.
+		// via the non-contiguous combined <= 512 branch into a newly allocated span on the surviving child node.
 		_, err = c.Put("other", testData{value: 4, dataSize: 10})
 		require.NoError(t, err)
 		require.Equal(t, []string{"root_prefix"}, evictedKeys)
 		childID := c.nodeMapAt(c.hashKey("root_prefix/child_suffix"))
 		assert.Zero(t, c.nodes[childID].prefixFlags&prefixFlagPinned)
 
-		// 2. General append combined > 64 non-contiguous merge branch:
-		longParent := "P_" + strings.Repeat("p", 40)
-		longChild := longParent + "/" + strings.Repeat("c", 40)
+		// 2. General append combined > 512 non-contiguous merge branch:
+		longParent := "P_" + strings.Repeat("p", 300)
+		longChild := longParent + "/" + strings.Repeat("c", 300)
 		_, err = c.Put(longParent, testData{value: 5, dataSize: 10})
 		require.NoError(t, err)
 		_, err = c.Put("separator_2", testData{value: 6, dataSize: 10})
@@ -2866,6 +2866,45 @@ func TestArenaRadix_OnEvictEntry_Depth1KeyImmutabilityAndDepth2SpanReuse(t *test
 		require.Contains(t, evictedKeys, longParent)
 		longChildID := c.nodeMapAt(c.hashKey(longChild))
 		assert.Zero(t, c.nodes[longChildID].prefixFlags&prefixFlagPinned)
+
+		// 3. FreePrefixSpans reuse inside copyMergedPrefixBytesLocked for 512 < totalLen < 65535 and totalLen >= 65535:
+		cReuse := NewArenaRadixCache[int](100, WithInvariantChecking(true)).(*arenaRadix[int])
+		medHole := "H_" + strings.Repeat("h", 598)
+		medParent := "M_" + strings.Repeat("m", 298)
+		medChild := medParent + "/" + strings.Repeat("n", 299)
+		_, err = cReuse.Put(medHole, 1)
+		require.NoError(t, err)
+		_, err = cReuse.Put(medParent, 2)
+		require.NoError(t, err)
+		_, err = cReuse.Put("S_sep", 3)
+		require.NoError(t, err)
+		_, err = cReuse.Put(medChild, 4)
+		require.NoError(t, err)
+		_, ok = cReuse.Delete(medHole)
+		require.True(t, ok)
+		_, ok = cReuse.Delete(medParent)
+		require.True(t, ok)
+		medChildID := cReuse.nodeMapAt(cReuse.hashKey(medChild))
+		assert.Zero(t, cReuse.nodes[medChildID].prefixOff)
+
+		cReuseLarge := NewArenaRadixCache[int](100, WithInvariantChecking(true)).(*arenaRadix[int])
+		largeHole := "H_" + strings.Repeat("h", 69998)
+		largeParent := "P_" + strings.Repeat("p", 39998)
+		largeChild := largeParent + "/" + strings.Repeat("c", 29999)
+		_, err = cReuseLarge.Put(largeHole, 1)
+		require.NoError(t, err)
+		_, err = cReuseLarge.Put(largeParent, 2)
+		require.NoError(t, err)
+		_, err = cReuseLarge.Put("S_sep", 3)
+		require.NoError(t, err)
+		_, err = cReuseLarge.Put(largeChild, 4)
+		require.NoError(t, err)
+		_, ok = cReuseLarge.Delete(largeHole)
+		require.True(t, ok)
+		_, ok = cReuseLarge.Delete(largeParent)
+		require.True(t, ok)
+		largeChildID := cReuseLarge.nodeMapAt(cReuseLarge.hashKey(largeChild))
+		assert.Equal(t, uint32(4), cReuseLarge.nodes[largeChildID].prefixOff)
 	})
 }
 
@@ -3182,6 +3221,21 @@ func TestArenaRadix_PrefixArenaFreeSpansCompactionAndLargePrefixChurn(t *testing
 		_, err = c.Put(k6, 6)
 		require.NoError(t, err)
 		assert.False(t, c.prefixExposed.Load(), "prefixExposed must be reset after prefixArena compaction")
+		assert.Len(t, c.prefixArena, c.livePrefixBytes)
+
+		// 3. prefixExposed pure-growth branch (livePrefixBytes == len(prefixArena)):
+		// Expose depth-1 prefixes again and grow past cap(prefixArena) without any dead bytes.
+		for range c.Keys() {
+			break
+		}
+		require.True(t, c.prefixExposed.Load())
+		require.Equal(t, len(c.prefixArena), c.livePrefixBytes)
+
+		slack3 := cap(c.prefixArena) - len(c.prefixArena)
+		k7 := "7_" + strings.Repeat("g", slack3+100)
+		_, err = c.Put(k7, 7)
+		require.NoError(t, err)
+		assert.False(t, c.prefixExposed.Load(), "pure growth overflowing cap(prefixArena) must reallocate and reset prefixExposed")
 		assert.Len(t, c.prefixArena, c.livePrefixBytes)
 	})
 

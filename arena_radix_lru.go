@@ -69,13 +69,7 @@ func (c *arenaRadix[V]) weigh(key string, value V) uint64 {
 	return 1
 }
 
-// checkInvariants performs full-tree iterative invariant validation:
-// 1. maxSize > 0 and currentSize <= maxSize
-// 2. Bidirectional LRU list pointer integrity and size sum parity
-// 3. Root structure validity
-// 4. LCRS tree hierarchy (parent-child links, prefix non-emptiness, sorted siblings, compactness)
-// 5. Value-bearing node reachability and tree-to-LRU bijection
-// Uses non-recursive O(1)-space pre-order tree traversal to prevent stack overflows.
+// checkLRUNodeLinkInvariants validates bidirectional LRU pointers and head/tail endpoints for currID.
 func (c *arenaRadix[V]) checkLRUNodeLinkInvariants(currID, prevID uint32) {
 	if !c.nodes[currID].hasValue() {
 		panic(fmt.Sprintf("arenaRadix invariant violation: unexpected hasValue=false in LRU list for prefix '%s'", c.nodePrefix(currID)))
@@ -255,9 +249,6 @@ func (c *arenaRadix[V]) checkTreeInvariants() int {
 	// Iterative pre-order traversal using parent/sibling pointers (O(1) space).
 	// Validates tree integrity, sibling sorted order, parent pointers, compactness,
 	// prefixArena byte accounting, and 1:1 bijection between value-bearing nodes and LRU list elements.
-	if c.nodes[c.root].prefixOff != 0 || c.nodes[c.root].firstByte != 0 {
-		panic("arenaRadix invariant violation: root node must have zero prefixOff and firstByte")
-	}
 	treeCount := 0
 	treeNodeCount := 0
 	totalPrefixBytes := 0
@@ -411,6 +402,15 @@ func (c *arenaRadix[V]) checkFreeListInvariants(treeNodeCount int) {
 	}
 }
 
+// checkInvariants performs full-tree iterative invariant validation:
+// 1. maxSize > 0 and currentSize <= maxSize
+// 2. Bidirectional LRU list pointer integrity and size sum parity
+// 3. Root structure validity
+// 4. LCRS tree hierarchy (parent-child links, prefix non-emptiness, sorted siblings, compactness) and prefixArena accounting
+// 5. Value-bearing node reachability and tree-to-LRU bijection
+// 6. Flat hash table (hashSlots) and collisionPeers consistency
+// 7. Free-list integrity and total node accounting
+// Uses non-recursive O(1)-space pre-order tree traversal to prevent stack overflows.
 func (c *arenaRadix[V]) checkInvariants() {
 	// INVARIANT 1: maxSize > 0
 	if c.maxSize == 0 {

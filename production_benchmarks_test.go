@@ -452,6 +452,7 @@ func BenchmarkCompactionAndPressureShedLatency(b *testing.B) {
 						savedLivePrefixBytes := impl.livePrefixBytes
 						savedFreePrefixSpans := impl.freePrefixSpans
 						savedFreePrefixCount := impl.freePrefixCount
+						savedPrefixExposed := impl.prefixExposed.Load()
 						savedHashSlots := impl.hashSlots
 						savedHashMask := impl.hashMask
 						savedHashCount := impl.hashCount
@@ -471,6 +472,7 @@ func BenchmarkCompactionAndPressureShedLatency(b *testing.B) {
 							impl.livePrefixBytes = savedLivePrefixBytes
 							impl.freePrefixSpans = savedFreePrefixSpans
 							impl.freePrefixCount = savedFreePrefixCount
+							impl.prefixExposed.Store(savedPrefixExposed)
 							impl.hashSlots = savedHashSlots
 							impl.hashMask = savedHashMask
 							impl.hashCount = savedHashCount
