@@ -15,6 +15,7 @@
 package lru
 
 import (
+	"encoding/binary"
 	"fmt"
 	"reflect"
 	"runtime"
@@ -1012,6 +1013,107 @@ func TestArenaRadixCache_CheckInvariants_PanicScenarios(t *testing.T) {
 		c.collisionCount = 1
 		c.len = 1
 		assert.Panics(t, func() { c.checkNodeMapInvariants() })
+	})
+
+	t.Run("ChildLargePrefixAndPrefixBoundsAndFirstByteMismatch", func(t *testing.T) {
+		c := NewArenaRadixCache[testData](50, testDataWeigher).(*arenaRadix[testData])
+		_, err := c.Put("abcd", testData{value: 1, dataSize: 10})
+		require.NoError(t, err)
+		childID := c.nodes[c.root].child
+		require.NotEqual(t, nilNode, childID)
+
+		// 1. Large-prefix header offset < 4
+		c.nodes[childID].prefixLen = largePrefixSentinel
+		c.nodes[childID].prefixOff = 2
+		assert.Panics(t, func() { c.checkInvariants() })
+
+		// 2. Large-prefix decoded length < largePrefixSentinel
+		c.prefixArena = append(c.prefixArena, 0, 0, 0, 0)
+		binary.LittleEndian.PutUint32(c.prefixArena[0:4], 4)
+		c.nodes[childID].prefixOff = 4
+		assert.Panics(t, func() { c.checkInvariants() })
+
+		// 3. Child prefixOff + prefixLen > len(prefixArena)
+		c.prefixArena = []byte("abcd")
+		c.nodes[childID].prefixLen = 4
+		c.nodes[childID].prefixOff = 2
+		assert.Panics(t, func() { c.checkInvariants() })
+
+		// 4. Child firstByte != prefixArena[prefixOff]
+		c.nodes[childID].prefixOff = 0
+		c.nodes[childID].firstByte = 'z'
+		assert.Panics(t, func() { c.checkInvariants() })
+	})
+
+	t.Run("PrefixArenaAccountingAndFreePrefixSpanInvariantPanics", func(t *testing.T) {
+		c := NewArenaRadixCache[testData](50, testDataWeigher).(*arenaRadix[testData])
+		_, err := c.Put("abcd", testData{value: 1, dataSize: 10})
+		require.NoError(t, err)
+
+		// 1. livePrefixBytes != totalPrefixBytes
+		c.livePrefixBytes = 99
+		assert.Panics(t, func() { c.checkInvariants() })
+		c.livePrefixBytes = 4
+
+		// 2. Invalid freePrefixCount
+		c.freePrefixCount = -1
+		assert.Panics(t, func() { c.checkInvariants() })
+		c.freePrefixCount = len(c.freePrefixSpans) + 1
+		assert.Panics(t, func() { c.checkInvariants() })
+
+		// 3. Invalid or tail-abutting freePrefixSpan
+		c.freePrefixCount = 1
+		c.freePrefixSpans[0] = prefixSpan{off: 0, len: 0}
+		assert.Panics(t, func() { c.checkInvariants() })
+		c.freePrefixSpans[0] = prefixSpan{off: 0, len: uint32(len(c.prefixArena))}
+		assert.Panics(t, func() { c.checkInvariants() })
+
+		// 4. livePrefixBytes + freeBytes > len(prefixArena)
+		c.freePrefixSpans[0] = prefixSpan{off: 0, len: 2}
+		assert.Panics(t, func() { c.checkInvariants() })
+	})
+
+	t.Run("HashSlotsMaskProbeChainAndCountInvariantPanics", func(t *testing.T) {
+		c := NewArenaRadixCache[testData](50, testDataWeigher).(*arenaRadix[testData])
+		_, err := c.Put("k1", testData{value: 1, dataSize: 10})
+		require.NoError(t, err)
+
+		// 1. Invalid hashMask
+		savedMask := c.hashMask
+		c.hashMask = 0
+		assert.Panics(t, func() { c.checkNodeMapInvariants() })
+		c.hashMask = savedMask
+
+		// 2. Broken linear-probe chain (empty home slot before displaced slot)
+		h1 := c.hashKey("k1")
+		homeIdx, ok := c.findHashSlotIndex(h1)
+		require.True(t, ok)
+		slot := c.hashSlots[homeIdx]
+		displacedIdx := (homeIdx + 1) & c.hashMask
+		c.hashSlots[homeIdx] = arenaHashSlot{}
+		c.hashSlots[displacedIdx] = slot
+		assert.Panics(t, func() { c.checkNodeMapInvariants() })
+		c.hashSlots[displacedIdx] = arenaHashSlot{}
+		c.hashSlots[homeIdx] = slot
+
+		// 3. hashCount != actualCount
+		c.hashCount = 99
+		assert.Panics(t, func() { c.checkNodeMapInvariants() })
+	})
+
+	t.Run("FreeListNodeRetainsNonZeroPrefixFlagsOrHashTag21", func(t *testing.T) {
+		c := NewArenaRadixCache[testData](50, testDataWeigher).(*arenaRadix[testData])
+		_, _ = c.Put("k1", testData{value: 1, dataSize: 10})
+		_, _ = c.Put("k2", testData{value: 2, dataSize: 10})
+		_, _ = c.Delete("k1")
+		require.NotEqual(t, nilNode, c.freeHead)
+
+		c.nodes[c.freeHead].prefixFlags = prefixFlagPinned
+		assert.Panics(t, func() { c.checkInvariants() })
+		c.nodes[c.freeHead].prefixFlags = 0
+
+		c.nodes[c.freeHead].setHashTag21(1)
+		assert.Panics(t, func() { c.checkInvariants() })
 	})
 }
 
@@ -3286,4 +3388,50 @@ func TestArenaRadix_PrefixArenaFreeSpansCompactionAndLargePrefixChurn(t *testing
 		require.True(t, ok)
 		assert.Equal(t, 100, vLarge1)
 	})
+}
+
+func TestArenaRadix_DeleteFromHashSlotsFast_ZeroTag21Fallback(t *testing.T) {
+	// 1. Capacity eviction via Put -> eraseInternal when victim has hashTag21() == 0.
+	cEvict := NewArenaRadixCache[testData](20, WithInvariantChecking(true), testDataWeigher).(*arenaRadix[testData])
+	_, err := cEvict.Put("victim", testData{value: 1, dataSize: 10})
+	require.NoError(t, err)
+	_, err = cEvict.Put("survivor", testData{value: 2, dataSize: 10})
+	require.NoError(t, err)
+
+	victimID, ok := cEvict.nodeMapGet(cEvict.hashKey("victim"))
+	require.True(t, ok)
+	cEvict.nodes[victimID].setHashTag21(0)
+	require.Zero(t, cEvict.nodes[victimID].hashTag21())
+
+	evicted, err := cEvict.Put("newcomer", testData{value: 3, dataSize: 10})
+	require.NoError(t, err)
+	assertEvictedValues(t, evicted, []int64{1})
+	_, exists := cEvict.nodeMapGet(cEvict.hashKey("victim"))
+	assert.False(t, exists)
+	assert.Equal(t, 2, cEvict.hashCount)
+
+	// 2. Multi-node subtree DeletePrefix when !bufValid (onEvictEntry == nil, collisionCount == 0,
+	// hashMask <= hashTag21Mask) and subtree value nodes have hashTag21() == 0.
+	cSubtree := NewArenaRadixCache[testData](100, WithInvariantChecking(true), testDataWeigher).(*arenaRadix[testData])
+	for i, k := range []string{"dir/sub/alpha", "dir/sub/bravo", "other/keep"} {
+		_, err := cSubtree.Put(k, testData{value: int64(i + 10), dataSize: 10})
+		require.NoError(t, err)
+	}
+	for _, k := range []string{"dir/sub/alpha", "dir/sub/bravo"} {
+		id, ok := cSubtree.nodeMapGet(cSubtree.hashKey(k))
+		require.True(t, ok)
+		cSubtree.nodes[id].setHashTag21(0)
+		require.Zero(t, cSubtree.nodes[id].hashTag21())
+	}
+
+	cSubtree.DeletePrefix("dir/")
+	assert.Equal(t, 1, cSubtree.len)
+	assert.Equal(t, 1, cSubtree.hashCount)
+	_, ok = cSubtree.nodeMapGet(cSubtree.hashKey("dir/sub/alpha"))
+	assert.False(t, ok)
+	_, ok = cSubtree.nodeMapGet(cSubtree.hashKey("dir/sub/bravo"))
+	assert.False(t, ok)
+	vKeep, ok := cSubtree.Get("other/keep")
+	require.True(t, ok)
+	assert.Equal(t, int64(12), vKeep.value)
 }

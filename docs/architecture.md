@@ -13,7 +13,7 @@ This document details the internal data structures, concurrency models, and memo
 | **Per-Node Heap Allocations** | 1 allocation per new entry during growth (0 on update; capacity turnover in `Put` recycles evicted `*entry[V]` in-place via `recycledEntry`) | 1 allocation per node during growth (capacity turnover in `Put` recycles evicted `*radixNode[V]` in-place via `recycleNodes [2]*radixNode[V]`) | **0 node allocations** (recycled via intrusive free-list; prefixes stored in contiguous `prefixArena []byte` with `freePrefixSpans` reuse) |
 | **Node Pointer Width** | 64-bit pointers | 64-bit pointers (5 pointers / node) | **32-bit indices** (`uint32`, sentinel `nilNode = math.MaxUint32`) |
 | **Max Entry Capacity** | Memory / Heap limited | Memory / Heap limited | **`2^32 - 2` total arena nodes** (`0..math.MaxUint32-2`; `nilNode = MaxUint32`, `foregroundNoProtect = MaxUint32-1`) |
-| **Point Get Latency** | **~50 ns/op** (`O(1)` Hash Map) | ~170 ns/op (`O(K)` Trie Descent) | **~100 ns/op** (`O(1)` Seeded `maphash` Map + Zero-Alloc `keyLen` & Suffix Check) |
+| **Point Get Latency** | **~50 ns/op** (`O(1)` Hash Map) | ~170 ns/op (`O(K)` Trie Descent) | **~100 ns/op** (`O(1)` Seeded `maphash` Flat Hash Index + Zero-Alloc `keyLen` & Suffix Check) |
 | **Sequential Put Latency** | ~98 ns/op in-place (~383 ns/op turnover) | ~175 ns/op in-place (~472 ns/op turnover) | ~270 ns/op in-place (~515 ns/op turnover, 0 node allocs) |
 | **Point Replace Latency** | ~71 ns/op (0 allocs) | ~121 ns/op (0 allocs) | ~124 ns/op (0 allocs) |
 | **Prefix Delete (100 items)** | ~151.2–219.9 µs (`O(N)` full scan) | **~2.25–2.50 µs** (**65.7x–88.0x faster**) | **~7.3–7.6 µs** (**20.7x–28.9x faster**) |

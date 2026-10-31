@@ -237,11 +237,16 @@ func (c *arenaRadix[V]) checkPrefixArenaInvariants(totalPrefixBytes int) {
 	if c.freePrefixCount < 0 || c.freePrefixCount > len(c.freePrefixSpans) {
 		panic(fmt.Sprintf("arenaRadix invariant violation: invalid freePrefixCount %d", c.freePrefixCount))
 	}
+	freeBytes := 0
 	for i := 0; i < c.freePrefixCount; i++ {
 		sp := c.freePrefixSpans[i]
-		if sp.len == 0 || uint64(sp.off)+uint64(sp.len) > uint64(len(c.prefixArena)) {
+		if sp.len == 0 || uint64(sp.off)+uint64(sp.len) >= uint64(len(c.prefixArena)) {
 			panic(fmt.Sprintf("arenaRadix invariant violation: invalid freePrefixSpan [%d, %d+%d) for prefixArena len %d", sp.off, sp.off, sp.len, len(c.prefixArena)))
 		}
+		freeBytes += int(sp.len)
+	}
+	if c.livePrefixBytes+freeBytes > len(c.prefixArena) {
+		panic("arenaRadix invariant violation: livePrefixBytes + freePrefixSpans exceeds prefixArena len")
 	}
 }
 
@@ -326,23 +331,35 @@ func (c *arenaRadix[V]) checkCollisionPeerBucketInvariants(h uint64, peers []uin
 	return len(peers)
 }
 
+func (c *arenaRadix[V]) checkHashSlotInvariants(idx int, slot arenaHashSlot) {
+	id := slot.nodeID
+	if id >= uint32(len(c.nodes)) {
+		panic(fmt.Sprintf("arenaRadix invariant violation: hashSlots contains out-of-bounds index %d (len=%d)", id, len(c.nodes)))
+	}
+	if !c.nodes[id].hasValue() {
+		panic(fmt.Sprintf("arenaRadix invariant violation: hashSlots points to node %d with hasValue=false", id))
+	}
+	if arenaHashTag(c.hashNodeKey(id)) != slot.tag {
+		panic(fmt.Sprintf("arenaRadix invariant violation: hashSlots tag mismatch for node %d", id))
+	}
+	for pos := slot.tag & c.hashMask; pos != uint32(idx); pos = (pos + 1) & c.hashMask {
+		if c.hashSlots[pos].tag == 0 {
+			panic(fmt.Sprintf("arenaRadix invariant violation: broken hashSlots probe chain for slot %d (empty slot at %d)", idx, pos))
+		}
+	}
+}
+
 func (c *arenaRadix[V]) checkNodeMapInvariants() {
+	if len(c.hashSlots) < minHashSlotsCap || len(c.hashSlots)&(len(c.hashSlots)-1) != 0 || c.hashMask != uint32(len(c.hashSlots)-1) {
+		panic("arenaRadix invariant violation: invalid hashSlots capacity or mask")
+	}
 	actualCount := 0
-	for _, slot := range c.hashSlots {
+	for idx, slot := range c.hashSlots {
 		if slot.tag == 0 {
 			continue
 		}
 		actualCount++
-		id := slot.nodeID
-		if id >= uint32(len(c.nodes)) {
-			panic(fmt.Sprintf("arenaRadix invariant violation: hashSlots contains out-of-bounds index %d (len=%d)", id, len(c.nodes)))
-		}
-		if !c.nodes[id].hasValue() {
-			panic(fmt.Sprintf("arenaRadix invariant violation: hashSlots points to node %d with hasValue=false", id))
-		}
-		if arenaHashTag(c.hashNodeKey(id)) != slot.tag {
-			panic(fmt.Sprintf("arenaRadix invariant violation: hashSlots tag mismatch for node %d", id))
-		}
+		c.checkHashSlotInvariants(idx, slot)
 	}
 	if actualCount != c.hashCount {
 		panic(fmt.Sprintf("arenaRadix invariant violation: hashCount %d != actual occupied slots %d", c.hashCount, actualCount))
@@ -375,7 +392,7 @@ func (c *arenaRadix[V]) checkFreeNodeInvariants(freeID uint32) {
 	if c.nodes[freeID].size != 0 {
 		panic(fmt.Sprintf("arenaRadix invariant violation: free-list node %d has non-zero size %d", freeID, c.nodes[freeID].size))
 	}
-	if c.nodes[freeID].prefixLen != 0 || c.nodes[freeID].prefixOff != 0 || c.nodes[freeID].firstByte != 0 || c.nodes[freeID].keyLen() != 0 {
+	if c.nodes[freeID].prefixLen != 0 || c.nodes[freeID].prefixOff != 0 || c.nodes[freeID].firstByte != 0 || c.nodes[freeID].prefixFlags != 0 || c.nodes[freeID].keyLenAndFlags != 0 {
 		panic(fmt.Sprintf("arenaRadix invariant violation: free-list node %d has non-zero prefix metadata or keyLen %d", freeID, c.nodes[freeID].keyLen()))
 	}
 	if c.nodes[freeID].parent != nilNode || c.nodes[freeID].child != nilNode || c.nodes[freeID].sibling != nilNode || c.nodes[freeID].prev != nilNode {
