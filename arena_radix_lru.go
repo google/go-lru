@@ -965,11 +965,10 @@ func (c *arenaRadix[V]) initSubtreeKeyBuf(nodeID uint32, keyBuf *[512]byte) (int
 	return keyPos, true
 }
 
+// appendSubtreeKeyBuf appends prefix into keyBuf at keyPos when bufValid is true and the
+// resulting length fits within keyBuf, and always returns the advanced offset keyPos + len(prefix).
 func appendSubtreeKeyBuf(keyBuf *[512]byte, keyPos int, prefix string, bufValid bool) int {
-	if !bufValid {
-		return keyPos
-	}
-	if keyPos+len(prefix) <= len(keyBuf) {
+	if bufValid && keyPos+len(prefix) <= len(keyBuf) {
 		copy(keyBuf[keyPos:], prefix)
 	}
 	return keyPos + len(prefix)
