@@ -486,7 +486,7 @@ func (c *arenaRadix[V]) rUnlock() {
 	c.mu.RUnlock()
 }
 
-// Compact performs lossless O(N) compaction of the arena node slice and flat hash table
+// Compact performs lossless O(N) compaction of the arena node slice, prefix arena, and flat hash table
 // under exclusive write lock while preserving 100% of live entries, sizes, and exact LRU order.
 func (c *arenaRadix[V]) Compact() {
 	c.mu.Lock()
