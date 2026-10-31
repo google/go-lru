@@ -85,7 +85,7 @@ go test -run=^$ -bench="Benchmark(KeyDistributions|PayloadSizes|ConcurrencyScali
 
 ## 5. Enforcing Performance Targets & Regression Thresholds (`./cmd/benchcheck`)
 
-`./cmd/benchcheck` is a zero-dependency Go command that parses `go test -bench=^Benchmark_ -benchmem` output (including multi-sample `-count=N` runs and custom metrics `heap-B/entry` and `reclaimed-B/op`), enforces calibrated absolute performance and zero-allocation targets across all 89 target-enforced `Benchmark_*` sub-benchmarks, and detects relative regressions between a baseline and candidate run.
+`./cmd/benchcheck` is a zero-dependency Go command that parses `go test -bench=^Benchmark_ -benchmem` output (including multi-sample `-count=N` runs and custom metrics `heap-B/entry` and `reclaimed-B/op`), enforces calibrated absolute performance and zero-allocation targets across all 92 target-enforced `Benchmark_*` sub-benchmarks, and detects relative regressions between a baseline and candidate run.
 
 ### Local Target & Regression Verification
 
@@ -118,6 +118,7 @@ go run ./cmd/benchcheck -base benchmark-base.txt -head benchmark-head.txt -forma
 | `-min-allocs-delta` | `1.0` | Minimum absolute `allocs/op` increase required to flag a regression |
 | `-min-custom-delta` | `1.0` | Minimum absolute custom metric delta required to flag a regression |
 | `-strict-missing` | `false` | Fail if any baseline benchmark is missing from candidate or unmatched by target rules |
+| `-allow-within-targets` | `true` | Allow relative increases that remain within configured absolute target budgets |
 | `-format` | `"markdown"` | Output report format (`"markdown"` or `"text"`) |
 | `-summary` | `""` | Optional path (e.g., `$GITHUB_STEP_SUMMARY`) to append the Markdown report to |
 

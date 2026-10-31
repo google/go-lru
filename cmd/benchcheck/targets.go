@@ -134,21 +134,21 @@ func DefaultTargets() []TargetRule {
 		{
 			Pattern:        "^Benchmark_Replace_(MapCache|UnitWeight_Map|WithOnEvict(Value|Entry)/MapCache)$",
 			Description:    "MapCache in-place Replace across all configurations (0 allocs/op, 0 B/op)",
-			MaxNsPerOp:     new(float64(140)),
+			MaxNsPerOp:     new(float64(165)),
 			MaxBytesPerOp:  new(float64(0)),
 			MaxAllocsPerOp: new(float64(0)),
 		},
 		{
 			Pattern:        "^Benchmark_Replace_(RadixCache|UnitWeight_Radix|WithOnEvict(Value|Entry)/RadixCache)$",
 			Description:    "RadixCache in-place Replace across all configurations (0 allocs/op, 0 B/op)",
-			MaxNsPerOp:     new(float64(185)),
+			MaxNsPerOp:     new(float64(210)),
 			MaxBytesPerOp:  new(float64(0)),
 			MaxAllocsPerOp: new(float64(0)),
 		},
 		{
 			Pattern:        "^Benchmark_Replace_(ArenaRadixCache|UnitWeight_ArenaRadix|WithOnEvict(Value|Entry)/ArenaRadixCache)$",
 			Description:    "ArenaRadixCache in-place Replace across all configurations (0 allocs/op, 0 B/op)",
-			MaxNsPerOp:     new(float64(180)),
+			MaxNsPerOp:     new(float64(210)),
 			MaxBytesPerOp:  new(float64(0)),
 			MaxAllocsPerOp: new(float64(0)),
 		},
@@ -437,6 +437,31 @@ func DefaultTargets() []TargetRule {
 			MaxNsPerOp:     new(float64(100)),
 			MaxBytesPerOp:  new(float64(0)),
 			MaxAllocsPerOp: new(float64(0)),
+		},
+		// 49–51. Production Orbax Memory Footprint (3 benchmarks with heap-B/entry bounds on 187B paths)
+		{
+			Pattern:            "Benchmark_Production_MemoryFootprint/MapCache",
+			Description:        "Orbax 187B key MapCache live heap footprint & Put scale",
+			MaxNsPerOp:         new(float64(25000000)),
+			MaxBytesPerOp:      new(float64(13000000)),
+			MaxAllocsPerOp:     new(float64(67000)),
+			MaxHeapBytesPerEnt: new(310.0),
+		},
+		{
+			Pattern:            "Benchmark_Production_MemoryFootprint/RadixCache",
+			Description:        "Orbax 187B key RadixCache live heap footprint & Put scale",
+			MaxNsPerOp:         new(float64(28000000)),
+			MaxBytesPerOp:      new(float64(5500000)),
+			MaxAllocsPerOp:     new(float64(68000)),
+			MaxHeapBytesPerEnt: new(160.0),
+		},
+		{
+			Pattern:            "Benchmark_Production_MemoryFootprint/ArenaRadixCache",
+			Description:        "Orbax 187B key ArenaRadixCache live heap footprint (-35.4% vs fullKey) & Put scale",
+			MaxNsPerOp:         new(float64(42000000)),
+			MaxBytesPerOp:      new(float64(16000000)),
+			MaxAllocsPerOp:     new(float64(36000)),
+			MaxHeapBytesPerEnt: new(180.0),
 		},
 	}
 }

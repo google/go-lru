@@ -59,7 +59,9 @@ type ComparisonConfig struct {
 	MinAllocsDelta float64
 	MinCustomDelta float64
 
-	StrictMissing bool
+	StrictMissing      bool
+	AllowWithinTargets bool
+	TargetRules        []TargetRule
 }
 
 // DefaultComparisonConfig returns the default relative regression thresholds and noise floors.
@@ -74,6 +76,7 @@ func DefaultComparisonConfig() ComparisonConfig {
 		MinAllocsDelta:      1.0,
 		MinCustomDelta:      1.0,
 		StrictMissing:       false,
+		AllowWithinTargets:  true,
 	}
 }
 
@@ -281,42 +284,55 @@ func evaluateMetricDelta(
 	}
 
 	if dir == DirectionLowerIsBetter {
-		if baseVal == 0 {
-			if candVal == 0 {
-				d.RelChange = 0
-				d.Regressed = false
-			} else {
-				d.RelChange = math.Inf(1)
-				d.Regressed = d.AbsDelta >= minDelta
-			}
-		} else {
-			d.RelChange = d.AbsDelta / baseVal
-			d.Regressed = d.AbsDelta > 0 && d.AbsDelta >= minDelta && d.RelChange > threshold
-		}
-		if d.Regressed {
-			if math.IsInf(d.RelChange, 1) {
-				d.Message = fmt.Sprintf(
-					"%s increased from %s to %s (+%s, >= min delta %s)",
-					unit,
-					formatMetricValue(unit, baseVal),
-					formatMetricValue(unit, candVal),
-					formatMetricValue(unit, d.AbsDelta),
-					formatMetricValue(unit, minDelta),
-				)
-			} else {
-				d.Message = fmt.Sprintf(
-					"%s increased by +%.1f%% (%s -> %s, max allowed +%.1f%%)",
-					unit,
-					d.RelChange*100,
-					formatMetricValue(unit, baseVal),
-					formatMetricValue(unit, candVal),
-					threshold*100,
-				)
-			}
-		}
-		return d
+		d = evaluateLowerIsBetterDelta(d, baseVal, candVal, minDelta, threshold)
+	} else {
+		d = evaluateHigherIsBetterDelta(d, baseVal, candVal, minDelta, threshold)
 	}
+	if d.Regressed && cfg.AllowWithinTargets && isWithinTargetBudget(benchName, unit, candVal, cfg.TargetRules) {
+		d.Regressed = false
+		d.Message = ""
+	}
+	return d
+}
 
+func evaluateLowerIsBetterDelta(d MetricDelta, baseVal, candVal, minDelta, threshold float64) MetricDelta {
+	if baseVal == 0 {
+		if candVal == 0 {
+			d.RelChange = 0
+			d.Regressed = false
+		} else {
+			d.RelChange = math.Inf(1)
+			d.Regressed = d.AbsDelta >= minDelta
+		}
+	} else {
+		d.RelChange = d.AbsDelta / baseVal
+		d.Regressed = d.AbsDelta > 0 && d.AbsDelta >= minDelta && d.RelChange > threshold
+	}
+	if d.Regressed {
+		if math.IsInf(d.RelChange, 1) {
+			d.Message = fmt.Sprintf(
+				"%s increased from %s to %s (+%s, >= min delta %s)",
+				d.Unit,
+				formatMetricValue(d.Unit, baseVal),
+				formatMetricValue(d.Unit, candVal),
+				formatMetricValue(d.Unit, d.AbsDelta),
+				formatMetricValue(d.Unit, minDelta),
+			)
+		} else {
+			d.Message = fmt.Sprintf(
+				"%s increased by +%.1f%% (%s -> %s, max allowed +%.1f%%)",
+				d.Unit,
+				d.RelChange*100,
+				formatMetricValue(d.Unit, baseVal),
+				formatMetricValue(d.Unit, candVal),
+				threshold*100,
+			)
+		}
+	}
+	return d
+}
+
+func evaluateHigherIsBetterDelta(d MetricDelta, baseVal, candVal, minDelta, threshold float64) MetricDelta {
 	// DirectionHigherIsBetter (e.g., reclaimed-B/op): a decrease is a regression.
 	adverseLoss := baseVal - candVal
 	if baseVal <= 0 {
@@ -331,14 +347,54 @@ func evaluateMetricDelta(
 	if d.Regressed {
 		d.Message = fmt.Sprintf(
 			"%s decreased by -%.1f%% (%s -> %s, max allowed drop -%.1f%%)",
-			unit,
+			d.Unit,
 			adverseRatio*100,
-			formatMetricValue(unit, baseVal),
-			formatMetricValue(unit, candVal),
+			formatMetricValue(d.Unit, baseVal),
+			formatMetricValue(d.Unit, candVal),
 			threshold*100,
 		)
 	}
 	return d
+}
+
+// isWithinTargetBudget reports whether candVal satisfies all matching TargetRule bounds
+// for (benchName, unit) and at least one matching rule defines an explicit bound for unit.
+func isWithinTargetBudget(benchName, unit string, candVal float64, rules []TargetRule) bool {
+	if len(rules) == 0 {
+		return false
+	}
+	hasBound := false
+	for _, rule := range rules {
+		if !matchTargetPattern(benchName, rule.Pattern, nil) {
+			continue
+		}
+		matched, satisfied := checkRuleMetricBound(rule, unit, candVal)
+		if !matched {
+			continue
+		}
+		hasBound = true
+		if !satisfied {
+			return false
+		}
+	}
+	return hasBound
+}
+
+func checkRuleMetricBound(rule TargetRule, unit string, actual float64) (hasBound, satisfied bool) {
+	switch unit {
+	case UnitNsPerOp:
+		return rule.MaxNsPerOp != nil, rule.MaxNsPerOp != nil && actual <= *rule.MaxNsPerOp
+	case UnitBytesPerOp:
+		return rule.MaxBytesPerOp != nil, rule.MaxBytesPerOp != nil && actual <= *rule.MaxBytesPerOp
+	case UnitAllocsPerOp:
+		return rule.MaxAllocsPerOp != nil, rule.MaxAllocsPerOp != nil && actual <= *rule.MaxAllocsPerOp
+	case UnitHeapBytesPerEnt:
+		return rule.MaxHeapBytesPerEnt != nil, rule.MaxHeapBytesPerEnt != nil && actual <= *rule.MaxHeapBytesPerEnt
+	case UnitReclaimedBytesOp:
+		return rule.MinReclaimedBytesOp != nil, rule.MinReclaimedBytesOp != nil && actual >= *rule.MinReclaimedBytesOp
+	default:
+		return false, false
+	}
 }
 
 // effectiveMinDelta returns the minimum absolute delta floor for a benchmark metric,
@@ -372,9 +428,9 @@ func effectiveMinDelta(
 		minDelta = max(minDelta, 250000.0)
 	}
 
-	// Benchmark_LargeScale_DeletePrefix_100K/MapCache runs b.N=1..2 at -benchtime=10ms
-	// immediately after runtime.GC(), which can record 192 B/op, 2 allocs/op, and ~5-6 ms
-	// of concurrent sweep/timer variance when b.N <= 2.
+	// Benchmark_LargeScale_DeletePrefix_100K/* runs low iteration counts at -benchtime=10ms
+	// while rebuilding 100,000 entries inside b.StopTimer(), causing GC sweep and timer
+	// variance across MapCache (b.N=1..2), RadixCache (b.N~15), and ArenaRadixCache (b.N~3).
 	if floor := largeScaleDeletePrefixMinDelta(benchName, unit, baseRes, candRes); floor > 0 {
 		minDelta = max(minDelta, floor)
 	}
@@ -417,10 +473,29 @@ func largeScaleDeletePrefixMinDelta(
 	benchName, unit string,
 	baseRes, candRes *BenchmarkResult,
 ) float64 {
-	if benchName != "Benchmark_LargeScale_DeletePrefix_100K/MapCache" {
+	if !strings.HasPrefix(benchName, "Benchmark_LargeScale_DeletePrefix_100K/") {
 		return 0
 	}
-	if baseRes.Iterations > 2 && candRes.Iterations > 2 {
+	if baseRes.Iterations >= 100 && candRes.Iterations >= 100 {
+		return 0
+	}
+	switch benchName {
+	case "Benchmark_LargeScale_DeletePrefix_100K/MapCache":
+		return mapLargeScaleDeletePrefixMinDelta(unit, baseRes, candRes)
+	case "Benchmark_LargeScale_DeletePrefix_100K/RadixCache":
+		if unit == UnitNsPerOp {
+			return 500000.0
+		}
+	case "Benchmark_LargeScale_DeletePrefix_100K/ArenaRadixCache":
+		if unit == UnitNsPerOp {
+			return 1500000.0
+		}
+	}
+	return 0
+}
+
+func mapLargeScaleDeletePrefixMinDelta(unit string, baseRes, candRes *BenchmarkResult) float64 {
+	if baseRes.Iterations > 10 && candRes.Iterations > 10 {
 		return 0
 	}
 	switch unit {

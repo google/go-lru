@@ -119,6 +119,9 @@ Benchmark_Stats_RadixCache/Sequential-96                      	  810264	        
 Benchmark_Stats_RadixCache/Parallel-96                        	 1087350	        55.18 ns/op	       0 B/op	       0 allocs/op
 Benchmark_Stats_ArenaRadixCache/Sequential-96                 	  785236	        76.41 ns/op	       0 B/op	       0 allocs/op
 Benchmark_Stats_ArenaRadixCache/Parallel-96                   	 1080692	        55.52 ns/op	       0 B/op	       0 allocs/op
+Benchmark_Production_MemoryFootprint/MapCache-96              	       1	  13523256 ns/op	       293.4 heap-B/entry	11386280 B/op	   65817 allocs/op
+Benchmark_Production_MemoryFootprint/RadixCache-96            	       1	  15010355 ns/op	       145.4 heap-B/entry	 4816504 B/op	   67102 allocs/op
+Benchmark_Production_MemoryFootprint/ArenaRadixCache-96       	       1	  26303578 ns/op	       165.9 heap-B/entry	14329400 B/op	   34114 allocs/op
 PASS
 ok  	github.com/google/go-lru	12.345s
 `
@@ -468,6 +471,8 @@ Benchmark_Get_MapCache/Flat-96                              	 1000000	        50
 Benchmark_DeletePrefix_RadixCache/Flat-96                   	   22000	      2500.0 ns/op	       0 B/op	       0 allocs/op
 Benchmark_ParallelThroughput_WriteHeavy/ArenaRadixCache-96  	  101574	       590.0 ns/op	      42 B/op	       0 allocs/op
 Benchmark_LargeScale_DeletePrefix_100K/MapCache-96          	       2	   6142951.0 ns/op	       0 B/op	       0 allocs/op
+Benchmark_LargeScale_DeletePrefix_100K/RadixCache-96        	      16	    681404.5 ns/op	       0 B/op	       0 allocs/op
+Benchmark_LargeScale_DeletePrefix_100K/ArenaRadixCache-96   	       3	   4376141.5 ns/op	       0 B/op	       0 allocs/op
 Benchmark_ArenaRadixCache_Compact-96                        	      18	    519373.5 ns/op	  810000 reclaimed-B/op	  713072 B/op	      20 allocs/op
 `
 	candInput := `
@@ -475,6 +480,8 @@ Benchmark_Get_MapCache/Flat-96                              	 1000000	        58
 Benchmark_DeletePrefix_RadixCache/Flat-96                   	   21000	      2550.0 ns/op	       4 B/op	       0 allocs/op
 Benchmark_ParallelThroughput_WriteHeavy/ArenaRadixCache-96  	   65000	       620.0 ns/op	     130 B/op	       0 allocs/op
 Benchmark_LargeScale_DeletePrefix_100K/MapCache-96          	       1	  11011284.0 ns/op	     192 B/op	       2 allocs/op
+Benchmark_LargeScale_DeletePrefix_100K/RadixCache-96        	      14	    932033.0 ns/op	       0 B/op	       0 allocs/op
+Benchmark_LargeScale_DeletePrefix_100K/ArenaRadixCache-96   	       2	   5700000.0 ns/op	       0 B/op	       0 allocs/op
 Benchmark_ArenaRadixCache_Compact-96                        	      14	    736689.0 ns/op	  805000 reclaimed-B/op	  713072 B/op	      20 allocs/op
 `
 	baseSuite, err := Parse(strings.NewReader(baseInput), AggregateMedian)
@@ -489,6 +496,44 @@ Benchmark_ArenaRadixCache_Compact-96                        	      14	    736689
 	require.NoError(t, err)
 	assert.True(t, rep.Passed())
 	assert.Empty(t, rep.Regressions)
+}
+
+func TestCompareSuites_AllowsIntentionalTradeoffsWithinTargetBudgets(t *testing.T) {
+	// Arrange
+	baseInput := `
+Benchmark_Put_ArenaRadixCache/Flat-96             	  220000	       500.3 ns/op	      80 B/op	       0 allocs/op
+Benchmark_Get_ArenaRadixCache/Flat-96             	 1000000	        57.8 ns/op	       0 B/op	       0 allocs/op
+Benchmark_All_ArenaRadixCache-96                  	   20000	      3447.5 ns/op	       0 B/op	       0 allocs/op
+`
+	candInput := `
+Benchmark_Put_ArenaRadixCache/Flat-96             	  200000	       539.8 ns/op	      91 B/op	       1 allocs/op
+Benchmark_Get_ArenaRadixCache/Flat-96             	  600000	        96.1 ns/op	       0 B/op	       0 allocs/op
+Benchmark_All_ArenaRadixCache-96                  	     900	     57554.0 ns/op	   24000 B/op	    1000 allocs/op
+`
+	baseSuite, err := Parse(strings.NewReader(baseInput), AggregateMedian)
+	require.NoError(t, err)
+	candSuite, err := Parse(strings.NewReader(candInput), AggregateMedian)
+	require.NoError(t, err)
+
+	cfgWithTargets := DefaultComparisonConfig()
+	cfgWithTargets.TargetRules = DefaultTargets()
+
+	cfgStrictRelative := DefaultComparisonConfig()
+	cfgStrictRelative.AllowWithinTargets = false
+	cfgStrictRelative.TargetRules = DefaultTargets()
+
+	// Act
+	repAllowed, err1 := CompareSuites(baseSuite, candSuite, cfgWithTargets)
+	repStrict, err2 := CompareSuites(baseSuite, candSuite, cfgStrictRelative)
+
+	// Assert
+	require.NoError(t, err1)
+	assert.True(t, repAllowed.Passed())
+	assert.Empty(t, repAllowed.Regressions)
+
+	require.NoError(t, err2)
+	assert.False(t, repStrict.Passed())
+	assert.Len(t, repStrict.Regressions, 5)
 }
 
 func TestCompareSuites_MissingAndRenamedBenchmarks(t *testing.T) {
@@ -554,8 +599,8 @@ func TestCheckTargets_DefaultTargetsCoverAllRepositoryBenchmarks(t *testing.T) {
 
 	// Assert
 	require.NoError(t, err)
-	assert.Equal(t, 89, rep.Evaluated)
-	assert.Equal(t, 89, rep.Matched)
+	assert.Equal(t, 92, rep.Evaluated)
+	assert.Equal(t, 92, rep.Matched)
 	assert.Empty(t, rep.Unmatched)
 	assert.Empty(t, rep.Violations)
 	assert.True(t, rep.Passed())

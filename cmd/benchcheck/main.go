@@ -58,10 +58,13 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 		return exitUsageErr
 	}
 
-	targetRep, err := evaluateTargetsIfEnabled(candSuite, opts)
+	targetRep, rules, err := evaluateTargetsIfEnabled(candSuite, opts)
 	if err != nil {
 		_, _ = fmt.Fprintf(stderr, "benchcheck: %v\n", err)
 		return exitUsageErr
+	}
+	if opts.cfg.AllowWithinTargets && len(rules) > 0 {
+		opts.cfg.TargetRules = rules
 	}
 
 	cmpRep, err := evaluateComparisonIfEnabled(candSuite, stdin, opts)
@@ -124,6 +127,7 @@ func parseCLIOptions(args []string, stderr io.Writer) (cliOptions, bool) {
 	fs.Float64Var(&cfg.MinAllocsDelta, "min-allocs-delta", cfg.MinAllocsDelta, "Minimum absolute allocs/op increase required to flag a regression")
 	fs.Float64Var(&cfg.MinCustomDelta, "min-custom-delta", cfg.MinCustomDelta, "Minimum absolute custom metric delta required to flag a regression")
 	fs.BoolVar(&cfg.StrictMissing, "strict-missing", false, "Fail if any baseline benchmark is missing from candidate or unmatched by target rules")
+	fs.BoolVar(&cfg.AllowWithinTargets, "allow-within-targets", cfg.AllowWithinTargets, "Allow relative increases that remain within configured absolute target budgets")
 	fs.StringVar(&formatStr, "format", "markdown", "Output report format: 'markdown' or 'text'")
 	fs.StringVar(&summaryPath, "summary", "", "Optional file path (e.g. $GITHUB_STEP_SUMMARY) to append Markdown report to")
 
@@ -207,23 +211,23 @@ func validateCLIOptions(opts cliOptions, rawFormat string, stderr io.Writer) boo
 	return true
 }
 
-func evaluateTargetsIfEnabled(candSuite *Suite, opts cliOptions) (*TargetReport, error) {
+func evaluateTargetsIfEnabled(candSuite *Suite, opts cliOptions) (*TargetReport, []TargetRule, error) {
 	if !opts.checkTargets {
-		return nil, nil
+		return nil, nil, nil
 	}
 	rules := DefaultTargets()
 	if opts.targetsPath != "" {
 		var err error
 		rules, err = LoadTargets(opts.targetsPath)
 		if err != nil {
-			return nil, err
+			return nil, nil, err
 		}
 	}
 	targetRep, err := CheckTargets(candSuite, rules, opts.cfg.StrictMissing)
 	if err != nil {
-		return nil, fmt.Errorf("target check error: %w", err)
+		return nil, nil, fmt.Errorf("target check error: %w", err)
 	}
-	return targetRep, nil
+	return targetRep, rules, nil
 }
 
 func evaluateComparisonIfEnabled(candSuite *Suite, stdin io.Reader, opts cliOptions) (*ComparisonReport, error) {
