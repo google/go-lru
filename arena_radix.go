@@ -268,6 +268,8 @@ func (c *arenaRadix[V]) mergeAdjacentFreeSpanLocked(mergedIdx int) {
 // recordFreePrefixSpanLocked adds [off, off+spanLen) to c.freePrefixSpans, coalescing with
 // adjacent spans, trimming tail spans, or evicting the smallest tracked span if the 32-slot table is full.
 func (c *arenaRadix[V]) recordFreePrefixSpanLocked(off, spanLen uint32) {
+	minIdx := 0
+	minLen := uint32(math.MaxUint32)
 	for i := 0; i < c.freePrefixCount; i++ {
 		sp := &c.freePrefixSpans[i]
 		if sp.off+sp.len == off {
@@ -283,19 +285,15 @@ func (c *arenaRadix[V]) recordFreePrefixSpanLocked(off, spanLen uint32) {
 			c.trimFreePrefixSpansAtTailLocked()
 			return
 		}
+		if sp.len < minLen {
+			minLen = sp.len
+			minIdx = i
+		}
 	}
 	if c.freePrefixCount < len(c.freePrefixSpans) {
 		c.freePrefixSpans[c.freePrefixCount] = prefixSpan{off: off, len: spanLen}
 		c.freePrefixCount++
 		return
-	}
-	minIdx := 0
-	minLen := c.freePrefixSpans[0].len
-	for i := 1; i < len(c.freePrefixSpans); i++ {
-		if c.freePrefixSpans[i].len < minLen {
-			minLen = c.freePrefixSpans[i].len
-			minIdx = i
-		}
 	}
 	if spanLen > minLen {
 		c.freePrefixSpans[minIdx] = prefixSpan{off: off, len: spanLen}
@@ -994,6 +992,47 @@ func (c *arenaRadix[V]) freeNode(id uint32) {
 	var zero V
 	c.clearNodePrefix(id)
 	n := &c.nodes[id]
+	n.prefixFlags = 0
+	n.keyLenAndFlags = 0
+	n.value = zero
+	n.size = 0
+	n.parent = nilNode
+	n.child = nilNode
+	n.sibling = nilNode
+	n.prev = nilNode
+
+	n.next = c.freeHead
+	c.freeHead = id
+	c.freeCount++
+}
+
+// freeSubtreeNodeLocked reclaims a detached subtree node during freeSubtree.
+// Once the 32-slot prefix span recycler is full, non-tail small spans skip the
+// O(32) recycler scan; their bytes remain accounted as dead slack in prefixArena
+// (len(prefixArena) - livePrefixBytes) for subsequent compaction.
+func (c *arenaRadix[V]) freeSubtreeNodeLocked(id uint32) {
+	var zero V
+	n := &c.nodes[id]
+	if pLen := int(n.prefixLen); pLen != 0 {
+		if pLen == int(largePrefixSentinel) {
+			c.clearNodePrefix(id)
+		} else {
+			off := n.prefixOff
+			flags := n.prefixFlags
+			c.livePrefixBytes -= pLen
+			if flags&prefixFlagPinned == 0 && !c.prefixExposed.Load() {
+				if int(off)+pLen == len(c.prefixArena) {
+					c.prefixArena = c.prefixArena[:off]
+					c.trimFreePrefixSpansAtTailLocked()
+				} else if c.freePrefixCount < len(c.freePrefixSpans) {
+					c.recordFreePrefixSpanLocked(off, uint32(pLen))
+				}
+			}
+		}
+	}
+	n.prefixOff = 0
+	n.prefixLen = 0
+	n.firstByte = 0
 	n.prefixFlags = 0
 	n.keyLenAndFlags = 0
 	n.value = zero

@@ -1073,6 +1073,47 @@ func appendSubtreeKeyBuf(keyBuf *[512]byte, keyPos int, prefix string, bufValid 
 	return keyPos + len(prefix)
 }
 
+// evictSubtreeValueNodeFastLocked is the fast path of evictSubtreeValueNodeLocked when
+// c.onEvictEntry == nil, c.collisionCount == 0, and c.hashMask <= hashTag21Mask.
+func (c *arenaRadix[V]) evictSubtreeValueNodeFastLocked(evictQ *evictCallbackQueue[V], currID uint32) {
+	if !c.deleteNodeFromHashSlotsFastLocked(currID) {
+		c.removeOrPromoteNodeMapLocked(c.hashNodeKey(currID), currID)
+	}
+	evictedVal := c.nodes[currID].value
+	evictedSize := c.nodes[currID].size
+	c.onEntryDeleted(evictedSize)
+	c.currentSize -= evictedSize
+	c.remove(currID)
+	c.nodeMapDirty = true
+	c.nodes[currID].setHasValue(false)
+	c.notifyEvict(evictQ, "", evictedVal, evictedSize, EvictionReasonDeleted)
+}
+
+func (c *arenaRadix[V]) freeSubtreeFastLocked(evictQ *evictCallbackQueue[V], nodeID uint32) {
+	currID := nodeID
+	for currID != nilNode {
+		if c.nodes[currID].hasValue() {
+			c.evictSubtreeValueNodeFastLocked(evictQ, currID)
+		}
+		if childID := c.nodes[currID].child; childID != nilNode {
+			currID = childID
+			continue
+		}
+		for currID != nodeID && c.nodes[currID].sibling == nilNode {
+			parentID := c.nodes[currID].parent
+			c.freeSubtreeNodeLocked(currID)
+			currID = parentID
+		}
+		if currID == nodeID {
+			c.freeSubtreeNodeLocked(currID)
+			return
+		}
+		siblingID := c.nodes[currID].sibling
+		c.freeSubtreeNodeLocked(currID)
+		currID = siblingID
+	}
+}
+
 // freeSubtree iteratively reclaims all nodes in a detached subtree using O(1) stack space,
 // removing active values from the LRU list, hashSlots, and accounting,
 // and returning nodes to the free-list.
@@ -1084,16 +1125,16 @@ func (c *arenaRadix[V]) freeSubtree(evictQ *evictCallbackQueue[V], nodeID uint32
 		if c.nodes[nodeID].hasValue() {
 			c.evictSubtreeValueNodeLocked(evictQ, nodeID, nil, false)
 		}
-		c.freeNode(nodeID)
+		c.freeSubtreeNodeLocked(nodeID)
+		return
+	}
+	if c.onEvictEntry == nil && c.collisionCount == 0 && c.hashMask <= hashTag21Mask {
+		c.freeSubtreeFastLocked(evictQ, nodeID)
 		return
 	}
 
 	var keyBuf [512]byte
-	var keyPos int
-	var bufValid bool
-	if c.onEvictEntry != nil || c.collisionCount > 0 || c.hashMask > hashTag21Mask {
-		keyPos, bufValid = c.initSubtreeKeyBuf(nodeID, &keyBuf)
-	}
+	keyPos, bufValid := c.initSubtreeKeyBuf(nodeID, &keyBuf)
 
 	currID := nodeID
 	for currID != nilNode {
@@ -1117,18 +1158,18 @@ func (c *arenaRadix[V]) freeSubtree(evictQ *evictCallbackQueue[V], nodeID uint32
 		for currID != nodeID && c.nodes[currID].sibling == nilNode {
 			keyPos -= c.nodePrefixLen(currID)
 			parentID := c.nodes[currID].parent
-			c.freeNode(currID)
+			c.freeSubtreeNodeLocked(currID)
 			currID = parentID
 		}
 
 		if currID == nodeID {
-			c.freeNode(currID)
+			c.freeSubtreeNodeLocked(currID)
 			return
 		}
 
 		siblingID := c.nodes[currID].sibling
 		keyPos = appendSubtreeKeyBuf(&keyBuf, keyPos-c.nodePrefixLen(currID), c.nodePrefix(siblingID), bufValid)
-		c.freeNode(currID)
+		c.freeSubtreeNodeLocked(currID)
 		currID = siblingID
 	}
 }

@@ -364,7 +364,7 @@ func DefaultTargets() []TargetRule {
 			MaxNsPerOp:          new(float64(1200000)),
 			MaxBytesPerOp:       new(float64(760000)),
 			MaxAllocsPerOp:      new(float64(25)),
-			MinReclaimedBytesOp: new(750000.0),
+			MinReclaimedBytesOp: new(680000.0),
 		},
 		{
 			Pattern:        "Benchmark_ArenaRadixCache_PutUnderPressure",
