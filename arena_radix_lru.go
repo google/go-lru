@@ -390,7 +390,7 @@ func (c *arenaRadix[V]) checkInvariants() {
 	// INVARIANT 5: Tree traversal & bijection checks
 	treeNodeCount := c.checkTreeInvariants()
 
-	// INVARIANT 6: Hash accelerator map (nodeMap) index bounds, value presence, and hash consistency.
+	// INVARIANT 6: Flat hash table (hashSlots) index bounds, value presence, and hash consistency.
 	c.checkNodeMapInvariants()
 
 	// INVARIANT 7: Free-list integrity and total node accounting (liveTreeNodes + freeListCount == len(nodes)).
@@ -427,7 +427,7 @@ func (c *arenaRadix[V]) rUnlock() {
 	c.mu.RUnlock()
 }
 
-// Compact performs lossless O(N) compaction of the arena node slice and hash lookup map
+// Compact performs lossless O(N) compaction of the arena node slice and flat hash table
 // under exclusive write lock while preserving 100% of live entries, sizes, and exact LRU order.
 func (c *arenaRadix[V]) Compact() {
 	c.mu.Lock()
@@ -838,6 +838,9 @@ func (c *arenaRadix[V]) evictAllForClearLocked(evictQ *evictCallbackQueue[V]) {
 		nextID := c.nodes[currID].next
 		var key string
 		if c.onEvictEntry != nil {
+			if c.nodes[currID].parent == c.root && c.nodes[currID].prefixLen > 0 {
+				c.prefixExposed.Store(true)
+			}
 			key = c.reconstructKey(currID)
 		}
 		evictedVal := c.nodes[currID].value
@@ -895,7 +898,7 @@ func (c *arenaRadix[V]) deleteNonEmptyPrefixLocked(evictQ *evictCallbackQueue[V]
 			// Temporarily restore upward parent pointer for non-recursive traversal
 			c.nodes[childID].parent = nodeID
 
-			// Now sweep the detached subtree to fix LRU, nodeMap, and currentSize
+			// Now sweep the detached subtree to fix LRU, hashSlots, and currentSize
 			c.freeSubtree(evictQ, childID)
 			c.compressPathUpwards(nodeID)
 			c.finishDeleteReclaimLocked(evictQ, sizeBefore, sampledEpoch, pressure)
@@ -951,7 +954,7 @@ func (c *arenaRadix[V]) DeletePrefix(prefix string) {
 }
 
 // evictSubtreeValueNodeLocked removes an active value-bearing node encountered during subtree
-// reclamation from the LRU list, nodeMap, and size accounting, and enqueues its eviction callback.
+// reclamation from the LRU list, hashSlots, and size accounting, and enqueues its eviction callback.
 func (c *arenaRadix[V]) evictSubtreeValueNodeLocked(evictQ *evictCallbackQueue[V], currID uint32, keyBytes []byte, hasKeyBytes bool) {
 	var zero V
 	var key string
@@ -962,7 +965,9 @@ func (c *arenaRadix[V]) evictSubtreeValueNodeLocked(evictQ *evictCallbackQueue[V
 		c.removeOrPromoteNodeMapLocked(maphash.Bytes(c.seed, keyBytes), currID)
 		fastDeleted = true
 	case c.onEvictEntry != nil:
-		c.nodes[currID].prefixFlags |= prefixFlagPinned
+		if c.nodes[currID].parent == c.root {
+			c.nodes[currID].prefixFlags |= prefixFlagPinned
+		}
 		key = c.reconstructKey(currID)
 		c.removeOrPromoteNodeMapLocked(c.hashKey(key), currID)
 		fastDeleted = true
@@ -1010,7 +1015,7 @@ func appendSubtreeKeyBuf(keyBuf *[512]byte, keyPos int, prefix string, bufValid 
 }
 
 // freeSubtree iteratively reclaims all nodes in a detached subtree using O(1) stack space,
-// removing active values from the LRU list, nodeMap, and accounting,
+// removing active values from the LRU list, hashSlots, and accounting,
 // and returning nodes to the free-list.
 func (c *arenaRadix[V]) freeSubtree(evictQ *evictCallbackQueue[V], nodeID uint32) {
 	if nodeID == nilNode {

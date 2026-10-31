@@ -17,6 +17,7 @@ package lru
 import (
 	"bytes"
 	"context"
+	"encoding/binary"
 	"fmt"
 	"math"
 	"math/bits"
@@ -1634,10 +1635,10 @@ func longestCommonPrefix(a, b string) int {
 	n := min(len(a), len(b))
 	i := 0
 	if n >= 8 {
-		pa := unsafe.Pointer(unsafe.StringData(a))
-		pb := unsafe.Pointer(unsafe.StringData(b))
+		ab := unsafe.Slice(unsafe.StringData(a), n)
+		bb := unsafe.Slice(unsafe.StringData(b), n)
 		for ; i <= n-8; i += 8 {
-			if diff := *(*uint64)(unsafe.Add(pa, i)) ^ *(*uint64)(unsafe.Add(pb, i)); diff != 0 {
+			if diff := binary.LittleEndian.Uint64(ab[i:]) ^ binary.LittleEndian.Uint64(bb[i:]); diff != 0 {
 				return i + (bits.TrailingZeros64(diff) >> 3)
 			}
 		}

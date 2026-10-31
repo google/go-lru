@@ -1690,14 +1690,14 @@ func TestCompaction_MapCompactSkipsReallocationWithoutSlack(t *testing.T) {
 
 // TestCompaction_ArenaRadixContiguousCompactRequiresTrueSlack verifies that when
 // ArenaRadixCache is at capacity and a Put triggers 1 LRU eviction that is immediately
-// reused by allocNode() (leaving freeHead == nilNode, len(nodes) == cap(nodes), and
-// len(nodeMap) == peakEntryLen), Compact() and Tier 1 EvaluateMemoryPressure() are
+// reused by allocateNode() (leaving freeHead == nilNode, len(nodes) == cap(nodes), and
+// hashCount == peakEntryLen), Compact() and Tier 1 EvaluateMemoryPressure() are
 // zero-allocation no-ops unless true contiguous slack exists.
 func TestCompaction_ArenaRadixContiguousCompactRequiresTrueSlack(t *testing.T) {
 	t.Run("SteadyStateTurnoverWithZeroSlackPerformsZeroAllocCompactAndTier1NoOp", func(t *testing.T) {
 		// Arrange: Fill ArenaRadixCache(100) with 100 entries and trigger 1 capacity eviction
 		// (matching TestCompaction_MapCompactSkipsReallocationWithoutSlack). The evicted node is immediately
-		// reused by allocNode(), leaving freeHead == nilNode, len == peakEntryLen == 100, and deletedSinceCompact == 1.
+		// reused by allocateNode(), leaving freeHead == nilNode, len == peakEntryLen == 100, and deletedSinceCompact == 1.
 		var pressureBits atomic.Uint64
 		pressureBits.Store(math.Float64bits(0.10))
 		c := NewArenaRadixCache[int](100,
@@ -1726,7 +1726,7 @@ func TestCompaction_ArenaRadixContiguousCompactRequiresTrueSlack(t *testing.T) {
 		require.False(t, c.shouldAutoCompactLocked(nilNode))
 
 		nodesPtrBefore := unsafe.SliceData(c.nodes)
-		mapPtrBefore := unsafe.SliceData(c.hashSlots)
+		hashSlotsPtrBefore := unsafe.SliceData(c.hashSlots)
 
 		// Act: Evaluate Tier 1 pressure (0.80) and call explicit Compact().
 		pressureBits.Store(math.Float64bits(0.80))
@@ -1739,7 +1739,7 @@ func TestCompaction_ArenaRadixContiguousCompactRequiresTrueSlack(t *testing.T) {
 		// Assert
 		st := c.Stats()
 		assert.Same(t, nodesPtrBefore, unsafe.SliceData(c.nodes), "c.nodes must not be reallocated when contiguous slack is absent")
-		assert.Same(t, mapPtrBefore, unsafe.SliceData(c.hashSlots), "c.hashSlots must not be reallocated when map slack is absent")
+		assert.Same(t, hashSlotsPtrBefore, unsafe.SliceData(c.hashSlots), "c.hashSlots must not be reallocated when hash table slack is absent")
 		assert.Zero(t, compactAllocs, "Compact() without contiguous slack must perform 0 allocations")
 		assert.Zero(t, st.CompactionsPressureTier1)
 		assert.Zero(t, st.CompactionsExplicit)
@@ -1773,7 +1773,7 @@ func TestCompaction_ArenaRadixContiguousCompactRequiresTrueSlack(t *testing.T) {
 		require.True(t, c.hasContiguousSlackLocked())
 		require.True(t, c.isDirtyLocked())
 
-		// Act: Explicit Compact() trims the unallocated tail capacity of c.nodes down to len(c.nodes) and rebuilds nodeMap.
+		// Act: Explicit Compact() trims the unallocated tail capacity of c.nodes down to len(c.nodes) and rebuilds hashSlots.
 		c.Compact()
 
 		// Assert

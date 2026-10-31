@@ -1248,7 +1248,9 @@ func (c *arenaRadix[V]) eraseInternal(evictQ *evictCallbackQueue[V], nodeID uint
 		return zero, false
 	}
 	if c.onEvictEntry != nil {
-		c.nodes[nodeID].prefixFlags |= prefixFlagPinned
+		if c.nodes[nodeID].parent == c.root {
+			c.nodes[nodeID].prefixFlags |= prefixFlagPinned
+		}
 		key := c.reconstructKey(nodeID)
 		return c.eraseInternalWithHash(evictQ, nodeID, c.hashKey(key), key, reason)
 	}
@@ -1288,7 +1290,7 @@ func (c *arenaRadix[V]) clearEmptyArenaStateLocked() {
 	c.len = 0
 	c.livePrefixBytes = 0
 	c.freePrefixCount = 0
-	if !c.prefixExposed.Load() && cap(c.prefixArena) <= 4096 && c.peakEntryLen <= minPeakSlackEntries && c.deletedSinceCompact < minChurnCompactDeletes {
+	if !c.prefixExposed.Load() && (c.onEvictEntry == nil || len(c.prefixArena) == 0) && cap(c.prefixArena) <= 4096 && c.peakEntryLen <= minPeakSlackEntries && c.deletedSinceCompact < minChurnCompactDeletes {
 		c.prefixArena = c.prefixArena[:0]
 	} else {
 		c.prefixArena = nil

@@ -1939,7 +1939,7 @@ func TestArenaRadixCache_DeepHierarchyOver64LevelsAndRoutingPrefixCloning(t *tes
 
 	t.Run("RoutingPrefixDoesNotPinLargeKeyBackingArray", func(t *testing.T) {
 		// Arrange: Put two 64 KiB keys ("dir/A" + 64 KiB suffix and "dir/B" + 64 KiB suffix)
-		// so splitting at "dir/" invokes clonePrefix on both split halves, then insert short sibling keys
+		// so splitting at "dir/" copies both split halves into c.prefixArena, then insert short sibling keys
 		// ("dir/a" and "dir/b") and erase both 64 KiB keys so the "dir/" routing node survives.
 		//
 		// White-box testing rationale: String backing-array aliasing on internal routing and leaf nodes is
@@ -2072,9 +2072,9 @@ func TestArenaRadixCache_LargeKeysAndSharedPrefixesOver64KiB(t *testing.T) {
 //     where foregroundNoProtect == nilNode - 1 == math.MaxUint32 - 1 (4,294,967,294).
 //     Reaching this boundary through public Cache.Put calls requires populating
 //     len(c.nodes) - int(c.freeCount) == math.MaxUint32 - 2 (4,294,967,293) active arenaRadixNode structs.
-//     Because unsafe.Sizeof(arenaRadixNode[testData]{}) == 64 bytes on 64-bit platforms, backing the c.nodes slice alone
-//     requires 4,294,967,293 * 64 == 274,877,906,752 bytes (~274.88 GiB) of contiguous heap memory (plus >100 GiB
-//     for c.nodeMap), which is infeasible to allocate in a unit test on standard hardware.
+//     Because unsafe.Sizeof(arenaRadixNode[testData]{}) == 56 bytes on 64-bit platforms, backing the c.nodes slice alone
+//     requires 4,294,967,293 * 56 == 240,518,168,408 bytes (~240.52 GiB) of contiguous heap memory (plus >32 GiB
+//     for c.hashSlots), which is infeasible to allocate in a unit test on standard hardware.
 //  2. Why the guard is nevertheless essential for correctness:
 //     a) Sentinel Collision & Panic Prevention: Arena node indices are 32-bit unsigned integers where
 //     nilNode == math.MaxUint32 and foregroundNoProtect == math.MaxUint32 - 1. A new-key Put that splits an
@@ -2444,7 +2444,7 @@ func TestArenaRadixCache_MuCacheLineSeparation(t *testing.T) {
 	// Act
 	nodesOffset := unsafe.Offsetof(c.nodes)
 	nodesEnd := nodesOffset + unsafe.Sizeof(c.nodes)
-	nodeMapOffset := unsafe.Offsetof(c.hashSlots)
+	hashSlotsOffset := unsafe.Offsetof(c.hashSlots)
 	rootOffset := unsafe.Offsetof(c.root)
 	headOffset := unsafe.Offsetof(c.head)
 	tailOffset := unsafe.Offsetof(c.tail)
@@ -2460,7 +2460,7 @@ func TestArenaRadixCache_MuCacheLineSeparation(t *testing.T) {
 
 	// Assert
 	assert.Greater(t, muOffset, nodesOffset, "mu must be positioned after nodes")
-	assert.Greater(t, muOffset, nodeMapOffset, "mu must be positioned after hashSlots")
+	assert.Greater(t, muOffset, hashSlotsOffset, "mu must be positioned after hashSlots")
 	assert.Greater(t, muOffset, rootOffset, "mu must be positioned after root")
 	assert.Greater(t, muOffset, headOffset, "mu must be positioned after head")
 	assert.Greater(t, muOffset, tailOffset, "mu must be positioned after tail")
@@ -2694,5 +2694,91 @@ func TestArenaRadix_AllocationCharacterization_PathCompressionAndDeepKeys(t *tes
 		arenaLargeRoot.nodes[rootChildID].setKeyLen(len(longBase + "/child_"))
 		arenaLargeRoot.DeletePrefix(longBase)
 		assert.Zero(t, arenaLargeRoot.len)
+	})
+}
+
+func TestArenaRadix_OnEvictEntry_Depth1KeyImmutabilityAndDepth2SpanReuse(t *testing.T) {
+	t.Run("DeletePrefixAllPreservesEvictedDepth1KeyAgainstSubsequentPut", func(t *testing.T) {
+		var evictedKeys []string
+		c := NewArenaRadixCache[int](100,
+			WithInvariantChecking(true),
+			WithOnEvictEntry(func(k string, _ int, _ EvictionReason) {
+				evictedKeys = append(evictedKeys, k)
+			}),
+		)
+
+		_, err := c.Put("alpha_key", 1)
+		require.NoError(t, err)
+		c.DeletePrefix("")
+		_, err = c.Put("zzzzzzzzz", 2)
+		require.NoError(t, err)
+
+		require.Equal(t, []string{"alpha_key"}, evictedKeys)
+	})
+
+	t.Run("DeletePrefixNonEmptyToEmptyPreservesEvictedDepth1Key", func(t *testing.T) {
+		var evictedKeys []string
+		c := NewArenaRadixCache[int](100,
+			WithInvariantChecking(true),
+			WithOnEvictEntry(func(k string, _ int, _ EvictionReason) {
+				evictedKeys = append(evictedKeys, k)
+			}),
+		)
+
+		_, err := c.Put("alpha_key", 1)
+		require.NoError(t, err)
+		c.DeletePrefix("alpha")
+		_, err = c.Put("zzzzzzzzz", 2)
+		require.NoError(t, err)
+
+		require.Equal(t, []string{"alpha_key"}, evictedKeys)
+	})
+
+	t.Run("PreInsertEvictionToEmptyUnderPressurePreservesEvictedDepth1Key", func(t *testing.T) {
+		var evictedKeys []string
+		c := NewArenaRadixCache[testData](10,
+			WithInvariantChecking(true),
+			testDataWeigher,
+			WithPressureFunc(func() float64 { return 0.80 }),
+			WithCompactionThreshold(0.75),
+			WithEvictionThreshold(0.95),
+			WithOnEvictEntry(func(k string, _ testData, _ EvictionReason) {
+				evictedKeys = append(evictedKeys, k)
+			}),
+		)
+
+		_, err := c.Put("alpha_key", testData{value: 1, dataSize: 10})
+		require.NoError(t, err)
+		_, err = c.Put("zzzzzzzzz", testData{value: 2, dataSize: 10})
+		require.NoError(t, err)
+
+		require.Equal(t, []string{"alpha_key"}, evictedKeys)
+	})
+
+	t.Run("Depth2EvictionDoesNotPinPrefixSpan", func(t *testing.T) {
+		var evictedKeys []string
+		c := NewArenaRadixCache[testData](30,
+			WithInvariantChecking(true),
+			testDataWeigher,
+			WithOnEvictEntry(func(k string, _ testData, _ EvictionReason) {
+				evictedKeys = append(evictedKeys, k)
+			}),
+		).(*arenaRadix[testData])
+
+		_, err := c.Put("dir/sub/alpha", testData{value: 1, dataSize: 10})
+		require.NoError(t, err)
+		_, err = c.Put("dir/sub/bravo", testData{value: 2, dataSize: 10})
+		require.NoError(t, err)
+		_, err = c.Put("dir/other", testData{value: 3, dataSize: 10})
+		require.NoError(t, err)
+
+		arenaLenBeforeEvict := len(c.prefixArena)
+		// Inserting "dir/third" (10B) evicts "dir/sub/alpha" (depth >= 2).
+		// Because "dir/sub/alpha" is at depth >= 2, its key is reconstructed into a fresh []byte,
+		// and its suffix span in prefixArena must be recycled rather than pinned.
+		_, err = c.Put("dir/third", testData{value: 4, dataSize: 10})
+		require.NoError(t, err)
+		require.Equal(t, []string{"dir/sub/alpha"}, evictedKeys)
+		assert.LessOrEqual(t, len(c.prefixArena), arenaLenBeforeEvict+len("third"))
 	})
 }
