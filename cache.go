@@ -20,7 +20,7 @@
 //   - RadixCache: A Left-Child Right-Sibling (LCRS) radix tree with intrusive LRU pointers.
 //   - ArenaRadixCache: A flat-slice arena-allocated radix tree with 32-bit node indices that
 //     eliminate internal tree pointer traversal during garbage collection, while stored values
-//     and prefixes retain standard Go GC properties.
+//     and key strings retain standard Go GC properties.
 //
 // All cache constructors require maxSize > 0 and unconditionally panic if maxSize == 0.
 package lru
@@ -89,7 +89,7 @@ type Cache[V any] interface {
 	// Values returns an iterator over all live values in deterministic MRU-to-LRU order.
 	//
 	// Iteration acquires a read lock (RLock) for the duration of the loop, does not
-	// alter LRU recency order, skips key reconstruction on radix backends (0 allocs/op),
+	// alter LRU recency order, skips key reconstruction on RadixCache (0 allocs/op across all backends),
 	// and supports early termination (break). Callers must not invoke write-locking
 	// methods or nested read-locking methods on the same Cache while iterating.
 	Values() iter.Seq[V]

@@ -1807,7 +1807,7 @@ func testMultiByteUTF8AndHighByteRadixPrefixSplits(t *testing.T) {
 	var entryEvents []diffEvictEvent
 	h := newEvictRecordingHarness(t, 160, &valEvents, &entryEvents)
 
-	// Keys ordered to exercise all 4 insertNode clonePrefix call sites on 1-byte segments >= 0x80:
+	// Keys ordered to exercise RadixCache insertNode clonePrefix call sites and ArenaRadixCache slicePrefix/edgeStart splits on 1-byte segments >= 0x80:
 	// 1. "dir\xaf" followed by "dir" -> splits existing child with 1-byte suffix oldPrefix[lcp:] == "\xaf"
 	// 2. "dir\x80", "dir\xff" -> inserts 1-byte child leaves search == "\x80", "\xff" under "dir"
 	// 3. "\x80alpha", "\x80beta" -> splits 1-byte shared prefix oldPrefix[:lcp] == "\x80"
@@ -2043,7 +2043,7 @@ func runBinaryKeysDifferentialTest(t *testing.T) {
 	}
 	assertParity("after-256-single-byte-keys")
 
-	// 2. Insert an 80-level deep prefix chain (exceeding the [64] stack buffer in reconstructKey/hashNodeKey/freeSubtree).
+	// 2. Insert an 80-level deep prefix chain (exceeding the [64] stack buffer in RadixCache reconstructKey/freeSubtree).
 	for depth := 1; depth <= 80; depth++ {
 		k := strings.Repeat("x", depth)
 		val := (depth % 7) + 1

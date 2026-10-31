@@ -15,6 +15,7 @@
 package lru
 
 import (
+	"hash/maphash"
 	"math"
 	"slices"
 	"strings"
@@ -24,24 +25,68 @@ import (
 // nilNode represents the sentinel null reference for 32-bit node indices.
 const nilNode uint32 = math.MaxUint32
 
+const (
+	// nodeHasValueBit stores the hasValue boolean flag in bit 31 of
+	// arenaRadixNode.edgeStartAndFlags.
+	nodeHasValueBit uint32 = 1 << 31
+	// nodeEdgeStartMask masks bits 0..30 of arenaRadixNode.edgeStartAndFlags,
+	// supporting key offsets up to 2 GiB - 1 (2,147,483,647 bytes).
+	nodeEdgeStartMask uint32 = nodeHasValueBit - 1
+)
+
 // arenaRadixNode represents a node in the arena-backed radix tree.
 // It uses a Left-Child Right-Sibling (LCRS) tree representation and 32-bit indices
 // within a contiguous slice to eliminate per-node heap allocations and internal tree pointer
-// traversal during GC cycles, while stored values and prefixes retain standard Go GC properties.
+// traversal during GC cycles, while stored values and fullKey strings retain standard Go GC properties.
+// Storing fullKey at bytes 0..15 and packing hasValue + 31-bit edgeStart into edgeStartAndFlags at bytes 44..47
+// enables O(1) key verification, O(1) maphash re-hashing, and 0-alloc key access and path compression
+// within a 48-byte base header (56 bytes for 8-byte V, fitting within a single 64-byte CPU cache line).
 type arenaRadixNode[V any] struct {
-	prefix   string // Edge label component
-	size     uint64 // Tracked size of the value stored at this node
-	parent   uint32 // Arena slice index of parent node
-	child    uint32 // Arena slice index of first child (LCRS)
-	sibling  uint32 // Arena slice index of next sibling (LCRS)
-	prev     uint32 // Arena slice index of previous node in intrusive LRU list
-	next     uint32 // Arena slice index of next node in intrusive LRU list (or free-list)
-	hasValue bool   // True if this node stores a live cache entry value
-	value    V      // Value stored at this node
+	fullKey           string // Full key from root up to this node (incoming edge label is fullKey[edgeStart():])
+	size              uint64 // Tracked size of the value stored at this node
+	parent            uint32 // Arena slice index of parent node
+	child             uint32 // Arena slice index of first child (LCRS)
+	sibling           uint32 // Arena slice index of next sibling (LCRS)
+	prev              uint32 // Arena slice index of previous node in intrusive LRU list
+	next              uint32 // Arena slice index of next node in intrusive LRU list (or free-list)
+	edgeStartAndFlags uint32 // Bit 31: hasValue; bits 0..30: byte offset within fullKey where incoming edge begins
+	value             V      // Value stored at this node
+}
+
+// hasValue reports whether this node holds an active cache entry value.
+func (n *arenaRadixNode[V]) hasValue() bool {
+	return n.edgeStartAndFlags&nodeHasValueBit != 0
+}
+
+// setHasValue sets or clears the hasValue flag in bit 31 of edgeStartAndFlags.
+func (n *arenaRadixNode[V]) setHasValue(v bool) {
+	if v {
+		n.edgeStartAndFlags |= nodeHasValueBit
+	} else {
+		n.edgeStartAndFlags &^= nodeHasValueBit
+	}
+}
+
+// edgeStart returns the byte offset in fullKey where this node's compressed edge begins.
+func (n *arenaRadixNode[V]) edgeStart() int {
+	return int(n.edgeStartAndFlags & nodeEdgeStartMask)
+}
+
+// setEdgeStart sets the 31-bit edgeStart offset in edgeStartAndFlags while preserving hasValue.
+func (n *arenaRadixNode[V]) setEdgeStart(start int) {
+	n.edgeStartAndFlags = (n.edgeStartAndFlags & nodeHasValueBit) | (uint32(start) & nodeEdgeStartMask)
+}
+
+func (n *arenaRadixNode[V]) edge() string {
+	return n.fullKey[n.edgeStart():]
+}
+
+func (n *arenaRadixNode[V]) edgeFirstByte() byte {
+	return n.fullKey[n.edgeStart()]
 }
 
 // arenaRadix implements the Cache[V] and PressureAwareCache[V] interfaces using a contiguous arena-backed
-// radix tree coupled with an intrusive 32-bit doubly-linked LRU list and an O(1) FNV-1a hash lookup accelerator.
+// radix tree coupled with an intrusive 32-bit doubly-linked LRU list and an O(1) maphash lookup accelerator.
 type arenaRadix[V any] struct {
 	maxSize     uint64
 	currentSize uint64
@@ -50,6 +95,7 @@ type arenaRadix[V any] struct {
 	freeHead  uint32
 	freeCount uint32
 
+	seed           maphash.Seed
 	nodeMap        map[uint64]uint32
 	collisionPeers map[uint64][]uint32
 	nodeMapDirty   bool
@@ -66,7 +112,7 @@ type arenaRadix[V any] struct {
 	onEvictValue func(value V, reason EvictionReason)
 	onEvictEntry func(key string, value V, reason EvictionReason)
 
-	// mu is placed after the fields read on every lookup (nodes, nodeMap, root):
+	// mu is placed after the fields read on every lookup (nodes, seed, nodeMap, root):
 	// RLock/RUnlock atomically update its reader count, and sharing a cache line
 	// with those fields would make every concurrent lookup miss (false sharing).
 	mu sync.RWMutex
@@ -89,91 +135,14 @@ func (c *arenaRadix[V]) notifyReplaced(evictQ *evictCallbackQueue[V], key string
 	}
 }
 
-// reconstructKey reconstructs the full key for nodeID by walking the ancestor chain up to c.root.
-// It is invoked when onEvictEntry is non-nil (and the caller does not already have the key in hand)
-// or during All() / Keys() iteration.
-func (c *arenaRadix[V]) reconstructKey(nodeID uint32) string {
-	if nodeID == nilNode || nodeID == c.root {
-		return ""
-	}
-	if c.nodes[nodeID].parent == c.root {
-		return c.nodes[nodeID].prefix
-	}
-	var stackBuf [64]uint32
-	path := stackBuf[:0]
-	totalLen := 0
-	for curr := nodeID; curr != c.root && curr != nilNode; curr = c.nodes[curr].parent {
-		path = append(path, curr)
-		totalLen += len(c.nodes[curr].prefix)
-	}
-	var b strings.Builder
-	b.Grow(totalLen)
-	for _, id := range slices.Backward(path) {
-		b.WriteString(c.nodes[id].prefix)
-	}
-	return b.String()
+// hashKey computes the 64-bit hardware-accelerated maphash of key using the cache's seed.
+func (c *arenaRadix[V]) hashKey(key string) uint64 {
+	return maphash.String(c.seed, key)
 }
 
-// FNV-1a 64-bit hashing constants.
-const (
-	offset64 uint64 = 14695981039346656037
-	prime64  uint64 = 1099511628211
-)
-
-// hashString computes the 64-bit FNV-1a hash of string s.
-func hashString(s string) uint64 {
-	return hashStringCont(offset64, s)
-}
-
-// hashStringCont continues a 64-bit FNV-1a hash calculation from h over string s.
-func hashStringCont(h uint64, s string) uint64 {
-	for i := range len(s) {
-		h ^= uint64(s[i])
-		h *= prime64
-	}
-	return h
-}
-
-func (c *arenaRadix[V]) hashNodeKeySlow(nodeID uint32) uint64 {
-	var stackBuf [64]uint32
-	path := stackBuf[:0]
-	for curr := nodeID; curr != c.root && curr != nilNode; curr = c.nodes[curr].parent {
-		path = append(path, curr)
-	}
-	h := offset64
-	for _, id := range slices.Backward(path) {
-		h = hashStringCont(h, c.nodes[id].prefix)
-	}
-	return h
-}
-
-// hashNodeKey computes the 64-bit FNV-1a hash of the full key for nodeID
-// by walking the ancestor chain. Uses an 8-level register/stack fast path,
-// a 64-level stack buffer for deeper trees, and seamlessly handles depths > 64.
+// hashNodeKey computes the 64-bit maphash of the full key for nodeID in O(1) time.
 func (c *arenaRadix[V]) hashNodeKey(nodeID uint32) uint64 {
-	if nodeID == nilNode || nodeID == c.root {
-		return offset64
-	}
-	p1 := c.nodes[nodeID].parent
-	if p1 == c.root || p1 == nilNode {
-		return hashString(c.nodes[nodeID].prefix)
-	}
-	var buf [8]uint32
-	buf[0] = nodeID
-	buf[1] = p1
-	n := 2
-	for curr := c.nodes[p1].parent; curr != c.root && curr != nilNode; curr = c.nodes[curr].parent {
-		if n == len(buf) {
-			return c.hashNodeKeySlow(nodeID)
-		}
-		buf[n] = curr
-		n++
-	}
-	h := offset64
-	for i := n - 1; i >= 0; i-- {
-		h = hashStringCont(h, c.nodes[buf[i]].prefix)
-	}
-	return h
+	return c.hashKey(c.nodes[nodeID].fullKey)
 }
 
 // allocateNode allocates a node index from the free-list or appends to the arena slice.
@@ -203,9 +172,9 @@ func (c *arenaRadix[V]) allocateNode() uint32 {
 func (c *arenaRadix[V]) freeNode(id uint32) {
 	var zero V
 	n := &c.nodes[id]
-	n.prefix = ""
+	n.fullKey = ""
+	n.edgeStartAndFlags = 0
 	n.value = zero
-	n.hasValue = false
 	n.size = 0
 	n.parent = nilNode
 	n.child = nilNode
@@ -217,12 +186,12 @@ func (c *arenaRadix[V]) freeNode(id uint32) {
 	c.freeCount++
 }
 
-// getChild finds a child node of nID whose prefix starts with the given byte b.
+// getChild finds a child node of nID whose incoming edge starts with the given byte b.
 // Returns nilNode if no matching child is found.
 func (c *arenaRadix[V]) getChild(nID uint32, b byte) uint32 {
 	nodes := c.nodes
 	for curr := nodes[nID].child; curr != nilNode; curr = nodes[curr].sibling {
-		c0 := nodes[curr].prefix[0]
+		c0 := nodes[curr].edgeFirstByte()
 		if c0 == b {
 			return curr
 		}
@@ -234,11 +203,12 @@ func (c *arenaRadix[V]) getChild(nID uint32, b byte) uint32 {
 	return nilNode
 }
 
-// addChild adds a child node under nID, preserving lexicographical order by prefix[0].
+// addChild adds a child node under nID, preserving lexicographical order by incoming edge first byte.
 func (c *arenaRadix[V]) addChild(nID uint32, newChildID uint32) {
 	c.nodes[newChildID].parent = nID
+	newFirstByte := c.nodes[newChildID].edgeFirstByte()
 	pcurr := &c.nodes[nID].child
-	for *pcurr != nilNode && c.nodes[*pcurr].prefix[0] < c.nodes[newChildID].prefix[0] {
+	for *pcurr != nilNode && c.nodes[*pcurr].edgeFirstByte() < newFirstByte {
 		pcurr = &c.nodes[*pcurr].sibling
 	}
 	c.nodes[newChildID].sibling = *pcurr
@@ -275,81 +245,85 @@ func (c *arenaRadix[V]) replaceChild(nID uint32, oldChildID uint32, newChildID u
 	panic("replaceChild: requested child not found in sibling list")
 }
 
+// slicePrefix returns a[:end] (which equals b[:end]), choosing whichever source
+// string avoids pinning a large backing array, or cloning when both are large.
+func slicePrefix(a, b string, end int) string {
+	src := a
+	if len(b) < len(src) {
+		src = b
+	}
+	if len(src)-end > 64 {
+		return clonePrefix(src[:end])
+	}
+	return src[:end]
+}
+
 // insertNode inserts key-value into the radix trie and returns the node index.
 func (c *arenaRadix[V]) insertNode(key string, value V) uint32 {
 	nodeID := c.root
 	search := key
+	offset := 0
 
 	for {
 		if len(search) == 0 {
 			c.nodes[nodeID].value = value
-			c.nodes[nodeID].hasValue = true
+			c.nodes[nodeID].setHasValue(true)
 			return nodeID
 		}
 
 		childID := c.getChild(nodeID, search[0])
 		if childID == nilNode {
 			newLeafID := c.allocateNode()
-			c.nodes[newLeafID].prefix = clonePrefix(search)
+			c.nodes[newLeafID].fullKey = key
+			c.nodes[newLeafID].setEdgeStart(offset)
 			c.nodes[newLeafID].value = value
-			c.nodes[newLeafID].hasValue = true
+			c.nodes[newLeafID].setHasValue(true)
 			c.addChild(nodeID, newLeafID)
 			return newLeafID
 		}
 
-		lcp := longestCommonPrefix(search, c.nodes[childID].prefix)
+		childEdge := c.nodes[childID].edge()
+		lcp := longestCommonPrefix(search, childEdge)
 
-		if lcp == len(c.nodes[childID].prefix) {
+		if lcp == len(childEdge) {
 			search = search[lcp:]
+			offset += lcp
 			nodeID = childID
 			continue
 		}
 
-		// Clone both split prefix halves so surviving intermediate routing nodes never pin
-		// the underlying backing arrays of large evicted leaf keys.
-		oldPrefix := c.nodes[childID].prefix
+		// Ensure surviving intermediate routing nodes never pin large evicted leaf backing arrays.
+		splitEnd := offset + lcp
+		splitPrefix := slicePrefix(key, c.nodes[childID].fullKey, splitEnd)
 		splitNodeID := c.allocateNode()
-		c.nodes[splitNodeID].prefix = clonePrefix(oldPrefix[:lcp])
+		c.nodes[splitNodeID].fullKey = splitPrefix
+		c.nodes[splitNodeID].setEdgeStart(offset)
 		c.nodes[splitNodeID].parent = nodeID
 
 		c.replaceChild(nodeID, childID, splitNodeID)
 
-		c.nodes[childID].prefix = clonePrefix(oldPrefix[lcp:])
+		c.nodes[childID].setEdgeStart(splitEnd)
 		c.addChild(splitNodeID, childID)
 
 		if lcp == len(search) {
 			c.nodes[splitNodeID].value = value
-			c.nodes[splitNodeID].hasValue = true
+			c.nodes[splitNodeID].setHasValue(true)
 			return splitNodeID
 		}
 
 		newLeafID := c.allocateNode()
-		c.nodes[newLeafID].prefix = clonePrefix(search[lcp:])
+		c.nodes[newLeafID].fullKey = key
+		c.nodes[newLeafID].setEdgeStart(splitEnd)
 		c.nodes[newLeafID].value = value
-		c.nodes[newLeafID].hasValue = true
+		c.nodes[newLeafID].setHasValue(true)
 		c.addChild(splitNodeID, newLeafID)
 		return newLeafID
 	}
 }
 
-// verifyKey validates that nodeID represents key by walking upwards via parent pointers with zero heap allocations.
+// verifyKey validates that nodeID represents key in O(1) with zero heap allocations.
 func (c *arenaRadix[V]) verifyKey(nodeID uint32, key string) bool {
-	curr := nodeID
-	end := len(key)
-
-	for curr != c.root && curr != nilNode {
-		n := &c.nodes[curr]
-		prefix := n.prefix
-		prefixLen := len(prefix)
-
-		if end < prefixLen || key[end-prefixLen:end] != prefix {
-			return false
-		}
-		end -= prefixLen
-		curr = n.parent
-	}
-
-	return end == 0 && curr == c.root
+	return c.nodes[nodeID].fullKey == key
 }
 
 func (c *arenaRadix[V]) findNodeByTrieWalk(key string) (uint32, bool) {
@@ -358,7 +332,7 @@ func (c *arenaRadix[V]) findNodeByTrieWalk(key string) (uint32, bool) {
 
 	for curr != nilNode {
 		if len(search) == 0 {
-			if c.nodes[curr].hasValue {
+			if c.nodes[curr].hasValue() {
 				return curr, true
 			}
 			return nilNode, false
@@ -369,12 +343,12 @@ func (c *arenaRadix[V]) findNodeByTrieWalk(key string) (uint32, bool) {
 			return nilNode, false
 		}
 
-		prefix := c.nodes[childID].prefix
-		if !strings.HasPrefix(search, prefix) {
+		edge := c.nodes[childID].edge()
+		if !strings.HasPrefix(search, edge) {
 			return nilNode, false
 		}
 
-		search = search[len(prefix):]
+		search = search[len(edge):]
 		curr = childID
 	}
 
@@ -393,7 +367,7 @@ func (c *arenaRadix[V]) walkNodeKeyFallback(key string, keyHash uint64, heal boo
 
 func (c *arenaRadix[V]) lookupOrWalkNodeKey(key string, keyHash uint64) (nodeID uint32, walked, found bool) {
 	if id, ok := c.nodeMap[keyHash]; ok {
-		if id < uint32(len(c.nodes)) && c.nodes[id].hasValue && c.verifyKey(id, key) {
+		if id < uint32(len(c.nodes)) && c.nodes[id].hasValue() && c.verifyKey(id, key) {
 			return id, false, true
 		}
 	} else if len(c.nodeMap)+c.collisionCount == c.len {
@@ -406,11 +380,11 @@ func (c *arenaRadix[V]) lookupOrWalkNodeKey(key string, keyHash uint64) (nodeID 
 	return curr, true, ok
 }
 
-// lookupNodeKeyWithHash finds a value-bearing node index for key using a precomputed FNV-1a hash
+// lookupNodeKeyWithHash finds a value-bearing node index for key using a precomputed maphash
 // without mutating c.nodeMap.
 func (c *arenaRadix[V]) lookupNodeKeyWithHash(key string, keyHash uint64) (uint32, bool) {
 	if id, ok := c.nodeMap[keyHash]; ok {
-		if id < uint32(len(c.nodes)) && c.nodes[id].hasValue && c.verifyKey(id, key) {
+		if id < uint32(len(c.nodes)) && c.nodes[id].hasValue() && c.verifyKey(id, key) {
 			return id, true
 		}
 	} else if len(c.nodeMap)+c.collisionCount == c.len {
@@ -428,7 +402,7 @@ func (c *arenaRadix[V]) getNodeKeyWithHash(key string, keyHash uint64) (uint32, 
 
 func (c *arenaRadix[V]) getNodeKeyForPut(key string, keyHash uint64) (nodeID uint32, found, mapMiss bool) {
 	if id, ok := c.nodeMap[keyHash]; ok {
-		if id < uint32(len(c.nodes)) && c.nodes[id].hasValue && c.verifyKey(id, key) {
+		if id < uint32(len(c.nodes)) && c.nodes[id].hasValue() && c.verifyKey(id, key) {
 			return id, true, false
 		}
 	} else if len(c.nodeMap)+c.collisionCount == c.len {
@@ -441,7 +415,7 @@ func (c *arenaRadix[V]) getNodeKeyForPut(key string, keyHash uint64) (nodeID uin
 // compressPathUpwards walks up the tree, pruning empty leaf nodes and merging single-child intermediate routing nodes.
 func (c *arenaRadix[V]) compressPathUpwards(currID uint32) {
 	for currID != nilNode && currID != c.root {
-		if c.nodes[currID].hasValue {
+		if c.nodes[currID].hasValue() {
 			break
 		}
 
@@ -455,7 +429,7 @@ func (c *arenaRadix[V]) compressPathUpwards(currID uint32) {
 
 		if c.nodes[c.nodes[currID].child].sibling == nilNode {
 			onlyChildID := c.nodes[currID].child
-			c.nodes[onlyChildID].prefix = concatPrefix(c.nodes[currID].prefix, c.nodes[onlyChildID].prefix)
+			c.nodes[onlyChildID].setEdgeStart(c.nodes[currID].edgeStart())
 			c.nodes[onlyChildID].parent = c.nodes[currID].parent
 
 			parentID := c.nodes[currID].parent
@@ -556,19 +530,16 @@ func (c *arenaRadix[V]) isDirtyLocked() bool {
 // eraseInternal handles unlinking from LRU, cleaning up nodeMap, and deleting from the tree
 // when the caller does not already have the key or hash in hand.
 func (c *arenaRadix[V]) eraseInternal(evictQ *evictCallbackQueue[V], nodeID uint32, reason EvictionReason) (V, bool) {
-	if nodeID == nilNode || !c.nodes[nodeID].hasValue {
+	if nodeID == nilNode || !c.nodes[nodeID].hasValue() {
 		var zero V
 		return zero, false
 	}
-	if c.onEvictEntry != nil {
-		key := c.reconstructKey(nodeID)
-		return c.eraseInternalWithHash(evictQ, nodeID, hashString(key), key, reason)
-	}
-	return c.eraseInternalWithHash(evictQ, nodeID, c.hashNodeKey(nodeID), "", reason)
+	key := c.nodes[nodeID].fullKey
+	return c.eraseInternalWithHash(evictQ, nodeID, c.hashKey(key), key, reason)
 }
 
 func (c *arenaRadix[V]) eraseInternalWithHash(evictQ *evictCallbackQueue[V], nodeID uint32, hash uint64, key string, reason EvictionReason) (V, bool) {
-	if nodeID == nilNode || !c.nodes[nodeID].hasValue {
+	if nodeID == nilNode || !c.nodes[nodeID].hasValue() {
 		var zero V
 		return zero, false
 	}
@@ -584,7 +555,7 @@ func (c *arenaRadix[V]) eraseInternalWithHash(evictQ *evictCallbackQueue[V], nod
 	c.remove(nodeID)
 	var zero V
 	c.nodes[nodeID].value = zero
-	c.nodes[nodeID].hasValue = false
+	c.nodes[nodeID].setHasValue(false)
 	c.compressPathUpwards(nodeID)
 
 	c.notifyEvict(evictQ, key, deletedEntry, evictedSize, reason)
@@ -661,7 +632,7 @@ func (c *arenaRadix[V]) compactContiguousLocked() bool {
 		collisions := 0
 		var newCollisionPeers map[uint64][]uint32
 		for id := range uint32(len(c.nodes)) {
-			if c.nodes[id].hasValue {
+			if c.nodes[id].hasValue() {
 				h := c.hashNodeKey(id)
 				if prevID, exists := newNodeMap[h]; exists {
 					collisions++
@@ -723,7 +694,7 @@ func (c *arenaRadix[V]) compactDataStructuresLocked() bool {
 			continue
 		}
 		oldNode := &c.nodes[oldID]
-		if oldNode.hasValue {
+		if oldNode.hasValue() {
 			h := c.hashNodeKey(oldID)
 			if prevID, exists := newNodeMap[h]; exists {
 				collisions++
@@ -735,15 +706,15 @@ func (c *arenaRadix[V]) compactDataStructuresLocked() bool {
 			newNodeMap[h] = newID
 		}
 		newNodes[newID] = arenaRadixNode[V]{
-			prefix:   oldNode.prefix,
-			value:    oldNode.value,
-			size:     oldNode.size,
-			parent:   remap(oldNode.parent),
-			child:    remap(oldNode.child),
-			sibling:  remap(oldNode.sibling),
-			prev:     remap(oldNode.prev),
-			next:     remap(oldNode.next),
-			hasValue: oldNode.hasValue,
+			fullKey:           oldNode.fullKey,
+			value:             oldNode.value,
+			size:              oldNode.size,
+			parent:            remap(oldNode.parent),
+			child:             remap(oldNode.child),
+			sibling:           remap(oldNode.sibling),
+			prev:              remap(oldNode.prev),
+			next:              remap(oldNode.next),
+			edgeStartAndFlags: oldNode.edgeStartAndFlags,
 		}
 	}
 
@@ -817,7 +788,7 @@ func (c *arenaRadix[V]) shedAndCompactLocked(evictQ *evictCallbackQueue[V], targ
 		return nil
 	}
 	autoCompactID := protectedNodeID
-	if protectedNodeID == foregroundNoProtect || (protectedNodeID != nilNode && !c.nodes[protectedNodeID].hasValue) {
+	if protectedNodeID == foregroundNoProtect || (protectedNodeID != nilNode && !c.nodes[protectedNodeID].hasValue()) {
 		protectedNodeID = nilNode
 	}
 
@@ -885,7 +856,7 @@ func (c *arenaRadix[V]) promoteCollisionPeerLocked(keyHash uint64, nodeID uint32
 	if prevID == nodeID {
 		return
 	}
-	prevValid := prevID < uint32(len(c.nodes)) && c.nodes[prevID].hasValue && c.hashNodeKey(prevID) == keyHash
+	prevValid := prevID < uint32(len(c.nodes)) && c.nodes[prevID].hasValue() && c.hashNodeKey(prevID) == keyHash
 	peers := c.collisionPeers[keyHash]
 	idx := slices.Index(peers, nodeID)
 	switch {
@@ -914,7 +885,7 @@ func (c *arenaRadix[V]) popValidCollisionPeerLocked(hash uint64, excludeID uint3
 		if c.collisionCount > 0 {
 			c.collisionCount--
 		}
-		if last != excludeID && last < uint32(len(c.nodes)) && c.nodes[last].hasValue && c.hashNodeKey(last) == hash {
+		if last != excludeID && last < uint32(len(c.nodes)) && c.nodes[last].hasValue() && c.hashNodeKey(last) == hash {
 			if len(peers) == 0 {
 				delete(c.collisionPeers, hash)
 				if len(c.collisionPeers) == 0 {
