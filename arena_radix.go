@@ -56,6 +56,10 @@ const (
 
 	// minHashSlotsCap is the minimum power-of-two capacity of the open-addressed hashSlots table.
 	minHashSlotsCap = 16
+
+	// maxPrefixArenaBytes is the maximum byte capacity of prefixArena so 32-bit prefixOff
+	// and prefixSpan offsets never overflow uint32.
+	maxPrefixArenaBytes = math.MaxUint32
 )
 
 // arenaHashSlot represents an 8-byte slot in the open-addressed flat hash table.
@@ -108,7 +112,8 @@ func (n *arenaRadixNode[V]) setHasValue(v bool) {
 	}
 }
 
-// keyLen returns the total byte length of the full key from root up to this node.
+// keyLen returns the 17-bit full-key byte length stored in keyLenAndFlags (capped at nodeKeyLenMask
+// as a sentinel for keys >= 131,071 bytes).
 func (n *arenaRadixNode[V]) keyLen() int {
 	return int(n.keyLenAndFlags & nodeKeyLenMask)
 }
@@ -154,8 +159,6 @@ type arenaRadix[V any] struct {
 	hashMask       uint32
 	hashCount      int
 	collisionPeers map[uint64][]uint32
-	nodeMapDirty   bool
-	prefixExposed  atomic.Bool
 	collisionCount int
 
 	root uint32
@@ -169,10 +172,12 @@ type arenaRadix[V any] struct {
 	onEvictValue func(value V, reason EvictionReason)
 	onEvictEntry func(key string, value V, reason EvictionReason)
 
-	// mu is placed after the fields read on every lookup (nodes, seed, hashSlots, root):
+	// mu is placed after the fields read on every lookup (nodes, prefixArena, seed, hashSlots, hashMask, root):
 	// RLock/RUnlock atomically update its reader count, and sharing a cache line
 	// with those fields would make every concurrent lookup miss (false sharing).
-	mu sync.RWMutex
+	mu            sync.RWMutex
+	nodeMapDirty  bool
+	prefixExposed atomic.Bool
 
 	pressureState
 }
@@ -201,6 +206,16 @@ func (c *arenaRadix[V]) nodePrefix(nodeID uint32) string {
 	return unsafe.String(&c.prefixArena[off], pLen)
 }
 
+// exposeDepth1PrefixIfNeeded marks c.prefixArena as externally exposed when nodeID is a
+// non-empty depth-1 child of c.root whose prefixArena slice will be returned directly
+// as a zero-copy string by reconstructKey during iteration or clear-all eviction.
+func (c *arenaRadix[V]) exposeDepth1PrefixIfNeeded(nodeID uint32) {
+	if c.nodes[nodeID].parent == c.root && c.nodes[nodeID].prefixLen > 0 && !c.prefixExposed.Load() {
+		c.prefixExposed.Store(true)
+	}
+}
+
+// removeFreePrefixSpanAtLocked removes the free prefix span at idx by swapping in the last element.
 func (c *arenaRadix[V]) removeFreePrefixSpanAtLocked(idx int) {
 	last := c.freePrefixCount - 1
 	c.freePrefixSpans[idx] = c.freePrefixSpans[last]
@@ -208,6 +223,7 @@ func (c *arenaRadix[V]) removeFreePrefixSpanAtLocked(idx int) {
 	c.freePrefixCount = last
 }
 
+// trimFreePrefixSpansAtTailLocked repeatedly trims any free spans abutting the end of c.prefixArena.
 func (c *arenaRadix[V]) trimFreePrefixSpansAtTailLocked() {
 	for {
 		trimmed := false
@@ -227,6 +243,7 @@ func (c *arenaRadix[V]) trimFreePrefixSpansAtTailLocked() {
 	}
 }
 
+// mergeAdjacentFreeSpanLocked coalesces freePrefixSpans[mergedIdx] with any neighboring span.
 func (c *arenaRadix[V]) mergeAdjacentFreeSpanLocked(mergedIdx int) {
 	sp := c.freePrefixSpans[mergedIdx]
 	for j := 0; j < c.freePrefixCount; j++ {
@@ -248,6 +265,8 @@ func (c *arenaRadix[V]) mergeAdjacentFreeSpanLocked(mergedIdx int) {
 	}
 }
 
+// recordFreePrefixSpanLocked adds [off, off+spanLen) to c.freePrefixSpans, coalescing with
+// adjacent spans, trimming tail spans, or evicting the smallest tracked span if the 32-slot table is full.
 func (c *arenaRadix[V]) recordFreePrefixSpanLocked(off, spanLen uint32) {
 	for i := 0; i < c.freePrefixCount; i++ {
 		sp := &c.freePrefixSpans[i]
@@ -283,6 +302,8 @@ func (c *arenaRadix[V]) recordFreePrefixSpanLocked(off, spanLen uint32) {
 	}
 }
 
+// takeFreePrefixSpanLocked allocates a recycled byte span of length sLen from c.freePrefixSpans
+// using best-fit selection, Carve-splitting any larger span in place.
 func (c *arenaRadix[V]) takeFreePrefixSpanLocked(sLen uint32) (uint32, bool) {
 	bestIdx := -1
 	for i := 0; i < c.freePrefixCount; i++ {
@@ -304,11 +325,18 @@ func (c *arenaRadix[V]) takeFreePrefixSpanLocked(sLen uint32) (uint32, bool) {
 	return 0, false
 }
 
+// releasePrefixSpanLocked decrements c.livePrefixBytes (including the 4-byte length header at off-4
+// when isLarge is true) and recycles or tail-trims the span unless it is pinned by prefixFlagPinned
+// or c.prefixExposed (which protect zero-copy strings handed to callers from in-place overwrite).
 func (c *arenaRadix[V]) releasePrefixSpanLocked(off uint32, pLen int, isLarge bool, flags uint8) {
 	if pLen == 0 {
 		return
 	}
-	c.livePrefixBytes -= pLen
+	if isLarge {
+		c.livePrefixBytes -= pLen + 4
+	} else {
+		c.livePrefixBytes -= pLen
+	}
 	if flags&prefixFlagPinned != 0 || c.prefixExposed.Load() {
 		return
 	}
@@ -328,6 +356,7 @@ func (c *arenaRadix[V]) releasePrefixSpanLocked(off uint32, pLen int, isLarge bo
 	}
 }
 
+// clearNodePrefix releases nodeID's prefix span in c.prefixArena and resets its prefix metadata.
 func (c *arenaRadix[V]) clearNodePrefix(nodeID uint32) {
 	n := &c.nodes[nodeID]
 	if n.prefixLen == 0 {
@@ -347,18 +376,50 @@ func (c *arenaRadix[V]) clearNodePrefix(nodeID uint32) {
 	c.releasePrefixSpanLocked(off, pLen, isLarge, flags)
 }
 
+// ensurePrefixArenaCap enforces the uint32 maxPrefixArenaBytes limit and triggers prefixArena
+// compaction prior to slice reallocation when dead bytes can be reclaimed or prefixExposed is set.
 func (c *arenaRadix[V]) ensurePrefixArenaCap(needed int) {
+	if uint64(len(c.prefixArena))+uint64(needed) > uint64(maxPrefixArenaBytes) {
+		if c.livePrefixBytes < len(c.prefixArena) {
+			c.compactPrefixArenaLocked(needed)
+		}
+		if uint64(len(c.prefixArena))+uint64(needed) > uint64(maxPrefixArenaBytes) {
+			panic("arena radix prefix capacity exceeded limit")
+		}
+	}
 	if len(c.prefixArena)+needed <= cap(c.prefixArena) {
 		return
 	}
-	if len(c.prefixArena) >= 1024 && c.livePrefixBytes*2 <= len(c.prefixArena) {
+	if (c.prefixExposed.Load() && c.livePrefixBytes < len(c.prefixArena)) ||
+		(len(c.prefixArena) >= 1024 && (c.livePrefixBytes*2 <= len(c.prefixArena) || (c.livePrefixBytes < len(c.prefixArena) && (c.livePrefixBytes+needed)*2 <= cap(c.prefixArena)))) {
 		c.compactPrefixArenaLocked(needed)
 	}
 }
 
+// growPrefixArenaNoCompactLocked grows c.prefixArena to accommodate needed additional bytes
+// without compacting or relocating existing offsets, preserving caller-held offsets across the growth.
+func (c *arenaRadix[V]) growPrefixArenaNoCompactLocked(needed int) {
+	minCap := uint64(len(c.prefixArena)) + uint64(needed)
+	if minCap > uint64(maxPrefixArenaBytes) {
+		panic("arena radix prefix capacity exceeded limit")
+	}
+	if int(minCap) <= cap(c.prefixArena) {
+		return
+	}
+	newCap := max(cap(c.prefixArena)*2, int(minCap), 64)
+	if uint64(newCap) > uint64(maxPrefixArenaBytes) {
+		newCap = int(maxPrefixArenaBytes)
+	}
+	grown := make([]byte, len(c.prefixArena), newCap)
+	copy(grown, c.prefixArena)
+	c.prefixArena = grown
+}
+
+// setLargeNodePrefix stores a prefix of length >= 65,535 bytes for nodeID in c.prefixArena,
+// writing its 32-bit little-endian length in the 4 bytes immediately preceding prefixOff.
 func (c *arenaRadix[V]) setLargeNodePrefix(nodeID uint32, s string) {
 	sLen := len(s)
-	if c.freePrefixCount > 0 {
+	if c.freePrefixCount > 0 && uint64(sLen)+4 <= uint64(maxPrefixArenaBytes) {
 		if rawOff, ok := c.takeFreePrefixSpanLocked(uint32(sLen + 4)); ok {
 			binary.LittleEndian.PutUint32(c.prefixArena[rawOff:rawOff+4], uint32(sLen))
 			off := rawOff + 4
@@ -368,7 +429,7 @@ func (c *arenaRadix[V]) setLargeNodePrefix(nodeID uint32, s string) {
 			n.prefixLen = largePrefixSentinel
 			n.firstByte = s[0]
 			n.prefixFlags &^= prefixFlagPinned
-			c.livePrefixBytes += sLen
+			c.livePrefixBytes += sLen + 4
 			return
 		}
 	}
@@ -383,9 +444,11 @@ func (c *arenaRadix[V]) setLargeNodePrefix(nodeID uint32, s string) {
 	n.prefixLen = largePrefixSentinel
 	n.firstByte = s[0]
 	n.prefixFlags &^= prefixFlagPinned
-	c.livePrefixBytes += sLen
+	c.livePrefixBytes += sLen + 4
 }
 
+// setNodePrefix assigns s as nodeID's edge prefix in c.prefixArena, reusing a recycled span
+// from c.freePrefixSpans when available.
 func (c *arenaRadix[V]) setNodePrefix(nodeID uint32, s string) {
 	if c.nodes[nodeID].prefixLen != 0 {
 		c.clearNodePrefix(nodeID)
@@ -421,17 +484,36 @@ func (c *arenaRadix[V]) setNodePrefix(nodeID uint32, s string) {
 	c.livePrefixBytes += sLen
 }
 
+// setNodePrefixFromArenaSliceLocked copies c.prefixArena[srcOff:srcOff+sLen] into a newly
+// allocated span (either recycled from c.freePrefixSpans or appended via growPrefixArenaNoCompactLocked
+// so srcOff is never invalidated by compaction).
 func (c *arenaRadix[V]) setNodePrefixFromArenaSliceLocked(nodeID, srcOff uint32, sLen int) {
 	needed := sLen
 	if sLen >= int(largePrefixSentinel) {
 		needed += 4
 	}
-	if len(c.prefixArena)+needed > cap(c.prefixArena) {
-		newCap := max(cap(c.prefixArena)*2, len(c.prefixArena)+needed, 64)
-		grown := make([]byte, len(c.prefixArena), newCap)
-		copy(grown, c.prefixArena)
-		c.prefixArena = grown
+	if c.freePrefixCount > 0 && uint64(needed) <= uint64(maxPrefixArenaBytes) {
+		if spanOff, ok := c.takeFreePrefixSpanLocked(uint32(needed)); ok {
+			dstOff := spanOff
+			if sLen >= int(largePrefixSentinel) {
+				binary.LittleEndian.PutUint32(c.prefixArena[spanOff:spanOff+4], uint32(sLen))
+				dstOff = spanOff + 4
+			}
+			copy(c.prefixArena[dstOff:int(dstOff)+sLen], c.prefixArena[srcOff:int(srcOff)+sLen])
+			n := &c.nodes[nodeID]
+			n.prefixOff = dstOff
+			if sLen >= int(largePrefixSentinel) {
+				n.prefixLen = largePrefixSentinel
+			} else {
+				n.prefixLen = uint16(sLen)
+			}
+			n.firstByte = c.prefixArena[dstOff]
+			n.prefixFlags &^= prefixFlagPinned
+			c.livePrefixBytes += needed
+			return
+		}
 	}
+	c.growPrefixArenaNoCompactLocked(needed)
 	if sLen >= int(largePrefixSentinel) {
 		var hdr [4]byte
 		binary.LittleEndian.PutUint32(hdr[:], uint32(sLen))
@@ -448,9 +530,12 @@ func (c *arenaRadix[V]) setNodePrefixFromArenaSliceLocked(nodeID, srcOff uint32,
 	}
 	n.firstByte = c.prefixArena[dstOff]
 	n.prefixFlags &^= prefixFlagPinned
-	c.livePrefixBytes += sLen
+	c.livePrefixBytes += needed
 }
 
+// splitNodePrefixLocked splits childID's prefix at lcp between splitNodeID ([:lcp]) and childID ([lcp:]).
+// It operates in-place when both halves are < 65,535B (or when a large prefix is unpinned and only the
+// leading half is >= 65,535B), and otherwise pre-compacts via ensurePrefixArenaCap before copying.
 func (c *arenaRadix[V]) splitNodePrefixLocked(childID, splitNodeID uint32, lcp int) {
 	oldLen := c.nodePrefixLen(childID)
 	remLen := oldLen - lcp
@@ -460,8 +545,11 @@ func (c *arenaRadix[V]) splitNodePrefixLocked(childID, splitNodeID uint32, lcp i
 	wasLarge := c.nodes[childID].prefixLen == largePrefixSentinel
 
 	if lcp < int(largePrefixSentinel) && remLen < int(largePrefixSentinel) {
-		if wasLarge && oldFlags&prefixFlagPinned == 0 && !c.prefixExposed.Load() {
-			c.recordFreePrefixSpanLocked(oldOff-4, 4)
+		if wasLarge {
+			c.livePrefixBytes -= 4
+			if oldFlags&prefixFlagPinned == 0 && !c.prefixExposed.Load() {
+				c.recordFreePrefixSpanLocked(oldOff-4, 4)
+			}
 		}
 		c.nodes[splitNodeID].prefixOff = oldOff
 		c.nodes[splitNodeID].prefixLen = uint16(lcp)
@@ -475,6 +563,33 @@ func (c *arenaRadix[V]) splitNodePrefixLocked(childID, splitNodeID uint32, lcp i
 		return
 	}
 
+	if wasLarge && lcp >= int(largePrefixSentinel) && remLen < int(largePrefixSentinel) && oldFlags&prefixFlagPinned == 0 && !c.prefixExposed.Load() {
+		binary.LittleEndian.PutUint32(c.prefixArena[oldOff-4:oldOff], uint32(lcp))
+		c.nodes[splitNodeID].prefixOff = oldOff
+		c.nodes[splitNodeID].prefixLen = largePrefixSentinel
+		c.nodes[splitNodeID].firstByte = c.prefixArena[oldOff]
+		c.nodes[splitNodeID].prefixFlags &^= prefixFlagPinned
+
+		remOff := oldOff + uint32(lcp)
+		c.nodes[childID].prefixOff = remOff
+		c.nodes[childID].prefixLen = uint16(remLen)
+		c.nodes[childID].firstByte = c.prefixArena[remOff]
+		c.nodes[childID].prefixFlags &^= prefixFlagPinned
+		return
+	}
+
+	needed1 := lcp
+	if lcp >= int(largePrefixSentinel) {
+		needed1 += 4
+	}
+	needed2 := remLen
+	if remLen >= int(largePrefixSentinel) {
+		needed2 += 4
+	}
+	c.ensurePrefixArenaCap(needed1 + needed2)
+	oldOff = c.nodes[childID].prefixOff
+	oldFlags = c.nodes[childID].prefixFlags
+
 	c.nodes[childID].prefixOff = 0
 	c.nodes[childID].prefixLen = 0
 	c.nodes[childID].firstByte = 0
@@ -484,6 +599,40 @@ func (c *arenaRadix[V]) splitNodePrefixLocked(childID, splitNodeID uint32, lcp i
 	c.releasePrefixSpanLocked(oldOff, oldLen, wasLarge, oldFlags)
 }
 
+// copyMergedPrefixBytesLocked allocates a span of size needed (from freePrefixSpans or by growing
+// prefixArena without invalidating existing offsets) and copies currID's and onlyChildID's prefixes into it.
+func (c *arenaRadix[V]) copyMergedPrefixBytesLocked(currID, onlyChildID uint32, len1, len2, totalLen, needed int) uint32 {
+	if c.freePrefixCount > 0 && uint64(needed) <= uint64(maxPrefixArenaBytes) {
+		if spanOff, ok := c.takeFreePrefixSpanLocked(uint32(needed)); ok {
+			off1 := c.nodes[currID].prefixOff
+			off2 := c.nodes[onlyChildID].prefixOff
+			newOff := spanOff
+			if totalLen >= int(largePrefixSentinel) {
+				binary.LittleEndian.PutUint32(c.prefixArena[spanOff:spanOff+4], uint32(totalLen))
+				newOff = spanOff + 4
+			}
+			copy(c.prefixArena[newOff:int(newOff)+len1], c.prefixArena[off1:int(off1)+len1])
+			copy(c.prefixArena[int(newOff)+len1:int(newOff)+totalLen], c.prefixArena[off2:int(off2)+len2])
+			return newOff
+		}
+	}
+	c.ensurePrefixArenaCap(needed)
+	c.growPrefixArenaNoCompactLocked(needed)
+	off1 := c.nodes[currID].prefixOff
+	off2 := c.nodes[onlyChildID].prefixOff
+	if totalLen >= int(largePrefixSentinel) {
+		var hdr [4]byte
+		binary.LittleEndian.PutUint32(hdr[:], uint32(totalLen))
+		c.prefixArena = append(c.prefixArena, hdr[:]...)
+	}
+	newOff := uint32(len(c.prefixArena))
+	c.prefixArena = append(c.prefixArena, c.prefixArena[off1:int(off1)+len1]...)
+	c.prefixArena = append(c.prefixArena, c.prefixArena[off2:int(off2)+len2]...)
+	return newOff
+}
+
+// mergeNodePrefixesLocked concatenates currID's prefix ahead of onlyChildID's prefix during
+// upward path compression, coalescing contiguous spans in-place whenever possible.
 func (c *arenaRadix[V]) mergeNodePrefixesLocked(currID, onlyChildID uint32) {
 	curr := &c.nodes[currID]
 	onlyChild := &c.nodes[onlyChildID]
@@ -500,8 +649,8 @@ func (c *arenaRadix[V]) mergeNodePrefixesLocked(currID, onlyChildID uint32) {
 			curr.prefixFlags = 0
 			return
 		}
-		if combined <= 64 {
-			var buf [64]byte
+		if combined <= 512 {
+			var buf [512]byte
 			copy(buf[:], c.nodePrefix(currID))
 			copy(buf[curr.prefixLen:], c.nodePrefix(onlyChildID))
 			c.clearNodePrefix(onlyChildID)
@@ -514,32 +663,33 @@ func (c *arenaRadix[V]) mergeNodePrefixesLocked(currID, onlyChildID uint32) {
 	len1 := c.nodePrefixLen(currID)
 	len2 := c.nodePrefixLen(onlyChildID)
 	totalLen := len1 + len2
+	if curr.prefixLen == largePrefixSentinel && onlyChild.prefixLen < largePrefixSentinel &&
+		curr.prefixOff+uint32(len1) == onlyChild.prefixOff &&
+		curr.prefixFlags&prefixFlagPinned == 0 && !c.prefixExposed.Load() {
+		binary.LittleEndian.PutUint32(c.prefixArena[curr.prefixOff-4:curr.prefixOff], uint32(totalLen))
+		onlyChild.prefixOff = curr.prefixOff
+		onlyChild.prefixLen = largePrefixSentinel
+		onlyChild.firstByte = curr.firstByte
+		onlyChild.prefixFlags = (onlyChild.prefixFlags &^ prefixFlagPinned) | (onlyChild.prefixFlags & prefixFlagPinned)
+		curr.prefixOff = 0
+		curr.prefixLen = 0
+		curr.firstByte = 0
+		curr.prefixFlags &^= prefixFlagPinned
+		return
+	}
+
 	needed := totalLen
 	if totalLen >= int(largePrefixSentinel) {
 		needed += 4
 	}
-	c.ensurePrefixArenaCap(needed)
-	if len(c.prefixArena)+needed > cap(c.prefixArena) {
-		newCap := max(cap(c.prefixArena)*2, len(c.prefixArena)+needed, 64)
-		grown := make([]byte, len(c.prefixArena), newCap)
-		copy(grown, c.prefixArena)
-		c.prefixArena = grown
-	}
+	newOff := c.copyMergedPrefixBytesLocked(currID, onlyChildID, len1, len2, totalLen, needed)
+
 	off1 := c.nodes[currID].prefixOff
 	off2 := c.nodes[onlyChildID].prefixOff
 	large1 := c.nodes[currID].prefixLen == largePrefixSentinel
 	large2 := c.nodes[onlyChildID].prefixLen == largePrefixSentinel
 	flags1 := c.nodes[currID].prefixFlags
 	flags2 := c.nodes[onlyChildID].prefixFlags
-
-	if totalLen >= int(largePrefixSentinel) {
-		var hdr [4]byte
-		binary.LittleEndian.PutUint32(hdr[:], uint32(totalLen))
-		c.prefixArena = append(c.prefixArena, hdr[:]...)
-	}
-	newOff := uint32(len(c.prefixArena))
-	c.prefixArena = append(c.prefixArena, c.prefixArena[off1:int(off1)+len1]...)
-	c.prefixArena = append(c.prefixArena, c.prefixArena[off2:int(off2)+len2]...)
 
 	c.nodes[currID].prefixOff = 0
 	c.nodes[currID].prefixLen = 0
@@ -554,7 +704,7 @@ func (c *arenaRadix[V]) mergeNodePrefixesLocked(currID, onlyChildID uint32) {
 	}
 	c.nodes[onlyChildID].firstByte = c.prefixArena[newOff]
 	c.nodes[onlyChildID].prefixFlags = flags2 &^ prefixFlagPinned
-	c.livePrefixBytes += totalLen
+	c.livePrefixBytes += needed
 
 	c.releasePrefixSpanLocked(off2, len2, large2, flags2)
 	c.releasePrefixSpanLocked(off1, len1, large1, flags1)
@@ -631,6 +781,8 @@ func (c *arenaRadix[V]) findHashSlotIndex(keyHash uint64) (uint32, bool) {
 	}
 }
 
+// nodeMapGet and the other nodeMap* helpers below operate on the open-addressed c.hashSlots
+// flat table (retaining the historical nodeMap* method names used by white-box tests).
 func (c *arenaRadix[V]) nodeMapGet(keyHash uint64) (uint32, bool) {
 	if idx, ok := c.findHashSlotIndex(keyHash); ok {
 		return c.hashSlots[idx].nodeID, true
@@ -716,6 +868,8 @@ func (c *arenaRadix[V]) backshiftDeleteSlot(delIdx uint32) {
 			return
 		}
 		homeIdx := slot.tag & mask
+		// Cyclic linear-probe distance from homeIdx (mod 2^k via mask): shift slot back into
+		// emptyIdx iff emptyIdx lies within [homeIdx, currIdx] along the probe chain.
 		if ((emptyIdx - homeIdx) & mask) <= ((currIdx - homeIdx) & mask) {
 			c.hashSlots[emptyIdx] = slot
 			emptyIdx = currIdx
@@ -1326,7 +1480,8 @@ func (c *arenaRadix[V]) clearEmptyArenaStateLocked() {
 	c.resetWatermarks()
 }
 
-// resetEmptyArenaLocked releases peak arena slice and hash-map allocations when the cache transitions to empty.
+// resetEmptyArenaLocked resets the node arena, prefixArena, and hashSlots when the cache transitions
+// to empty (retaining small unchurned buffers or releasing peak allocations) and advances the reclamation epoch.
 // Caller MUST hold c.mu.Lock().
 func (c *arenaRadix[V]) resetEmptyArenaLocked() {
 	c.clearEmptyArenaStateLocked()
@@ -1348,29 +1503,37 @@ func (c *arenaRadix[V]) shouldAutoCompactLocked(protectedNodeID uint32) bool {
 	return c.shouldAutoCompactEntryCounts(c.hasContiguousSlackLocked(), false, c.len)
 }
 
+// compactPrefixArenaLocked rebuilds c.prefixArena with 2x live capacity (capped at maxPrefixArenaBytes)
+// during foreground growth when dead prefix bytes or prefixExposed prevent in-place reuse.
 func (c *arenaRadix[V]) compactPrefixArenaLocked(extraCap int) {
-	newCap := max(cap(c.prefixArena), (c.livePrefixBytes+extraCap)*2, 64)
+	minCap := uint64(c.livePrefixBytes) + uint64(extraCap)
+	newCap := max((c.livePrefixBytes+extraCap)*2, 64)
+	if minCap <= uint64(maxPrefixArenaBytes) && uint64(newCap) > uint64(maxPrefixArenaBytes) {
+		newCap = int(maxPrefixArenaBytes)
+	}
 	c.rebuildPrefixArenaWithCapLocked(newCap)
 }
 
+// compactPrefixArenaExactLocked tightly packs c.prefixArena to exact live byte count c.livePrefixBytes.
 func (c *arenaRadix[V]) compactPrefixArenaExactLocked() {
 	exactBytes := c.livePrefixBytes
-	for id := range uint32(len(c.nodes)) {
-		if (id == c.root || c.nodes[id].parent != nilNode) && c.nodes[id].prefixLen == largePrefixSentinel {
-			exactBytes += 4
-		}
-	}
 	if exactBytes == 0 {
 		c.prefixArena = nil
 		c.freePrefixCount = 0
 		c.prefixExposed.Store(false)
 		return
 	}
+	if len(c.prefixArena) == exactBytes && cap(c.prefixArena) == exactBytes && !c.prefixExposed.Load() {
+		return
+	}
 	c.rebuildPrefixArenaWithCapLocked(exactBytes)
 }
 
+// rebuildPrefixArenaWithCapLocked copies all live node prefixes into a fresh slice of capacity newCap,
+// updating each node's prefixOff and clearing prefixFlagPinned, freePrefixSpans, and prefixExposed.
 func (c *arenaRadix[V]) rebuildPrefixArenaWithCapLocked(newCap int) {
 	newArena := make([]byte, 0, newCap)
+	liveBytes := 0
 	for id := range uint32(len(c.nodes)) {
 		if id != c.root && c.nodes[id].parent == nilNode {
 			continue
@@ -1386,13 +1549,16 @@ func (c *arenaRadix[V]) rebuildPrefixArenaWithCapLocked(newCap int) {
 			var hdr [4]byte
 			binary.LittleEndian.PutUint32(hdr[:], uint32(len(p)))
 			newArena = append(newArena, hdr[:]...)
+			liveBytes += 4
 		}
 		off := uint32(len(newArena))
 		newArena = append(newArena, p...)
 		n.prefixOff = off
 		n.prefixFlags &^= prefixFlagPinned
+		liveBytes += len(p)
 	}
 	c.prefixArena = newArena
+	c.livePrefixBytes = liveBytes
 	c.freePrefixCount = 0
 	c.prefixExposed.Store(false)
 }

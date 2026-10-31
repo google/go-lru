@@ -79,7 +79,7 @@ type shardedCache[V any] struct {
 	backend                 Backend
 	enableInvariantChecking bool
 
-	// Cache-line padding isolates read-only hot-path routing fields (shards, shardFn)
+	// Cache-line padding isolates read-only hot-path routing fields (shards, arenaShards, shardFn)
 	// from atomic counters and coordinator state mutated during DeletePrefix, eviction
 	// callbacks, or memory-pressure sampling.
 	_                    [64]byte

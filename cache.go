@@ -18,9 +18,9 @@
 // (and optionally partitioned across N independent shards via NewShardedCache or WithShards):
 //   - MapCache: A standard doubly-linked list + map implementation with O(1) operations.
 //   - RadixCache: A Left-Child Right-Sibling (LCRS) radix tree with intrusive LRU pointers.
-//   - ArenaRadixCache: A flat-slice arena-allocated radix tree with 32-bit node indices that
-//     eliminate internal tree pointer traversal during garbage collection, while stored values
-//     and prefixes retain standard Go GC properties.
+//   - ArenaRadixCache: A flat-slice arena-allocated radix tree with 32-bit node indices and a
+//     contiguous byte-slice prefix arena that eliminate internal tree and key pointer traversal
+//     during garbage collection, while stored values retain standard Go GC properties.
 //
 // All cache constructors require maxSize > 0 and unconditionally panic if maxSize == 0.
 package lru

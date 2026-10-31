@@ -155,7 +155,7 @@ func (c *arenaRadix[V]) checkRootInvariants() {
 	if c.root == nilNode || c.root >= uint32(len(c.nodes)) {
 		panic("arenaRadix invariant violation: root node is nilNode or out of bounds")
 	}
-	if c.nodes[c.root].prefixLen != 0 || c.nodes[c.root].keyLen() != 0 {
+	if c.nodes[c.root].prefixLen != 0 || c.nodes[c.root].prefixOff != 0 || c.nodes[c.root].firstByte != 0 || c.nodes[c.root].keyLen() != 0 {
 		panic("arenaRadix invariant violation: root node must have empty prefix and zero keyLen")
 	}
 	if c.nodes[c.root].parent != nilNode {
@@ -192,12 +192,26 @@ func (c *arenaRadix[V]) checkSingleChildInvariants(currID, chID, prevSiblingID u
 		panic(fmt.Sprintf("arenaRadix invariant violation: child index %d out of bounds (len=%d)", chID, len(c.nodes)))
 	}
 	chNode := &c.nodes[chID]
+	if chNode.prefixLen == largePrefixSentinel {
+		if chNode.prefixOff < 4 || uint64(chNode.prefixOff) > uint64(len(c.prefixArena)) {
+			panic(fmt.Sprintf("arenaRadix invariant violation: child %d large-prefix header offset %d out of bounds (len=%d)", chID, chNode.prefixOff, len(c.prefixArena)))
+		}
+		if c.nodePrefixLen(chID) < int(largePrefixSentinel) {
+			panic(fmt.Sprintf("arenaRadix invariant violation: child %d large-prefix length %d < %d", chID, c.nodePrefixLen(chID), largePrefixSentinel))
+		}
+	}
+	chPrefixLen := c.nodePrefixLen(chID)
+	if chPrefixLen <= 0 || uint64(chNode.prefixOff)+uint64(chPrefixLen) > uint64(len(c.prefixArena)) {
+		panic(fmt.Sprintf("arenaRadix invariant violation: non-root child node %d has empty or out-of-bounds prefix [%d, %d+%d) (len=%d)", chID, chNode.prefixOff, chNode.prefixOff, chPrefixLen, len(c.prefixArena)))
+	}
+	if chNode.firstByte != c.prefixArena[chNode.prefixOff] {
+		panic(fmt.Sprintf("arenaRadix invariant violation: child %d firstByte %d != prefixArena[%d] (%d)", chID, chNode.firstByte, chNode.prefixOff, c.prefixArena[chNode.prefixOff]))
+	}
 	if chNode.parent != currID {
 		panic(fmt.Sprintf("arenaRadix invariant violation: child with prefix '%s' has incorrect parent pointer", c.nodePrefix(chID)))
 	}
-	chPrefixLen := c.nodePrefixLen(chID)
 	expectedKeyLen := min(parentKeyLen+chPrefixLen, int(nodeKeyLenMask))
-	if chPrefixLen == 0 || chNode.keyLen() != expectedKeyLen {
+	if chNode.keyLen() != expectedKeyLen {
 		panic("arenaRadix invariant violation: non-root child node has empty prefix or invalid keyLen")
 	}
 	if prevSiblingID != nilNode && c.nodes[prevSiblingID].firstByte >= chNode.firstByte {
@@ -221,12 +235,32 @@ func (c *arenaRadix[V]) checkChildrenAndCompactness(currID uint32) {
 	}
 }
 
+func (c *arenaRadix[V]) checkPrefixArenaInvariants(totalPrefixBytes int) {
+	if totalPrefixBytes != c.livePrefixBytes {
+		panic(fmt.Sprintf("arenaRadix invariant violation: livePrefixBytes %d does not match tree prefix sum %d", c.livePrefixBytes, totalPrefixBytes))
+	}
+
+	if c.freePrefixCount < 0 || c.freePrefixCount > len(c.freePrefixSpans) {
+		panic(fmt.Sprintf("arenaRadix invariant violation: invalid freePrefixCount %d", c.freePrefixCount))
+	}
+	for i := 0; i < c.freePrefixCount; i++ {
+		sp := c.freePrefixSpans[i]
+		if sp.len == 0 || uint64(sp.off)+uint64(sp.len) > uint64(len(c.prefixArena)) {
+			panic(fmt.Sprintf("arenaRadix invariant violation: invalid freePrefixSpan [%d, %d+%d) for prefixArena len %d", sp.off, sp.off, sp.len, len(c.prefixArena)))
+		}
+	}
+}
+
 func (c *arenaRadix[V]) checkTreeInvariants() int {
 	// Iterative pre-order traversal using parent/sibling pointers (O(1) space).
 	// Validates tree integrity, sibling sorted order, parent pointers, compactness,
-	// and 1:1 bijection between value-bearing nodes and LRU list elements.
+	// prefixArena byte accounting, and 1:1 bijection between value-bearing nodes and LRU list elements.
+	if c.nodes[c.root].prefixOff != 0 || c.nodes[c.root].firstByte != 0 {
+		panic("arenaRadix invariant violation: root node must have zero prefixOff and firstByte")
+	}
 	treeCount := 0
 	treeNodeCount := 0
+	totalPrefixBytes := 0
 	var treeSumSize uint64
 	currID := c.root
 	for currID != nilNode {
@@ -234,6 +268,12 @@ func (c *arenaRadix[V]) checkTreeInvariants() int {
 			panic(fmt.Sprintf("arenaRadix invariant violation: tree contains out-of-bounds index %d (len=%d)", currID, len(c.nodes)))
 		}
 		treeNodeCount++
+		if currID != c.root {
+			totalPrefixBytes += c.nodePrefixLen(currID)
+			if c.nodes[currID].prefixLen == largePrefixSentinel {
+				totalPrefixBytes += 4
+			}
+		}
 		if c.nodes[currID].hasValue() {
 			treeCount++
 			if math.MaxUint64-treeSumSize < c.nodes[currID].size {
@@ -268,6 +308,8 @@ func (c *arenaRadix[V]) checkTreeInvariants() int {
 		panic(fmt.Sprintf("arenaRadix: currentSize drift in tree: currentSize=%d treeSumSize=%d", c.currentSize, treeSumSize))
 	}
 
+	c.checkPrefixArenaInvariants(totalPrefixBytes)
+
 	return treeNodeCount
 }
 
@@ -277,14 +319,14 @@ func (c *arenaRadix[V]) checkCollisionPeerBucketInvariants(h uint64, peers []uin
 	}
 	mappedID, ok := c.nodeMapGet(h)
 	if !ok {
-		panic(fmt.Sprintf("arenaRadix invariant violation: collisionPeers[%d] exists without nodeMap[%d]", h, h))
+		panic(fmt.Sprintf("arenaRadix invariant violation: collisionPeers[%d] exists without hashSlots entry for %d", h, h))
 	}
 	for i, peerID := range peers {
 		if peerID >= uint32(len(c.nodes)) || !c.nodes[peerID].hasValue() || c.hashNodeKey(peerID) != h {
 			panic(fmt.Sprintf("arenaRadix invariant violation: invalid collision peer %d for hash %d", peerID, h))
 		}
 		if mappedID == peerID {
-			panic(fmt.Sprintf("arenaRadix invariant violation: collision peer %d duplicates nodeMap[%d]", peerID, h))
+			panic(fmt.Sprintf("arenaRadix invariant violation: collision peer %d duplicates hashSlots entry for %d", peerID, h))
 		}
 		if slices.Contains(peers[:i], peerID) {
 			panic(fmt.Sprintf("arenaRadix invariant violation: duplicate collision peer %d for hash %d", peerID, h))
@@ -302,13 +344,13 @@ func (c *arenaRadix[V]) checkNodeMapInvariants() {
 		actualCount++
 		id := slot.nodeID
 		if id >= uint32(len(c.nodes)) {
-			panic(fmt.Sprintf("arenaRadix invariant violation: nodeMap contains out-of-bounds index %d (len=%d)", id, len(c.nodes)))
+			panic(fmt.Sprintf("arenaRadix invariant violation: hashSlots contains out-of-bounds index %d (len=%d)", id, len(c.nodes)))
 		}
 		if !c.nodes[id].hasValue() {
-			panic(fmt.Sprintf("arenaRadix invariant violation: nodeMap points to node %d with hasValue=false", id))
+			panic(fmt.Sprintf("arenaRadix invariant violation: hashSlots points to node %d with hasValue=false", id))
 		}
 		if arenaHashTag(c.hashNodeKey(id)) != slot.tag {
-			panic(fmt.Sprintf("arenaRadix invariant violation: nodeMap hash mismatch for node %d", id))
+			panic(fmt.Sprintf("arenaRadix invariant violation: hashSlots tag mismatch for node %d", id))
 		}
 	}
 	if actualCount != c.hashCount {
@@ -322,7 +364,7 @@ func (c *arenaRadix[V]) checkNodeMapInvariants() {
 		panic(fmt.Sprintf("arenaRadix invariant violation: collisionCount %d != totalPeers %d", c.collisionCount, totalPeers))
 	}
 	if c.hashCount+c.collisionCount > c.len {
-		panic(fmt.Sprintf("arenaRadix invariant violation: len(nodeMap) (%d) + collisionCount (%d) > len (%d)", c.hashCount, c.collisionCount, c.len))
+		panic(fmt.Sprintf("arenaRadix invariant violation: hashCount (%d) + collisionCount (%d) > len (%d)", c.hashCount, c.collisionCount, c.len))
 	}
 }
 
@@ -342,8 +384,8 @@ func (c *arenaRadix[V]) checkFreeNodeInvariants(freeID uint32) {
 	if c.nodes[freeID].size != 0 {
 		panic(fmt.Sprintf("arenaRadix invariant violation: free-list node %d has non-zero size %d", freeID, c.nodes[freeID].size))
 	}
-	if c.nodes[freeID].prefixLen != 0 || c.nodes[freeID].keyLen() != 0 {
-		panic(fmt.Sprintf("arenaRadix invariant violation: free-list node %d has non-empty prefix '%s' or keyLen %d", freeID, c.nodePrefix(freeID), c.nodes[freeID].keyLen()))
+	if c.nodes[freeID].prefixLen != 0 || c.nodes[freeID].prefixOff != 0 || c.nodes[freeID].firstByte != 0 || c.nodes[freeID].keyLen() != 0 {
+		panic(fmt.Sprintf("arenaRadix invariant violation: free-list node %d has non-zero prefix metadata or keyLen %d", freeID, c.nodes[freeID].keyLen()))
 	}
 	if c.nodes[freeID].parent != nilNode || c.nodes[freeID].child != nilNode || c.nodes[freeID].sibling != nilNode || c.nodes[freeID].prev != nilNode {
 		panic(fmt.Sprintf("arenaRadix invariant violation: free-list node %d has non-nilNode tree/LRU pointers", freeID))
@@ -529,9 +571,11 @@ func (c *arenaRadix[V]) insertNewOnPutLocked(evictQ *evictCallbackQueue[V], key 
 	reclaimedPrePut := false
 	compactedPrePut := false
 
-	// A single new-key insert can allocate up to 2 nodes (one routing node, one leaf).
-	// If the slice has reached its physical uint32 maximum, ensure enough free slots exist.
-	for uint64(len(c.nodes))-uint64(c.freeCount)+2 > uint64(foregroundNoProtect) && c.tail != nilNode {
+	// A single new-key insert can allocate up to 2 nodes (one routing node, one leaf)
+	// and add len(key) plus up to 12 bytes of large-prefix headers to prefixArena.
+	// If either arena has reached its physical uint32 maximum, ensure enough room exists.
+	for (uint64(len(c.nodes))-uint64(c.freeCount)+2 > uint64(foregroundNoProtect) ||
+		uint64(c.livePrefixBytes)+uint64(len(key))+12 > uint64(maxPrefixArenaBytes)) && c.tail != nilNode {
 		if evicted, ok := c.evictOne(evictQ); ok {
 			evictedValues = append(evictedValues, evicted)
 			evictedPrePut = true
@@ -561,7 +605,7 @@ func (c *arenaRadix[V]) insertNewOnPutLocked(evictQ *evictCallbackQueue[V], key 
 	c.putInserted++
 	c.onEntryPut(c.len, valueSize)
 	c.currentSize += valueSize
-	if verifiedMapMiss && c.collisionPeers == nil {
+	if verifiedMapMiss {
 		c.insertNewHashSlotLocked(keyHash, nodeID)
 	} else {
 		c.recordNodeMapInsertLocked(keyHash, nodeID)
@@ -838,9 +882,7 @@ func (c *arenaRadix[V]) evictAllForClearLocked(evictQ *evictCallbackQueue[V]) {
 		nextID := c.nodes[currID].next
 		var key string
 		if c.onEvictEntry != nil {
-			if c.nodes[currID].parent == c.root && c.nodes[currID].prefixLen > 0 {
-				c.prefixExposed.Store(true)
-			}
+			c.exposeDepth1PrefixIfNeeded(currID)
 			key = c.reconstructKey(currID)
 		}
 		evictedVal := c.nodes[currID].value
@@ -1087,10 +1129,8 @@ func (c *arenaRadix[V]) iterateAll(yield func(string, V) bool) bool {
 	c.mu.RLock()
 	defer c.rUnlock()
 
-	if c.head != nilNode {
-		c.prefixExposed.Store(true)
-	}
 	for currID := c.head; currID != nilNode; currID = c.nodes[currID].next {
+		c.exposeDepth1PrefixIfNeeded(currID)
 		if !yield(c.reconstructKey(currID), c.nodes[currID].value) {
 			return false
 		}
@@ -1111,10 +1151,8 @@ func (c *arenaRadix[V]) iterateKeys(yield func(string) bool) bool {
 	c.mu.RLock()
 	defer c.rUnlock()
 
-	if c.head != nilNode {
-		c.prefixExposed.Store(true)
-	}
 	for currID := c.head; currID != nilNode; currID = c.nodes[currID].next {
+		c.exposeDepth1PrefixIfNeeded(currID)
 		if !yield(c.reconstructKey(currID)) {
 			return false
 		}

@@ -1638,6 +1638,9 @@ func longestCommonPrefix(a, b string) int {
 		ab := unsafe.Slice(unsafe.StringData(a), n)
 		bb := unsafe.Slice(unsafe.StringData(b), n)
 		for ; i <= n-8; i += 8 {
+			// Under little-endian byte order, the lowest-indexed differing byte occupies the
+			// least-significant non-zero bits of diff, so TrailingZeros64(diff) >> 3 (dividing
+			// bit offset by 8) yields the exact byte offset of the first mismatch within the 8-byte word.
 			if diff := binary.LittleEndian.Uint64(ab[i:]) ^ binary.LittleEndian.Uint64(bb[i:]); diff != 0 {
 				return i + (bits.TrailingZeros64(diff) >> 3)
 			}

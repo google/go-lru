@@ -2868,3 +2868,368 @@ func TestArenaRadix_OnEvictEntry_Depth1KeyImmutabilityAndDepth2SpanReuse(t *test
 		assert.Zero(t, c.nodes[longChildID].prefixFlags&prefixFlagPinned)
 	})
 }
+
+func TestArenaRadix_HashTag32CollisionAndSlotBelongsToOtherHash(t *testing.T) {
+	c := NewArenaRadixCache[int](100, WithInvariantChecking(true)).(*arenaRadix[int])
+
+	_, err := c.Put("key1", 10)
+	require.NoError(t, err)
+	_, err = c.Put("key2", 20)
+	require.NoError(t, err)
+
+	h1 := c.hashKey("key1")
+	// Flip bit 0 and bit 32 so h2 != h1 while uint32(h2 ^ (h2 >> 32)) == uint32(h1 ^ (h1 >> 32)).
+	h2 := h1 ^ 0x00000001_00000001
+	require.NotEqual(t, h1, h2)
+	require.Equal(t, arenaHashTag(h1), arenaHashTag(h2))
+
+	idx1, ok := c.findHashSlotIndex(h1)
+	require.True(t, ok)
+	id1 := c.hashSlots[idx1].nodeID
+	id2, ok := c.nodeMapGet(c.hashKey("key2"))
+	require.True(t, ok)
+
+	// 1. Verify slotBelongsToOtherHash boundary conditions and 32-bit tag vs 64-bit hash distinction.
+	assert.False(t, c.slotBelongsToOtherHash(arenaHashSlot{tag: arenaHashTag(h1), nodeID: nilNode}, h2))
+	assert.False(t, c.slotBelongsToOtherHash(arenaHashSlot{tag: arenaHashTag(h1), nodeID: c.root}, h2))
+	assert.False(t, c.slotBelongsToOtherHash(c.hashSlots[idx1], h1), "same 64-bit hash must not be reported as another hash")
+	assert.True(t, c.slotBelongsToOtherHash(c.hashSlots[idx1], h2), "distinct 64-bit hash with identical 32-bit tag must be reported as another hash")
+
+	// 2. Verify lookupHashSlot and public lookup/get/delete with h2 treat idx1 as belonging to another hash
+	// (slotMatched == false), avoiding false-positive 64-bit collision fallback walks.
+	fallbacksBefore := c.Stats().ArenaHashFallbacks
+	gotID, slotMatched, verified := c.lookupHashSlot("missing_key", h2)
+	assert.Equal(t, nilNode, gotID)
+	assert.False(t, slotMatched, "32-bit tag collision with a different 64-bit hash must not set slotMatched")
+	assert.False(t, verified)
+
+	_, ok = c.peekWithHash("missing_key", h2)
+	assert.False(t, ok)
+	_, ok = c.getWithHash("missing_key", h2)
+	assert.False(t, ok)
+	_, ok = c.deleteWithHash("missing_key", h2)
+	assert.False(t, ok)
+	assert.Equal(t, fallbacksBefore, c.Stats().ArenaHashFallbacks, "tag-only collision miss must not trigger trie walk fallback")
+
+	// Contrast with a 64-bit hash collision on h1: slotBelongsToOtherHash is false, so slotMatched is true.
+	gotID, slotMatched, verified = c.lookupHashSlot("missing_key", h1)
+	assert.Equal(t, nilNode, gotID)
+	assert.True(t, slotMatched, "64-bit hash collision must set slotMatched")
+	assert.False(t, verified)
+
+	// 3. Verify findHashSlotIndex, nodeMapSet, nodeMapGet, lookupHashSlot, and removeOrPromoteNodeMapLocked
+	// when both h1 (at idx1) and h2 (probed past idx1 to idx2) occupy the probe chain with the same 32-bit tag.
+	hKey2Natural := c.hashKey("key2")
+	c.nodeMapDelete(hKey2Natural)
+
+	idx2Probe, exists := c.findHashSlotIndex(h2)
+	assert.False(t, exists, "findHashSlotIndex(h2) must probe past h1's slot at idx1")
+	assert.NotEqual(t, idx1, idx2Probe)
+
+	c.nodeMapSet(h2, id2)
+	assert.Equal(t, 2, c.hashCount)
+
+	gotID1, ok1 := c.nodeMapGet(h1)
+	require.True(t, ok1)
+	assert.Equal(t, id1, gotID1)
+
+	gotID2, ok2 := c.nodeMapGet(h2)
+	require.True(t, ok2)
+	assert.Equal(t, id2, gotID2)
+
+	gotLookupID2, slotMatched2, verified2 := c.lookupHashSlot("key2", h2)
+	assert.Equal(t, id2, gotLookupID2)
+	assert.True(t, slotMatched2)
+	assert.True(t, verified2)
+
+	// Removing (h2, id2) via removeOrPromoteNodeMapLocked must skip idx1 (which belongs to h1)
+	// and delete idx2, leaving (h1, id1) intact.
+	c.removeOrPromoteNodeMapLocked(h2, id2)
+	assert.Equal(t, 1, c.hashCount)
+	gotID1After, ok1After := c.nodeMapGet(h1)
+	require.True(t, ok1After)
+	assert.Equal(t, id1, gotID1After)
+	_, ok2After := c.nodeMapGet(h2)
+	assert.False(t, ok2After)
+
+	// Restore key2's natural hash slot and verify all cache invariants hold.
+	c.nodeMapSet(hKey2Natural, id2)
+	c.checkInvariants()
+}
+
+func TestArenaRadix_ReconstructKeyExceedingNodeKeyLenMask(t *testing.T) {
+	var evictedKeys []string
+	var evictedReasons []EvictionReason
+	c := NewArenaRadixCache[testData](30,
+		WithInvariantChecking(true),
+		testDataWeigher,
+		WithOnEvictEntry(func(k string, _ testData, reason EvictionReason) {
+			evictedKeys = append(evictedKeys, k)
+			evictedReasons = append(evictedReasons, reason)
+		}),
+	).(*arenaRadix[testData])
+
+	// Construct multi-segment keys (depth >= 2) whose total length is 140,001 bytes > nodeKeyLenMask (131,071).
+	sharedPrefix := strings.Repeat("p", 70000) + "/"
+	keyA := sharedPrefix + strings.Repeat("a", 70000)
+	keyB := sharedPrefix + strings.Repeat("b", 70000)
+	require.Greater(t, len(keyA), int(nodeKeyLenMask))
+	require.Greater(t, len(keyB), int(nodeKeyLenMask))
+
+	_, err := c.Put(keyA, testData{value: 1, dataSize: 10})
+	require.NoError(t, err)
+	_, err = c.Put(keyB, testData{value: 2, dataSize: 10})
+	require.NoError(t, err)
+
+	idA, ok := c.nodeMapGet(c.hashKey(keyA))
+	require.True(t, ok)
+	idB, ok := c.nodeMapGet(c.hashKey(keyB))
+	require.True(t, ok)
+
+	// Both leaf nodes are at depth 2 (parent != root) and saturate the 17-bit keyLen field at nodeKeyLenMask.
+	assert.NotEqual(t, c.root, c.nodes[idA].parent)
+	assert.NotEqual(t, c.root, c.nodes[idB].parent)
+	assert.Equal(t, int(nodeKeyLenMask), c.nodes[idA].keyLen())
+	assert.Equal(t, int(nodeKeyLenMask), c.nodes[idB].keyLen())
+
+	// 1. Direct reconstructKey() must return the full untruncated 140,001-byte keys.
+	assert.Equal(t, keyA, c.reconstructKey(idA))
+	assert.Equal(t, keyB, c.reconstructKey(idB))
+
+	// 2. Keys() and All() iterators must yield the exact full keys in MRU-to-LRU order.
+	assert.Equal(t, []string{keyB, keyA}, slices.Collect(c.Keys()))
+	var allKeys []string
+	var allVals []int64
+	for k, v := range c.All() {
+		allKeys = append(allKeys, k)
+		allVals = append(allVals, v.value)
+	}
+	assert.Equal(t, []string{keyB, keyA}, allKeys)
+	assert.Equal(t, []int64{2, 1}, allVals)
+
+	// 3. Get and Peek must verify the full > 131,071-byte multi-segment key.
+	gotB, ok := c.Peek(keyB)
+	require.True(t, ok)
+	assert.Equal(t, int64(2), gotB.value)
+	gotA, ok := c.Get(keyA) // Promotes keyA to MRU so keyB becomes the LRU tail victim.
+	require.True(t, ok)
+	assert.Equal(t, int64(1), gotA.value)
+
+	// 4. Capacity eviction of depth-2 node idB (via Put of a 25-byte entry into maxSize=30)
+	// must reconstruct and pass the exact 140,001-byte keyB to WithOnEvictEntry.
+	evicted, err := c.Put("survivor", testData{value: 3, dataSize: 20})
+	require.NoError(t, err)
+	assertEvictedValues(t, evicted, []int64{2})
+	require.Equal(t, []string{keyB}, evictedKeys)
+	require.Equal(t, []EvictionReason{EvictionReasonCapacity}, evictedReasons)
+}
+
+func TestArenaRadix_PrefixArenaFreeSpansCompactionAndLargePrefixChurn(t *testing.T) {
+	t.Run("CoalesceAdjacentSpansBothDirections", func(t *testing.T) {
+		// Direction 1: sp.off + sp.len == other.off in mergeAdjacentFreeSpanLocked
+		// Free A, then C, then B (where B attaches to A's end and bridges to C's start).
+		c1 := NewArenaRadixCache[int](100, WithInvariantChecking(true)).(*arenaRadix[int])
+		keyA := "A_" + strings.Repeat("a", 8)
+		keyB := "B_" + strings.Repeat("b", 8)
+		keyC := "C_" + strings.Repeat("c", 8)
+		keyD := "D_" + strings.Repeat("d", 8)
+
+		for i, k := range []string{keyA, keyB, keyC, keyD} {
+			_, err := c1.Put(k, i+1)
+			require.NoError(t, err)
+		}
+		_, ok := c1.Delete(keyA)
+		require.True(t, ok)
+		_, ok = c1.Delete(keyC)
+		require.True(t, ok)
+		require.Equal(t, 2, c1.freePrefixCount)
+
+		_, ok = c1.Delete(keyB)
+		require.True(t, ok)
+		require.Equal(t, 1, c1.freePrefixCount)
+		assert.Equal(t, prefixSpan{off: 0, len: 30}, c1.freePrefixSpans[0])
+
+		// Deleting tail keyD trims D and then trims the coalesced [0, 30) span.
+		_, ok = c1.Delete(keyD)
+		require.True(t, ok)
+		assert.Zero(t, c1.freePrefixCount)
+		assert.Empty(t, c1.prefixArena)
+
+		// Direction 2: other.off + other.len == sp.off in mergeAdjacentFreeSpanLocked
+		// Free C, then A, then B (where B attaches to C's start and bridges back to A's end).
+		c2 := NewArenaRadixCache[int](100, WithInvariantChecking(true)).(*arenaRadix[int])
+		for i, k := range []string{keyA, keyB, keyC, keyD} {
+			_, err := c2.Put(k, i+1)
+			require.NoError(t, err)
+		}
+		_, ok = c2.Delete(keyC)
+		require.True(t, ok)
+		_, ok = c2.Delete(keyA)
+		require.True(t, ok)
+		require.Equal(t, 2, c2.freePrefixCount)
+
+		_, ok = c2.Delete(keyB)
+		require.True(t, ok)
+		require.Equal(t, 1, c2.freePrefixCount)
+		assert.Equal(t, prefixSpan{off: 0, len: 30}, c2.freePrefixSpans[0])
+	})
+
+	t.Run("FreePrefixSpans32SlotOverflowReplacesSmallestAndIgnoresSmaller", func(t *testing.T) {
+		c := NewArenaRadixCache[int](500, WithInvariantChecking(true)).(*arenaRadix[int])
+
+		const totalHoles = 34
+		holeKeys := make([]string, totalHoles)
+		for i := range totalHoles {
+			// Give every hole and separator a unique first byte so all nodes remain direct children of root without splitting.
+			holeFirst := byte(1 + i*2)
+			sepFirst := byte(2 + i*2)
+			var holeLen int
+			switch i {
+			case 0:
+				holeLen = 14
+			case 1:
+				holeLen = 10 // Smallest among first 32 holes (at index 1).
+			case 32:
+				holeLen = 60 // 33rd hole: larger than minLen (10), must replace index 1.
+			case 33:
+				holeLen = 8 // 34th hole: smaller than new minLen (14), must be ignored.
+			default:
+				holeLen = 14 + i
+			}
+			holeKeys[i] = string([]byte{holeFirst}) + strings.Repeat("h", holeLen-1)
+			sepKey := string([]byte{sepFirst}) + "sep!"
+
+			_, err := c.Put(holeKeys[i], i+1)
+			require.NoError(t, err)
+			_, err = c.Put(sepKey, 1000+i)
+			require.NoError(t, err)
+		}
+
+		for i := range 32 {
+			_, ok := c.Delete(holeKeys[i])
+			require.True(t, ok)
+		}
+		require.Equal(t, 32, c.freePrefixCount)
+		assert.Equal(t, uint32(10), c.freePrefixSpans[1].len)
+
+		// Freeing the 33rd hole (len 60 > minLen 10) replaces the smallest slot at index 1.
+		_, ok := c.Delete(holeKeys[32])
+		require.True(t, ok)
+		require.Equal(t, 32, c.freePrefixCount)
+		assert.Equal(t, uint32(60), c.freePrefixSpans[1].len)
+
+		// Freeing the 34th hole (len 8 < new minLen 14) leaves all 32 slots unchanged.
+		spansSnapshot := c.freePrefixSpans
+		_, ok = c.Delete(holeKeys[33])
+		require.True(t, ok)
+		require.Equal(t, 32, c.freePrefixCount)
+		assert.Equal(t, spansSnapshot, c.freePrefixSpans)
+
+		// Allocating a new key of length 15 carves from the best-fit 16-byte span (hole 2).
+		newKey := string([]byte{200}) + strings.Repeat("n", 14)
+		_, err := c.Put(newKey, 9999)
+		require.NoError(t, err)
+		assert.Equal(t, uint32(1), c.freePrefixSpans[2].len)
+	})
+
+	t.Run("EnsurePrefixArenaCapAutoCompactionAndPrefixExposedReset", func(t *testing.T) {
+		c := NewArenaRadixCache[int](100, WithInvariantChecking(true)).(*arenaRadix[int])
+
+		// Insert 4 keys of 350 bytes each -> len(prefixArena) == 1400 >= 1024.
+		k1 := "1_" + strings.Repeat("a", 348)
+		k2 := "2_" + strings.Repeat("b", 348)
+		k3 := "3_" + strings.Repeat("c", 348)
+		k4 := "4_" + strings.Repeat("d", 348)
+		for i, k := range []string{k1, k2, k3, k4} {
+			_, err := c.Put(k, i+1)
+			require.NoError(t, err)
+		}
+
+		// 1. Non-exposed >= 1024 auto-compaction branch:
+		// Delete k1 and k3 (leaving two 350B non-adjacent free spans; livePrefixBytes == 700 <= 1400/2).
+		_, ok := c.Delete(k1)
+		require.True(t, ok)
+		_, ok = c.Delete(k3)
+		require.True(t, ok)
+		require.Equal(t, 2, c.freePrefixCount)
+		require.Equal(t, 700, c.livePrefixBytes)
+		require.Len(t, c.prefixArena, 1400)
+
+		// Insert k5 (> 350B so neither free span fits, and > remaining cap slack) to trigger auto-compaction.
+		slack := cap(c.prefixArena) - len(c.prefixArena)
+		k5 := "5_" + strings.Repeat("e", max(slack+100, 400))
+		_, err := c.Put(k5, 5)
+		require.NoError(t, err)
+		assert.Zero(t, c.freePrefixCount, "compaction during ensurePrefixArenaCap must clear freePrefixSpans")
+		assert.Len(t, c.prefixArena, c.livePrefixBytes)
+
+		// 2. prefixExposed auto-compaction branch:
+		// Expose depth-1 prefixes via Keys() iterator so prefixExposed is set to true.
+		for range c.Keys() {
+			break
+		}
+		require.True(t, c.prefixExposed.Load())
+
+		// Delete k2: because prefixExposed is true, its 350 bytes remain dead in prefixArena without entering freePrefixSpans.
+		_, ok = c.Delete(k2)
+		require.True(t, ok)
+		require.Zero(t, c.freePrefixCount)
+		require.Less(t, c.livePrefixBytes, len(c.prefixArena))
+
+		// Insert k6 exceeding remaining capacity slack, triggering ensurePrefixArenaCap compaction and resetting prefixExposed.
+		slack2 := cap(c.prefixArena) - len(c.prefixArena)
+		k6 := "6_" + strings.Repeat("f", slack2+100)
+		_, err = c.Put(k6, 6)
+		require.NoError(t, err)
+		assert.False(t, c.prefixExposed.Load(), "prefixExposed must be reset after prefixArena compaction")
+		assert.Len(t, c.prefixArena, c.livePrefixBytes)
+	})
+
+	t.Run("LargePrefixSplitAndMergeChurnKeepsArenaCapacityBounded", func(t *testing.T) {
+		c := NewArenaRadixCache[int](100, WithInvariantChecking(true)).(*arenaRadix[int])
+
+		// Part 1: In-place split and merge of a large prefix (lcp >= 65,535, remLen < 65,535).
+		largeShared := strings.Repeat("L", int(largePrefixSentinel)+500) + "/"
+		inPlaceKey1 := largeShared + "alpha_" + strings.Repeat("a", 100)
+		inPlaceKey2 := largeShared + "bravo_" + strings.Repeat("b", 100)
+
+		_, err := c.Put(inPlaceKey1, 1)
+		require.NoError(t, err)
+		_, err = c.Put(inPlaceKey2, 2)
+		require.NoError(t, err)
+		_, ok := c.Delete(inPlaceKey2)
+		require.True(t, ok)
+		capAfterWarmup := cap(c.prefixArena)
+
+		for i := range 25 {
+			_, err = c.Put(inPlaceKey2, i+10)
+			require.NoError(t, err)
+			_, ok = c.Delete(inPlaceKey2)
+			require.True(t, ok)
+		}
+		assert.Equal(t, capAfterWarmup, cap(c.prefixArena), "in-place large-prefix split/merge churn must not grow prefixArena capacity")
+		v1, ok := c.Get(inPlaceKey1)
+		require.True(t, ok)
+		assert.Equal(t, 1, v1)
+
+		// Part 2: Split and merge where both lcp >= 65,535 and remLen >= 65,535 (exercising general large-prefix split/merge + compaction).
+		bothLargeKey1 := largeShared + "alpha_" + strings.Repeat("a", int(largePrefixSentinel)+200)
+		bothLargeKey2 := largeShared + "bravo_" + strings.Repeat("b", 100)
+		_, ok = c.Delete(inPlaceKey1)
+		require.True(t, ok)
+
+		_, err = c.Put(bothLargeKey1, 100)
+		require.NoError(t, err)
+		for i := range 15 {
+			_, err = c.Put(bothLargeKey2, 200+i)
+			require.NoError(t, err)
+			_, ok = c.Delete(bothLargeKey2)
+			require.True(t, ok)
+		}
+		// Live prefix bytes are ~132KB; capacity must remain bounded (<= 1MB) rather than ratcheting exponentially.
+		assert.LessOrEqual(t, cap(c.prefixArena), 1024*1024)
+		vLarge1, ok := c.Get(bothLargeKey1)
+		require.True(t, ok)
+		assert.Equal(t, 100, vLarge1)
+	})
+}
