@@ -924,6 +924,8 @@ func (c *arenaRadix[V]) DeletePrefix(prefix string) {
 	evictQ.invoke(&c.pressureState, c.onEvictValue, c.onEvictEntry)
 }
 
+// evictSubtreeValueNodeLocked removes an active value-bearing node encountered during subtree
+// reclamation from the LRU list, nodeMap, and size accounting, and enqueues its eviction callback.
 func (c *arenaRadix[V]) evictSubtreeValueNodeLocked(evictQ *evictCallbackQueue[V], currID uint32, keyBytes []byte, hasKeyBytes bool) {
 	var zero V
 	var key string
@@ -953,26 +955,24 @@ func (c *arenaRadix[V]) evictSubtreeValueNodeLocked(evictQ *evictCallbackQueue[V
 	c.notifyEvict(evictQ, key, evictedVal, evictedSize, EvictionReasonDeleted)
 }
 
+// initSubtreeKeyBuf seeds keyBuf with the full key of the subtree root nodeID.
+// It returns (keyLen, true) when nodeID's key fits within keyBuf and matches its ancestor chain.
 func (c *arenaRadix[V]) initSubtreeKeyBuf(nodeID uint32, keyBuf *[512]byte) (int, bool) {
-	keyPos := c.nodes[nodeID].keyLen()
-	if keyPos <= 0 || keyPos > len(keyBuf) {
-		return 0, false
-	}
-	pos := keyPos
-	curr := nodeID
-	for curr != c.root && curr != nilNode {
-		p := c.nodes[curr].prefix
-		if len(p) > pos {
-			return 0, false
-		}
-		pos -= len(p)
-		copy(keyBuf[pos:], p)
-		curr = c.nodes[curr].parent
-	}
-	if pos != 0 || curr != c.root {
+	keyPos := int(c.nodes[nodeID].keyLenAndFlags & nodeKeyLenMask)
+	if keyPos <= 0 || keyPos > len(keyBuf) || !c.fillNodeKeyBuf(nodeID, keyPos, keyBuf[:keyPos]) {
 		return 0, false
 	}
 	return keyPos, true
+}
+
+func appendSubtreeKeyBuf(keyBuf *[512]byte, keyPos int, prefix string, bufValid bool) int {
+	if !bufValid {
+		return keyPos
+	}
+	if keyPos+len(prefix) <= len(keyBuf) {
+		copy(keyBuf[keyPos:], prefix)
+	}
+	return keyPos + len(prefix)
 }
 
 // freeSubtree iteratively reclaims all nodes in a detached subtree using O(1) stack space,
@@ -980,6 +980,13 @@ func (c *arenaRadix[V]) initSubtreeKeyBuf(nodeID uint32, keyBuf *[512]byte) (int
 // and returning nodes to the free-list.
 func (c *arenaRadix[V]) freeSubtree(evictQ *evictCallbackQueue[V], nodeID uint32) {
 	if nodeID == nilNode {
+		return
+	}
+	if c.nodes[nodeID].child == nilNode {
+		if c.nodes[nodeID].hasValue() {
+			c.evictSubtreeValueNodeLocked(evictQ, nodeID, nil, false)
+		}
+		c.freeNode(nodeID)
 		return
 	}
 
@@ -996,22 +1003,17 @@ func (c *arenaRadix[V]) freeSubtree(evictQ *evictCallbackQueue[V], nodeID uint32
 			}
 		}
 
+		// Track keyPos unconditionally across descent, backtrack, and sibling transitions even
+		// when keyPos exceeds len(keyBuf), so backtracking out of a >512B branch into a <=512B
+		// sibling restores the exact offset against the intact prefix in keyBuf.
 		if childID := c.nodes[currID].child; childID != nilNode {
-			if bufValid {
-				p := c.nodes[childID].prefix
-				if keyPos+len(p) <= len(keyBuf) {
-					copy(keyBuf[keyPos:], p)
-				}
-				keyPos += len(p)
-			}
+			keyPos = appendSubtreeKeyBuf(&keyBuf, keyPos, c.nodes[childID].prefix, bufValid)
 			currID = childID
 			continue
 		}
 
 		for currID != nodeID && c.nodes[currID].sibling == nilNode {
-			if bufValid {
-				keyPos -= len(c.nodes[currID].prefix)
-			}
+			keyPos -= len(c.nodes[currID].prefix)
 			parentID := c.nodes[currID].parent
 			c.freeNode(currID)
 			currID = parentID
@@ -1023,14 +1025,7 @@ func (c *arenaRadix[V]) freeSubtree(evictQ *evictCallbackQueue[V], nodeID uint32
 		}
 
 		siblingID := c.nodes[currID].sibling
-		if bufValid {
-			keyPos -= len(c.nodes[currID].prefix)
-			p := c.nodes[siblingID].prefix
-			if keyPos+len(p) <= len(keyBuf) {
-				copy(keyBuf[keyPos:], p)
-			}
-			keyPos += len(p)
-		}
+		keyPos = appendSubtreeKeyBuf(&keyBuf, keyPos-len(c.nodes[currID].prefix), c.nodes[siblingID].prefix, bufValid)
 		c.freeNode(currID)
 		currID = siblingID
 	}

@@ -128,6 +128,22 @@ func (c *arenaRadix[V]) notifyReplaced(evictQ *evictCallbackQueue[V], key string
 	}
 }
 
+// fillNodeKeyBuf copies the ancestor prefixes of nodeID backward into buf[:totalLen].
+// It returns true if the ancestor chain reaches c.root and its prefixes sum to totalLen.
+func (c *arenaRadix[V]) fillNodeKeyBuf(nodeID uint32, totalLen int, buf []byte) bool {
+	pos := totalLen
+	for nodeID != c.root && nodeID != nilNode {
+		p := c.nodes[nodeID].prefix
+		if len(p) > pos {
+			return false
+		}
+		pos -= len(p)
+		copy(buf[pos:], p)
+		nodeID = c.nodes[nodeID].parent
+	}
+	return pos == 0 && nodeID == c.root
+}
+
 // reconstructKey reconstructs the full key for nodeID by walking the ancestor chain up to c.root.
 // It is invoked when onEvictEntry is non-nil (and the caller does not already have the key in hand)
 // or during All() / Keys() iteration.
@@ -138,15 +154,19 @@ func (c *arenaRadix[V]) reconstructKey(nodeID uint32) string {
 	if c.nodes[nodeID].parent == c.root {
 		return c.nodes[nodeID].prefix
 	}
-	totalLen := c.nodes[nodeID].keyLen()
-	buf := make([]byte, totalLen)
-	pos := totalLen
-	for curr := nodeID; curr != c.root && curr != nilNode; curr = c.nodes[curr].parent {
-		p := c.nodes[curr].prefix
-		pos -= len(p)
-		copy(buf[pos:], p)
+	if totalLen := c.nodes[nodeID].keyLen(); totalLen > 0 {
+		buf := make([]byte, totalLen)
+		if c.fillNodeKeyBuf(nodeID, totalLen, buf) {
+			return unsafe.String(unsafe.SliceData(buf), totalLen)
+		}
 	}
-	return unsafe.String(unsafe.SliceData(buf), totalLen)
+	exactLen := 0
+	for curr := nodeID; curr != c.root && curr != nilNode; curr = c.nodes[curr].parent {
+		exactLen += len(c.nodes[curr].prefix)
+	}
+	buf := make([]byte, exactLen)
+	_ = c.fillNodeKeyBuf(nodeID, exactLen, buf)
+	return unsafe.String(unsafe.SliceData(buf), exactLen)
 }
 
 // hashKey computes the 64-bit hardware-accelerated maphash of key using the cache's seed.
@@ -178,41 +198,19 @@ func (c *arenaRadix[V]) hashNodeKey(nodeID uint32) uint64 {
 				return c.hashKey(unsafe.String(&buf[0], totalLen))
 			}
 		}
-		pos := totalLen
-		curr := nodeID
-		for curr != c.root && curr != nilNode {
-			p := c.nodes[curr].prefix
-			if len(p) > pos {
-				pos = -1
-				break
-			}
-			pos -= len(p)
-			copy(buf[pos:], p)
-			curr = c.nodes[curr].parent
-		}
-		if pos == 0 && curr == c.root {
+		if c.fillNodeKeyBuf(nodeID, totalLen, buf[:totalLen]) {
 			return c.hashKey(unsafe.String(&buf[0], totalLen))
 		}
 	}
 	return c.hashNodeKeyLarge(nodeID, totalLen)
 }
 
+// hashNodeKeyLarge hashes keys for nodes whose totalLen exceeds the 64-byte fast-path stack buffer
+// or whose stored keyLen() does not match the ancestor prefix sum.
 func (c *arenaRadix[V]) hashNodeKeyLarge(nodeID uint32, totalLen int) uint64 {
 	if totalLen > 0 && totalLen <= 512 {
 		var buf [512]byte
-		pos := totalLen
-		curr := nodeID
-		for curr != c.root && curr != nilNode {
-			p := c.nodes[curr].prefix
-			if len(p) > pos {
-				pos = -1
-				break
-			}
-			pos -= len(p)
-			copy(buf[pos:], p)
-			curr = c.nodes[curr].parent
-		}
-		if pos == 0 && curr == c.root {
+		if c.fillNodeKeyBuf(nodeID, totalLen, buf[:totalLen]) {
 			return c.hashKey(unsafe.String(&buf[0], totalLen))
 		}
 	}
@@ -391,28 +389,22 @@ func (c *arenaRadix[V]) insertNode(key string, value V) uint32 {
 	}
 }
 
-// verifyKey validates that nodeID represents key by checking keyLen in O(1)
-// and walking upwards via parent pointers with zero heap allocations.
+// verifyKey verifies whether nodeID represents the exact full key by comparing keyLen()
+// and walking upward from nodeID to c.root matching each node's prefix suffix-first.
 func (c *arenaRadix[V]) verifyKey(nodeID uint32, key string) bool {
-	if c.nodes[nodeID].keyLen() != len(key) {
+	if int(c.nodes[nodeID].keyLenAndFlags&nodeKeyLenMask) != len(key) {
 		return false
 	}
-	curr := nodeID
 	end := len(key)
-
-	for curr != c.root && curr != nilNode {
-		n := &c.nodes[curr]
-		prefix := n.prefix
-		prefixLen := len(prefix)
-
-		if end < prefixLen || key[end-prefixLen:end] != prefix {
+	for nodeID != c.root && nodeID != nilNode {
+		p := c.nodes[nodeID].prefix
+		if end < len(p) || key[end-len(p):end] != p {
 			return false
 		}
-		end -= prefixLen
-		curr = n.parent
+		end -= len(p)
+		nodeID = c.nodes[nodeID].parent
 	}
-
-	return end == 0 && curr == c.root
+	return end == 0 && nodeID == c.root
 }
 
 func (c *arenaRadix[V]) findNodeByTrieWalk(key string) (uint32, bool) {

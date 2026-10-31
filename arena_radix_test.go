@@ -2375,6 +2375,64 @@ func TestArenaRadixCache_StatsArenaNodesAndHashFallbacks(t *testing.T) {
 		require.True(t, ok)
 		assert.Equal(t, int64(102), v.value)
 		assert.Equal(t, uint64(5), cCollide.Stats().ArenaHashFallbacks)
+		delete(cCollide.nodeMap, hAlphaCollide)
+
+		// Equal-length multi-level leaf suffix mismatch ("dir/sub/alpha" vs "dir/sub/bravo", both keyLen == 13).
+		_, err = cCollide.Put("dir/sub/alpha", testData{value: 300, dataSize: 10})
+		require.NoError(t, err)
+		_, err = cCollide.Put("dir/sub/bravo", testData{value: 400, dataSize: 10})
+		require.NoError(t, err)
+		hSubAlpha := cCollide.hashKey("dir/sub/alpha")
+		idSubBravo := cCollide.nodeMap[cCollide.hashKey("dir/sub/bravo")]
+		require.NotZero(t, idSubBravo)
+		assert.False(t, cCollide.verifyKey(idSubBravo, "dir/sub/alpha"))
+
+		cCollide.nodeMap[hSubAlpha] = idSubBravo
+		v, ok = cCollide.Peek("dir/sub/alpha")
+		require.True(t, ok)
+		assert.Equal(t, int64(300), v.value)
+		assert.Equal(t, uint64(6), cCollide.Stats().ArenaHashFallbacks)
+
+		v, ok = cCollide.Get("dir/sub/alpha")
+		require.True(t, ok)
+		assert.Equal(t, int64(300), v.value)
+		assert.Equal(t, uint64(7), cCollide.Stats().ArenaHashFallbacks)
+
+		// Equal-length multi-level ancestor prefix mismatch with identical leaf suffixes ("dirA/item1" vs "dirB/item1", both keyLen == 10, leaf suffix "1").
+		_, err = cCollide.Put("dirA/item1", testData{value: 500, dataSize: 10})
+		require.NoError(t, err)
+		_, err = cCollide.Put("dirA/item2", testData{value: 501, dataSize: 10})
+		require.NoError(t, err)
+		_, err = cCollide.Put("dirB/item1", testData{value: 600, dataSize: 10})
+		require.NoError(t, err)
+		_, err = cCollide.Put("dirB/item2", testData{value: 601, dataSize: 10})
+		require.NoError(t, err)
+
+		hDirA1 := cCollide.hashKey("dirA/item1")
+		idDirA1 := cCollide.nodeMap[hDirA1]
+		idDirB1 := cCollide.nodeMap[cCollide.hashKey("dirB/item1")]
+		require.NotZero(t, idDirA1)
+		require.NotZero(t, idDirB1)
+		assert.False(t, cCollide.verifyKey(idDirB1, "dirA/item1"))
+
+		cCollide.nodeMap[hDirA1] = idDirB1
+		v, ok = cCollide.Peek("dirA/item1")
+		require.True(t, ok)
+		assert.Equal(t, int64(500), v.value)
+		assert.Equal(t, uint64(8), cCollide.Stats().ArenaHashFallbacks)
+
+		v, ok = cCollide.Get("dirA/item1")
+		require.True(t, ok)
+		assert.Equal(t, int64(500), v.value)
+		assert.Equal(t, uint64(9), cCollide.Stats().ArenaHashFallbacks)
+
+		// Corrupt keyLen guards in verifyKey: (a) end < len(prefix) at an ancestor, and (b) end > 0 at c.root.
+		savedDirA1KeyLen := cCollide.nodes[idDirA1].keyLen()
+		cCollide.nodes[idDirA1].setKeyLen(2)
+		assert.False(t, cCollide.verifyKey(idDirA1, "x1"))
+		cCollide.nodes[idDirA1].setKeyLen(12)
+		assert.False(t, cCollide.verifyKey(idDirA1, "xxdirA/item1"))
+		cCollide.nodes[idDirA1].setKeyLen(savedDirA1KeyLen)
 	})
 }
 
@@ -2501,6 +2559,18 @@ func TestArenaRadix_AllocationCharacterization_PathCompressionAndDeepKeys(t *tes
 				assert.Zero(t, testing.AllocsPerRun(50, func() {
 					keySeq(func(k string) bool { return k != "" })
 				}), "backend %v Keys must be 0 allocs/op", b)
+			} else {
+				cDepth1 := New[uint64](100, WithBackend(b))
+				_, _ = cDepth1.Put("alpha", 1)
+				_, _ = cDepth1.Put("bravo", 2)
+				allDepth1Seq := cDepth1.All()
+				keyDepth1Seq := cDepth1.Keys()
+				assert.Zero(t, testing.AllocsPerRun(50, func() {
+					allDepth1Seq(func(k string, v uint64) bool { return k != "" && v > 0 })
+				}), "backend %v depth-1 All must be 0 allocs/op", b)
+				assert.Zero(t, testing.AllocsPerRun(50, func() {
+					keyDepth1Seq(func(k string) bool { return k != "" })
+				}), "backend %v depth-1 Keys must be 0 allocs/op", b)
 			}
 		}
 	})
@@ -2536,24 +2606,56 @@ func TestArenaRadix_AllocationCharacterization_PathCompressionAndDeepKeys(t *tes
 			fmt.Fprintf(&deepSB, "/%02d", i)
 			_, _ = arenaDeep.Put(deepSB.String(), i)
 		}
+		depth2Key := "/01/02"
+		depth2ID := arenaDeep.nodeMap[arenaDeep.hashKey(depth2Key)]
+		depth10Key := "/01/02/03/04/05/06/07/08/09/10"
+		depth10ID := arenaDeep.nodeMap[arenaDeep.hashKey(depth10Key)]
 		deepLeafKey := deepSB.String()
 		deepLeafID := arenaDeep.nodeMap[arenaDeep.hashKey(deepLeafKey)]
+
+		assert.Equal(t, arenaDeep.hashKey(depth2Key), arenaDeep.hashNodeKey(depth2ID))
+		assert.Zero(t, testing.AllocsPerRun(100, func() {
+			_ = arenaDeep.hashNodeKey(depth2ID)
+		}), "hashNodeKey is 0 allocs for depth == 2 (totalLen <= 64)")
+
+		assert.Equal(t, arenaDeep.hashKey(depth10Key), arenaDeep.hashNodeKey(depth10ID))
+		assert.Zero(t, testing.AllocsPerRun(100, func() {
+			_ = arenaDeep.hashNodeKey(depth10ID)
+		}), "hashNodeKey is 0 allocs for depth == 10 >= 3 (totalLen <= 64)")
+
+		savedDepth2KeyLen := arenaDeep.nodes[depth2ID].keyLen()
+		arenaDeep.nodes[depth2ID].setKeyLen(2)
+		assert.Equal(t, arenaDeep.hashKey(depth2Key), arenaDeep.hashNodeKey(depth2ID))
+		arenaDeep.nodes[depth2ID].setKeyLen(40)
+		assert.Equal(t, arenaDeep.hashKey(depth2Key), arenaDeep.hashNodeKey(depth2ID))
+		arenaDeep.nodes[depth2ID].setKeyLen(savedDepth2KeyLen)
+
+		savedDepth10KeyLen := arenaDeep.nodes[depth10ID].keyLen()
+		arenaDeep.nodes[depth10ID].setKeyLen(2)
+		assert.Equal(t, arenaDeep.hashKey(depth10Key), arenaDeep.hashNodeKey(depth10ID))
+		arenaDeep.nodes[depth10ID].setKeyLen(40)
+		assert.Equal(t, arenaDeep.hashKey(depth10Key), arenaDeep.hashNodeKey(depth10ID))
+		arenaDeep.nodes[depth10ID].setKeyLen(savedDepth10KeyLen)
 
 		deepHashAllocs := testing.AllocsPerRun(100, func() {
 			_ = arenaDeep.hashNodeKey(deepLeafID)
 		})
 		assert.Zero(t, deepHashAllocs, "hashNodeKey is 0 allocs for keys <= 512 bytes even at depth > 64")
 
-		// Also verify hashNodeKey fallback when keyLen mismatches prefix chain (e.g. white-box mutation).
+		// Also verify hashNodeKey and reconstructKey fallbacks when keyLen mismatches prefix chain (e.g. white-box mutation).
 		savedKeyLen := arenaDeep.nodes[deepLeafID].keyLen()
 		arenaDeep.nodes[deepLeafID].setKeyLen(2)
 		assert.Equal(t, arenaDeep.hashKey(deepLeafKey), arenaDeep.hashNodeKey(deepLeafID))
+		assert.Equal(t, deepLeafKey, arenaDeep.reconstructKey(deepLeafID))
 		arenaDeep.nodes[deepLeafID].setKeyLen(100)
 		assert.Equal(t, arenaDeep.hashKey(deepLeafKey), arenaDeep.hashNodeKey(deepLeafID))
+		arenaDeep.nodes[deepLeafID].setKeyLen(500)
+		assert.Equal(t, deepLeafKey, arenaDeep.reconstructKey(deepLeafID))
 		arenaDeep.nodes[deepLeafID].setKeyLen(savedKeyLen)
 
 		// Verify DeletePrefix / freeSubtree / initSubtreeKeyBuf fallback paths for keys > 512 bytes
-		// (both when subtree root keyLen <= 512 with > 512B descendants and when subtree root keyLen > 512).
+		// (both when subtree root keyLen <= 512 with > 512B descendants and when subtree root keyLen > 512),
+		// as well as the single-leaf fast path in freeSubtree (when matched prefix node has child == nilNode).
 		var evictedLargeKeys []string
 		arenaLargePrefix := NewArenaRadixCache[int](100, WithOnEvictEntry(func(k string, _ int, _ EvictionReason) {
 			evictedLargeKeys = append(evictedLargeKeys, k)
@@ -2564,12 +2666,20 @@ func TestArenaRadix_AllocationCharacterization_PathCompressionAndDeepKeys(t *tes
 		_, _ = arenaLargePrefix.Put("large_prefix/short", 1)
 		_, _ = arenaLargePrefix.Put(kLargeA, 2)
 		_, _ = arenaLargePrefix.Put(kLargeB, 3)
+		arenaLargePrefix.DeletePrefix("large_prefix/short")
+		assert.Equal(t, []string{"large_prefix/short"}, evictedLargeKeys)
+		evictedLargeKeys = nil
+		_, _ = arenaLargePrefix.Put("large_prefix/short", 1)
 		arenaLargePrefix.DeletePrefix("large_prefix/")
 		assert.Zero(t, arenaLargePrefix.len)
 		assert.ElementsMatch(t, []string{"large_prefix/short", kLargeA, kLargeB}, evictedLargeKeys)
 
-		// Also verify initSubtreeKeyBuf fallback when subtree root itself exceeds 512 bytes or has mismatched keyLen.
+		// Also verify initSubtreeKeyBuf fallback when subtree root itself exceeds 512 bytes or has mismatched keyLen,
+		// and single-leaf DeletePrefix without an onEvictEntry callback.
 		arenaLargeRoot := NewArenaRadixCache[int](100).(*arenaRadix[int])
+		_, _ = arenaLargeRoot.Put("large_prefix/short", 1)
+		arenaLargeRoot.DeletePrefix("large_prefix/short")
+		assert.Zero(t, arenaLargeRoot.len)
 		_, _ = arenaLargeRoot.Put(kLargeA, 2)
 		_, _ = arenaLargeRoot.Put(kLargeB, 3)
 		var testBuf [512]byte
