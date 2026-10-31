@@ -808,42 +808,11 @@ func (c *radixCache[V]) updateExistingOnPutLocked(
 	return evictedValues, reclaimedPrePut
 }
 
-func (c *radixCache[V]) insertNewOnPutLocked(
-	evictQ *evictCallbackQueue[V],
-	key string,
-	value V,
-	valueSize, sizeBefore uint64,
-	pressure float64,
-) (node *radixNode[V], evictedValues []V, reclaimedPrePut, compactedPrePut bool) {
-	evictedPrePut := false
-	c.recyclingForPut = true
-	// Evict from the LRU tail before inserting into the trie to avoid redundant node splits and merges.
-	for c.shouldEvictPreInsertOnPut(valueSize, c.maxSize, c.currentSize, c.len, evictedPrePut) && c.tail != nil {
-		if evicted, ok := c.evictOne(evictQ); ok {
-			evictedValues = append(evictedValues, evicted)
-			evictedPrePut = true
-		}
-	}
-	c.recyclingForPut = false
-	if c.shouldReclaimEmptyPrePut(c.len, false, evictedPrePut, valueSize, sizeBefore, pressure) {
-		c.recordCompactionByPressure(pressure)
-		c.clearEmptyTreeStateLocked()
-		reclaimedPrePut = true
-		compactedPrePut = true
-	} else if c.shouldReclaimSingleSurvivorOnMutation(c.len, c.deletedSinceCompact > 0, false, evictedPrePut, c.currentSize+valueSize, sizeBefore, pressure) {
-		reclaimedPrePut = true
-	}
-	node = c.insertNode(key, value)
+func (c *radixCache[V]) clearRecycleNodes() {
 	for c.recycleLen > 0 {
 		c.recycleLen--
 		c.recycleNodes[c.recycleLen] = nil
 	}
-	node.size = valueSize
-	c.pushFront(node)
-	c.putInserted++
-	c.onEntryPut(c.len, valueSize)
-	c.currentSize += valueSize
-	return node, evictedValues, reclaimedPrePut, compactedPrePut
 }
 
 // Put inserts or updates a key-value entry in the cache.
@@ -865,12 +834,36 @@ func (c *radixCache[V]) Put(key string, value V) ([]V, error) {
 	sizeBefore := c.currentSize
 	reclaimedPrePut := false
 	compactedPrePut := false
+	evictedPrePut := false
 
 	node, exists := c.getNode(key)
 	if exists {
 		evictedValues, reclaimedPrePut = c.updateExistingOnPutLocked(&evictQ, node, key, value, valueSize, sizeBefore, pressure)
 	} else {
-		node, evictedValues, reclaimedPrePut, compactedPrePut = c.insertNewOnPutLocked(&evictQ, key, value, valueSize, sizeBefore, pressure)
+		c.recyclingForPut = true
+		// Evict from the LRU tail before inserting into the trie to avoid redundant node splits and merges.
+		for c.shouldEvictPreInsertOnPut(valueSize, c.maxSize, c.currentSize, c.len, evictedPrePut) && c.tail != nil {
+			if evicted, ok := c.evictOne(&evictQ); ok {
+				evictedValues = append(evictedValues, evicted)
+				evictedPrePut = true
+			}
+		}
+		c.recyclingForPut = false
+		if c.shouldReclaimEmptyPrePut(c.len, false, evictedPrePut, valueSize, sizeBefore, pressure) {
+			c.recordCompactionByPressure(pressure)
+			c.clearEmptyTreeStateLocked()
+			reclaimedPrePut = true
+			compactedPrePut = true
+		} else if c.shouldReclaimSingleSurvivorOnMutation(c.len, c.deletedSinceCompact > 0, false, evictedPrePut, c.currentSize+valueSize, sizeBefore, pressure) {
+			reclaimedPrePut = true
+		}
+		node = c.insertNode(key, value)
+		c.clearRecycleNodes()
+		node.size = valueSize
+		c.pushFront(node)
+		c.putInserted++
+		c.onEntryPut(c.len, valueSize)
+		c.currentSize += valueSize
 	}
 
 	if c.needsMutationReclaim(reclaimedPrePut, c.currentSize, sizeBefore, pressure) {

@@ -398,48 +398,14 @@ func (c *mapCache[V]) updateExistingOnPutLocked(
 	return evictedValues, reclaimedPrePut
 }
 
-func (c *mapCache[V]) insertNewOnPutLocked(
-	evictQ *evictCallbackQueue[V],
-	key string,
-	value V,
-	valueSize, sizeBefore uint64,
-	pressure float64,
-) (e *entry[V], evictedValues []V, reclaimedPrePut, compactedPrePut bool) {
-	var recycledEntry *entry[V]
-	evictedPrePut := false
-	// Evict prior to adding new entry if valueSize would exceed remaining capacity (prevents uint64 overflow).
-	for c.shouldEvictPreInsertOnPut(valueSize, c.maxSize, c.currentSize, c.entries.Len(), evictedPrePut) && c.entries.Len() > 0 {
-		victim := c.entries.Back()
-		evicted := c.eraseEntryLocked(evictQ, victim, EvictionReasonCapacity)
-		if recycledEntry == nil {
-			recycledEntry = victim
-		}
-		evictedValues = append(evictedValues, evicted)
-		evictedPrePut = true
-	}
-	if c.shouldReclaimEmptyPrePut(c.entries.Len(), false, evictedPrePut, valueSize, sizeBefore, pressure) {
-		c.recordCompactionByPressure(pressure)
-		c.clearEmptyIndexStateLocked()
-		reclaimedPrePut = true
-		compactedPrePut = true
-	} else if c.shouldReclaimSingleSurvivorOnMutation(c.entries.Len(), c.hasSlackLocked(), false, evictedPrePut, c.currentSize+valueSize, sizeBefore, pressure) {
-		reclaimedPrePut = true
-	}
-	// Clone key to prevent substring keys from pinning large caller backing arrays.
-	clonedKey := clonePrefix(key)
+func allocOrRecycleEntry[V any](recycledEntry *entry[V], key string, value V, valueSize uint64) *entry[V] {
 	if recycledEntry != nil {
-		recycledEntry.key = clonedKey
+		recycledEntry.key = key
 		recycledEntry.value = value
 		recycledEntry.size = valueSize
-		e = c.entries.PushFront(recycledEntry)
-	} else {
-		e = c.entries.PushFront(&entry[V]{key: clonedKey, value: value, size: valueSize})
+		return recycledEntry
 	}
-	c.index[clonedKey] = e
-	c.putInserted++
-	c.onEntryPut(c.entries.Len(), valueSize)
-	c.currentSize += valueSize
-	return e, evictedValues, reclaimedPrePut, compactedPrePut
+	return &entry[V]{key: key, value: value, size: valueSize}
 }
 
 // Put inserts or updates the given key and value in the cache.
@@ -462,12 +428,38 @@ func (c *mapCache[V]) Put(key string, value V) ([]V, error) {
 	sizeBefore := c.currentSize
 	reclaimedPrePut := false
 	compactedPrePut := false
+	evictedPrePut := false
 
 	e, ok := c.index[key]
 	if ok {
 		evictedValues, reclaimedPrePut = c.updateExistingOnPutLocked(&evictQ, e, value, valueSize, sizeBefore, pressure)
 	} else {
-		e, evictedValues, reclaimedPrePut, compactedPrePut = c.insertNewOnPutLocked(&evictQ, key, value, valueSize, sizeBefore, pressure)
+		var recycledEntry *entry[V]
+		// Evict prior to adding new entry if valueSize would exceed remaining capacity (prevents uint64 overflow).
+		for c.shouldEvictPreInsertOnPut(valueSize, c.maxSize, c.currentSize, c.entries.Len(), evictedPrePut) && c.entries.Len() > 0 {
+			victim := c.entries.Back()
+			evicted := c.eraseEntryLocked(&evictQ, victim, EvictionReasonCapacity)
+			if recycledEntry == nil {
+				recycledEntry = victim
+			}
+			evictedValues = append(evictedValues, evicted)
+			evictedPrePut = true
+		}
+		if c.shouldReclaimEmptyPrePut(c.entries.Len(), false, evictedPrePut, valueSize, sizeBefore, pressure) {
+			c.recordCompactionByPressure(pressure)
+			c.clearEmptyIndexStateLocked()
+			reclaimedPrePut = true
+			compactedPrePut = true
+		} else if c.shouldReclaimSingleSurvivorOnMutation(c.entries.Len(), c.hasSlackLocked(), false, evictedPrePut, c.currentSize+valueSize, sizeBefore, pressure) {
+			reclaimedPrePut = true
+		}
+		// Clone key to prevent substring keys from pinning large caller backing arrays.
+		clonedKey := clonePrefix(key)
+		e = c.entries.PushFront(allocOrRecycleEntry(recycledEntry, clonedKey, value, valueSize))
+		c.index[clonedKey] = e
+		c.putInserted++
+		c.onEntryPut(c.entries.Len(), valueSize)
+		c.currentSize += valueSize
 	}
 
 	if c.needsMutationReclaim(reclaimedPrePut, c.currentSize, sizeBefore, pressure) {

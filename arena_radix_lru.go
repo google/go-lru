@@ -582,7 +582,16 @@ func (c *arenaRadix[V]) updateExistingOnPutLocked(evictQ *evictCallbackQueue[V],
 	return evictedValues, reclaimedPrePut
 }
 
-func (c *arenaRadix[V]) insertNewOnPutLocked(evictQ *evictCallbackQueue[V], key string, keyHash uint64, value V, valueSize, sizeBefore uint64, pressure float64, verifiedMapMiss bool) (uint32, []V, bool, bool) {
+func (c *arenaRadix[V]) needsPreInsertEvictOrReclaimLocked(keyLen int, valueSize uint64) bool {
+	return valueSize > c.maxSize-c.currentSize ||
+		valueSize == 0 ||
+		c.len <= 1 ||
+		c.zeroSizeCount > 0 ||
+		uint64(len(c.nodes))-uint64(c.freeCount)+2 > uint64(foregroundNoProtect) ||
+		uint64(c.livePrefixBytes)+uint64(keyLen)+12 > uint64(maxPrefixArenaBytes)
+}
+
+func (c *arenaRadix[V]) evictAndReclaimPrePutLocked(evictQ *evictCallbackQueue[V], keyLen int, valueSize, sizeBefore uint64, pressure float64) ([]V, bool, bool) {
 	var evictedValues []V
 	evictedPrePut := false
 	reclaimedPrePut := false
@@ -592,7 +601,7 @@ func (c *arenaRadix[V]) insertNewOnPutLocked(evictQ *evictCallbackQueue[V], key 
 	// and add len(key) plus up to 12 bytes of large-prefix headers to prefixArena.
 	// If either arena has reached its physical uint32 maximum, ensure enough room exists.
 	for (uint64(len(c.nodes))-uint64(c.freeCount)+2 > uint64(foregroundNoProtect) ||
-		uint64(c.livePrefixBytes)+uint64(len(key))+12 > uint64(maxPrefixArenaBytes)) && c.tail != nilNode {
+		uint64(c.livePrefixBytes)+uint64(keyLen)+12 > uint64(maxPrefixArenaBytes)) && c.tail != nilNode {
 		if evicted, ok := c.evictOne(evictQ); ok {
 			evictedValues = append(evictedValues, evicted)
 			evictedPrePut = true
@@ -615,19 +624,7 @@ func (c *arenaRadix[V]) insertNewOnPutLocked(evictQ *evictCallbackQueue[V], key 
 	} else if c.shouldReclaimSingleSurvivorOnMutation(c.len, c.freeCount > 0 || c.nodeMapDirty, c.freeCount >= minSingleSurvivorFreeNodes, evictedPrePut, c.currentSize+valueSize, sizeBefore, pressure) {
 		reclaimedPrePut = true
 	}
-
-	nodeID := c.insertNode(key, value)
-	c.nodes[nodeID].size = valueSize
-	c.pushFront(nodeID)
-	c.putInserted++
-	c.onEntryPut(c.len, valueSize)
-	c.currentSize += valueSize
-	if verifiedMapMiss {
-		c.insertNewHashSlotLocked(keyHash, nodeID)
-	} else {
-		c.recordNodeMapInsertLocked(keyHash, nodeID)
-	}
-	return nodeID, evictedValues, reclaimedPrePut, compactedPrePut
+	return evictedValues, reclaimedPrePut, compactedPrePut
 }
 
 // Put inserts or updates the given key and value in the cache.
@@ -658,7 +655,20 @@ func (c *arenaRadix[V]) putWithHash(key string, keyHash uint64, value V) ([]V, e
 	if exists {
 		evictedValues, reclaimedPrePut = c.updateExistingOnPutLocked(&evictQ, nodeID, key, keyHash, value, valueSize, sizeBefore, pressure)
 	} else {
-		nodeID, evictedValues, reclaimedPrePut, compactedPrePut = c.insertNewOnPutLocked(&evictQ, key, keyHash, value, valueSize, sizeBefore, pressure, mapMiss)
+		if c.needsPreInsertEvictOrReclaimLocked(len(key), valueSize) {
+			evictedValues, reclaimedPrePut, compactedPrePut = c.evictAndReclaimPrePutLocked(&evictQ, len(key), valueSize, sizeBefore, pressure)
+		}
+		nodeID = c.insertNode(key, value)
+		c.nodes[nodeID].size = valueSize
+		c.pushFront(nodeID)
+		c.putInserted++
+		c.onEntryPut(c.len, valueSize)
+		c.currentSize += valueSize
+		if mapMiss {
+			c.insertNewHashSlotLocked(keyHash, nodeID)
+		} else {
+			c.recordNodeMapInsertLocked(keyHash, nodeID)
+		}
 	}
 
 	if c.needsArenaPutReclaimLocked(reclaimedPrePut, sizeBefore, pressure) {
