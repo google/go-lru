@@ -325,7 +325,7 @@ func (c *mapCache[V]) evictOne(evictQ *evictCallbackQueue[V]) (V, bool) {
 		var zero V
 		return zero, false
 	}
-	return c.eraseInternal(evictQ, e.key, EvictionReasonCapacity)
+	return c.eraseEntryLocked(evictQ, e, EvictionReasonCapacity), true
 }
 
 func (c *mapCache[V]) finishDeleteReclaimLocked(evictQ *evictCallbackQueue[V], sizeBefore, sampledEpoch uint64, pressure float64) {
@@ -398,6 +398,18 @@ func (c *mapCache[V]) updateExistingOnPutLocked(
 	return evictedValues, reclaimedPrePut
 }
 
+// allocOrRecycleEntry reuses a detached entry evicted during pre-insert capacity eviction
+// or allocates a new entry when no victim was evicted.
+func allocOrRecycleEntry[V any](recycledEntry *entry[V], key string, value V, valueSize uint64) *entry[V] {
+	if recycledEntry != nil {
+		recycledEntry.key = key
+		recycledEntry.value = value
+		recycledEntry.size = valueSize
+		return recycledEntry
+	}
+	return &entry[V]{key: key, value: value, size: valueSize}
+}
+
 // Put inserts or updates the given key and value in the cache.
 // If the key already exists, its value is replaced and moved to the most recently used (MRU) position.
 // If the cache exceeds capacity after insertion, least recently used (LRU) entries are evicted
@@ -424,12 +436,16 @@ func (c *mapCache[V]) Put(key string, value V) ([]V, error) {
 	if ok {
 		evictedValues, reclaimedPrePut = c.updateExistingOnPutLocked(&evictQ, e, value, valueSize, sizeBefore, pressure)
 	} else {
+		var recycledEntry *entry[V]
 		// Evict prior to adding new entry if valueSize would exceed remaining capacity (prevents uint64 overflow).
 		for c.shouldEvictPreInsertOnPut(valueSize, c.maxSize, c.currentSize, c.entries.Len(), evictedPrePut) && c.entries.Len() > 0 {
-			if evicted, evictedOK := c.evictOne(&evictQ); evictedOK {
-				evictedValues = append(evictedValues, evicted)
-				evictedPrePut = true
+			victim := c.entries.Back()
+			evicted := c.eraseEntryLocked(&evictQ, victim, EvictionReasonCapacity)
+			if recycledEntry == nil {
+				recycledEntry = victim
 			}
+			evictedValues = append(evictedValues, evicted)
+			evictedPrePut = true
 		}
 		if c.shouldReclaimEmptyPrePut(c.entries.Len(), false, evictedPrePut, valueSize, sizeBefore, pressure) {
 			c.recordCompactionByPressure(pressure)
@@ -441,7 +457,7 @@ func (c *mapCache[V]) Put(key string, value V) ([]V, error) {
 		}
 		// Clone key to prevent substring keys from pinning large caller backing arrays.
 		clonedKey := clonePrefix(key)
-		e = c.entries.PushFront(&entry[V]{key: clonedKey, value: value, size: valueSize})
+		e = c.entries.PushFront(allocOrRecycleEntry(recycledEntry, clonedKey, value, valueSize))
 		c.index[clonedKey] = e
 		c.putInserted++
 		c.onEntryPut(c.entries.Len(), valueSize)
@@ -460,6 +476,25 @@ func (c *mapCache[V]) Put(key string, value V) ([]V, error) {
 	return evictedValues, nil
 }
 
+func (c *mapCache[V]) eraseEntryLocked(evictQ *evictCallbackQueue[V], e *entry[V], reason EvictionReason) V {
+	evictedKey := e.key
+	deletedEntry := e.value
+	evictedSize := e.size
+	c.onEntryDeleted(evictedSize)
+	c.currentSize -= evictedSize
+
+	delete(c.index, evictedKey)
+	c.dirtyIndex = true
+	c.entries.Remove(e)
+	var zero V
+	e.key = ""
+	e.value = zero
+	e.size = 0
+
+	c.notifyEvict(evictQ, evictedKey, deletedEntry, evictedSize, reason)
+	return deletedEntry
+}
+
 // eraseInternal removes any entry for the supplied key from the cache without acquiring locks.
 // It returns the value of the erased key and true, or the zero value of V and false if not present.
 // Caller must hold c.mu (write lock).
@@ -469,23 +504,7 @@ func (c *mapCache[V]) eraseInternal(evictQ *evictCallbackQueue[V], key string, r
 		var zero V
 		return zero, false
 	}
-
-	evictedKey := e.key
-	deletedEntry := e.value
-	evictedSize := e.size
-	c.onEntryDeleted(evictedSize)
-	c.currentSize -= evictedSize
-
-	delete(c.index, key)
-	c.dirtyIndex = true
-	c.entries.Remove(e)
-	var zero V
-	e.key = ""
-	e.value = zero
-	e.size = 0
-
-	c.notifyEvict(evictQ, evictedKey, deletedEntry, evictedSize, reason)
-	return deletedEntry, true
+	return c.eraseEntryLocked(evictQ, e, reason), true
 }
 
 func (c *mapCache[V]) clearEmptyIndexStateLocked() {
@@ -592,12 +611,12 @@ func (c *mapCache[V]) canFitGrowthLocked(e *entry[V], maxNewer, sizeDelta, avail
 	}
 }
 
-func (c *mapCache[V]) replaceResizeOrEvictLocked(evictQ *evictCallbackQueue[V], e *entry[V], key string, oldSize, newSize, sizeBefore, sampledEpoch uint64, pressure float64) (evictedAny, selfEvicted bool) {
+func (c *mapCache[V]) replaceResizeOrEvictLocked(evictQ *evictCallbackQueue[V], e *entry[V], oldSize, newSize, sizeBefore, sampledEpoch uint64, pressure float64) (evictedAny, selfEvicted bool) {
 	if newSize > oldSize {
 		sizeDelta := newSize - oldSize
 		if newSize > c.maxSize || !c.canFitGrowthLocked(e, c.maxSize-newSize, sizeDelta, c.maxSize-c.currentSize) {
 			c.replaceSelfEvicted++
-			c.eraseInternal(evictQ, key, EvictionReasonCapacity)
+			c.eraseEntryLocked(evictQ, e, EvictionReasonCapacity)
 			c.finishDeleteReclaimLocked(evictQ, sizeBefore, sampledEpoch, pressure)
 			return false, true
 		}
@@ -645,7 +664,7 @@ func (c *mapCache[V]) Replace(key string, value V) error {
 
 	if newSize != oldSize {
 		var selfEvicted bool
-		evictedAny, selfEvicted = c.replaceResizeOrEvictLocked(&evictQ, e, key, oldSize, newSize, sizeBefore, sampledEpoch, pressure)
+		evictedAny, selfEvicted = c.replaceResizeOrEvictLocked(&evictQ, e, oldSize, newSize, sizeBefore, sampledEpoch, pressure)
 		if selfEvicted {
 			c.unlock()
 			evictQ.invoke(&c.pressureState, c.onEvictValue, c.onEvictEntry)
@@ -711,9 +730,9 @@ func (c *mapCache[V]) deleteNonEmptyPrefixLocked(evictQ *evictCallbackQueue[V], 
 	c.deletePrefixExecuted++
 	sizeBefore := c.currentSize
 	erasedAny := false
-	for key := range c.index {
+	for key, e := range c.index {
 		if strings.HasPrefix(key, prefix) {
-			c.eraseInternal(evictQ, key, EvictionReasonDeleted)
+			c.eraseEntryLocked(evictQ, e, EvictionReasonDeleted)
 			erasedAny = true
 		}
 	}
@@ -903,9 +922,7 @@ func (c *mapCache[V]) shedAndCompactLocked(evictQ *evictCallbackQueue[V], target
 		}
 		nextVictim := victim.prev
 		if c.shouldEvictShedVictim(victim == protectedElem, victim.size, needFullFlush, needByteShed, targetZeroCount) {
-			if val, ok := c.eraseInternal(evictQ, victim.key, EvictionReasonPressure); ok {
-				evicted = append(evicted, val)
-			}
+			evicted = append(evicted, c.eraseEntryLocked(evictQ, victim, EvictionReasonPressure))
 		}
 		victim = nextVictim
 	}

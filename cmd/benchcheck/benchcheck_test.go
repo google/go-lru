@@ -660,7 +660,7 @@ Benchmark_ArenaRadixCache_Compact-96              	     100	    520000 ns/op	   
 	assert.Equal(t, "Benchmark_LargeScale_Put_100K/RadixCache", rep.Violations[3].Benchmark)
 	assert.Equal(t, UnitHeapBytesPerEnt, rep.Violations[3].Metric)
 
-	// 5: Benchmark_ArenaRadixCache_Compact violates MinReclaimedBytesOp (200000 < 750000)
+	// 5: Benchmark_ArenaRadixCache_Compact violates MinReclaimedBytesOp (200000 < 680000)
 	assert.Equal(t, "Benchmark_ArenaRadixCache_Compact", rep.Violations[4].Benchmark)
 	assert.Equal(t, UnitReclaimedBytesOp, rep.Violations[4].Metric)
 

@@ -448,7 +448,14 @@ func BenchmarkCompactionAndPressureShedLatency(b *testing.B) {
 						}
 					case *arenaRadix[uint64]:
 						savedNodes := impl.nodes
-						savedNodeMap := impl.nodeMap
+						savedPrefixArena := impl.prefixArena
+						savedLivePrefixBytes := impl.livePrefixBytes
+						savedFreePrefixSpans := impl.freePrefixSpans
+						savedFreePrefixCount := impl.freePrefixCount
+						savedPrefixExposed := impl.prefixExposed.Load()
+						savedHashSlots := impl.hashSlots
+						savedHashMask := impl.hashMask
+						savedHashCount := impl.hashCount
 						savedCollisionPeers := impl.collisionPeers
 						savedCollisionCount := impl.collisionCount
 						savedRoot := impl.root
@@ -461,7 +468,14 @@ func BenchmarkCompactionAndPressureShedLatency(b *testing.B) {
 						savedPeak := impl.peakEntryLen
 						restorePreCompact = func() {
 							impl.nodes = savedNodes
-							impl.nodeMap = savedNodeMap
+							impl.prefixArena = savedPrefixArena
+							impl.livePrefixBytes = savedLivePrefixBytes
+							impl.freePrefixSpans = savedFreePrefixSpans
+							impl.freePrefixCount = savedFreePrefixCount
+							impl.prefixExposed.Store(savedPrefixExposed)
+							impl.hashSlots = savedHashSlots
+							impl.hashMask = savedHashMask
+							impl.hashCount = savedHashCount
 							impl.collisionPeers = savedCollisionPeers
 							impl.collisionCount = savedCollisionCount
 							impl.root = savedRoot

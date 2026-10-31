@@ -17,8 +17,10 @@ package lru
 import (
 	"bytes"
 	"context"
+	"encoding/binary"
 	"fmt"
 	"math"
+	"math/bits"
 	"runtime"
 	"runtime/metrics"
 	"runtime/pprof"
@@ -1631,7 +1633,20 @@ func concatPrefix(a, b string) string {
 // longestCommonPrefix finds the length of the longest common prefix of a and b.
 func longestCommonPrefix(a, b string) int {
 	n := min(len(a), len(b))
-	for i := range n {
+	i := 0
+	if n >= 8 {
+		ab := unsafe.Slice(unsafe.StringData(a), n)
+		bb := unsafe.Slice(unsafe.StringData(b), n)
+		for ; i <= n-8; i += 8 {
+			// Under little-endian byte order, the lowest-indexed differing byte occupies the
+			// least-significant non-zero bits of diff, so TrailingZeros64(diff) >> 3 (dividing
+			// bit offset by 8) yields the exact byte offset of the first mismatch within the 8-byte word.
+			if diff := binary.LittleEndian.Uint64(ab[i:]) ^ binary.LittleEndian.Uint64(bb[i:]); diff != 0 {
+				return i + (bits.TrailingZeros64(diff) >> 3)
+			}
+		}
+	}
+	for ; i < n; i++ {
 		if a[i] != b[i] {
 			return i
 		}

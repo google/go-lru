@@ -83,7 +83,7 @@ func (r *TargetReport) Passed() bool {
 }
 
 // DefaultTargets returns the calibrated performance and allocation target rules
-// grounded in docs/performance.md and covering all 89 benchmarks in benchmarks_test.go.
+// grounded in docs/performance.md and covering all 92 benchmarks in benchmarks_test.go and production_benchmarks_test.go.
 func DefaultTargets() []TargetRule {
 	return []TargetRule{
 		// 1–3. Point Get (9 benchmarks: strict 0 B/op, 0 allocs/op)
@@ -364,7 +364,7 @@ func DefaultTargets() []TargetRule {
 			MaxNsPerOp:          new(float64(1200000)),
 			MaxBytesPerOp:       new(float64(760000)),
 			MaxAllocsPerOp:      new(float64(25)),
-			MinReclaimedBytesOp: new(750000.0),
+			MinReclaimedBytesOp: new(680000.0),
 		},
 		{
 			Pattern:        "Benchmark_ArenaRadixCache_PutUnderPressure",

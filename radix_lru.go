@@ -18,9 +18,9 @@ import (
 	"fmt"
 	"iter"
 	"math"
-	"slices"
 	"strings"
 	"sync"
+	"unsafe"
 )
 
 // radixNode represents a node in the compressed radix tree (trie).
@@ -70,6 +70,12 @@ type radixCache[V any] struct {
 
 	// mu synchronizes concurrent access to all cache data structures.
 	mu sync.RWMutex
+
+	// recycleNodes temporarily holds up to 2 detached radixNode instances during Put's
+	// pre-insert capacity eviction so insertNode can reuse them in-place without heap allocation.
+	recycleNodes    [2]*radixNode[V]
+	recycleLen      uint8
+	recyclingForPut bool
 
 	pressureState
 }
@@ -142,19 +148,20 @@ func (c *radixCache[V]) reconstructKey(node *radixNode[V]) string {
 	if node.parent == c.root {
 		return node.prefix
 	}
-	var stackBuf [64]*radixNode[V]
-	path := stackBuf[:0]
 	totalLen := 0
 	for curr := node; curr != nil && curr != c.root; curr = curr.parent {
-		path = append(path, curr)
 		totalLen += len(curr.prefix)
 	}
-	var b strings.Builder
-	b.Grow(totalLen)
-	for _, n := range slices.Backward(path) {
-		b.WriteString(n.prefix)
+	if totalLen == 0 {
+		return ""
 	}
-	return b.String()
+	buf := make([]byte, totalLen)
+	pos := totalLen
+	for curr := node; curr != nil && curr != c.root; curr = curr.parent {
+		pos -= len(curr.prefix)
+		copy(buf[pos:], curr.prefix)
+	}
+	return unsafe.String(unsafe.SliceData(buf), totalLen)
 }
 
 func (c *radixCache[V]) checkLRUNodeLinkInvariants(curr, prevNode *radixNode[V]) {
@@ -399,6 +406,24 @@ func (n *radixNode[V]) replaceChild(oldChild, newChild *radixNode[V]) {
 	panic("replaceChild: requested child not found in sibling list")
 }
 
+func (c *radixCache[V]) allocNode() *radixNode[V] {
+	if c.recycleLen > 0 {
+		c.recycleLen--
+		n := c.recycleNodes[c.recycleLen]
+		c.recycleNodes[c.recycleLen] = nil
+		return n
+	}
+	return &radixNode[V]{}
+}
+
+func (c *radixCache[V]) freeNode(n *radixNode[V]) {
+	n.prefix = ""
+	if c.recyclingForPut && int(c.recycleLen) < len(c.recycleNodes) {
+		c.recycleNodes[c.recycleLen] = n
+		c.recycleLen++
+	}
+}
+
 // insertNode inserts a new key into the radix tree and returns the leaf node.
 func (c *radixCache[V]) insertNode(key string, value V) *radixNode[V] {
 	node := c.root
@@ -414,11 +439,10 @@ func (c *radixCache[V]) insertNode(key string, value V) *radixNode[V] {
 		child := node.getChild(search[0])
 		if child == nil {
 			// Clone the substring to prevent memory leaks from sliced string headers pinning large backing arrays
-			newLeaf := &radixNode[V]{
-				prefix:   clonePrefix(search),
-				value:    value,
-				hasValue: true,
-			}
+			newLeaf := c.allocNode()
+			newLeaf.prefix = clonePrefix(search)
+			newLeaf.value = value
+			newLeaf.hasValue = true
 			node.addChild(newLeaf)
 			return newLeaf
 		}
@@ -434,10 +458,9 @@ func (c *radixCache[V]) insertNode(key string, value V) *radixNode[V] {
 		// Clone both split prefix halves so surviving intermediate routing nodes never pin
 		// the underlying backing arrays of large evicted leaf keys.
 		oldPrefix := child.prefix
-		splitNode := &radixNode[V]{
-			prefix: clonePrefix(oldPrefix[:lcp]),
-			parent: node,
-		}
+		splitNode := c.allocNode()
+		splitNode.prefix = clonePrefix(oldPrefix[:lcp])
+		splitNode.parent = node
 
 		node.replaceChild(child, splitNode)
 
@@ -451,11 +474,10 @@ func (c *radixCache[V]) insertNode(key string, value V) *radixNode[V] {
 			return splitNode
 		}
 
-		newLeaf := &radixNode[V]{
-			prefix:   clonePrefix(search[lcp:]),
-			value:    value,
-			hasValue: true,
-		}
+		newLeaf := c.allocNode()
+		newLeaf.prefix = clonePrefix(search[lcp:])
+		newLeaf.value = value
+		newLeaf.hasValue = true
 		splitNode.addChild(newLeaf)
 		return newLeaf
 	}
@@ -499,7 +521,7 @@ func (c *radixCache[V]) compressPathUpwards(curr *radixNode[V]) {
 		if curr.child == nil {
 			parent := curr.parent
 			parent.removeChild(curr)
-			curr.prefix = ""
+			c.freeNode(curr)
 			curr = parent
 			continue
 		}
@@ -511,7 +533,7 @@ func (c *radixCache[V]) compressPathUpwards(curr *radixNode[V]) {
 
 			curr.parent.replaceChild(curr, onlyChild)
 			curr.child = nil
-			curr.prefix = ""
+			c.freeNode(curr)
 
 			return
 		}
@@ -786,6 +808,14 @@ func (c *radixCache[V]) updateExistingOnPutLocked(
 	return evictedValues, reclaimedPrePut
 }
 
+// clearRecycleNodes zeroes any unconsumed node pointers in c.recycleNodes after insertNode completes.
+func (c *radixCache[V]) clearRecycleNodes() {
+	for c.recycleLen > 0 {
+		c.recycleLen--
+		c.recycleNodes[c.recycleLen] = nil
+	}
+}
+
 // Put inserts or updates a key-value entry in the cache.
 // If the key exists, its value is updated and moved to MRU.
 // If capacity is exceeded, excess LRU entries are evicted and returned.
@@ -811,6 +841,7 @@ func (c *radixCache[V]) Put(key string, value V) ([]V, error) {
 	if exists {
 		evictedValues, reclaimedPrePut = c.updateExistingOnPutLocked(&evictQ, node, key, value, valueSize, sizeBefore, pressure)
 	} else {
+		c.recyclingForPut = true
 		// Evict from the LRU tail before inserting into the trie to avoid redundant node splits and merges.
 		for c.shouldEvictPreInsertOnPut(valueSize, c.maxSize, c.currentSize, c.len, evictedPrePut) && c.tail != nil {
 			if evicted, ok := c.evictOne(&evictQ); ok {
@@ -818,6 +849,7 @@ func (c *radixCache[V]) Put(key string, value V) ([]V, error) {
 				evictedPrePut = true
 			}
 		}
+		c.recyclingForPut = false
 		if c.shouldReclaimEmptyPrePut(c.len, false, evictedPrePut, valueSize, sizeBefore, pressure) {
 			c.recordCompactionByPressure(pressure)
 			c.clearEmptyTreeStateLocked()
@@ -827,6 +859,7 @@ func (c *radixCache[V]) Put(key string, value V) ([]V, error) {
 			reclaimedPrePut = true
 		}
 		node = c.insertNode(key, value)
+		c.clearRecycleNodes()
 		node.size = valueSize
 		c.pushFront(node)
 		c.putInserted++
