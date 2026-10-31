@@ -346,7 +346,7 @@ func resolveWeigher[V any](options Options) func(string, V) uint64 {
 // configured, OnEvictValue is invoked before OnEvictEntry. Capacity and pressure evictions invoke
 // callbacks in LRU-to-MRU order; DeletePrefix invokes callbacks once per removed entry in an
 // unspecified order. Prefer WithOnEvictValue when the key is not needed, as it avoids key
-// reconstruction overhead on RadixCache.
+// reconstruction overhead on RadixCache and ArenaRadixCache.
 //
 // For zero heap allocations on hot paths, pass a function whose value parameter type V matches
 // the target Cache[V]. A type-erased WithOnEvictValue[any] is also supported for shared Options

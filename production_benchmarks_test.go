@@ -594,6 +594,79 @@ func BenchmarkGCPauseAndScanOverhead(b *testing.B) {
 	})
 }
 
+const (
+	orbaxAlphabet   = "0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ_-"
+	orbaxRootPrefix = "gs://orbax-checkpoints-prod-us-central1/models/gemini-ultra-v4/experiments/exp_2026_10_train/step_0042/transformer/"
+	orbaxLeafSuffix = "_attention_qkv_projection_kernel_sharded_tensor_chunk_data.ocdb"
+)
+
+func buildOrbaxKeys(numDirs, shardsPerDir int) []string {
+	keys := make([]string, 0, numDirs*shardsPerDir)
+	var keyBuf [187]byte
+	copy(keyBuf[:115], orbaxRootPrefix)
+	copy(keyBuf[116:121], "/lyr_")
+	keyBuf[122] = '/'
+	copy(keyBuf[124:187], orbaxLeafSuffix)
+
+	for d := range numDirs {
+		keyBuf[115] = orbaxAlphabet[d/64]
+		keyBuf[121] = orbaxAlphabet[d%64]
+		for s := range shardsPerDir {
+			keyBuf[123] = orbaxAlphabet[s]
+			keys = append(keys, string(keyBuf[:]))
+		}
+	}
+	return keys
+}
+
+// Benchmark_Production_MemoryFootprint measures the net live heap memory per entry (heap-B/entry)
+// across MapCache, RadixCache, and ArenaRadixCache on 187-byte Orbax checkpoint paths (123-byte
+// shared directory prefix + 64-byte leaf tensor shard suffix).
+func Benchmark_Production_MemoryFootprint(b *testing.B) {
+	const (
+		numDirs      = 512
+		shardsPerDir = 64
+		numEntries   = numDirs * shardsPerDir
+	)
+
+	for _, bf := range allBackendFactories[uint64]() {
+		b.Run(bf.name, func(b *testing.B) {
+			b.ReportAllocs()
+			var mBefore, mAfter runtime.MemStats
+			var lastCache Cache[uint64]
+
+			for iter := range b.N {
+				b.StopTimer()
+				if iter == b.N-1 {
+					runtime.GC()
+					runtime.GC()
+					runtime.ReadMemStats(&mBefore)
+				}
+				keys := buildOrbaxKeys(numDirs, shardsPerDir)
+				c := bf.make(uint64(numEntries * 2))
+				b.StartTimer()
+
+				for j, k := range keys {
+					_, _ = c.Put(k, uint64(j))
+				}
+
+				if iter == b.N-1 {
+					b.StopTimer()
+					lastCache = c
+					runtime.GC()
+					runtime.GC()
+					runtime.ReadMemStats(&mAfter)
+					runtime.KeepAlive(lastCache)
+					b.StartTimer()
+				}
+			}
+			if mAfter.HeapAlloc > mBefore.HeapAlloc {
+				b.ReportMetric(float64(mAfter.HeapAlloc-mBefore.HeapAlloc)/float64(numEntries), "heap-B/entry")
+			}
+		})
+	}
+}
+
 // ============================================================================
 // Suite 2.6: Pressure Sampling Overhead (H-01 runtime.Stack) & Eviction Callbacks
 // ============================================================================

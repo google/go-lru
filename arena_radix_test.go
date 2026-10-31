@@ -939,33 +939,33 @@ func TestArenaRadixCache_CheckInvariants_PanicScenarios(t *testing.T) {
 		})
 	})
 
-	t.Run("RootNonZeroEdgeStart", func(t *testing.T) {
+	t.Run("RootNonZeroKeyLen", func(t *testing.T) {
 		c := NewArenaRadixCache[testData](50, testDataWeigher).(*arenaRadix[testData])
-		c.nodes[c.root].setEdgeStart(1)
+		c.nodes[c.root].setKeyLen(1)
 		assert.Panics(t, func() {
 			c.checkInvariants()
 		})
 	})
 
-	t.Run("ChildInvalidEdgeStart", func(t *testing.T) {
+	t.Run("ChildInvalidKeyLen", func(t *testing.T) {
 		c := NewArenaRadixCache[testData](50, testDataWeigher).(*arenaRadix[testData])
 		_, err := c.Put("a/b", testData{value: 1, dataSize: 10})
 		require.NoError(t, err)
 		childID := c.nodes[c.root].child
 		require.NotEqual(t, nilNode, childID)
-		c.nodes[childID].setEdgeStart(1)
+		c.nodes[childID].setKeyLen(99)
 		assert.Panics(t, func() {
 			c.checkInvariants()
 		})
 	})
 
-	t.Run("FreeListNodeNonZeroEdgeStart", func(t *testing.T) {
+	t.Run("FreeListNodeNonZeroKeyLen", func(t *testing.T) {
 		c := NewArenaRadixCache[testData](50, testDataWeigher).(*arenaRadix[testData])
 		_, _ = c.Put("k1", testData{value: 1, dataSize: 10})
 		_, _ = c.Put("k2", testData{value: 2, dataSize: 10})
 		_, _ = c.Delete("k1")
 		require.NotEqual(t, nilNode, c.freeHead)
-		c.nodes[c.freeHead].setEdgeStart(2)
+		c.nodes[c.freeHead].setKeyLen(2)
 		assert.Panics(t, func() {
 			c.checkInvariants()
 		})
@@ -998,7 +998,7 @@ func TestArenaRadixCache_CheckInvariants_PanicScenarios(t *testing.T) {
 
 		// 5. Duplicate peer IDs in collisionPeers[h1]
 		delete(c.nodeMap, h2)
-		c.nodes[id2].fullKey = "k1"
+		c.nodes[id2].prefix = "1"
 		c.collisionPeers = map[uint64][]uint32{h1: {id2, id2}}
 		c.collisionCount = 2
 		assert.Panics(t, func() { c.checkNodeMapInvariants() })
@@ -1748,8 +1748,8 @@ func TestArenaRadixCache_HashCollisionAndNodeMapHealing(t *testing.T) {
 		id3 := c.nodeMap[h3]
 		delete(c.nodeMap, h2)
 		delete(c.nodeMap, h3)
-		c.nodes[id2].fullKey = "k1"
-		c.nodes[id3].fullKey = "k1"
+		c.nodes[id2].prefix = "1"
+		c.nodes[id3].prefix = "1"
 
 		// Promote id2 and id3 into h1's bucket so id1 and id2 become active collisionPeers[h1].
 		c.promoteCollisionPeerLocked(h1, id2)
@@ -1825,7 +1825,7 @@ func TestArenaRadixCache_HashCollisionAndNodeMapHealing(t *testing.T) {
 		id1 := c.nodeMap[h1]
 		id2 := c.nodeMap[h2]
 		delete(c.nodeMap, h2)
-		c.nodes[id2].fullKey = "k1"
+		c.nodes[id2].prefix = "1"
 		c.nodeMapDirty = true
 
 		// 1. Contiguous compaction (c.freeHead == nilNode) rebuilds collisionPeers and collisionCount.
@@ -1871,7 +1871,7 @@ func TestArenaRadixCache_HashCollisionAndNodeMapHealing(t *testing.T) {
 		idTail := c.nodeMap[hTail]
 		idHead := c.nodeMap[hColl]
 		delete(c.nodeMap, hTail)
-		c.nodes[idTail].fullKey = "head-coll"
+		c.nodes[idTail].prefix = "head-coll"
 		c.promoteCollisionPeerLocked(hColl, idTail)
 		require.Equal(t, idTail, c.nodeMap[hColl])
 		require.Equal(t, []uint32{idHead}, c.collisionPeers[hColl])
@@ -1939,13 +1939,12 @@ func TestArenaRadixCache_DeepHierarchyOver64LevelsAndRoutingPrefixCloning(t *tes
 
 	t.Run("RoutingPrefixDoesNotPinLargeKeyBackingArray", func(t *testing.T) {
 		// Arrange: Put two 64 KiB keys ("dir/A" + 64 KiB suffix and "dir/B" + 64 KiB suffix)
-		// so splitting at "dir/" invokes slicePrefix with both candidate strings having > 64 bytes
-		// of trailing capacity (exercising clonePrefix(src[:end])), then insert short sibling keys
+		// so splitting at "dir/" invokes clonePrefix on both split halves, then insert short sibling keys
 		// ("dir/a" and "dir/b") and erase both 64 KiB keys so the "dir/" routing node survives.
 		//
-		// White-box testing rationale: String backing-array aliasing on internal routing nodes is
-		// invisible to public Get results, so verifying that the 4-byte "dir/" routing prefix does not pin
-		// either 64 KiB key buffer requires inspecting unsafe.StringData on the internal routing node.
+		// White-box testing rationale: String backing-array aliasing on internal routing and leaf nodes is
+		// invisible to public Get results, so verifying that the 4-byte "dir/" routing prefix and leaf suffixes
+		// do not pin caller key buffers requires inspecting unsafe.StringData on the internal arena nodes.
 		c := NewArenaRadixCache[string](1<<20, WithInvariantChecking(true)).(*arenaRadix[string])
 		largeKeyA := strings.Clone("dir/A" + strings.Repeat("X", 1<<16))
 		largeKeyB := strings.Clone("dir/B" + strings.Repeat("Y", 1<<16))
@@ -1959,6 +1958,11 @@ func TestArenaRadixCache_DeepHierarchyOver64LevelsAndRoutingPrefixCloning(t *tes
 		_, err = c.Put(largeKeyB, "vb_large")
 		require.NoError(t, err)
 
+		// Also verify leaf node prefix is detached from the caller's backing array while live.
+		leafIDB := c.nodeMap[c.hashKey(largeKeyB)]
+		leafPrefixPtrB := uintptr(unsafe.Pointer(unsafe.StringData(c.nodes[leafIDB].prefix)))
+		assert.True(t, leafPrefixPtrB < largeStartB || leafPrefixPtrB >= largeEndB, "leaf node prefix must not pin largeKeyB backing array")
+
 		// Act: Insert short sibling keys and erase both 64 KiB keys.
 		_, err = c.Put("dir/a", "va")
 		require.NoError(t, err)
@@ -1967,11 +1971,11 @@ func TestArenaRadixCache_DeepHierarchyOver64LevelsAndRoutingPrefixCloning(t *tes
 		_, _ = c.Delete(largeKeyA)
 		_, _ = c.Delete(largeKeyB)
 
-		// Assert: Routing node fullKey "dir/" does not alias either 64 KiB key's backing array.
+		// Assert: Routing node prefix "dir/" does not alias either 64 KiB key's backing array.
 		routingID := c.nodes[c.root].child
 		require.NotEqual(t, nilNode, routingID)
-		assert.Equal(t, "dir/", c.nodes[routingID].fullKey)
-		prefixPtr := uintptr(unsafe.Pointer(unsafe.StringData(c.nodes[routingID].fullKey)))
+		assert.Equal(t, "dir/", c.nodes[routingID].prefix)
+		prefixPtr := uintptr(unsafe.Pointer(unsafe.StringData(c.nodes[routingID].prefix)))
 		assert.True(t, prefixPtr < largeStartA || prefixPtr >= largeEndA, "routing node prefix must not pin largeKeyA backing array")
 		assert.True(t, prefixPtr < largeStartB || prefixPtr >= largeEndB, "routing node prefix must not pin largeKeyB backing array")
 		runtime.KeepAlive(largeKeyA)
@@ -2207,16 +2211,10 @@ func TestArenaRadixCache_Iterators(t *testing.T) {
 			require.NoError(t, err)
 		}
 		ac := cNoInv.(*arenaRadix[testData])
-		allSeq := cNoInv.All()
-		keySeq := cNoInv.Keys()
+		assert.Empty(t, ac.reconstructKey(nilNode))
+		assert.Empty(t, ac.reconstructKey(ac.root))
 		valSeq := cNoInv.Values()
 		allocs := testing.AllocsPerRun(100, func() {
-			allSeq(func(k string, v testData) bool {
-				return k != "" && v.value >= 0
-			})
-			keySeq(func(k string) bool {
-				return k != ""
-			})
 			valSeq(func(v testData) bool {
 				return v.value >= 0
 			})
@@ -2226,7 +2224,7 @@ func TestArenaRadixCache_Iterators(t *testing.T) {
 				}
 			}
 		})
-		assert.Zero(t, allocs, "ArenaRadixCache All(), Keys(), and Values() must allocate 0 heap objects")
+		assert.Zero(t, allocs, "ArenaRadixCache.Values() must allocate 0 heap objects")
 
 		// Confirm iteration did not mutate LRU eviction order: inserting k5 (10B) evicts oldest entry k0 (value 1).
 		evicted, err := c.Put("arena/k5", testData{value: 6, dataSize: 10})
@@ -2377,6 +2375,64 @@ func TestArenaRadixCache_StatsArenaNodesAndHashFallbacks(t *testing.T) {
 		require.True(t, ok)
 		assert.Equal(t, int64(102), v.value)
 		assert.Equal(t, uint64(5), cCollide.Stats().ArenaHashFallbacks)
+		delete(cCollide.nodeMap, hAlphaCollide)
+
+		// Equal-length multi-level leaf suffix mismatch ("dir/sub/alpha" vs "dir/sub/bravo", both keyLen == 13).
+		_, err = cCollide.Put("dir/sub/alpha", testData{value: 300, dataSize: 10})
+		require.NoError(t, err)
+		_, err = cCollide.Put("dir/sub/bravo", testData{value: 400, dataSize: 10})
+		require.NoError(t, err)
+		hSubAlpha := cCollide.hashKey("dir/sub/alpha")
+		idSubBravo := cCollide.nodeMap[cCollide.hashKey("dir/sub/bravo")]
+		require.NotZero(t, idSubBravo)
+		assert.False(t, cCollide.verifyKey(idSubBravo, "dir/sub/alpha"))
+
+		cCollide.nodeMap[hSubAlpha] = idSubBravo
+		v, ok = cCollide.Peek("dir/sub/alpha")
+		require.True(t, ok)
+		assert.Equal(t, int64(300), v.value)
+		assert.Equal(t, uint64(6), cCollide.Stats().ArenaHashFallbacks)
+
+		v, ok = cCollide.Get("dir/sub/alpha")
+		require.True(t, ok)
+		assert.Equal(t, int64(300), v.value)
+		assert.Equal(t, uint64(7), cCollide.Stats().ArenaHashFallbacks)
+
+		// Equal-length multi-level ancestor prefix mismatch with identical leaf suffixes ("dirA/item1" vs "dirB/item1", both keyLen == 10, leaf suffix "1").
+		_, err = cCollide.Put("dirA/item1", testData{value: 500, dataSize: 10})
+		require.NoError(t, err)
+		_, err = cCollide.Put("dirA/item2", testData{value: 501, dataSize: 10})
+		require.NoError(t, err)
+		_, err = cCollide.Put("dirB/item1", testData{value: 600, dataSize: 10})
+		require.NoError(t, err)
+		_, err = cCollide.Put("dirB/item2", testData{value: 601, dataSize: 10})
+		require.NoError(t, err)
+
+		hDirA1 := cCollide.hashKey("dirA/item1")
+		idDirA1 := cCollide.nodeMap[hDirA1]
+		idDirB1 := cCollide.nodeMap[cCollide.hashKey("dirB/item1")]
+		require.NotZero(t, idDirA1)
+		require.NotZero(t, idDirB1)
+		assert.False(t, cCollide.verifyKey(idDirB1, "dirA/item1"))
+
+		cCollide.nodeMap[hDirA1] = idDirB1
+		v, ok = cCollide.Peek("dirA/item1")
+		require.True(t, ok)
+		assert.Equal(t, int64(500), v.value)
+		assert.Equal(t, uint64(8), cCollide.Stats().ArenaHashFallbacks)
+
+		v, ok = cCollide.Get("dirA/item1")
+		require.True(t, ok)
+		assert.Equal(t, int64(500), v.value)
+		assert.Equal(t, uint64(9), cCollide.Stats().ArenaHashFallbacks)
+
+		// Corrupt keyLen guards in verifyKey: (a) end < len(prefix) at an ancestor, and (b) end > 0 at c.root.
+		savedDirA1KeyLen := cCollide.nodes[idDirA1].keyLen()
+		cCollide.nodes[idDirA1].setKeyLen(2)
+		assert.False(t, cCollide.verifyKey(idDirA1, "x1"))
+		cCollide.nodes[idDirA1].setKeyLen(12)
+		assert.False(t, cCollide.verifyKey(idDirA1, "xxdirA/item1"))
+		cCollide.nodes[idDirA1].setKeyLen(savedDirA1KeyLen)
 	})
 }
 
@@ -2455,12 +2511,12 @@ func TestArenaRadix_CacheLineLayoutAndStructAlignment(t *testing.T) {
 		unsafe.Offsetof(rc.root), unsafe.Offsetof(rc.mu),
 		unsafe.Offsetof(ac.nodes), acMuOffset)
 
-	// Act & Assert 3: arenaRadixNode[uint64] embeds `fullKey string` at offset 0 and `edgeStartAndFlags uint32` at offset 44.
+	// Act & Assert 3: arenaRadixNode[uint64] embeds `prefix string` at offset 0 and `keyLenAndFlags uint32` at offset 44.
 	var node arenaRadixNode[uint64]
-	assert.Equal(t, uintptr(0), unsafe.Offsetof(node.fullKey))
-	assert.Equal(t, uintptr(16), unsafe.Sizeof(node.fullKey))
-	assert.Equal(t, uintptr(44), unsafe.Offsetof(node.edgeStartAndFlags))
-	assert.Equal(t, uintptr(4), unsafe.Sizeof(node.edgeStartAndFlags))
+	assert.Equal(t, uintptr(0), unsafe.Offsetof(node.prefix))
+	assert.Equal(t, uintptr(16), unsafe.Sizeof(node.prefix))
+	assert.Equal(t, uintptr(44), unsafe.Offsetof(node.keyLenAndFlags))
+	assert.Equal(t, uintptr(4), unsafe.Sizeof(node.keyLenAndFlags))
 	assert.Equal(t, uintptr(56), unsafe.Sizeof(node))
 	nodeType := reflect.TypeFor[arenaRadixNode[uint64]]()
 	assert.Equal(t, reflect.String, nodeType.Field(0).Type.Kind())
@@ -2496,19 +2552,33 @@ func TestArenaRadix_AllocationCharacterization_PathCompressionAndDeepKeys(t *tes
 			assert.Zero(t, testing.AllocsPerRun(50, func() {
 				valSeq(func(v uint64) bool { return v > 0 })
 			}), "backend %v Values must be 0 allocs/op", b)
-			if b != BackendRadix {
+			if b == BackendMap {
 				assert.Zero(t, testing.AllocsPerRun(50, func() {
 					allSeq(func(k string, v uint64) bool { return k != "" && v > 0 })
 				}), "backend %v All must be 0 allocs/op", b)
 				assert.Zero(t, testing.AllocsPerRun(50, func() {
 					keySeq(func(k string) bool { return k != "" })
 				}), "backend %v Keys must be 0 allocs/op", b)
+			} else {
+				cDepth1 := New[uint64](100, WithBackend(b))
+				_, _ = cDepth1.Put("alpha", 1)
+				_, _ = cDepth1.Put("bravo", 2)
+				allDepth1Seq := cDepth1.All()
+				keyDepth1Seq := cDepth1.Keys()
+				assert.Zero(t, testing.AllocsPerRun(50, func() {
+					allDepth1Seq(func(k string, v uint64) bool { return k != "" && v > 0 })
+				}), "backend %v depth-1 All must be 0 allocs/op", b)
+				assert.Zero(t, testing.AllocsPerRun(50, func() {
+					keyDepth1Seq(func(k string) bool { return k != "" })
+				}), "backend %v depth-1 Keys must be 0 allocs/op", b)
 			}
 		}
 	})
 
-	t.Run("ZeroAllocPathCompressionAndDeepHashNodeKey", func(t *testing.T) {
-		// Arrange: Splitting an edge and compressing the path on delete both execute with 0 heap allocations.
+	t.Run("RadixSplitAndCompressAndDeepHashNodeKey", func(t *testing.T) {
+		// Arrange: In RadixCache and ArenaRadixCache, inserting a sibling key that splits an edge
+		// into multi-byte segments calls clonePrefix 3 times (3 heap allocs), and deleting
+		// that key calls compressPathUpwards which executes concatPrefix (1 heap alloc).
 		arenaC := NewArenaRadixCache[int](100)
 		_, _ = arenaC.Put("service/users/profile/1001_alpha", 1)
 		k2 := "service/users/profile/1002_beta"
@@ -2522,22 +2592,108 @@ func TestArenaRadix_AllocationCharacterization_PathCompressionAndDeepKeys(t *tes
 		})
 
 		// Assert
-		assert.Zero(t, allocs,
-			"ArenaRadixCache steady-state split+compress cycle must allocate 0 heap objects")
+		assert.GreaterOrEqual(t, allocs, 4.0,
+			"ArenaRadixCache split+compress cycle allocates >= 4 cloned edge prefix strings per Put+Delete")
 
-		// Verify O(1) zero-allocation hashNodeKey even at depth > 64.
+		// Verify zero-allocation hashNodeKey across root/nilNode, stack-buffered deep keys (depth 75),
+		// and streaming maphash.Hash fallback for keys > 512 bytes.
 		arenaDeep := NewArenaRadixCache[int](200).(*arenaRadix[int])
+		assert.Equal(t, arenaDeep.hashKey(""), arenaDeep.hashNodeKey(nilNode))
+		assert.Equal(t, arenaDeep.hashKey(""), arenaDeep.hashNodeKey(arenaDeep.root))
+
 		var deepSB strings.Builder
 		for i := 1; i <= 75; i++ {
 			fmt.Fprintf(&deepSB, "/%02d", i)
 			_, _ = arenaDeep.Put(deepSB.String(), i)
 		}
+		depth2Key := "/01/02"
+		depth2ID := arenaDeep.nodeMap[arenaDeep.hashKey(depth2Key)]
+		depth10Key := "/01/02/03/04/05/06/07/08/09/10"
+		depth10ID := arenaDeep.nodeMap[arenaDeep.hashKey(depth10Key)]
 		deepLeafKey := deepSB.String()
 		deepLeafID := arenaDeep.nodeMap[arenaDeep.hashKey(deepLeafKey)]
+
+		assert.Equal(t, arenaDeep.hashKey(depth2Key), arenaDeep.hashNodeKey(depth2ID))
+		assert.Zero(t, testing.AllocsPerRun(100, func() {
+			_ = arenaDeep.hashNodeKey(depth2ID)
+		}), "hashNodeKey is 0 allocs for depth == 2 (totalLen <= 64)")
+
+		assert.Equal(t, arenaDeep.hashKey(depth10Key), arenaDeep.hashNodeKey(depth10ID))
+		assert.Zero(t, testing.AllocsPerRun(100, func() {
+			_ = arenaDeep.hashNodeKey(depth10ID)
+		}), "hashNodeKey is 0 allocs for depth == 10 >= 3 (totalLen <= 64)")
+
+		savedDepth2KeyLen := arenaDeep.nodes[depth2ID].keyLen()
+		arenaDeep.nodes[depth2ID].setKeyLen(2)
+		assert.Equal(t, arenaDeep.hashKey(depth2Key), arenaDeep.hashNodeKey(depth2ID))
+		arenaDeep.nodes[depth2ID].setKeyLen(40)
+		assert.Equal(t, arenaDeep.hashKey(depth2Key), arenaDeep.hashNodeKey(depth2ID))
+		arenaDeep.nodes[depth2ID].setKeyLen(savedDepth2KeyLen)
+
+		savedDepth10KeyLen := arenaDeep.nodes[depth10ID].keyLen()
+		arenaDeep.nodes[depth10ID].setKeyLen(2)
+		assert.Equal(t, arenaDeep.hashKey(depth10Key), arenaDeep.hashNodeKey(depth10ID))
+		arenaDeep.nodes[depth10ID].setKeyLen(40)
+		assert.Equal(t, arenaDeep.hashKey(depth10Key), arenaDeep.hashNodeKey(depth10ID))
+		arenaDeep.nodes[depth10ID].setKeyLen(savedDepth10KeyLen)
 
 		deepHashAllocs := testing.AllocsPerRun(100, func() {
 			_ = arenaDeep.hashNodeKey(deepLeafID)
 		})
-		assert.Zero(t, deepHashAllocs, "hashNodeKey is O(1) and 0 allocs at any depth")
+		assert.Zero(t, deepHashAllocs, "hashNodeKey is 0 allocs for keys <= 512 bytes even at depth > 64")
+
+		// Also verify hashNodeKey and reconstructKey fallbacks when keyLen mismatches prefix chain (e.g. white-box mutation).
+		savedKeyLen := arenaDeep.nodes[deepLeafID].keyLen()
+		arenaDeep.nodes[deepLeafID].setKeyLen(2)
+		assert.Equal(t, arenaDeep.hashKey(deepLeafKey), arenaDeep.hashNodeKey(deepLeafID))
+		assert.Equal(t, deepLeafKey, arenaDeep.reconstructKey(deepLeafID))
+		arenaDeep.nodes[deepLeafID].setKeyLen(100)
+		assert.Equal(t, arenaDeep.hashKey(deepLeafKey), arenaDeep.hashNodeKey(deepLeafID))
+		arenaDeep.nodes[deepLeafID].setKeyLen(500)
+		assert.Equal(t, deepLeafKey, arenaDeep.reconstructKey(deepLeafID))
+		arenaDeep.nodes[deepLeafID].setKeyLen(savedKeyLen)
+
+		// Verify DeletePrefix / freeSubtree / initSubtreeKeyBuf fallback paths for keys > 512 bytes
+		// (both when subtree root keyLen <= 512 with > 512B descendants and when subtree root keyLen > 512),
+		// as well as the single-leaf fast path in freeSubtree (when matched prefix node has child == nilNode).
+		var evictedLargeKeys []string
+		arenaLargePrefix := NewArenaRadixCache[int](100, WithOnEvictEntry(func(k string, _ int, _ EvictionReason) {
+			evictedLargeKeys = append(evictedLargeKeys, k)
+		})).(*arenaRadix[int])
+		longBase := "large_prefix/" + strings.Repeat("x", 500)
+		kLargeA := longBase + "/child_a_" + strings.Repeat("a", 50)
+		kLargeB := longBase + "/child_b_" + strings.Repeat("b", 50)
+		_, _ = arenaLargePrefix.Put("large_prefix/short", 1)
+		_, _ = arenaLargePrefix.Put(kLargeA, 2)
+		_, _ = arenaLargePrefix.Put(kLargeB, 3)
+		arenaLargePrefix.DeletePrefix("large_prefix/short")
+		assert.Equal(t, []string{"large_prefix/short"}, evictedLargeKeys)
+		evictedLargeKeys = nil
+		_, _ = arenaLargePrefix.Put("large_prefix/short", 1)
+		arenaLargePrefix.DeletePrefix("large_prefix/")
+		assert.Zero(t, arenaLargePrefix.len)
+		assert.ElementsMatch(t, []string{"large_prefix/short", kLargeA, kLargeB}, evictedLargeKeys)
+
+		// Also verify initSubtreeKeyBuf fallback when subtree root itself exceeds 512 bytes or has mismatched keyLen,
+		// and single-leaf DeletePrefix without an onEvictEntry callback.
+		arenaLargeRoot := NewArenaRadixCache[int](100).(*arenaRadix[int])
+		_, _ = arenaLargeRoot.Put("large_prefix/short", 1)
+		arenaLargeRoot.DeletePrefix("large_prefix/short")
+		assert.Zero(t, arenaLargeRoot.len)
+		_, _ = arenaLargeRoot.Put(kLargeA, 2)
+		_, _ = arenaLargeRoot.Put(kLargeB, 3)
+		var testBuf [512]byte
+		rootChildID := arenaLargeRoot.nodes[arenaLargeRoot.root].child
+		_, okBuf := arenaLargeRoot.initSubtreeKeyBuf(rootChildID, &testBuf)
+		assert.False(t, okBuf, "initSubtreeKeyBuf must return false when node keyLen > 512")
+		arenaLargeRoot.nodes[rootChildID].setKeyLen(2)
+		_, okBuf = arenaLargeRoot.initSubtreeKeyBuf(rootChildID, &testBuf)
+		assert.False(t, okBuf, "initSubtreeKeyBuf must return false when keyLen is smaller than prefix length")
+		arenaLargeRoot.nodes[rootChildID].setKeyLen(500)
+		_, okBuf = arenaLargeRoot.initSubtreeKeyBuf(rootChildID, &testBuf)
+		assert.False(t, okBuf, "initSubtreeKeyBuf must return false when keyLen does not match ancestor prefixes")
+		arenaLargeRoot.nodes[rootChildID].setKeyLen(len(longBase + "/child_"))
+		arenaLargeRoot.DeletePrefix(longBase)
+		assert.Zero(t, arenaLargeRoot.len)
 	})
 }

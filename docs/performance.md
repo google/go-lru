@@ -22,13 +22,13 @@ All reference benchmarks were collected on an **Intel Xeon CPU @ 2.60GHz (96 vCP
 | **Individual Delete (`Delete`)** | 237.9 ns/op (0 B, 0 allocs) | **147.7 ns/op** (0 B, 0 allocs) | 310.6 ns/op (0 B, 0 allocs) |
 | **Stats Snapshot (`Stats()`)** | **~16 ns/op** (0 B, 0 allocs) | **~16 ns/op** (0 B, 0 allocs) | **~17 ns/op** (0 B, 0 allocs) |
 
-> ¹ **Existing-key overwrite `Put`** (when the working set fits within `maxSize`) updates the entry in place with **0 B, 0 allocs/op** across `MapCache`, `RadixCache`, and `ArenaRadixCache`, and a new-entry `Put` into a warm `MapCache` allocates only **1 heap node (`*entry[V]`)** thanks to its generic intrusive doubly-linked list (`entryList[V]`). `MapCache` and `RadixCache` defensively clone multi-byte non-digit keys/prefixes via `clonePrefix` (`strings.Clone`) so caller substring backing arrays are never pinned, whereas `ArenaRadixCache` stores `fullKey` directly on leaf nodes (`0` key-clone allocations on leaf insert) and uses `slicePrefix` during internal edge splits to call `clonePrefix(src[:end])` only when the shorter candidate key `src` has more than 64 trailing bytes past the split offset (`len(src)-end > 64`). By contrast, `Benchmark_Put_*` configures `capacity := uint64(len(keys) * 5)` (50,000 B for a 10,000-key × 10 B working set, holding 5,000 of the 10,000 keys), exercising **50%-capacity turnover `Put`** where every `Put` after warmup is a new-key write paired with an LRU tail eviction: `MapCache` and `RadixCache` allocate `strings.Clone` + intrusive `*entry[V]` or `*radixNode[V]` + evicted `[]V` slice per post-warmup turnover write (**2–3 allocs/op** after `testing.B` integer truncation across the initial 5,000 warmup puts), whereas `ArenaRadixCache` allocates only the evicted `[]V` slice (**<= 1 allocs/op** / **0–1 allocs/op**, with **0 node allocations** thanks to intrusive free-list node recycling).
+> ¹ **Existing-key overwrite `Put`** (when the working set fits within `maxSize`) updates the entry in place with **0 B, 0 allocs/op** across `MapCache`, `RadixCache`, and `ArenaRadixCache`, and a new-entry `Put` into a warm `MapCache` allocates only **1 heap node (`*entry[V]`)** thanks to its generic intrusive doubly-linked list (`entryList[V]`). All three backends defensively clone multi-byte non-digit keys/edge suffixes via `clonePrefix` (`strings.Clone`) so caller substring backing arrays are never pinned by leaf or routing nodes. By contrast, `Benchmark_Put_*` configures `capacity := uint64(len(keys) * 5)` (50,000 B for a 10,000-key × 10 B working set, holding 5,000 of the 10,000 keys), exercising **50%-capacity turnover `Put`** where every `Put` after warmup is a new-key write paired with an LRU tail eviction: `MapCache` and `RadixCache` allocate `strings.Clone` + intrusive `*entry[V]` or `*radixNode[V]` + evicted `[]V` slice per post-warmup turnover write (**2–3 allocs/op** after `testing.B` integer truncation across the initial 5,000 warmup puts), whereas `ArenaRadixCache` recycles arena node slots via its intrusive free-list (**<= 1 allocs/op** after integer truncation across the warmup phase, with **0 node allocations**).
 >
 > ² `Replace` performs **0 heap allocations** across all three backends (`MapCache`, `RadixCache`, and `ArenaRadixCache`), storing the generic value `V` directly in the node/entry without interface boxing.
 
 ### Key Takeaways
 - **`MapCache`** achieves the lowest single-key point lookup (~50 ns) and write (~98 ns in-place overwrite; ~383–466 ns under 50%-capacity turnover) latency when keys are flat and prefix operations are rare.
-- **`ArenaRadixCache`** accelerates radix lookups by **1.6x–1.7x** over `RadixCache` (~100 ns vs ~170 ns) via its seeded 64-bit `hash/maphash` index and `O(1)` `fullKey` verifier (`verifyKey`).
+- **`ArenaRadixCache`** accelerates radix lookups by **1.6x–1.7x** over `RadixCache` (~100 ns vs ~170 ns) via its seeded 64-bit `hash/maphash` index and zero-allocation `keyLen` + suffix verifier (`verifyKey`).
 - All three backends (**`MapCache`**, **`RadixCache`**, and **`ArenaRadixCache`**) perform in-place value updates (`Replace` and existing-key `Put` overwrites) and telemetry snapshots (`Stats()`) with **0 internal heap allocations per operation**, and `ArenaRadixCache` recycles deleted node indices in steady state via its intrusive free-list (`<= 1 allocs/op` vs `2–3 allocs/op` during 50%-capacity turnover).
 
 ---
@@ -85,7 +85,7 @@ go test -run=^$ -bench="Benchmark(KeyDistributions|PayloadSizes|ConcurrencyScali
 
 ## 5. Enforcing Performance Targets & Regression Thresholds (`./cmd/benchcheck`)
 
-`./cmd/benchcheck` is a zero-dependency Go command that parses `go test -bench=^Benchmark_ -benchmem` output (including multi-sample `-count=N` runs and custom metrics `heap-B/entry` and `reclaimed-B/op`), enforces calibrated absolute performance and zero-allocation targets across all 89 target-enforced `Benchmark_*` sub-benchmarks, and detects relative regressions between a baseline and candidate run.
+`./cmd/benchcheck` is a zero-dependency Go command that parses `go test -bench=^Benchmark_ -benchmem` output (including multi-sample `-count=N` runs and custom metrics `heap-B/entry` and `reclaimed-B/op`), enforces calibrated absolute performance and zero-allocation targets across all 92 target-enforced `Benchmark_*` sub-benchmarks, and detects relative regressions between a baseline and candidate run.
 
 ### Local Target & Regression Verification
 
@@ -118,6 +118,7 @@ go run ./cmd/benchcheck -base benchmark-base.txt -head benchmark-head.txt -forma
 | `-min-allocs-delta` | `1.0` | Minimum absolute `allocs/op` increase required to flag a regression |
 | `-min-custom-delta` | `1.0` | Minimum absolute custom metric delta required to flag a regression |
 | `-strict-missing` | `false` | Fail if any baseline benchmark is missing from candidate or unmatched by target rules |
+| `-allow-within-targets` | `true` | Allow relative increases that remain within configured absolute target budgets |
 | `-format` | `"markdown"` | Output report format (`"markdown"` or `"text"`) |
 | `-summary` | `""` | Optional path (e.g., `$GITHUB_STEP_SUMMARY`) to append the Markdown report to |
 
