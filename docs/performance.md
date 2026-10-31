@@ -10,16 +10,16 @@ All reference benchmarks were collected on an **Intel Xeon CPU @ 2.60GHz (96 vCP
 
 | Operation | `MapCache` | `RadixCache` | `ArenaRadixCache` |
 | :--- | :--- | :--- | :--- |
-| **Get (Flat)** | **50.6 ns/op** (0 B, 0 allocs) | 174.0 ns/op (0 B, 0 allocs) | 100.7 ns/op (0 B, 0 allocs) |
-| **Get (Nested, Depth 2)** | **49.5 ns/op** (0 B, 0 allocs) | 169.6 ns/op (0 B, 0 allocs) | 107.8 ns/op (0 B, 0 allocs) |
-| **Get (Deeply Nested, Depth 10)** | **64.3 ns/op** (0 B, 0 allocs) | 185.2 ns/op (0 B, 0 allocs) | 194.1 ns/op (0 B, 0 allocs) |
-| **Peek (`Peek`)** | **33.2 ns/op** (0 B, 0 allocs) | 163.3 ns/op (0 B, 0 allocs) | 103.8 ns/op (0 B, 0 allocs) |
-| **Put (Existing-Key Overwrite, In-Place)**¹ | **97.7 ns/op** (0 B, 0 allocs in-place) | 178.2 ns/op (0 B, 0 allocs in-place) | 270.6 ns/op (0 B, 0 allocs in-place) |
-| **Put (Nested, Depth 2, In-Place Overwrite)**¹ | **98.1 ns/op** (0 B, 0 allocs in-place) | 172.3 ns/op (0 B, 0 allocs in-place) | 270.9 ns/op (0 B, 0 allocs in-place) |
-| **Put (Deeply Nested, Depth 10, In-Place Overwrite)**¹ | **119.0 ns/op** (0 B, 0 allocs in-place) | 229.9 ns/op (0 B, 0 allocs in-place) | 471.8 ns/op (0 B, 0 allocs in-place) |
-| **Put (`Benchmark_Put_*`, 50%-Capacity Turnover)**¹ | **383–466 ns/op** (96–144 B, 2–3 allocs/op) | 472–511 ns/op (132–135 B, 2–3 allocs/op) | 515–822 ns/op (~30–35 B, <= 1 allocs/op) |
-| **Replace Value (`Replace`)**² | **71.3 ns/op** (0 B internal, 0 allocs) | 121.4 ns/op (0 B, 0 allocs) | 124.4 ns/op (0 B, 0 allocs) |
-| **Individual Delete (`Delete`)** | 237.9 ns/op (0 B, 0 allocs) | **147.7 ns/op** (0 B, 0 allocs) | 310.6 ns/op (0 B, 0 allocs) |
+| **Get (Flat)** | **50.6 ns/op** (0 B, 0 allocs) | 174.0 ns/op (0 B, 0 allocs) | **50.4 ns/op** (0 B, 0 allocs) |
+| **Get (Nested, Depth 2)** | **49.5 ns/op** (0 B, 0 allocs) | 169.6 ns/op (0 B, 0 allocs) | **49.9 ns/op** (0 B, 0 allocs) |
+| **Get (Deeply Nested, Depth 10)** | 64.3 ns/op (0 B, 0 allocs) | 185.2 ns/op (0 B, 0 allocs) | **63.1 ns/op** (0 B, 0 allocs) |
+| **Peek (`Peek`)** | **33.2 ns/op** (0 B, 0 allocs) | 163.3 ns/op (0 B, 0 allocs) | **40.4 ns/op** (0 B, 0 allocs) |
+| **Put (Existing-Key Overwrite, In-Place)**¹ | **97.7 ns/op** (0 B, 0 allocs in-place) | 178.2 ns/op (0 B, 0 allocs in-place) | 120.0 ns/op (0 B, 0 allocs in-place) |
+| **Put (Nested, Depth 2, In-Place Overwrite)**¹ | **98.1 ns/op** (0 B, 0 allocs in-place) | 172.3 ns/op (0 B, 0 allocs in-place) | 126.4 ns/op (0 B, 0 allocs in-place) |
+| **Put (Deeply Nested, Depth 10, In-Place Overwrite)**¹ | **119.0 ns/op** (0 B, 0 allocs in-place) | 229.9 ns/op (0 B, 0 allocs in-place) | 139.0 ns/op (0 B, 0 allocs in-place) |
+| **Put (`Benchmark_Put_*`, 50%-Capacity Turnover)**¹ | **383–466 ns/op** (96–144 B, 2–3 allocs/op) | 472–511 ns/op (132–135 B, 2–3 allocs/op) | 471–656 ns/op (~79–116 B, <= 1 allocs/op) |
+| **Replace Value (`Replace`)**² | **71.3 ns/op** (0 B internal, 0 allocs) | 121.4 ns/op (0 B, 0 allocs) | **72.3 ns/op** (0 B, 0 allocs) |
+| **Individual Delete (`Delete`)** | 237.9 ns/op (0 B, 0 allocs) | **95.5 ns/op** (0 B, 0 allocs) | 134.1 ns/op (0 B, 0 allocs) |
 | **Stats Snapshot (`Stats()`)** | **~16 ns/op** (0 B, 0 allocs) | **~16 ns/op** (0 B, 0 allocs) | **~17 ns/op** (0 B, 0 allocs) |
 
 > ¹ **Existing-key overwrite `Put`** (when the working set fits within `maxSize`) updates the entry in place with **0 B, 0 allocs/op** across `MapCache`, `RadixCache`, and `ArenaRadixCache`, and a new-entry `Put` into a warm `MapCache` allocates only **1 heap node (`*entry[V]`)** thanks to its generic intrusive doubly-linked list (`entryList[V]`). `MapCache` and `RadixCache` defensively clone multi-byte non-digit keys/prefixes via `clonePrefix` (`strings.Clone`) so caller substring backing arrays are never pinned, whereas `ArenaRadixCache` stores `fullKey` directly on leaf nodes (`0` key-clone allocations on leaf insert) and uses `slicePrefix` during internal edge splits to call `clonePrefix(src[:end])` only when the shorter candidate key `src` has more than 64 trailing bytes past the split offset (`len(src)-end > 64`). By contrast, `Benchmark_Put_*` configures `capacity := uint64(len(keys) * 5)` (50,000 B for a 10,000-key × 10 B working set, holding 5,000 of the 10,000 keys), exercising **50%-capacity turnover `Put`** where every `Put` after warmup is a new-key write paired with an LRU tail eviction: `MapCache` and `RadixCache` allocate `strings.Clone` + intrusive `*entry[V]` or `*radixNode[V]` + evicted `[]V` slice per post-warmup turnover write (**2–3 allocs/op** after `testing.B` integer truncation across the initial 5,000 warmup puts), whereas `ArenaRadixCache` allocates only the evicted `[]V` slice (**<= 1 allocs/op** / **0–1 allocs/op**, with **0 node allocations** thanks to intrusive free-list node recycling).
@@ -28,7 +28,7 @@ All reference benchmarks were collected on an **Intel Xeon CPU @ 2.60GHz (96 vCP
 
 ### Key Takeaways
 - **`MapCache`** achieves the lowest single-key point lookup (~50 ns) and write (~98 ns in-place overwrite; ~383–466 ns under 50%-capacity turnover) latency when keys are flat and prefix operations are rare.
-- **`ArenaRadixCache`** accelerates radix lookups by **1.6x–1.7x** over `RadixCache` (~100 ns vs ~170 ns) via its seeded 64-bit `hash/maphash` index and `O(1)` `fullKey` verifier (`verifyKey`).
+- **`ArenaRadixCache`** accelerates radix lookups by **2.9x–4.0x** over `RadixCache` (~40–63 ns vs ~163–185 ns, matching `MapCache` point lookup latency) via its seeded 64-bit `hash/maphash` index and `O(1)` `fullKey` verifier (`verifyKey`).
 - All three backends (**`MapCache`**, **`RadixCache`**, and **`ArenaRadixCache`**) perform in-place value updates (`Replace` and existing-key `Put` overwrites) and telemetry snapshots (`Stats()`) with **0 internal heap allocations per operation**, and `ArenaRadixCache` recycles deleted node indices in steady state via its intrusive free-list (`<= 1 allocs/op` vs `2–3 allocs/op` during 50%-capacity turnover).
 
 ---

@@ -104,7 +104,7 @@ func DefaultTargets() []TargetRule {
 		{
 			Pattern:        "Benchmark_Get_ArenaRadixCache/*",
 			Description:    "ArenaRadixCache point Get (0 allocs/op, 0 B/op)",
-			MaxNsPerOp:     new(float64(320)),
+			MaxNsPerOp:     new(float64(140)),
 			MaxBytesPerOp:  new(float64(0)),
 			MaxAllocsPerOp: new(float64(0)),
 		},
@@ -126,7 +126,7 @@ func DefaultTargets() []TargetRule {
 		{
 			Pattern:        "Benchmark_Peek_ArenaRadixCache",
 			Description:    "ArenaRadixCache point Peek (0 allocs/op, 0 B/op)",
-			MaxNsPerOp:     new(float64(200)),
+			MaxNsPerOp:     new(float64(95)),
 			MaxBytesPerOp:  new(float64(0)),
 			MaxAllocsPerOp: new(float64(0)),
 		},
@@ -148,7 +148,7 @@ func DefaultTargets() []TargetRule {
 		{
 			Pattern:        "^Benchmark_Replace_(ArenaRadixCache|UnitWeight_ArenaRadix|WithOnEvict(Value|Entry)/ArenaRadixCache)$",
 			Description:    "ArenaRadixCache in-place Replace across all configurations (0 allocs/op, 0 B/op)",
-			MaxNsPerOp:     new(float64(180)),
+			MaxNsPerOp:     new(float64(160)),
 			MaxBytesPerOp:  new(float64(0)),
 			MaxAllocsPerOp: new(float64(0)),
 		},
@@ -191,7 +191,7 @@ func DefaultTargets() []TargetRule {
 		{
 			Pattern:        "Benchmark_Put_UnitWeight_ArenaRadix",
 			Description:    "ArenaRadixCache unit-weight in-place Put after 10K warmup (0 allocs/op)",
-			MaxNsPerOp:     new(float64(360)),
+			MaxNsPerOp:     new(float64(250)),
 			MaxBytesPerOp:  new(float64(112)),
 			MaxAllocsPerOp: new(float64(0)),
 		},
@@ -255,7 +255,7 @@ func DefaultTargets() []TargetRule {
 		{
 			Pattern:        "Benchmark_Delete_ArenaRadixCache",
 			Description:    "ArenaRadixCache Delete (0 allocs/op)",
-			MaxNsPerOp:     new(float64(240)),
+			MaxNsPerOp:     new(float64(200)),
 			MaxBytesPerOp:  new(float64(8)),
 			MaxAllocsPerOp: new(float64(0)),
 		},
