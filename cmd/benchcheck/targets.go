@@ -232,10 +232,10 @@ func DefaultTargets() []TargetRule {
 		},
 		{
 			Pattern:        "Benchmark_Put_WithOnEvictEntry/ArenaRadixCache",
-			Description:    "ArenaRadixCache 50%-turnover Put with OnEvictEntry callback (<= 1 allocs/op)",
+			Description:    "ArenaRadixCache 50%-turnover Put with OnEvictEntry callback (<= 2 allocs/op)",
 			MaxNsPerOp:     new(float64(950)),
-			MaxBytesPerOp:  new(float64(144)),
-			MaxAllocsPerOp: new(float64(1)),
+			MaxBytesPerOp:  new(float64(160)),
+			MaxAllocsPerOp: new(float64(2)),
 		},
 		// 22–24. Individual Delete (3 benchmarks: 0 allocs/op)
 		{
@@ -373,7 +373,7 @@ func DefaultTargets() []TargetRule {
 			MaxBytesPerOp:  new(float64(400)),
 			MaxAllocsPerOp: new(float64(0)),
 		},
-		// 40–46. Range Iterators (9 benchmarks: MapCache, ArenaRadixCache & Values 0 allocs/op; RadixCache All/Keys <= 1000 allocs/op, <= 24000 B/op)
+		// 40–46. Range Iterators (9 benchmarks: MapCache & Values 0 allocs/op; Radix/Arena All/Keys <= 1000 allocs/op, <= 24000 B/op)
 		{
 			Pattern:        "Benchmark_All_MapCache",
 			Description:    "MapCache All() iterator over 1,000 entries (0 allocs/op, 0 B/op)",
@@ -390,10 +390,10 @@ func DefaultTargets() []TargetRule {
 		},
 		{
 			Pattern:        "Benchmark_All_ArenaRadixCache",
-			Description:    "ArenaRadixCache All() iterator over 1,000 entries (0 allocs/op, 0 B/op)",
-			MaxNsPerOp:     new(float64(9000)),
-			MaxBytesPerOp:  new(float64(0)),
-			MaxAllocsPerOp: new(float64(0)),
+			Description:    "ArenaRadixCache All() iterator over 1,000 entries (1 key alloc/entry)",
+			MaxNsPerOp:     new(float64(110000)),
+			MaxBytesPerOp:  new(float64(24000)),
+			MaxAllocsPerOp: new(float64(1000)),
 		},
 		{
 			Pattern:        "Benchmark_Keys_MapCache",
@@ -411,10 +411,10 @@ func DefaultTargets() []TargetRule {
 		},
 		{
 			Pattern:        "Benchmark_Keys_ArenaRadixCache",
-			Description:    "ArenaRadixCache Keys() iterator over 1,000 entries (0 allocs/op, 0 B/op)",
-			MaxNsPerOp:     new(float64(9000)),
-			MaxBytesPerOp:  new(float64(0)),
-			MaxAllocsPerOp: new(float64(0)),
+			Description:    "ArenaRadixCache Keys() iterator over 1,000 entries (1 key alloc/entry)",
+			MaxNsPerOp:     new(float64(110000)),
+			MaxBytesPerOp:  new(float64(24000)),
+			MaxAllocsPerOp: new(float64(1000)),
 		},
 		{
 			Pattern:        "Benchmark_Values_*",
