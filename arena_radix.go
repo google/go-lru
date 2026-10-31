@@ -321,7 +321,9 @@ func (c *arenaRadix[V]) releasePrefixSpanLocked(off uint32, pLen int, isLarge bo
 		c.trimFreePrefixSpansAtTailLocked()
 		return
 	}
-	if !isLarge {
+	if isLarge {
+		c.recordFreePrefixSpanLocked(off-4, uint32(pLen)+4)
+	} else {
 		c.recordFreePrefixSpanLocked(off, uint32(pLen))
 	}
 }
@@ -356,6 +358,20 @@ func (c *arenaRadix[V]) ensurePrefixArenaCap(needed int) {
 
 func (c *arenaRadix[V]) setLargeNodePrefix(nodeID uint32, s string) {
 	sLen := len(s)
+	if c.freePrefixCount > 0 {
+		if rawOff, ok := c.takeFreePrefixSpanLocked(uint32(sLen + 4)); ok {
+			binary.LittleEndian.PutUint32(c.prefixArena[rawOff:rawOff+4], uint32(sLen))
+			off := rawOff + 4
+			copy(c.prefixArena[off:int(off)+sLen], s)
+			n := &c.nodes[nodeID]
+			n.prefixOff = off
+			n.prefixLen = largePrefixSentinel
+			n.firstByte = s[0]
+			n.prefixFlags &^= prefixFlagPinned
+			c.livePrefixBytes += sLen
+			return
+		}
+	}
 	c.ensurePrefixArenaCap(sLen + 4)
 	var hdr [4]byte
 	binary.LittleEndian.PutUint32(hdr[:], uint32(sLen))
@@ -444,6 +460,9 @@ func (c *arenaRadix[V]) splitNodePrefixLocked(childID, splitNodeID uint32, lcp i
 	wasLarge := c.nodes[childID].prefixLen == largePrefixSentinel
 
 	if lcp < int(largePrefixSentinel) && remLen < int(largePrefixSentinel) {
+		if wasLarge && oldFlags&prefixFlagPinned == 0 && !c.prefixExposed.Load() {
+			c.recordFreePrefixSpanLocked(oldOff-4, 4)
+		}
 		c.nodes[splitNodeID].prefixOff = oldOff
 		c.nodes[splitNodeID].prefixLen = uint16(lcp)
 		c.nodes[splitNodeID].firstByte = oldFirst
@@ -485,11 +504,9 @@ func (c *arenaRadix[V]) mergeNodePrefixesLocked(currID, onlyChildID uint32) {
 			var buf [64]byte
 			copy(buf[:], c.nodePrefix(currID))
 			copy(buf[curr.prefixLen:], c.nodePrefix(onlyChildID))
-			pinned := (curr.prefixFlags | onlyChild.prefixFlags) & prefixFlagPinned
 			c.clearNodePrefix(onlyChildID)
 			c.clearNodePrefix(currID)
 			c.setNodePrefix(onlyChildID, unsafe.String(&buf[0], combined))
-			c.nodes[onlyChildID].prefixFlags |= pinned
 			return
 		}
 	}
@@ -536,7 +553,7 @@ func (c *arenaRadix[V]) mergeNodePrefixesLocked(currID, onlyChildID uint32) {
 		c.nodes[onlyChildID].prefixLen = uint16(totalLen)
 	}
 	c.nodes[onlyChildID].firstByte = c.prefixArena[newOff]
-	c.nodes[onlyChildID].prefixFlags = (flags2 &^ prefixFlagPinned) | ((flags1 | flags2) & prefixFlagPinned)
+	c.nodes[onlyChildID].prefixFlags = flags2 &^ prefixFlagPinned
 	c.livePrefixBytes += totalLen
 
 	c.releasePrefixSpanLocked(off2, len2, large2, flags2)
@@ -1558,7 +1575,7 @@ func (c *arenaRadix[V]) autoCompactTier2OnlyLocked(protectedNodeID uint32) {
 // shedAndCompactLocked evicts least-recently-used entries strictly from c.tail in a single O(N) pass
 // until c.currentSize <= targetSize (and proportionally sheds zero-size entries down to targetZeroCount),
 // protecting protectedNodeID when specified by the foreground mutation caller,
-// then performs lossless arena and map compaction if fragmentation warrants it.
+// then performs lossless arena and hash table compaction if fragmentation warrants it.
 // Caller MUST hold c.mu.Lock().
 func (c *arenaRadix[V]) shedAndCompactLocked(evictQ *evictCallbackQueue[V], targetSize uint64, retention float64, protectedNodeID uint32) []V {
 	if c.currentSize <= targetSize && c.zeroSizeCount == 0 && retention > 0.0 {
@@ -1600,7 +1617,7 @@ func (c *arenaRadix[V]) shedAndCompactLocked(evictQ *evictCallbackQueue[V], targ
 // maybeReclaimUnderPressureLocked evaluates the sampled pressure against configured thresholds:
 //   - If pressure >= EvictionThreshold (Tier 2 Critical Pressure): evict from LRU tail down to
 //     c.maxSize * EvictionRetentionRatio (preserving protectedNodeID if live), then compact if needed.
-//   - Else if pressure >= CompactionThreshold (Tier 1 Moderate Pressure): perform lossless arena and map compaction.
+//   - Else if pressure >= CompactionThreshold (Tier 1 Moderate Pressure): perform lossless arena and hash table compaction.
 //
 // Caller MUST hold c.mu.Lock().
 func (c *arenaRadix[V]) maybeReclaimUnderPressureLocked(evictQ *evictCallbackQueue[V], pressure float64, protectedNodeID uint32) []V {

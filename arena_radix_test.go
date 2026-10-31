@@ -1482,21 +1482,21 @@ func TestArenaRadixCache_ReplaceGrowAtMRUHeadUnderCriticalPressure(t *testing.T)
 
 // TestArenaRadixCache_HashCollisionAndNodeMapHealing verifies that ArenaRadixCache preserves key
 // reachability, LRU invariants, and compaction guarantees when 64-bit maphash collisions displace
-// entries in the O(1) c.nodeMap accelerator.
+// entries in the O(1) c.hashSlots accelerator.
 //
 // White-box testing rationale:
 //  1. ArenaRadixCache hashes keys internally using seeded 64-bit hash/maphash (c.hashKey). By the birthday bound,
 //     finding two distinct variable-length strings with the exact same 64-bit maphash in a 2^64 hash space
 //     requires ~2^32 (~4.29 billion) evaluations, which is computationally infeasible at unit-test runtime even
 //     though collisions can occur in production across billions of cumulative keys.
-//  2. Furthermore, c.nodeMap is an internal O(1) hash accelerator backed by an exact O(K) radix-trie walk fallback
+//  2. Furthermore, c.hashSlots is an internal O(1) hash accelerator backed by an exact O(K) radix-trie walk fallback
 //     (findNodeByTrieWalk). If Delete(K1) or a self-evicting/failing Replace(K1, ...) erroneously overwrites
-//     c.nodeMap[h] = idK1 before eraseInternalWithHash deletes c.nodeMap[h], public Get / Peek
+//     the hash slot for h with idK1 before eraseInternalWithHash deletes h, public Get / Peek
 //     calls still return functionally identical values via the slow-path trie walk while silently evicting the
-//     surviving colliding peer K2 from c.nodeMap and breaking the len(c.nodeMap)+c.collisionCount == c.len Pigeonhole Principle O(1)
+//     surviving colliding peer K2 from c.hashSlots and breaking the c.hashCount+c.collisionCount == c.len Pigeonhole Principle O(1)
 //     cache-miss fast-path across the entire cache.
-//     These subtests therefore seed a synthetic collision/displacement in c.nodeMap in setup and inspect c.nodeMap
-//     in assertions alongside public API Get/Peek/Put/Replace/Delete/Compact calls.
+//     These subtests therefore seed a synthetic collision/displacement in c.hashSlots (via the c.nodeMap* helpers) in setup
+//     and inspect c.hashSlots in assertions alongside public API Get/Peek/Put/Replace/Delete/Compact calls.
 func TestArenaRadixCache_HashCollisionAndNodeMapHealing(t *testing.T) {
 	const keyA = "prefix/key-alpha"
 	const keyB = "prefix/key-beta"
@@ -1722,7 +1722,7 @@ func TestArenaRadixCache_HashCollisionAndNodeMapHealing(t *testing.T) {
 		require.NoError(t, err)
 		ac.nodeMapDelete(ac.hashKey(""))
 
-		// Act: Delete "" (which resides at c.root == 0) while hash("") is not in c.nodeMap.
+		// Act: Delete "" (which resides at c.root == 0) while hash("") is not in c.hashSlots.
 		erased, ok := ac.Delete("")
 
 		// Assert: nodeMap retains the remaining entry intact.
@@ -2292,9 +2292,9 @@ func TestArenaRadixCache_StatsArenaNodesAndHashFallbacks(t *testing.T) {
 
 	t.Run("DisplacedAndCollidingNodeMapSlotsTriggerArenaHashFallbacks", func(t *testing.T) {
 		// White-box testing rationale: 64-bit maphash collisions are astronomically rare for natural
-		// keys, so verifying that displaced or colliding nodeMap entries fall back to radix tree traversal
+		// keys, so verifying that displaced or colliding c.hashSlots entries fall back to radix tree traversal
 		// and increment Stats().ArenaHashFallbacks across Peek, Get, Replace, Put, and Delete requires
-		// directly mutating c.nodeMap in a package-internal test.
+		// directly mutating c.hashSlots (via the c.nodeMap* helpers) in a package-internal test.
 
 		// Part A: Displaced slot (delete from nodeMap) with invariant checking enabled.
 		cDisplaced := NewArenaRadixCache[testData](1000, WithInvariantChecking(true), testDataWeigher).(*arenaRadix[testData])
@@ -2780,5 +2780,91 @@ func TestArenaRadix_OnEvictEntry_Depth1KeyImmutabilityAndDepth2SpanReuse(t *test
 		require.NoError(t, err)
 		require.Equal(t, []string{"dir/sub/alpha"}, evictedKeys)
 		assert.LessOrEqual(t, len(c.prefixArena), arenaLenBeforeEvict+len("third"))
+	})
+
+	t.Run("LargePrefixNonTailSpanReuseAndInPlaceSplitHeaderTrim", func(t *testing.T) {
+		c := NewArenaRadixCache[int](100, WithInvariantChecking(true)).(*arenaRadix[int])
+		largeA := "A" + strings.Repeat("a", 65535)
+		largeB := "B" + strings.Repeat("b", 65535)
+		smallTail := "C_tail"
+
+		_, err := c.Put(largeA, 1)
+		require.NoError(t, err)
+		_, err = c.Put(smallTail, 2)
+		require.NoError(t, err)
+		arenaLenWithTwo := len(c.prefixArena)
+
+		// Deleting non-tail largeA records its (len+4)-byte span in freePrefixSpans,
+		// which is reused in-place when largeB of equal length is inserted.
+		_, ok := c.Delete(largeA)
+		require.True(t, ok)
+		require.Equal(t, 1, c.freePrefixCount)
+
+		_, err = c.Put(largeB, 3)
+		require.NoError(t, err)
+		assert.Zero(t, c.freePrefixCount)
+		assert.Len(t, c.prefixArena, arenaLenWithTwo)
+
+		// Splitting a large prefix in-place into two < 65,535B halves records the orphaned 4-byte length header
+		// in freePrefixSpans so deleting the split nodes trims prefixArena past the split prefix.
+		splitKey1 := strings.Repeat("X", 40000) + strings.Repeat("Y", 30000)
+		splitKey2 := strings.Repeat("X", 40000) + strings.Repeat("Z", 100)
+		_, err = c.Put(splitKey1, 4)
+		require.NoError(t, err)
+		_, err = c.Put(splitKey2, 5)
+		require.NoError(t, err)
+
+		_, ok = c.Delete(splitKey2)
+		require.True(t, ok)
+		_, ok = c.Delete(splitKey1)
+		require.True(t, ok)
+		assert.Len(t, c.prefixArena, arenaLenWithTwo)
+	})
+
+	t.Run("NonContiguousMergeWithPinnedParentLeavesMergedSpanUnpinned", func(t *testing.T) {
+		var evictedKeys []string
+		c := NewArenaRadixCache[testData](30,
+			WithInvariantChecking(true),
+			testDataWeigher,
+			WithOnEvictEntry(func(k string, _ testData, _ EvictionReason) {
+				evictedKeys = append(evictedKeys, k)
+			}),
+		).(*arenaRadix[testData])
+
+		// 1. Small combined <= 64 non-contiguous merge branch:
+		// Insert parent first, then an unrelated key, then child so parent.prefixOff + parent.prefixLen != child.prefixOff.
+		_, err := c.Put("root_prefix", testData{value: 1, dataSize: 10})
+		require.NoError(t, err)
+		_, err = c.Put("separator_1", testData{value: 2, dataSize: 10})
+		require.NoError(t, err)
+		_, err = c.Put("root_prefix/child_suffix", testData{value: 3, dataSize: 10})
+		require.NoError(t, err)
+
+		// Inserting "other" evicts "root_prefix" (pinning its old span) and merges "root_prefix" + "/child_suffix"
+		// via the non-contiguous combined <= 64 branch into a newly allocated span on the surviving child node.
+		_, err = c.Put("other", testData{value: 4, dataSize: 10})
+		require.NoError(t, err)
+		require.Equal(t, []string{"root_prefix"}, evictedKeys)
+		childID := c.nodeMapAt(c.hashKey("root_prefix/child_suffix"))
+		assert.Zero(t, c.nodes[childID].prefixFlags&prefixFlagPinned)
+
+		// 2. General append combined > 64 non-contiguous merge branch:
+		longParent := "P_" + strings.Repeat("p", 40)
+		longChild := longParent + "/" + strings.Repeat("c", 40)
+		_, err = c.Put(longParent, testData{value: 5, dataSize: 10})
+		require.NoError(t, err)
+		_, err = c.Put("separator_2", testData{value: 6, dataSize: 10})
+		require.NoError(t, err)
+		_, err = c.Put(longChild, testData{value: 7, dataSize: 10})
+		require.NoError(t, err)
+		// Touch separator_2 so longParent is at LRU tail.
+		_, ok := c.Get("separator_2")
+		require.True(t, ok)
+
+		_, err = c.Put("other2", testData{value: 8, dataSize: 10})
+		require.NoError(t, err)
+		require.Contains(t, evictedKeys, longParent)
+		longChildID := c.nodeMapAt(c.hashKey(longChild))
+		assert.Zero(t, c.nodes[longChildID].prefixFlags&prefixFlagPinned)
 	})
 }
