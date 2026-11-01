@@ -10,26 +10,26 @@ All reference benchmarks were collected on an **Intel Xeon CPU @ 2.60GHz (96 vCP
 
 | Operation | `MapCache` | `RadixCache` | `ArenaRadixCache` |
 | :--- | :--- | :--- | :--- |
-| **Get (Flat)** | **50.6 ns/op** (0 B, 0 allocs) | 174.0 ns/op (0 B, 0 allocs) | 100.7 ns/op (0 B, 0 allocs) |
-| **Get (Nested, Depth 2)** | **49.5 ns/op** (0 B, 0 allocs) | 169.6 ns/op (0 B, 0 allocs) | 107.8 ns/op (0 B, 0 allocs) |
-| **Get (Deeply Nested, Depth 10)** | **64.3 ns/op** (0 B, 0 allocs) | 185.2 ns/op (0 B, 0 allocs) | 194.1 ns/op (0 B, 0 allocs) |
-| **Peek (`Peek`)** | **33.2 ns/op** (0 B, 0 allocs) | 163.3 ns/op (0 B, 0 allocs) | 103.8 ns/op (0 B, 0 allocs) |
-| **Put (Existing-Key Overwrite, In-Place)**¹ | **97.7 ns/op** (0 B, 0 allocs in-place) | 178.2 ns/op (0 B, 0 allocs in-place) | 270.6 ns/op (0 B, 0 allocs in-place) |
-| **Put (Nested, Depth 2, In-Place Overwrite)**¹ | **98.1 ns/op** (0 B, 0 allocs in-place) | 172.3 ns/op (0 B, 0 allocs in-place) | 270.9 ns/op (0 B, 0 allocs in-place) |
-| **Put (Deeply Nested, Depth 10, In-Place Overwrite)**¹ | **119.0 ns/op** (0 B, 0 allocs in-place) | 229.9 ns/op (0 B, 0 allocs in-place) | 471.8 ns/op (0 B, 0 allocs in-place) |
-| **Put (`Benchmark_Put_*`, 50%-Capacity Turnover)**¹ | **383–466 ns/op** (96–144 B, 2–3 allocs/op) | 472–511 ns/op (132–135 B, 2–3 allocs/op) | 515–822 ns/op (~30–35 B, <= 1 allocs/op) |
-| **Replace Value (`Replace`)**² | **71.3 ns/op** (0 B internal, 0 allocs) | 121.4 ns/op (0 B, 0 allocs) | 124.4 ns/op (0 B, 0 allocs) |
-| **Individual Delete (`Delete`)** | 237.9 ns/op (0 B, 0 allocs) | **147.7 ns/op** (0 B, 0 allocs) | 310.6 ns/op (0 B, 0 allocs) |
-| **Stats Snapshot (`Stats()`)** | **~16 ns/op** (0 B, 0 allocs) | **~16 ns/op** (0 B, 0 allocs) | **~17 ns/op** (0 B, 0 allocs) |
+| **Get (Flat)** | **48.9 ns/op** (0 B, 0 allocs) | 178.0 ns/op (0 B, 0 allocs) | 81.7 ns/op (0 B, 0 allocs) |
+| **Get (Nested, Depth 2)** | **48.1 ns/op** (0 B, 0 allocs) | 179.4 ns/op (0 B, 0 allocs) | 90.0 ns/op (0 B, 0 allocs) |
+| **Get (Deeply Nested, Depth 10)** | **69.0 ns/op** (0 B, 0 allocs) | 194.1 ns/op (0 B, 0 allocs) | 99.5 ns/op (0 B, 0 allocs) |
+| **Peek (`Peek`)** | **35.7 ns/op** (0 B, 0 allocs) | 174.9 ns/op (0 B, 0 allocs) | 85.2 ns/op (0 B, 0 allocs) |
+| **Put (Existing-Key Overwrite, In-Place)**¹ | **68.7 ns/op** (0 B, 0 allocs in-place) | 222.1 ns/op (0 B, 0 allocs in-place) | 101.9 ns/op (0 B, 0 allocs in-place) |
+| **Put (Nested, Depth 2, In-Place Overwrite)**¹ | **66.7 ns/op** (0 B, 0 allocs in-place) | 221.1 ns/op (0 B, 0 allocs in-place) | 110.7 ns/op (0 B, 0 allocs in-place) |
+| **Put (Deeply Nested, Depth 10, In-Place Overwrite)**¹ | **90.1 ns/op** (0 B, 0 allocs in-place) | 235.2 ns/op (0 B, 0 allocs in-place) | 119.7 ns/op (0 B, 0 allocs in-place) |
+| **Put (`Benchmark_Put_*`, 50%-Capacity Turnover)**¹ | **243–321 ns/op** (42–114 B, 2 allocs/op) | 373–438 ns/op (25–40 B, 2 allocs/op) | 435–484 ns/op (~30–81 B, 0 allocs/op; <= 1 allocs/op at 10ms) |
+| **Replace Value (`Replace`)**² | **54.3 ns/op** (0 B internal, 0 allocs) | 108.0 ns/op (0 B, 0 allocs) | 85.6 ns/op (0 B, 0 allocs) |
+| **Individual Delete (`Delete`)** | 111.0 ns/op (0 B, 0 allocs) | **79.8 ns/op** (0 B, 0 allocs) | 149.4 ns/op (0–4 B, 0 allocs) |
+| **Stats Snapshot (`Stats()`)** | **~67 ns/op** (0 B, 0 allocs) | **~67 ns/op** (0 B, 0 allocs) | **~66 ns/op** (0 B, 0 allocs) |
 
-> ¹ **Existing-key overwrite `Put`** (when the working set fits within `maxSize`) updates the entry in place with **0 B, 0 allocs/op** across `MapCache`, `RadixCache`, and `ArenaRadixCache`, and a new-entry `Put` into a warm `MapCache` during initial growth allocates **1 heap node (`*entry[V]`)** thanks to its generic intrusive doubly-linked list (`entryList[V]`). To prevent caller substring backing arrays from being pinned by leaf or routing nodes, `MapCache` and `RadixCache` defensively clone retained multi-byte non-digit key/prefix strings via `clonePrefix` (`strings.Clone`), whereas `ArenaRadixCache` stores edge prefixes in a contiguous `prefixArena []byte` (with 32-slot `freePrefixSpans` reuse, eliminating per-node heap string headers). By contrast, `Benchmark_Put_*` configures `capacity := uint64(len(keys) * 5)` (50,000 B for a 10,000-key × 10 B working set, holding 5,000 of the 10,000 keys), exercising **50%-capacity turnover `Put`** where every `Put` after warmup is a new-key write paired with an LRU tail eviction: during steady-state capacity turnover in `Put`, `MapCache` and `RadixCache` recycle evicted `*entry[V]` / `*radixNode[V]` structs in-place (`recycledEntry` in `MapCache`, `recycleNodes [2]*radixNode[V]` in `RadixCache`) while allocating `clonePrefix` (`strings.Clone`) + the returned evicted `[]V` slice (**2–3 allocs/op** across the combined warmup + turnover run), whereas `ArenaRadixCache` recycles both arena node slots via its intrusive free-list and prefix bytes via `prefixArena` / `freePrefixSpans` (**<= 1 allocs/op** after integer truncation across the warmup phase, with **0 node allocations**).
+> ¹ **Existing-key overwrite `Put`** (when the working set fits within `maxSize`) updates the entry in place with **0 B, 0 allocs/op** across `MapCache`, `RadixCache`, and `ArenaRadixCache`, and a new-entry `Put` into a warm `MapCache` during initial growth allocates **1 heap node (`*entry[V]`)** thanks to its generic intrusive doubly-linked list (`entryList[V]`). To prevent caller substring backing arrays from being pinned by leaf or routing nodes, `MapCache` and `RadixCache` defensively clone retained multi-byte non-digit key/prefix strings via `clonePrefix` (`strings.Clone`), whereas `ArenaRadixCache` stores edge prefixes in a contiguous `prefixArena []byte` (with 32-slot `freePrefixSpans` / `putPrefixSpan` reuse, eliminating per-node heap string headers). By contrast, `Benchmark_Put_*` configures `capacity := uint64(len(keys) * 5)` (50,000 B for a 10,000-key × 10 B working set, holding 5,000 of the 10,000 keys), exercising **50%-capacity turnover `Put`** where every `Put` after warmup is a new-key write paired with an LRU tail eviction: during steady-state capacity turnover in `Put`, `MapCache` and `RadixCache` recycle evicted `*entry[V]` / `*radixNode[V]` structs in-place (`recycledEntry` in `MapCache`, `recycleNodes [2]*radixNode[V]` in `RadixCache`) while allocating `clonePrefix` (`strings.Clone`) + the returned evicted `[]V` slice (**2 allocs/op** across the combined warmup + turnover run), whereas `ArenaRadixCache` recycles both arena node slots via its intrusive free-list and prefix bytes via `prefixArena` / `freePrefixSpans` / `putPrefixSpan` (**0 allocs/op** in steady state; **<= 1 allocs/op** after integer truncation across short `-benchtime=10ms` warmup runs, with **0 node allocations**).
 >
 > ² `Replace` performs **0 heap allocations** across all three backends (`MapCache`, `RadixCache`, and `ArenaRadixCache`), storing the generic value `V` directly in the node/entry without interface boxing.
 
 ### Key Takeaways
-- **`MapCache`** achieves the lowest single-key point lookup (~50 ns) and write (~98 ns in-place overwrite; ~383–466 ns under 50%-capacity turnover) latency when keys are flat and prefix operations are rare.
-- **`ArenaRadixCache`** accelerates radix lookups by **1.6x–1.7x** over `RadixCache` (~100 ns vs ~170 ns) via its seeded 64-bit `hash/maphash` open-addressed flat hash table (`hashSlots []arenaHashSlot`) and zero-allocation `keyLen` + suffix verifier (`verifyKey`).
-- All three backends (**`MapCache`**, **`RadixCache`**, and **`ArenaRadixCache`**) perform in-place value updates (`Replace` and existing-key `Put` overwrites) and telemetry snapshots (`Stats()`) with **0 internal heap allocations per operation**; during steady-state capacity turnover in `Put`, `MapCache` (`recycledEntry`) and `RadixCache` (`recycleNodes [2]*radixNode[V]`) recycle evicted node structs in-place, while `ArenaRadixCache` recycles both node indices via its intrusive free-list and prefix spans in `prefixArena []byte` (`<= 1 allocs/op` vs `2–3 allocs/op` during 50%-capacity turnover).
+- **`MapCache`** achieves the lowest single-key point lookup (~49 ns; ~48–69 ns across topologies) and write (~67–90 ns in-place overwrite; ~243–321 ns under 50%-capacity turnover) latency when keys are flat and prefix operations are rare.
+- **`ArenaRadixCache`** accelerates radix lookups by **2.0x–2.2x** over `RadixCache` (~82–100 ns vs ~178–194 ns) and in-place `Put` overwrites by **~2.0x–2.2x** (~102–120 ns vs ~221–235 ns) via its seeded 64-bit `hash/maphash` open-addressed flat hash table (`hashSlots []arenaHashSlot`) and zero-allocation `keyLen` + suffix verifier (`verifyKey`).
+- All three backends (**`MapCache`**, **`RadixCache`**, and **`ArenaRadixCache`**) perform in-place value updates (`Replace` and existing-key `Put` overwrites) and telemetry snapshots (`Stats()`) with **0 internal heap allocations per operation**; during steady-state capacity turnover in `Put`, `MapCache` (`recycledEntry`) and `RadixCache` (`recycleNodes [2]*radixNode[V]`) recycle evicted node structs in-place (`2 allocs/op`), while `ArenaRadixCache` recycles both node indices via its intrusive free-list and prefix spans in `prefixArena []byte` via `freePrefixSpans` / `putPrefixSpan` (`0 allocs/op` in steady state and `<= 1 allocs/op` across short `-benchtime=10ms` warmup runs, vs `2 allocs/op` on `MapCache` and `RadixCache` during 50%-capacity turnover).
 
 ---
 
@@ -37,25 +37,26 @@ All reference benchmarks were collected on an **Intel Xeon CPU @ 2.60GHz (96 vCP
 
 | Prefix Topology | `MapCache` (`O(N)` Scan) | `RadixCache` (`O(P + S)` Subtree) | `ArenaRadixCache` (`O(P + S)` Subtree) | Speedup vs `MapCache` |
 | :--- | :--- | :--- | :--- | :--- |
-| **Flat Prefix (100 items)** | 160.6 µs/op | **2.25 µs/op** | ~4.7 µs/op | **71.3x (`Radix`) / ~34.2x (`Arena`) faster** |
-| **Nested Prefix (100 items)** | 151.2 µs/op | **2.30 µs/op** | ~4.7 µs/op | **65.7x (`Radix`) / ~32.2x (`Arena`) faster** |
-| **Deeply Nested (100 items)** | 219.9 µs/op | **2.50 µs/op** | ~4.8 µs/op | **88.0x (`Radix`) / ~45.8x (`Arena`) faster** |
-| **100K Scale (50,000 purged items)** | 21.6 ms/op | **1.05 ms/op** | ~3.45 ms/op | **20.5x (`Radix`) / ~6.3x (`Arena`) faster** |
+| **Flat Prefix (100 items)** | 94.7 µs/op | **2.57 µs/op** | ~4.73 µs/op | **36.8x (`Radix`) / ~20.0x (`Arena`) faster** |
+| **Nested Prefix (100 items)** | 93.7 µs/op | **2.63 µs/op** | ~4.70 µs/op | **35.6x (`Radix`) / ~19.9x (`Arena`) faster** |
+| **Deeply Nested (100 items)** | 106.4 µs/op | **2.48 µs/op** | ~4.74 µs/op | **42.9x (`Radix`) / ~22.4x (`Arena`) faster** |
+| **100K Scale (50,000 purged items)** | 10.7 ms/op | **1.39 ms/op** | ~3.49 ms/op | **7.7x (`Radix`) / ~3.1x (`Arena`) faster** |
 
 ---
 
-## 3. True Heap Memory Footprint (100K & 1,000,000 Keys)
+## 3. True Heap Memory Footprint (32K, 100K & 1,000,000 Keys)
 
 Measured via `runtime.ReadMemStats` (`HeapAlloc`) after an isolated garbage collection sweep (`runtime.GC()` + `debug.FreeOSMemory()`):
 
 | Scale & Key Topology | `MapCache` Heap | `RadixCache` Heap | `ArenaRadixCache` Heap | Memory Reduction vs `MapCache` |
 | :--- | :--- | :--- | :--- | :--- |
-| **100K Nested (`Benchmark_LargeScale_Put_100K`)** | ~11.5 MB (~115.0 `heap-B/entry`) | ~9.6 MB (~96.0 `heap-B/entry`) | **~7.9 MB** (~78.9 `heap-B/entry`) | **16.5% less (`Radix`) / 31.4% less (`Arena`)** |
-| **1M Flat** (`file_%d.txt`) | 129.6 MB (135.9 B/entry) | **89.8 MB** (94.2 B/entry) | 102.0 MB (106.9 B/entry) | **30.7% less (`Radix`) / 21.4% less (`Arena`)** |
-| **1M Nested** (`dir_%04d/file_%04d.txt`) | 129.6 MB (135.9 B/entry) | **90.5 MB** (94.9 B/entry) | 101.9 MB (106.9 B/entry) | **30.2% less (`Radix`) / 21.4% less (`Arena`)** |
-| **1M Deeply Nested** (`projects/...`) | 129.6 MB (135.9 B/entry) | **90.9 MB** (95.4 B/entry) | 101.9 MB (106.9 B/entry) | **29.9% less (`Radix`) / 21.4% less (`Arena`)** |
+| **100K Nested (`Benchmark_LargeScale_Put_100K`)** | ~11.0 MB (~115.0 `heap-B/entry`) | ~9.2 MB (~96.0 `heap-B/entry`) | **~7.5 MB** (~78.9 `heap-B/entry`) | **16.5% less (`Radix`) / 31.4% less (`Arena`)** |
+| **32K Orbax 187B Keys (`Benchmark_Production_MemoryFootprint`)** | ~9.2 MB (~293.4 `heap-B/entry`) | **~4.5 MB** (~145.4 `heap-B/entry`) | ~5.1 MB (~162.1 `heap-B/entry`) | **50.4% less (`Radix`) / 44.8% less (`Arena`)** |
+| **1M Flat** (`file_%d.txt`) | 129.5 MB (135.8 B/entry) | 106.4 MB (111.5 B/entry) | **84.1 MB** (88.2 B/entry) | **17.9% less (`Radix`) / 35.1% less (`Arena`)** |
+| **1M Nested** (`dir_%04d/file_%04d.txt`) | 137.2 MB (143.8 B/entry) | 107.8 MB (113.1 B/entry) | **84.1 MB** (88.2 B/entry) | **21.4% less (`Radix`) / 38.7% less (`Arena`)** |
+| **1M Deeply Nested** (`projects/...`) | 190.5 MB (199.8 B/entry) | 107.8 MB (113.1 B/entry) | **85.6 MB** (89.8 B/entry) | **43.4% less (`Radix`) / 55.1% less (`Arena`)** |
 
-In addition to reported `b.ReportAllocs()` (`B/op` and `allocs/op`), `Benchmark_LargeScale_Put_100K` reports `heap-B/entry` (net live heap bytes per entry at 100K scale, where Go map bucket power-of-two sizing accounts for the higher per-entry overhead in `MapCache` relative to 1M scale) and `Benchmark_ArenaRadixCache_Compact` reports `reclaimed-B/op` (live heap bytes reclaimed per compaction pass).
+In addition to reported `b.ReportAllocs()` (`B/op` and `allocs/op`), `Benchmark_LargeScale_Put_100K` and `Benchmark_Production_MemoryFootprint` report `heap-B/entry` (net live heap bytes per entry at 100K nested and 32K production 187-byte Orbax checkpoint path scales, respectively) and `Benchmark_ArenaRadixCache_Compact` reports `reclaimed-B/op` (live heap bytes reclaimed per compaction pass).
 
 ---
 
@@ -71,14 +72,20 @@ go test -run=^$ -bench="Benchmark_(Put|Get|Peek|Replace|Delete|Stats)" -benchmem
 # Run multi-core parallel throughput benchmarks (Mixed, ReadHeavy, WriteHeavy)
 go test -run=^$ -bench="Benchmark_ParallelThroughput" -benchmem ./...
 
-# Run 100K-entry scale & ArenaRadixCache compaction/pressure benchmarks
-go test -run=^$ -bench="Benchmark_(LargeScale|ArenaRadixCache)" -benchmem ./...
+# Run 100K-entry scale, 32K production memory footprint, & ArenaRadixCache compaction/pressure benchmarks
+go test -run=^$ -bench="Benchmark_(LargeScale|Production_MemoryFootprint|ArenaRadixCache)" -benchmem ./...
 
 # Run live heap footprint (heap-B/entry) and compaction reclamation (reclaimed-B/op) benchmarks
-go test -run=^$ -bench="Benchmark_(LargeScale_Put_100K|ArenaRadixCache_Compact)" -benchmem ./...
+go test -run=^$ -bench="Benchmark_(LargeScale_Put_100K|Production_MemoryFootprint|ArenaRadixCache_Compact)" -benchmem ./...
 
 # Run extended production characterization benchmarks (Zipfian/Uniform, payload sizes, concurrency scaling, GC pause)
 go test -run=^$ -bench="Benchmark(KeyDistributions|PayloadSizes|ConcurrencyScaling|CompactionAndPressureShedLatency|GCPauseAndScanOverhead|PressureSamplingAndCallbacks|CustomPressureFuncOverhead)" -benchmem .
+
+# Run sharded cache multi-core parallel throughput benchmarks (Unsharded vs 16 vs 64 shards)
+go test -run=^$ -bench="BenchmarkShardedParallelThroughput" -benchmem .
+
+# Run OpenTelemetry (otellru) zero-allocation scrape callback & SDK collection benchmarks
+cd otellru && go test -run=^$ -bench=. -benchmem ./...
 ```
 
 ---

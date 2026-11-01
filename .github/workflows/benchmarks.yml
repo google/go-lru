@@ -6,6 +6,8 @@ on:
       - main
       - master
       - "feat/**"
+      - "perf/**"
+      - "fix/**"
   pull_request:
     branches:
       - main
@@ -44,6 +46,10 @@ jobs:
           set -o pipefail
           go test -run=^$ -bench=^Benchmark_ -benchmem -benchtime=10ms -count=6 ./... | tee benchmark-head.txt
 
+      - name: Run otellru Submodule Benchmarks
+        working-directory: otellru
+        run: go test -run=^$ -bench=. -benchmem -benchtime=10ms -count=3 ./...
+
       - name: Run Base Branch Benchmarks for Regression Comparison (PR only)
         if: github.event_name == 'pull_request'
         run: |
@@ -57,36 +63,6 @@ jobs:
           sed -i 's|^pkg: .*|pkg: github.com/google/go-lru|' benchmark-base.txt
           benchstat benchmark-base.txt benchmark-head.txt | tee benchstat-comparison.txt
 
-      - name: Publish Benchmark & Resource Footprint Summary
-        if: always()
-        run: |
-          {
-            echo "## 📊 Performance & Resource Usage Summary"
-            echo ""
-            echo "| Benchmark | Iterations | Throughput (\`ns/op\`) | Memory (\`B/op\`) | Allocations (\`allocs/op\`) | Additional Resource Metrics |"
-            echo "|---|---:|---:|---:|---:|---|"
-            awk '/^Benchmark_/ && !seen[$1]++ {
-              bench=$1; iters=$2; ns=$3 " " $4;
-              b_op="-"; allocs="-"; extra="";
-              for (i=5; i<NF; i+=2) {
-                if ($(i+1) == "B/op") { b_op = $i " B/op"; }
-                else if ($(i+1) == "allocs/op") { allocs = $i " allocs/op"; }
-                else { extra = extra $i " " $(i+1) " "; }
-              }
-              if (extra == "") { extra = "-"; }
-              printf "| \`%s\` | %s | %s | %s | %s | %s |\n", bench, iters, ns, b_op, allocs, extra
-            }' benchmark-head.txt
-            echo ""
-            if [ -f benchstat-comparison.txt ]; then
-              echo "### 🔍 PR vs. Base Regression Comparison (\`benchstat\`)"
-              echo ""
-              echo '```text'
-              cat benchstat-comparison.txt
-              echo '```'
-              echo ""
-            fi
-          } >> "$GITHUB_STEP_SUMMARY"
-
       - name: Enforce Performance Targets & Regression Thresholds
         run: |
           set -o pipefail
@@ -94,6 +70,22 @@ jobs:
             go run ./cmd/benchcheck -base benchmark-base.txt -head benchmark-head.txt -strict-missing -format markdown -summary "$GITHUB_STEP_SUMMARY" | tee benchcheck-report.md
           else
             go run ./cmd/benchcheck -head benchmark-head.txt -strict-missing -format markdown -summary "$GITHUB_STEP_SUMMARY" | tee benchcheck-report.md
+          fi
+
+      - name: Publish benchstat Statistical Comparison Summary (PR only)
+        if: always()
+        run: |
+          if [ -f benchstat-comparison.txt ]; then
+            {
+              echo ""
+              echo "<details><summary>Full <code>benchstat</code> Statistical Comparison vs. Base</summary>"
+              echo ""
+              echo '```text'
+              cat benchstat-comparison.txt
+              echo '```'
+              echo "</details>"
+              echo ""
+            } >> "$GITHUB_STEP_SUMMARY"
           fi
 
       - name: Upload Benchmark Artifacts
