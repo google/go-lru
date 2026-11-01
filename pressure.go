@@ -687,8 +687,10 @@ type atomicPool[T any] struct {
 
 func (p *atomicPool[T]) Get() *T {
 	for i := range len(p.slots) {
-		if ptr := p.slots[i].Swap(nil); ptr != nil {
-			return ptr
+		if p.slots[i].Load() != nil {
+			if ptr := p.slots[i].Swap(nil); ptr != nil {
+				return ptr
+			}
 		}
 	}
 	return p.pool.Get().(*T)
