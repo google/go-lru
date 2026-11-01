@@ -1744,11 +1744,8 @@ type pressureState struct {
 	fallbackReentrantReclaim   atomic.Bool
 	overflowSamplingGIDs       sync.Map
 	reentrantReclaimGIDs       sync.Map
-	pressureSampleSeq          atomic.Uint64
 	pressureInvokeSeq          atomic.Uint64
 	lastSampledSeq             atomic.Uint64
-	cachedPressureBits         atomic.Uint64
-	cachedPressureEpoch        atomic.Uint64
 	reclaimEpoch               atomic.Uint64
 	externalReclaimEpoch       atomic.Uint64
 	evictCallbackMu            sync.Mutex
@@ -1782,45 +1779,60 @@ type pressureState struct {
 	evictSlowWaiters           atomic.Int32
 	belowTier1Epoch            atomic.Uint64
 	belowTier2Epoch            atomic.Uint64
-	cachedBelowTier1Epoch      atomic.Uint64
-	cachedBelowTier2Epoch      atomic.Uint64
-	cachedPressureSeq          atomic.Uint64
-	cachedPublishSeq           atomic.Uint64
-	zeroWatermarkTier2Epoch    uint64
-	zeroWatermarkSeq           uint64
-	sampledCoordEpoch          uint64
-	sampledBelowTier1Epoch     uint64
-	sampledBelowTier2Epoch     uint64
-	sampledPressureSeq         uint64
-	lastSampledEpoch           uint64
-	childShards                []*pressureState
-	exitedSamplerSeq           atomic.Uint64
-	exitedSamplerGIDs          [64]atomic.Uint64
-	panickedSamplerEpoch       atomic.Uint64
-	panickedRootSeq            atomic.Uint64
-	panickedDescendantSeq      atomic.Uint64
-	primaryStartPanicEpoch     atomic.Uint64
-	fallbackStartPanicEpoch    atomic.Uint64
-	primaryStartSnapSeq        atomic.Uint64
-	fallbackStartSnapSeq       atomic.Uint64
-	preHookSnapSeq             atomic.Uint64
-	lastObservedGCreated       atomic.Uint64
-	preHookMu                  sync.Mutex
-	preHookPruning             atomic.Bool
-	preHookLiveGIDs            map[uint64]uint64
-	hasPanickedEntries         atomic.Bool
-	panickedMu                 sync.Mutex
-	panickedRootMap            map[uint64]uint64
-	panickedDescMap            map[uint64]uint64
-	prevEvictLabelRing         atomic.Pointer[[evictLabelRingSize]unsafe.Pointer]
-	evictConfirmedChildGID     atomic.Uint64
-	evictConfirmedChildHold    atomic.Uint64
-	evictGCreatedSample        [1]metrics.Sample
-	evictSnapGCreated          uint64
-	primarySnapGoidSum         uint64
-	evictGoidSnap              goidFastSnap
-	evictProbedUnlabeledHolds  uint32
-	evictSnapStale             bool
+
+	// Coordinator seqlock-published pressure sample fields (mutated under coord.pressureWriteMu,
+	// read lock-free via cachedPublishSeq seqlock).
+	cachedPublishSeq      atomic.Uint64
+	cachedPressureBits    atomic.Uint64
+	cachedPressureEpoch   atomic.Uint64
+	cachedBelowTier1Epoch atomic.Uint64
+	cachedBelowTier2Epoch atomic.Uint64
+	cachedPressureSeq     atomic.Uint64
+
+	// Shard-local watermark and pressure-application state (mutated under the shard's mu.Lock();
+	// windowSampleDue is an atomic flag armed under mu.Lock() on every 256th write and
+	// consumed before mu.Lock() on the next write).
+	zeroWatermarkTier2Epoch uint64
+	zeroWatermarkSeq        uint64
+	sampledBelowTier1Epoch  uint64
+	sampledBelowTier2Epoch  uint64
+	sampledCoordEpoch       uint64
+	sampledPressureSeq      uint64
+	localWriteSeq           uint64
+	cachedAppliedPubSeq     uint64
+	cachedAppliedSampleSeq  uint64
+	cachedAppliedPressure   float64
+	windowSampleDue         atomic.Bool
+
+	lastSampledEpoch          uint64
+	childShards               []*pressureState
+	exitedSamplerSeq          atomic.Uint64
+	exitedSamplerGIDs         [64]atomic.Uint64
+	panickedSamplerEpoch      atomic.Uint64
+	panickedRootSeq           atomic.Uint64
+	panickedDescendantSeq     atomic.Uint64
+	primaryStartPanicEpoch    atomic.Uint64
+	fallbackStartPanicEpoch   atomic.Uint64
+	primaryStartSnapSeq       atomic.Uint64
+	fallbackStartSnapSeq      atomic.Uint64
+	preHookSnapSeq            atomic.Uint64
+	lastObservedGCreated      atomic.Uint64
+	preHookMu                 sync.Mutex
+	preHookPruning            atomic.Bool
+	preHookLiveGIDs           map[uint64]uint64
+	hasPanickedEntries        atomic.Bool
+	panickedMu                sync.Mutex
+	panickedRootMap           map[uint64]uint64
+	panickedDescMap           map[uint64]uint64
+	prevEvictLabelRing        atomic.Pointer[[evictLabelRingSize]unsafe.Pointer]
+	evictConfirmedChildGID    atomic.Uint64
+	evictConfirmedChildHold   atomic.Uint64
+	evictGCreatedSample       [1]metrics.Sample
+	evictSnapGCreated         uint64
+	primarySnapGoidSum        uint64
+	evictGoidSnap             goidFastSnap
+	evictProbedUnlabeledHolds uint32
+	evictSnapStale            bool
 }
 
 func (p *pressureState) pressureStatePtr() *pressureState {
@@ -2806,11 +2818,18 @@ const (
 	sampleStoreAdoptedLast
 )
 
-func (p *pressureState) publishCachedPressureLocked(epoch, belowTier1, belowTier2, invokeSeq uint64, val float64, needsRefresh bool) {
+func (p *pressureState) beginCachedPublishLocked() uint64 {
 	seq := p.cachedPublishSeq.Load()
 	if seq&1 == 0 {
 		seq++
 		p.cachedPublishSeq.Store(seq)
+	}
+	return seq
+}
+
+func (p *pressureState) publishCachedPressureLocked(seq, epoch, belowTier1, belowTier2, invokeSeq uint64, val float64, needsRefresh bool) {
+	if seq&1 == 0 {
+		seq = p.beginCachedPublishLocked()
 	}
 	p.cachedPressureEpoch.Store(epoch)
 	if p.cachedBelowTier1Epoch.Load() != belowTier1 {
@@ -2834,11 +2853,7 @@ func (p *pressureState) publishCachedPressureLocked(epoch, belowTier1, belowTier
 }
 
 func (p *pressureState) invalidateCachedPressureLocked() {
-	seq := p.cachedPublishSeq.Load()
-	if seq&1 == 0 {
-		seq++
-		p.cachedPublishSeq.Store(seq)
-	}
+	seq := p.beginCachedPublishLocked()
 	p.pressureNeedsRefresh.Store(true)
 	p.cachedPublishSeq.Store(seq + 1)
 }
@@ -2849,11 +2864,7 @@ func (p *pressureState) republishCachedRecoveryEpochsLocked(belowTier1, belowTie
 	if belowTier1 <= oldTier1 && belowTier2 <= oldTier2 {
 		return
 	}
-	seq := p.cachedPublishSeq.Load()
-	if seq&1 == 0 {
-		seq++
-		p.cachedPublishSeq.Store(seq)
-	}
+	seq := p.beginCachedPublishLocked()
 	if belowTier1 > oldTier1 {
 		p.cachedBelowTier1Epoch.Store(belowTier1)
 	}
@@ -2876,22 +2887,25 @@ func (p *pressureState) syncCachedRecoveryEpochsLocked(belowTier1, belowTier2 ui
 	p.republishCachedRecoveryEpochsLocked(belowTier1, belowTier2)
 }
 
-func (p *pressureState) readValidCachedSampleForEpoch(epoch uint64) (float64, uint64, uint64, uint64, bool) {
+// readValidCachedSampleWithPubSeq performs a lock-free seqlock read of the
+// coordinator's cached pressure sample for epoch, returning the pressure value,
+// recovery epochs, invoke sequence, and even cachedPublishSeq snapshot when valid.
+func (p *pressureState) readValidCachedSampleWithPubSeq(epoch uint64) (pressure float64, belowTier1, belowTier2, sampleSeq, pubSeq uint64, ok bool) {
 	seq1 := p.cachedPublishSeq.Load()
 	if seq1 == 0 || seq1&1 != 0 || !p.pressureInitialized.Load() || p.pressureNeedsRefresh.Load() {
-		return 0.0, 0, 0, 0, false
+		return 0.0, 0, 0, 0, 0, false
 	}
 	if p.cachedPressureEpoch.Load() != epoch {
-		return 0.0, 0, 0, 0, false
+		return 0.0, 0, 0, 0, 0, false
 	}
 	bits := p.cachedPressureBits.Load()
-	belowTier1 := p.cachedBelowTier1Epoch.Load()
-	belowTier2 := p.cachedBelowTier2Epoch.Load()
-	sampleSeq := p.cachedPressureSeq.Load()
+	belowTier1 = p.cachedBelowTier1Epoch.Load()
+	belowTier2 = p.cachedBelowTier2Epoch.Load()
+	sampleSeq = p.cachedPressureSeq.Load()
 	if p.cachedPublishSeq.Load() != seq1 || !p.isCachedSampleStillValid(epoch) {
-		return 0.0, 0, 0, 0, false
+		return 0.0, 0, 0, 0, 0, false
 	}
-	return math.Float64frombits(bits), belowTier1, belowTier2, sampleSeq, true
+	return math.Float64frombits(bits), belowTier1, belowTier2, sampleSeq, seq1, true
 }
 
 func (p *pressureState) advanceRecoveryEpochsForValLocked(val float64, preBelowTier1, preBelowTier2 uint64) (uint64, uint64) {
@@ -2964,7 +2978,7 @@ func (p *pressureState) isElevatedSampleStaleLocked(val float64, belowTier1, bel
 
 func (p *pressureState) adoptNewerCachedSampleLocked(minSeq uint64) (float64, uint64, uint64, uint64, bool) {
 	coord := p.coord()
-	val, belowTier1, belowTier2, seq, ok := coord.readValidCachedSampleForEpoch(coord.reclaimEpoch.Load())
+	val, belowTier1, belowTier2, seq, _, ok := coord.readValidCachedSampleWithPubSeq(coord.reclaimEpoch.Load())
 	if !ok || seq <= minSeq || seq < p.sampledPressureSeq {
 		return 0, 0, 0, 0, false
 	}
@@ -2975,7 +2989,7 @@ func (p *pressureState) adoptNewerCachedSampleLocked(minSeq uint64) (float64, ui
 }
 
 func (p *pressureState) canAdoptPostRetryCachedSampleLocked(currentEpoch uint64, shardUnreclaimed bool, minSeq uint64) (float64, uint64, uint64, uint64, bool) {
-	val, belowTier1, belowTier2, seq, ok := p.coord().readValidCachedSampleForEpoch(currentEpoch)
+	val, belowTier1, belowTier2, seq, _, ok := p.coord().readValidCachedSampleWithPubSeq(currentEpoch)
 	if !ok || (shardUnreclaimed && seq < minSeq) || seq < p.sampledPressureSeq {
 		return 0, 0, 0, 0, false
 	}
@@ -2992,6 +3006,7 @@ func (p *pressureState) canAcceptUnreclaimedShardFallbackLocked(s pressureSample
 func (p *pressureState) resolvePostRetryPressureLocked(s pressureSample) (uint64, float64) {
 	if !s.valid && p.isSamplingGoroutine() {
 		p.hasValidSample = false
+		p.cachedAppliedPubSeq = 0
 		return p.reclaimEpoch.Load(), 0.0
 	}
 	coord := p.coord()
@@ -3018,18 +3033,12 @@ func (p *pressureState) resolvePostRetryPressureLocked(s pressureSample) (uint64
 		resolvedPressure = s.val
 	} else {
 		p.hasValidSample = false
+		p.cachedAppliedPubSeq = 0
 		resolvedPressure = 0.0
 	}
 	p.sampledCoordEpoch = acceptedCoordEpoch
 	p.syncZeroWatermarkLocked(belowTier1, belowTier2, sampleSeq, resolvedPressure)
 	return p.reclaimEpoch.Load(), resolvedPressure
-}
-
-func (p *pressureState) sampleForLock(fresh bool) pressureSample {
-	if fresh {
-		return p.coord().samplePressureFreshForShard(p)
-	}
-	return p.samplePressureWithEpoch()
 }
 
 func (p *pressureState) tryFastForwardSampledEpochLocked(targetShard *pressureState, s pressureSample) pressureSample {
@@ -3086,10 +3095,10 @@ func (p *pressureState) resolveLockLoopStepLocked(s pressureSample, sameShardRet
 	return s, true
 }
 
-func (p *pressureState) lockWithPressureSlow(mu *sync.RWMutex, fresh bool) (uint64, float64) {
-	s := p.sampleForLock(fresh)
-	mu.Lock()
+func (p *pressureState) lockWithPressureSlow(mu *sync.RWMutex) (uint64, float64) {
 	coord := p.coord()
+	s := coord.samplePressureFreshOnCoord(p)
+	mu.Lock()
 	if s.valid && s.epoch == coord.reclaimEpoch.Load() && !p.isElevatedSampleStaleLocked(s.val, s.belowTier1, s.belowTier2, s.invokeSeq) {
 		p.hasValidSample = true
 		p.sampledCoordEpoch = s.epoch
@@ -3104,17 +3113,10 @@ func (p *pressureState) lockWithPressureSlow(mu *sync.RWMutex, fresh bool) (uint
 			break
 		}
 		mu.Unlock()
-		s = p.sampleForLock(fresh)
+		s = coord.samplePressureFreshOnCoord(p)
 		mu.Lock()
 	}
 	return p.resolvePostRetryPressureLocked(s)
-}
-
-func (p *pressureState) canUseCachedSampleForEpoch(epoch, seq uint64) bool {
-	return (seq&pressureSampleWindowMask) != 1 &&
-		p.pressureInitialized.Load() &&
-		!p.pressureNeedsRefresh.Load() &&
-		p.cachedPressureEpoch.Load() == epoch
 }
 
 func (p *pressureState) isCachedSampleStillValid(epoch uint64) bool {
@@ -3124,44 +3126,156 @@ func (p *pressureState) isCachedSampleStillValid(epoch uint64) bool {
 		p.reclaimEpoch.Load() == epoch
 }
 
+// recordAppliedLowPressureSampleLocked caches the coordinator's seqlock publication
+// sequence and pressure on the shard when an adopted sample is valid and below
+// CompactionThreshold, or clears cachedAppliedPubSeq otherwise. Caller MUST hold mu.Lock().
+func (p *pressureState) recordAppliedLowPressureSampleLocked(pubSeq, sampleSeq uint64, pressure float64) {
+	if p.hasValidSample && pubSeq != 0 && pubSeq&1 == 0 && pressure < p.options.CompactionThreshold {
+		p.cachedAppliedPubSeq = pubSeq
+		p.cachedAppliedSampleSeq = sampleSeq
+		p.cachedAppliedPressure = pressure
+		return
+	}
+	p.cachedAppliedPubSeq = 0
+}
+
+// canReuseAppliedLowPressureLocked reports whether the shard's last applied
+// low-pressure sample still matches the coordinator's active seqlock publication
+// and reclamation epoch. Caller MUST hold mu.Lock().
+func (p *pressureState) canReuseAppliedLowPressureLocked(coord *pressureState) bool {
+	pubSeq := p.cachedAppliedPubSeq
+	return pubSeq != 0 &&
+		p.hasValidSample &&
+		p.sampledPressureSeq == p.cachedAppliedSampleSeq &&
+		coord.reclaimEpoch.Load() == p.sampledCoordEpoch &&
+		p.sampledPressureSeq >= coord.lastSampledSeq.Load() &&
+		coord.cachedPublishSeq.Load() == pubSeq
+}
+
+// adoptCoordCachedSampleLocked reads the coordinator's seqlock-cached pressure
+// sample and applies it to the shard if causally valid for the current reclamation
+// epoch. Caller MUST hold mu.Lock().
+//
+//go:noinline
+func (p *pressureState) adoptCoordCachedSampleLocked(coord *pressureState) (uint64, float64, bool) {
+	epoch := coord.reclaimEpoch.Load()
+	pressure, belowTier1, belowTier2, sampleSeq, pubSeq, ok := coord.readValidCachedSampleWithPubSeq(epoch)
+	if !ok || p.isElevatedSampleStaleLocked(pressure, belowTier1, belowTier2, sampleSeq) {
+		coord.pressureWriteMu.Lock()
+		epoch = coord.reclaimEpoch.Load()
+		pressure, belowTier1, belowTier2, sampleSeq, pubSeq, ok = coord.readValidCachedSampleWithPubSeq(epoch)
+		coord.pressureWriteMu.Unlock()
+		if !ok || p.isElevatedSampleStaleLocked(pressure, belowTier1, belowTier2, sampleSeq) {
+			return 0, 0, false
+		}
+	}
+	p.hasValidSample = true
+	p.sampledCoordEpoch = epoch
+	p.syncZeroWatermarkLocked(belowTier1, belowTier2, sampleSeq, pressure)
+	p.recordAppliedLowPressureSampleLocked(pubSeq, sampleSeq, pressure)
+	if coord == p {
+		return epoch, pressure, true
+	}
+	return p.reclaimEpoch.Load(), pressure, true
+}
+
+// tryCacheFreshSamplePubSeqLocked records the coordinator's current seqlock
+// publication sequence for a freshly collected low-pressure sample so subsequent
+// writes in the 256-write window can reuse it via canReuseAppliedLowPressureLocked.
+// Caller MUST hold mu.Lock().
+func (p *pressureState) tryCacheFreshSamplePubSeqLocked(coord *pressureState, invokeSeq, epoch uint64, val float64) {
+	if !p.hasValidSample || val >= p.options.CompactionThreshold {
+		p.cachedAppliedPubSeq = 0
+		return
+	}
+	pubSeq := coord.cachedPublishSeq.Load()
+	if pubSeq != 0 && pubSeq&1 == 0 &&
+		coord.cachedPressureSeq.Load() == invokeSeq &&
+		coord.cachedPressureEpoch.Load() == epoch &&
+		!coord.pressureNeedsRefresh.Load() &&
+		coord.cachedPublishSeq.Load() == pubSeq {
+		p.cachedAppliedPubSeq = pubSeq
+		p.cachedAppliedSampleSeq = invokeSeq
+		p.cachedAppliedPressure = val
+		return
+	}
+	p.cachedAppliedPubSeq = 0
+}
+
+// advanceLocalWriteSeqLocked increments the shard-local write counter under
+// mu.Lock() and arms windowSampleDue on every 256th write so the next write
+// refreshes the pressure sample before acquiring mu.Lock().
+func (p *pressureState) advanceLocalWriteSeqLocked() {
+	p.localWriteSeq++
+	if (p.localWriteSeq & pressureSampleWindowMask) == 0 {
+		p.windowSampleDue.Store(true)
+	}
+}
+
+// lockWithPressureFastMiss samples a fresh pressure reading outside mu.Lock()
+// on cold start, post-reclamation refresh, or 256-write window expiration, then
+// acquires mu.Lock() and applies or adopts a causally valid sample.
 func (p *pressureState) lockWithPressureFastMiss(mu *sync.RWMutex) (uint64, float64) {
+	if p.windowSampleDue.Load() {
+		p.windowSampleDue.Store(false)
+	}
 	coord := p.coord()
-	s := coord.samplePressureFreshForShard(p)
+	s := coord.samplePressureFreshOnCoord(p)
 	mu.Lock()
+	if p.windowSampleDue.Load() {
+		p.windowSampleDue.Store(false)
+	}
+	p.advanceLocalWriteSeqLocked()
 	if s.epoch == coord.reclaimEpoch.Load() && !(s.valid && p.isElevatedSampleStaleLocked(s.val, s.belowTier1, s.belowTier2, s.invokeSeq)) {
 		if !s.valid && p.isSamplingGoroutine() {
 			p.hasValidSample = false
+			p.cachedAppliedPubSeq = 0
 			return p.reclaimEpoch.Load(), 0.0
 		}
 		p.hasValidSample = s.valid
 		p.sampledCoordEpoch = s.epoch
 		p.syncZeroWatermarkLocked(s.belowTier1, s.belowTier2, s.invokeSeq, s.val)
+		p.tryCacheFreshSamplePubSeqLocked(coord, s.invokeSeq, s.epoch, s.val)
+		if coord == p {
+			return s.epoch, s.val
+		}
 		return p.reclaimEpoch.Load(), s.val
 	}
+	if sampledEpoch, pressure, ok := p.adoptCoordCachedSampleLocked(coord); ok {
+		return sampledEpoch, pressure
+	}
+	p.cachedAppliedPubSeq = 0
 	mu.Unlock()
-	return p.lockWithPressureSlow(mu, false)
+	return p.lockWithPressureSlow(mu)
 }
 
+// lockWithPressure acquires mu.Lock() and returns the shard's reclamation epoch
+// and effective memory pressure. When using the default runtime pressure probe,
+// writes within the 256-write amortization window reuse or adopt the coordinator's
+// cached sample under a single lock acquisition without pre-lock atomic RMWs.
 func (p *pressureState) lockWithPressure(mu *sync.RWMutex, fresh bool) (uint64, float64) {
 	coord := p.coord()
 	if !fresh && !coord.options.hasCustomPressureFunc {
-		epoch := coord.reclaimEpoch.Load()
-		if coord.canUseCachedSampleForEpoch(epoch, p.pressureSampleSeq.Add(1)) {
-			if pressure, belowTier1, belowTier2, sampleSeq, ok := coord.readValidCachedSampleForEpoch(epoch); ok {
-				mu.Lock()
-				if epoch == coord.reclaimEpoch.Load() && !p.isElevatedSampleStaleLocked(pressure, belowTier1, belowTier2, sampleSeq) {
-					p.hasValidSample = true
-					p.sampledCoordEpoch = epoch
-					p.syncZeroWatermarkLocked(belowTier1, belowTier2, sampleSeq, pressure)
-					return p.reclaimEpoch.Load(), pressure
+		if coord.pressureInitialized.Load() && !coord.pressureNeedsRefresh.Load() &&
+			(!p.windowSampleDue.Load() || !p.windowSampleDue.CompareAndSwap(true, false)) {
+			mu.Lock()
+			if p.canReuseAppliedLowPressureLocked(coord) {
+				p.advanceLocalWriteSeqLocked()
+				p.resetZeroWatermarkBelowTier2(p.cachedAppliedPressure)
+				if coord == p {
+					return p.sampledCoordEpoch, p.cachedAppliedPressure
 				}
-				mu.Unlock()
-				return p.lockWithPressureSlow(mu, false)
+				return p.reclaimEpoch.Load(), p.cachedAppliedPressure
 			}
+			if sampledEpoch, pressure, ok := p.adoptCoordCachedSampleLocked(coord); ok {
+				p.advanceLocalWriteSeqLocked()
+				return sampledEpoch, pressure
+			}
+			mu.Unlock()
 		}
 		return p.lockWithPressureFastMiss(mu)
 	}
-	return p.lockWithPressureSlow(mu, fresh)
+	return p.lockWithPressureSlow(mu)
 }
 
 func (p *pressureState) canReuseShardSample(validSample bool) bool {
@@ -3171,7 +3285,7 @@ func (p *pressureState) canReuseShardSample(validSample bool) bool {
 func (p *pressureState) adoptCachedShardSampleLocked(minSeq uint64, sample *shardSample) bool {
 	coord := p.coord()
 	curCoordEpoch := coord.reclaimEpoch.Load()
-	val, belowTier1, belowTier2, seq, ok := coord.readValidCachedSampleForEpoch(curCoordEpoch)
+	val, belowTier1, belowTier2, seq, _, ok := coord.readValidCachedSampleWithPubSeq(curCoordEpoch)
 	if !ok || seq < minSeq || seq < p.sampledPressureSeq {
 		return false
 	}
@@ -3202,6 +3316,7 @@ func (p *pressureState) tryApplyShardSampleLocked(fresh bool, sample *shardSampl
 			return false
 		}
 		p.hasValidSample = false
+		p.cachedAppliedPubSeq = 0
 		return true
 	}
 	coord := p.coord()
@@ -3397,6 +3512,11 @@ func (p *pressureState) storeSampledPressureWithSeq(targetShard *pressureState, 
 	epoch, shardEpoch, allowStore := p.resolveSampleEpochsLocked(targetShard, shardEpoch, shardExtEpoch, epoch, extEpoch, val, gid, slot, noPeerPanic)
 	invokeSeq, val, willStore, storeMode := p.decideSampleStoreLocked(originalEpoch, epoch, curEpoch, invokeSeq, val, allowStore)
 
+	var pubSeq uint64
+	if willStore {
+		pubSeq = p.beginCachedPublishLocked()
+	}
+
 	var belowTier1, belowTier2 uint64
 	switch {
 	case storeMode == sampleStoreAdoptedCached:
@@ -3413,7 +3533,7 @@ func (p *pressureState) storeSampledPressureWithSeq(targetShard *pressureState, 
 	}
 
 	if willStore {
-		p.publishCachedPressureLocked(epoch, belowTier1, belowTier2, invokeSeq, val, elevatedStale)
+		p.publishCachedPressureLocked(pubSeq, epoch, belowTier1, belowTier2, invokeSeq, val, elevatedStale)
 	}
 	if releaseFastPrimary {
 		p.finishFastPrimaryLocked()
@@ -3724,6 +3844,8 @@ func (p *pressureState) reentrantFallbackPressureSample(targetShard *pressureSta
 	}
 }
 
+// samplePressureFreshOnCoord evaluates p.options.PressureFunc lock-free outside the cache lock
+// with a goroutine-aware re-entrancy guard and cold-start fallback.
 func (p *pressureState) samplePressureFreshOnCoord(targetShard *pressureState) pressureSample {
 	if p.options.PressureFunc == nil {
 		shardEpoch := targetShard.reclaimEpoch.Load()
@@ -3762,40 +3884,6 @@ func (p *pressureState) samplePressureFreshOnCoord(targetShard *pressureState) p
 		return p.sampleWithFallbackSlot(targetShard, gid, parentGID)
 	}
 	return p.sampleWithOverflowSlot(targetShard, gid, parentGID)
-}
-
-// samplePressureFreshForShard evaluates p.options.PressureFunc lock-free outside the cache lock
-// with a goroutine-aware re-entrancy guard and cold-start fallback.
-func (p *pressureState) samplePressureFreshForShard(targetShard *pressureState) pressureSample {
-	return p.coord().samplePressureFreshOnCoord(targetShard)
-}
-
-// samplePressureWithEpoch returns the current memory pressure and epoch for foreground cache operations.
-// Custom PressureFunc callbacks are invoked on every call; the default runtime/metrics probe is amortized
-// across a 256-operation window (and immediately refreshed after any reclamation/compaction cycle).
-func (p *pressureState) samplePressureWithEpoch() pressureSample {
-	coord := p.coord()
-	if coord.options.hasCustomPressureFunc {
-		return coord.samplePressureFreshOnCoord(p)
-	}
-	epoch := coord.reclaimEpoch.Load()
-	if !coord.canUseCachedSampleForEpoch(epoch, p.pressureSampleSeq.Add(1)) {
-		return coord.samplePressureFreshOnCoord(p)
-	}
-	shardEpoch := p.reclaimEpoch.Load()
-	val, belowTier1, belowTier2, sampleSeq, ok := coord.readValidCachedSampleForEpoch(epoch)
-	if !ok {
-		return coord.samplePressureFreshOnCoord(p)
-	}
-	return pressureSample{
-		epoch:      epoch,
-		shardEpoch: shardEpoch,
-		invokeSeq:  sampleSeq,
-		belowTier1: belowTier1,
-		belowTier2: belowTier2,
-		val:        val,
-		valid:      true,
-	}
 }
 
 func (p *pressureState) onEntryPut(newLen int, size uint64) {
@@ -5252,6 +5340,7 @@ func (p *pressureState) resetZeroWatermarkBelowTier2(pressure float64) {
 }
 
 func (p *pressureState) syncZeroWatermarkLocked(belowTier1, belowTier2, sampleSeq uint64, pressure float64) {
+	p.cachedAppliedPubSeq = 0
 	if !p.hasValidSample || p.isSamplingGoroutine() {
 		return
 	}
