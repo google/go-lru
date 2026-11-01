@@ -175,9 +175,11 @@ type arenaRadix[V any] struct {
 	// mu is placed after the fields read on every lookup (nodes, prefixArena, seed, hashSlots, hashMask, root):
 	// RLock/RUnlock atomically update its reader count, and sharing a cache line
 	// with those fields would make every concurrent lookup miss (false sharing).
-	mu            sync.RWMutex
-	nodeMapDirty  bool
-	prefixExposed atomic.Bool
+	mu              sync.RWMutex
+	putPrefixSpan   prefixSpan
+	recyclingForPut bool
+	nodeMapDirty    bool
+	prefixExposed   atomic.Bool
 
 	pressureState
 }
@@ -223,11 +225,19 @@ func (c *arenaRadix[V]) removeFreePrefixSpanAtLocked(idx int) {
 	c.freePrefixCount = last
 }
 
-// trimFreePrefixSpansAtTailLocked repeatedly trims any free spans abutting the end of c.prefixArena.
+// trimFreePrefixSpansAtTailLocked trims any free span abutting the end of c.prefixArena.
+// Because recordFreePrefixSpanLocked coalesces adjacent spans on insertion, at most one
+// span in c.freePrefixSpans can abut a given arena end; if trimming that span exposes
+// c.putPrefixSpan at the new tail, a second pass trims c.putPrefixSpan and any span before it.
 func (c *arenaRadix[V]) trimFreePrefixSpansAtTailLocked() {
 	for {
-		trimmed := false
 		arenaEnd := uint32(len(c.prefixArena))
+		if c.putPrefixSpan.len > 0 && c.putPrefixSpan.off+c.putPrefixSpan.len == arenaEnd {
+			c.prefixArena = c.prefixArena[:c.putPrefixSpan.off]
+			c.putPrefixSpan = prefixSpan{}
+			arenaEnd = uint32(len(c.prefixArena))
+		}
+		trimmed := false
 		for i := 0; i < c.freePrefixCount; i++ {
 			sp := c.freePrefixSpans[i]
 			if sp.off+sp.len == arenaEnd {
@@ -237,21 +247,30 @@ func (c *arenaRadix[V]) trimFreePrefixSpansAtTailLocked() {
 				break
 			}
 		}
-		if !trimmed {
+		if !trimmed || c.putPrefixSpan.len == 0 || c.putPrefixSpan.off+c.putPrefixSpan.len != uint32(len(c.prefixArena)) {
 			return
 		}
 	}
 }
 
-// mergeAdjacentFreeSpanLocked coalesces freePrefixSpans[mergedIdx] with any neighboring span.
+// finishPutPrefixRecycleLocked ends pre-insert Put prefix span recycling and flushes any
+// unconsumed span in c.putPrefixSpan back to c.freePrefixSpans.
+func (c *arenaRadix[V]) finishPutPrefixRecycleLocked() {
+	c.recyclingForPut = false
+	if c.putPrefixSpan.len > 0 {
+		sp := c.putPrefixSpan
+		c.putPrefixSpan = prefixSpan{}
+		c.recordFreePrefixSpanLocked(sp.off, sp.len)
+	}
+}
+
+// mergeAdjacentFreeSpanLocked coalesces freePrefixSpans[mergedIdx] with any neighboring span at j > mergedIdx.
 func (c *arenaRadix[V]) mergeAdjacentFreeSpanLocked(mergedIdx int) {
 	sp := c.freePrefixSpans[mergedIdx]
-	for j := 0; j < c.freePrefixCount; j++ {
-		if j == mergedIdx {
-			continue
-		}
+	spEnd := sp.off + sp.len
+	for j := mergedIdx + 1; j < c.freePrefixCount; j++ {
 		other := c.freePrefixSpans[j]
-		if sp.off+sp.len == other.off {
+		if spEnd == other.off {
 			c.freePrefixSpans[mergedIdx].len += other.len
 			c.removeFreePrefixSpanAtLocked(j)
 			return
@@ -266,23 +285,22 @@ func (c *arenaRadix[V]) mergeAdjacentFreeSpanLocked(mergedIdx int) {
 }
 
 // recordFreePrefixSpanLocked adds [off, off+spanLen) to c.freePrefixSpans, coalescing with
-// adjacent spans, trimming tail spans, or evicting the smallest tracked span if the 32-slot table is full.
+// adjacent spans or evicting the smallest tracked span if the 32-slot table is full.
 func (c *arenaRadix[V]) recordFreePrefixSpanLocked(off, spanLen uint32) {
 	minIdx := 0
 	minLen := uint32(math.MaxUint32)
+	end := off + spanLen
 	for i := 0; i < c.freePrefixCount; i++ {
 		sp := &c.freePrefixSpans[i]
 		if sp.off+sp.len == off {
 			sp.len += spanLen
 			c.mergeAdjacentFreeSpanLocked(i)
-			c.trimFreePrefixSpansAtTailLocked()
 			return
 		}
-		if off+spanLen == sp.off {
+		if end == sp.off {
 			sp.off = off
 			sp.len += spanLen
 			c.mergeAdjacentFreeSpanLocked(i)
-			c.trimFreePrefixSpansAtTailLocked()
 			return
 		}
 		if sp.len < minLen {
@@ -302,9 +320,10 @@ func (c *arenaRadix[V]) recordFreePrefixSpanLocked(off, spanLen uint32) {
 
 // takeFreePrefixSpanLocked allocates a recycled byte span of length sLen from c.freePrefixSpans
 // using best-fit selection, Carve-splitting any larger span in place.
+// Scanning from the tail checks the most recently freed spans first in O(1) under steady-state turnover.
 func (c *arenaRadix[V]) takeFreePrefixSpanLocked(sLen uint32) (uint32, bool) {
 	bestIdx := -1
-	for i := 0; i < c.freePrefixCount; i++ {
+	for i := c.freePrefixCount - 1; i >= 0; i-- {
 		sp := c.freePrefixSpans[i]
 		if sp.len == sLen {
 			c.removeFreePrefixSpanAtLocked(i)
@@ -347,11 +366,33 @@ func (c *arenaRadix[V]) releasePrefixSpanLocked(off uint32, pLen int, isLarge bo
 		c.trimFreePrefixSpansAtTailLocked()
 		return
 	}
+	rawOff := off
+	rawLen := uint32(pLen)
 	if isLarge {
-		c.recordFreePrefixSpanLocked(off-4, uint32(pLen)+4)
-	} else {
-		c.recordFreePrefixSpanLocked(off, uint32(pLen))
+		rawOff -= 4
+		rawLen += 4
 	}
+	if c.recyclingForPut {
+		if c.putPrefixSpan.len > 0 {
+			if c.putPrefixSpan.off+c.putPrefixSpan.len == rawOff {
+				c.putPrefixSpan.len += rawLen
+				return
+			}
+			if rawOff+rawLen == c.putPrefixSpan.off {
+				c.putPrefixSpan.off = rawOff
+				c.putPrefixSpan.len += rawLen
+				return
+			}
+		}
+		if rawLen > c.putPrefixSpan.len {
+			if c.putPrefixSpan.len > 0 {
+				c.recordFreePrefixSpanLocked(c.putPrefixSpan.off, c.putPrefixSpan.len)
+			}
+			c.putPrefixSpan = prefixSpan{off: rawOff, len: rawLen}
+			return
+		}
+	}
+	c.recordFreePrefixSpanLocked(rawOff, rawLen)
 }
 
 // clearNodePrefix releases nodeID's prefix span in c.prefixArena and resets its prefix metadata.
@@ -409,16 +450,32 @@ func (c *arenaRadix[V]) growPrefixArenaNoCompactLocked(needed int) {
 	c.prefixExposed.Store(false)
 }
 
-// tryTakeFreePrefixPayloadSpanLocked attempts to carve a span of size needed from c.freePrefixSpans,
-// writing the 4-byte little-endian length header when payloadLen >= largePrefixSentinel and returning
-// the payload offset in c.prefixArena.
+// tryTakeFreePrefixPayloadSpanLocked attempts to carve a span of size needed from c.putPrefixSpan
+// or c.freePrefixSpans, writing the 4-byte little-endian length header when payloadLen >= largePrefixSentinel
+// and returning the payload offset in c.prefixArena.
 func (c *arenaRadix[V]) tryTakeFreePrefixPayloadSpanLocked(payloadLen, needed int) (uint32, bool) {
-	if c.freePrefixCount <= 0 || uint64(needed) > uint64(maxPrefixArenaBytes) {
+	if uint64(needed) > uint64(maxPrefixArenaBytes) {
 		return 0, false
 	}
-	rawOff, ok := c.takeFreePrefixSpanLocked(uint32(needed))
-	if !ok {
-		return 0, false
+	need32 := uint32(needed)
+	var rawOff uint32
+	if c.putPrefixSpan.len >= need32 {
+		rawOff = c.putPrefixSpan.off
+		if c.putPrefixSpan.len == need32 {
+			c.putPrefixSpan = prefixSpan{}
+		} else {
+			c.putPrefixSpan.off += need32
+			c.putPrefixSpan.len -= need32
+		}
+	} else {
+		if c.freePrefixCount <= 0 {
+			return 0, false
+		}
+		var ok bool
+		rawOff, ok = c.takeFreePrefixSpanLocked(need32)
+		if !ok {
+			return 0, false
+		}
 	}
 	if payloadLen >= int(largePrefixSentinel) {
 		binary.LittleEndian.PutUint32(c.prefixArena[rawOff:rawOff+4], uint32(payloadLen))
@@ -709,9 +766,9 @@ func (c *arenaRadix[V]) slotBelongsToOtherHash(slot arenaHashSlot, keyHash uint6
 	return nodeHash != keyHash && arenaHashTag(nodeHash) == slot.tag
 }
 
-func (c *arenaRadix[V]) lookupHashSlot(key string, keyHash uint64) (nodeID uint32, slotMatched, verified bool) {
+func (c *arenaRadix[V]) lookupHashSlotAt(key string, keyHash uint64) (nodeID, slotIdx uint32, slotMatched, verified bool) {
 	if len(c.hashSlots) == 0 {
-		return nilNode, false, false
+		return nilNode, 0, false, false
 	}
 	tag := arenaHashTag(keyHash)
 	mask := c.hashMask
@@ -719,12 +776,12 @@ func (c *arenaRadix[V]) lookupHashSlot(key string, keyHash uint64) (nodeID uint3
 	for {
 		slot := c.hashSlots[idx]
 		if slot.tag == 0 {
-			return nilNode, slotMatched, false
+			return nilNode, 0, slotMatched, false
 		}
 		if slot.tag == tag {
 			id := slot.nodeID
 			if id < uint32(len(c.nodes)) && c.nodes[id].hasValue() && c.verifyKey(id, key) {
-				return id, true, true
+				return id, idx, true, true
 			}
 			if !c.slotBelongsToOtherHash(slot, keyHash) {
 				slotMatched = true
@@ -732,6 +789,11 @@ func (c *arenaRadix[V]) lookupHashSlot(key string, keyHash uint64) (nodeID uint3
 		}
 		idx = (idx + 1) & mask
 	}
+}
+
+func (c *arenaRadix[V]) lookupHashSlot(key string, keyHash uint64) (nodeID uint32, slotMatched, verified bool) {
+	id, _, matched, ok := c.lookupHashSlotAt(key, keyHash)
+	return id, matched, ok
 }
 
 func (c *arenaRadix[V]) findHashSlotIndex(keyHash uint64) (uint32, bool) {
@@ -1064,27 +1126,48 @@ func (c *arenaRadix[V]) getChild(nID uint32, b byte) uint32 {
 	return nilNode
 }
 
-// addChild adds a child node under nID, preserving lexicographical order by firstByte.
-func (c *arenaRadix[V]) addChild(nID uint32, newChildID uint32) {
-	c.nodes[newChildID].parent = nID
-	newFirstByte := c.nodes[newChildID].firstByte
-	pcurr := &c.nodes[nID].child
-	for *pcurr != nilNode && c.nodes[*pcurr].firstByte < newFirstByte {
-		pcurr = &c.nodes[*pcurr].sibling
+// findChildWithPrev searches nID's sorted sibling list for a child starting with byte b.
+// If found, it returns (childID, prevID, nodes[childID].sibling).
+// If not found, it returns (nilNode, prevID, nextID) where prevID and nextID bracket
+// the insertion position for a new child starting with byte b.
+func (c *arenaRadix[V]) findChildWithPrev(nID uint32, b byte) (childID, prevID, nextID uint32) {
+	nodes := c.nodes
+	prev := nilNode
+	for curr := nodes[nID].child; curr != nilNode; curr = nodes[curr].sibling {
+		c0 := nodes[curr].firstByte
+		if c0 == b {
+			return curr, prev, nodes[curr].sibling
+		}
+		if c0 > b {
+			return nilNode, prev, curr
+		}
+		prev = curr
 	}
-	c.nodes[newChildID].sibling = *pcurr
-	*pcurr = newChildID
+	return nilNode, prev, nilNode
+}
+
+// linkChildAt inserts newChildID into nID's sibling list between prevID and nextID.
+func (c *arenaRadix[V]) linkChildAt(nID, prevID, nextID, newChildID uint32) {
+	nodes := c.nodes
+	nodes[newChildID].parent = nID
+	nodes[newChildID].sibling = nextID
+	if prevID == nilNode {
+		nodes[nID].child = newChildID
+	} else {
+		nodes[prevID].sibling = newChildID
+	}
 }
 
 // removeChild removes childToRemoveID from the sibling chain of nID.
 func (c *arenaRadix[V]) removeChild(nID uint32, childToRemoveID uint32) {
-	for pcurr := &c.nodes[nID].child; *pcurr != nilNode; pcurr = &c.nodes[*pcurr].sibling {
+	nodes := c.nodes
+	for pcurr := &nodes[nID].child; *pcurr != nilNode; pcurr = &nodes[*pcurr].sibling {
 		if *pcurr != childToRemoveID {
 			continue
 		}
-		*pcurr = c.nodes[childToRemoveID].sibling
-		c.nodes[childToRemoveID].sibling = nilNode
-		c.nodes[childToRemoveID].parent = nilNode
+		*pcurr = nodes[childToRemoveID].sibling
+		nodes[childToRemoveID].sibling = nilNode
+		nodes[childToRemoveID].parent = nilNode
 		return
 	}
 	panic("removeChild: requested child not found in sibling list")
@@ -1092,15 +1175,16 @@ func (c *arenaRadix[V]) removeChild(nID uint32, childToRemoveID uint32) {
 
 // replaceChild replaces oldChildID with newChildID in the sibling list of nID.
 func (c *arenaRadix[V]) replaceChild(nID uint32, oldChildID uint32, newChildID uint32) {
-	for pcurr := &c.nodes[nID].child; *pcurr != nilNode; pcurr = &c.nodes[*pcurr].sibling {
+	nodes := c.nodes
+	for pcurr := &nodes[nID].child; *pcurr != nilNode; pcurr = &nodes[*pcurr].sibling {
 		if *pcurr != oldChildID {
 			continue
 		}
-		c.nodes[newChildID].parent = nID
-		c.nodes[newChildID].sibling = c.nodes[oldChildID].sibling
+		nodes[newChildID].parent = nID
+		nodes[newChildID].sibling = nodes[oldChildID].sibling
 		*pcurr = newChildID
-		c.nodes[oldChildID].sibling = nilNode
-		c.nodes[oldChildID].parent = nilNode
+		nodes[oldChildID].sibling = nilNode
+		nodes[oldChildID].parent = nilNode
 		return
 	}
 	panic("replaceChild: requested child not found in sibling list")
@@ -1120,13 +1204,13 @@ func (c *arenaRadix[V]) insertNode(key string, value V) uint32 {
 			return nodeID
 		}
 
-		childID := c.getChild(nodeID, search[0])
+		childID, prevID, nextID := c.findChildWithPrev(nodeID, search[0])
 		if childID == nilNode {
 			newLeafID := c.allocateNode()
 			c.setNodePrefix(newLeafID, search)
 			c.nodes[newLeafID].value = value
 			c.nodes[newLeafID].keyLenAndFlags = kl | nodeHasValueBit
-			c.addChild(nodeID, newLeafID)
+			c.linkChildAt(nodeID, prevID, nextID, newLeafID)
 			return newLeafID
 		}
 
@@ -1145,10 +1229,11 @@ func (c *arenaRadix[V]) insertNode(key string, value V) uint32 {
 		splitNodeID := c.allocateNode()
 		c.splitNodePrefixLocked(childID, splitNodeID, lcp)
 		c.nodes[splitNodeID].setKeyLen(splitEnd)
-		c.nodes[splitNodeID].parent = nodeID
 
-		c.replaceChild(nodeID, childID, splitNodeID)
-		c.addChild(splitNodeID, childID)
+		c.linkChildAt(nodeID, prevID, nextID, splitNodeID)
+		c.nodes[childID].parent = splitNodeID
+		c.nodes[childID].sibling = nilNode
+		c.nodes[splitNodeID].child = childID
 
 		if lcp == len(search) {
 			c.nodes[splitNodeID].value = value
@@ -1158,9 +1243,17 @@ func (c *arenaRadix[V]) insertNode(key string, value V) uint32 {
 
 		newLeafID := c.allocateNode()
 		c.setNodePrefix(newLeafID, search[lcp:])
-		c.nodes[newLeafID].value = value
-		c.nodes[newLeafID].keyLenAndFlags = kl | nodeHasValueBit
-		c.addChild(splitNodeID, newLeafID)
+		nodes := c.nodes
+		nodes[newLeafID].value = value
+		nodes[newLeafID].keyLenAndFlags = kl | nodeHasValueBit
+		nodes[newLeafID].parent = splitNodeID
+		if nodes[newLeafID].firstByte < nodes[childID].firstByte {
+			nodes[newLeafID].sibling = childID
+			nodes[splitNodeID].child = newLeafID
+		} else {
+			nodes[newLeafID].sibling = nilNode
+			nodes[childID].sibling = newLeafID
+		}
 		return newLeafID
 	}
 }
@@ -1268,6 +1361,66 @@ func (c *arenaRadix[V]) getNodeKeyForPut(key string, keyHash uint64) (nodeID uin
 	return id, ok, false
 }
 
+// tryCollapseSiblingPrefixInPlaceLocked attempts to merge parentID and onlyChildID in-place
+// using parentID's prefix and deadLeafID's contiguous suffix span [parentOff+parentLen, ...)
+// when deadLeafID is being deleted and leaves parentID with onlyChildID as its sole child.
+func (c *arenaRadix[V]) tryCollapseSiblingPrefixInPlaceLocked(parentID, deadLeafID, onlyChildID uint32) bool {
+	parent := &c.nodes[parentID]
+	dead := &c.nodes[deadLeafID]
+	onlyChild := &c.nodes[onlyChildID]
+	if parent.prefixLen == largePrefixSentinel || dead.prefixLen == largePrefixSentinel || onlyChild.prefixLen == largePrefixSentinel {
+		return false
+	}
+	if dead.prefixLen < onlyChild.prefixLen {
+		return false
+	}
+	parentLen := int(parent.prefixLen)
+	childLen := int(onlyChild.prefixLen)
+	combined := parentLen + childLen
+	if combined >= int(largePrefixSentinel) {
+		return false
+	}
+	if parent.prefixOff+uint32(parentLen) != dead.prefixOff {
+		return false
+	}
+	if (parent.prefixFlags|dead.prefixFlags)&prefixFlagPinned != 0 || c.prefixExposed.Load() {
+		return false
+	}
+
+	dstOff := dead.prefixOff
+	oldChildOff := onlyChild.prefixOff
+	oldChildFlags := onlyChild.prefixFlags
+	copy(c.prefixArena[dstOff:int(dstOff)+childLen], c.prefixArena[oldChildOff:int(oldChildOff)+childLen])
+
+	extraLen := int(dead.prefixLen) - childLen
+	extraOff := dstOff + uint32(childLen)
+
+	onlyChild.prefixOff = parent.prefixOff
+	onlyChild.prefixLen = uint16(combined)
+	onlyChild.firstByte = parent.firstByte
+	onlyChild.prefixFlags = oldChildFlags &^ prefixFlagPinned
+
+	parent.prefixOff = 0
+	parent.prefixLen = 0
+	parent.firstByte = 0
+	parent.prefixFlags = 0
+
+	dead.prefixOff = 0
+	dead.prefixLen = 0
+	dead.firstByte = 0
+	dead.prefixFlags = 0
+
+	if extraLen > 0 {
+		if oldChildFlags&prefixFlagPinned == 0 && extraOff+uint32(extraLen) == oldChildOff {
+			c.releasePrefixSpanLocked(extraOff, childLen+extraLen, false, 0)
+			return true
+		}
+		c.releasePrefixSpanLocked(extraOff, extraLen, false, 0)
+	}
+	c.releasePrefixSpanLocked(oldChildOff, childLen, false, oldChildFlags)
+	return true
+}
+
 // compressPathUpwards walks up the tree, pruning empty leaf nodes and merging single-child intermediate routing nodes.
 func (c *arenaRadix[V]) compressPathUpwards(currID uint32) {
 	for currID != nilNode && currID != c.root {
@@ -1278,6 +1431,17 @@ func (c *arenaRadix[V]) compressPathUpwards(currID uint32) {
 		if c.nodes[currID].child == nilNode {
 			parentID := c.nodes[currID].parent
 			c.removeChild(parentID, currID)
+			if parentID != nilNode && parentID != c.root && !c.nodes[parentID].hasValue() {
+				onlyChildID := c.nodes[parentID].child
+				if onlyChildID != nilNode && c.nodes[onlyChildID].sibling == nilNode &&
+					c.tryCollapseSiblingPrefixInPlaceLocked(parentID, currID, onlyChildID) {
+					c.freeNode(currID)
+					grandParentID := c.nodes[parentID].parent
+					c.replaceChild(grandParentID, parentID, onlyChildID)
+					c.freeNode(parentID)
+					return
+				}
+			}
 			c.freeNode(currID)
 			currID = parentID
 			continue
@@ -1474,6 +1638,8 @@ func (c *arenaRadix[V]) clearEmptyArenaStateLocked() {
 	c.len = 0
 	c.livePrefixBytes = 0
 	c.freePrefixCount = 0
+	c.putPrefixSpan = prefixSpan{}
+	c.recyclingForPut = false
 	if !c.prefixExposed.Load() && (c.onEvictEntry == nil || len(c.prefixArena) == 0) && cap(c.prefixArena) <= 4096 && c.peakEntryLen <= minPeakSlackEntries && c.deletedSinceCompact < minChurnCompactDeletes {
 		c.prefixArena = c.prefixArena[:0]
 	} else {
@@ -1533,6 +1699,7 @@ func (c *arenaRadix[V]) compactPrefixArenaExactLocked() {
 	if exactBytes == 0 {
 		c.prefixArena = nil
 		c.freePrefixCount = 0
+		c.putPrefixSpan = prefixSpan{}
 		c.prefixExposed.Store(false)
 		return
 	}
@@ -1573,6 +1740,7 @@ func (c *arenaRadix[V]) rebuildPrefixArenaWithCapLocked(newCap int) {
 	c.prefixArena = newArena
 	c.livePrefixBytes = liveBytes
 	c.freePrefixCount = 0
+	c.putPrefixSpan = prefixSpan{}
 	c.prefixExposed.Store(false)
 }
 
@@ -1929,6 +2097,21 @@ func (c *arenaRadix[V]) removeCollisionPeerLocked(hash uint64, nodeID uint32) {
 	}
 }
 
+func (c *arenaRadix[V]) removeOrPromoteHashSlotAtLocked(idx uint32, hash uint64, nodeID uint32) {
+	if peerID, found := c.popValidCollisionPeerLocked(hash, nodeID); found {
+		tag := c.hashSlots[idx].tag
+		c.hashSlots[idx].nodeID = peerID
+		if peerID < uint32(len(c.nodes)) {
+			c.nodes[peerID].setHashTag21(tag)
+		}
+		return
+	}
+	c.backshiftDeleteSlot(idx)
+	if c.collisionCount > 0 && len(c.collisionPeers) == 0 {
+		c.collisionCount = 0
+	}
+}
+
 func (c *arenaRadix[V]) removeOrPromoteNodeMapLocked(hash uint64, nodeID uint32) {
 	if len(c.hashSlots) == 0 {
 		c.removeCollisionPeerLocked(hash, nodeID)
@@ -1945,17 +2128,7 @@ func (c *arenaRadix[V]) removeOrPromoteNodeMapLocked(hash uint64, nodeID uint32)
 		}
 		if slot.tag == tag {
 			if slot.nodeID == nodeID {
-				if peerID, found := c.popValidCollisionPeerLocked(hash, nodeID); found {
-					c.hashSlots[idx].nodeID = peerID
-					if peerID < uint32(len(c.nodes)) {
-						c.nodes[peerID].setHashTag21(tag)
-					}
-					return
-				}
-				c.backshiftDeleteSlot(idx)
-				if c.collisionCount > 0 && len(c.collisionPeers) == 0 {
-					c.collisionCount = 0
-				}
+				c.removeOrPromoteHashSlotAtLocked(idx, hash, nodeID)
 				return
 			}
 			if !c.slotBelongsToOtherHash(slot, hash) {

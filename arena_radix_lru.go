@@ -233,6 +233,9 @@ func (c *arenaRadix[V]) checkPrefixArenaInvariants(totalPrefixBytes int) {
 	if totalPrefixBytes != c.livePrefixBytes {
 		panic(fmt.Sprintf("arenaRadix invariant violation: livePrefixBytes %d does not match tree prefix sum %d", c.livePrefixBytes, totalPrefixBytes))
 	}
+	if c.recyclingForPut || c.putPrefixSpan != (prefixSpan{}) {
+		panic("arenaRadix invariant violation: putPrefixSpan not flushed after Put")
+	}
 
 	if c.freePrefixCount < 0 || c.freePrefixCount > len(c.freePrefixSpans) {
 		panic(fmt.Sprintf("arenaRadix invariant violation: invalid freePrefixCount %d", c.freePrefixCount))
@@ -661,9 +664,13 @@ func (c *arenaRadix[V]) putWithHash(key string, keyHash uint64, value V) ([]V, e
 		evictedValues, reclaimedPrePut = c.updateExistingOnPutLocked(&evictQ, nodeID, key, keyHash, value, valueSize, sizeBefore, pressure)
 	} else {
 		if c.needsPreInsertEvictOrReclaimLocked(len(key), valueSize) {
+			c.recyclingForPut = true
 			evictedValues, reclaimedPrePut, compactedPrePut = c.evictAndReclaimPrePutLocked(&evictQ, len(key), valueSize, sizeBefore, pressure)
 		}
 		nodeID = c.insertNode(key, value)
+		if c.recyclingForPut {
+			c.finishPutPrefixRecycleLocked()
+		}
 		c.nodes[nodeID].size = valueSize
 		c.pushFront(nodeID)
 		c.putInserted++
@@ -717,19 +724,27 @@ func (c *arenaRadix[V]) deleteWithHash(key string, keyHash uint64) (value V, ok 
 	evictQ := evictCallbackQueue[V]{exactSnap: true}
 	sampledEpoch, pressure := c.lockWithPressure(&c.mu, false)
 
-	nodeID, found := c.lookupNodeKeyWithHash(key, keyHash)
-	if !found {
-		c.deleteNotFound++
-		c.unlock()
-		return value, false
-	}
-
 	sizeBefore := c.currentSize
-	deleted, erased := c.eraseInternalWithHash(&evictQ, nodeID, keyHash, key, EvictionReasonDeleted)
-	if !erased {
-		c.deleteNotFound++
-		c.unlock()
-		return value, false
+	nodeID, slotIdx, slotMatched, verified := c.lookupHashSlotAt(key, keyHash)
+	var deleted V
+	if verified {
+		c.removeOrPromoteHashSlotAtLocked(slotIdx, keyHash, nodeID)
+		deleted, _ = c.finishEraseNodeLocked(&evictQ, nodeID, key, EvictionReasonDeleted)
+	} else {
+		if !slotMatched && c.hashCount+c.collisionCount == c.len {
+			c.deleteNotFound++
+			c.unlock()
+			return value, false
+		}
+		var found bool
+		nodeID, found = c.walkNodeKeyFallback(key, keyHash, false)
+		if !found {
+			c.deleteNotFound++
+			c.unlock()
+			return value, false
+		}
+		c.removeOrPromoteNodeMapLocked(keyHash, nodeID)
+		deleted, _ = c.finishEraseNodeLocked(&evictQ, nodeID, key, EvictionReasonDeleted)
 	}
 	c.deleteDeleted++
 	c.finishDeleteReclaimLocked(&evictQ, sizeBefore, sampledEpoch, pressure)
