@@ -759,7 +759,7 @@ func hashSlotsCapFor(entries int) int {
 // slotBelongsToOtherHash reports whether slot holds a live node whose 64-bit key hash
 // differs from keyHash but happens to share the same 32-bit arenaHashTag(keyHash).
 func (c *arenaRadix[V]) slotBelongsToOtherHash(slot arenaHashSlot, keyHash uint64) bool {
-	if slot.nodeID >= uint32(len(c.nodes)) || !c.nodes[slot.nodeID].hasValue() {
+	if uint(slot.nodeID) >= uint(len(c.nodes)) || !c.nodes[slot.nodeID].hasValue() {
 		return false
 	}
 	nodeHash := c.hashNodeKey(slot.nodeID)
@@ -780,7 +780,7 @@ func (c *arenaRadix[V]) lookupHashSlotAt(key string, keyHash uint64) (nodeID, sl
 		}
 		if slot.tag == tag {
 			id := slot.nodeID
-			if id < uint32(len(c.nodes)) && c.nodes[id].hasValue() && c.verifyKey(id, key) {
+			if uint(id) < uint(len(c.nodes)) && c.nodes[id].hasValue() && c.verifyKey(id, key) {
 				return id, idx, true, true
 			}
 			if !c.slotBelongsToOtherHash(slot, keyHash) {
@@ -791,6 +791,7 @@ func (c *arenaRadix[V]) lookupHashSlotAt(key string, keyHash uint64) (nodeID, sl
 	}
 }
 
+// lookupHashSlot wraps lookupHashSlotAt without returning the slot index (retained for white-box tests).
 func (c *arenaRadix[V]) lookupHashSlot(key string, keyHash uint64) (nodeID uint32, slotMatched, verified bool) {
 	id, _, matched, ok := c.lookupHashSlotAt(key, keyHash)
 	return id, matched, ok
@@ -1321,9 +1322,29 @@ func (c *arenaRadix[V]) walkNodeKeyFallback(key string, keyHash uint64, heal boo
 }
 
 func (c *arenaRadix[V]) lookupOrWalkNodeKey(key string, keyHash uint64) (nodeID uint32, walked, found bool) {
-	if id, slotMatched, verified := c.lookupHashSlot(key, keyHash); verified {
-		return id, false, true
-	} else if !slotMatched && c.hashCount+c.collisionCount == c.len {
+	slotMatched := false
+	if len(c.hashSlots) != 0 {
+		tag := arenaHashTag(keyHash)
+		mask := c.hashMask
+		idx := tag & mask
+		for {
+			slot := c.hashSlots[idx]
+			if slot.tag == 0 {
+				break
+			}
+			if slot.tag == tag {
+				id := slot.nodeID
+				if uint(id) < uint(len(c.nodes)) && c.nodes[id].hasValue() && c.verifyKey(id, key) {
+					return id, false, true
+				}
+				if !c.slotBelongsToOtherHash(slot, keyHash) {
+					slotMatched = true
+				}
+			}
+			idx = (idx + 1) & mask
+		}
+	}
+	if !slotMatched && c.hashCount+c.collisionCount == c.len {
 		// By Invariant 6 and the Pigeonhole Principle, when c.hashCount+c.collisionCount == c.len,
 		// every live value-bearing node's hash is present in c.hashSlots,
 		// so a hash slot miss is a guaranteed cache miss.
@@ -1336,9 +1357,29 @@ func (c *arenaRadix[V]) lookupOrWalkNodeKey(key string, keyHash uint64) (nodeID 
 // lookupNodeKeyWithHash finds a value-bearing node index for key using a precomputed maphash
 // without mutating c.hashSlots.
 func (c *arenaRadix[V]) lookupNodeKeyWithHash(key string, keyHash uint64) (uint32, bool) {
-	if id, slotMatched, verified := c.lookupHashSlot(key, keyHash); verified {
-		return id, true
-	} else if !slotMatched && c.hashCount+c.collisionCount == c.len {
+	slotMatched := false
+	if len(c.hashSlots) != 0 {
+		tag := arenaHashTag(keyHash)
+		mask := c.hashMask
+		idx := tag & mask
+		for {
+			slot := c.hashSlots[idx]
+			if slot.tag == 0 {
+				break
+			}
+			if slot.tag == tag {
+				id := slot.nodeID
+				if uint(id) < uint(len(c.nodes)) && c.nodes[id].hasValue() && c.verifyKey(id, key) {
+					return id, true
+				}
+				if !c.slotBelongsToOtherHash(slot, keyHash) {
+					slotMatched = true
+				}
+			}
+			idx = (idx + 1) & mask
+		}
+	}
+	if !slotMatched && c.hashCount+c.collisionCount == c.len {
 		return nilNode, false
 	}
 	return c.walkNodeKeyFallback(key, keyHash, false)
@@ -1347,14 +1388,58 @@ func (c *arenaRadix[V]) lookupNodeKeyWithHash(key string, keyHash uint64) (uint3
 // getNodeKeyWithHash finds a value-bearing node index for key under exclusive write lock,
 // healing c.hashSlots if resolved via the slow-path trie walk.
 func (c *arenaRadix[V]) getNodeKeyWithHash(key string, keyHash uint64) (uint32, bool) {
-	nodeID, found, _ := c.getNodeKeyForPut(key, keyHash)
-	return nodeID, found
+	slotMatched := false
+	if len(c.hashSlots) != 0 {
+		tag := arenaHashTag(keyHash)
+		mask := c.hashMask
+		idx := tag & mask
+		for {
+			slot := c.hashSlots[idx]
+			if slot.tag == 0 {
+				break
+			}
+			if slot.tag == tag {
+				id := slot.nodeID
+				if uint(id) < uint(len(c.nodes)) && c.nodes[id].hasValue() && c.verifyKey(id, key) {
+					return id, true
+				}
+				if !c.slotBelongsToOtherHash(slot, keyHash) {
+					slotMatched = true
+				}
+			}
+			idx = (idx + 1) & mask
+		}
+	}
+	if !slotMatched && c.hashCount+c.collisionCount == c.len {
+		return nilNode, false
+	}
+	return c.walkNodeKeyFallback(key, keyHash, true)
 }
 
 func (c *arenaRadix[V]) getNodeKeyForPut(key string, keyHash uint64) (nodeID uint32, found, mapMiss bool) {
-	if id, slotMatched, verified := c.lookupHashSlot(key, keyHash); verified {
-		return id, true, false
-	} else if !slotMatched && c.hashCount+c.collisionCount == c.len {
+	slotMatched := false
+	if len(c.hashSlots) != 0 {
+		tag := arenaHashTag(keyHash)
+		mask := c.hashMask
+		idx := tag & mask
+		for {
+			slot := c.hashSlots[idx]
+			if slot.tag == 0 {
+				break
+			}
+			if slot.tag == tag {
+				id := slot.nodeID
+				if uint(id) < uint(len(c.nodes)) && c.nodes[id].hasValue() && c.verifyKey(id, key) {
+					return id, true, false
+				}
+				if !c.slotBelongsToOtherHash(slot, keyHash) {
+					slotMatched = true
+				}
+			}
+			idx = (idx + 1) & mask
+		}
+	}
+	if !slotMatched && c.hashCount+c.collisionCount == c.len {
 		return nilNode, false, true
 	}
 	id, ok := c.walkNodeKeyFallback(key, keyHash, true)
