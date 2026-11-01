@@ -3177,18 +3177,49 @@ func TestArenaRadix_HashTag32CollisionAndSlotBelongsToOtherHash(t *testing.T) {
 	assert.False(t, ok)
 	_, ok = c.getWithHash("missing_key", h2)
 	assert.False(t, ok)
+	gotID, walked, found := c.lookupOrWalkNodeKey("missing_key", h2)
+	assert.Equal(t, nilNode, gotID)
+	assert.False(t, walked)
+	assert.False(t, found)
+	gotID, ok = c.lookupNodeKeyWithHash("missing_key", h2)
+	assert.Equal(t, nilNode, gotID)
+	assert.False(t, ok)
+	gotID, ok = c.getNodeKeyWithHash("missing_key", h2)
+	assert.Equal(t, nilNode, gotID)
+	assert.False(t, ok)
+	gotID, ok, mapMiss := c.getNodeKeyForPut("missing_key", h2)
+	assert.Equal(t, nilNode, gotID)
+	assert.False(t, ok)
+	assert.True(t, mapMiss)
 	_, ok = c.deleteWithHash("missing_key", h2)
 	assert.False(t, ok)
 	assert.Equal(t, fallbacksBefore, c.Stats().ArenaHashFallbacks, "tag-only collision miss must not trigger trie walk fallback")
 
-	// Contrast with a 64-bit hash collision on h1: slotBelongsToOtherHash is false, so slotMatched is true.
+	// Contrast with a 64-bit hash collision on h1: slotBelongsToOtherHash is false, so slotMatched is true
+	// and all four flattened lookup helpers take walkNodeKeyFallback.
 	gotID, slotMatched, verified = c.lookupHashSlot("missing_key", h1)
 	assert.Equal(t, nilNode, gotID)
 	assert.True(t, slotMatched, "64-bit hash collision must set slotMatched")
 	assert.False(t, verified)
 
-	// 3. Verify findHashSlotIndex, nodeMapSet, nodeMapGet, lookupHashSlot, and removeOrPromoteNodeMapLocked
-	// when both h1 (at idx1) and h2 (probed past idx1 to idx2) occupy the probe chain with the same 32-bit tag.
+	gotID, walked, found = c.lookupOrWalkNodeKey("missing_key", h1)
+	assert.Equal(t, nilNode, gotID)
+	assert.True(t, walked)
+	assert.False(t, found)
+	gotID, found = c.lookupNodeKeyWithHash("missing_key", h1)
+	assert.Equal(t, nilNode, gotID)
+	assert.False(t, found)
+	gotID, found = c.getNodeKeyWithHash("missing_key", h1)
+	assert.Equal(t, nilNode, gotID)
+	assert.False(t, found)
+	gotID, found, mapMiss = c.getNodeKeyForPut("missing_key", h1)
+	assert.Equal(t, nilNode, gotID)
+	assert.False(t, found)
+	assert.False(t, mapMiss)
+	assert.Equal(t, fallbacksBefore+4, c.Stats().ArenaHashFallbacks)
+
+	// 3. Verify findHashSlotIndex, nodeMapSet, nodeMapGet, lookupHashSlot, the four flattened lookup helpers,
+	// and removeOrPromoteNodeMapLocked when both h1 (at idx1) and h2 (probed past idx1 to idx2) occupy the probe chain with the same 32-bit tag.
 	hKey2Natural := c.hashKey("key2")
 	c.nodeMapDelete(hKey2Natural)
 
@@ -3212,6 +3243,23 @@ func TestArenaRadix_HashTag32CollisionAndSlotBelongsToOtherHash(t *testing.T) {
 	assert.True(t, slotMatched2)
 	assert.True(t, verified2)
 
+	fallbacksBeforeProbeHit := c.arenaHashFallbacks.Load()
+	gotID, walked, found = c.lookupOrWalkNodeKey("key2", h2)
+	assert.Equal(t, id2, gotID)
+	assert.False(t, walked)
+	assert.True(t, found)
+	gotID, found = c.lookupNodeKeyWithHash("key2", h2)
+	assert.Equal(t, id2, gotID)
+	assert.True(t, found)
+	gotID, found = c.getNodeKeyWithHash("key2", h2)
+	assert.Equal(t, id2, gotID)
+	assert.True(t, found)
+	gotID, found, mapMiss = c.getNodeKeyForPut("key2", h2)
+	assert.Equal(t, id2, gotID)
+	assert.True(t, found)
+	assert.False(t, mapMiss)
+	assert.Equal(t, fallbacksBeforeProbeHit, c.arenaHashFallbacks.Load())
+
 	// Removing (h2, id2) via removeOrPromoteNodeMapLocked must skip idx1 (which belongs to h1)
 	// and delete idx2, leaving (h1, id1) intact.
 	c.removeOrPromoteNodeMapLocked(h2, id2)
@@ -3224,6 +3272,64 @@ func TestArenaRadix_HashTag32CollisionAndSlotBelongsToOtherHash(t *testing.T) {
 
 	// Restore key2's natural hash slot and verify all cache invariants hold.
 	c.nodeMapSet(hKey2Natural, id2)
+	c.checkInvariants()
+
+	// 4. Verify len(c.hashSlots) == 0 guard across all four flattened lookup helpers
+	// both when c.len == 0 (fast miss) and when c.len > 0 with unpopulated hashSlots (fallback walk).
+	cEmpty := NewArenaRadixCache[int](100, WithInvariantChecking(true)).(*arenaRadix[int])
+	cEmpty.hashSlots = nil
+	cEmpty.hashMask = 0
+	fallbacksEmpty := cEmpty.arenaHashFallbacks.Load()
+	gotID, slotMatched, verified = cEmpty.lookupHashSlot("missing_key", h1)
+	assert.Equal(t, nilNode, gotID)
+	assert.False(t, slotMatched)
+	assert.False(t, verified)
+	gotID, walked, found = cEmpty.lookupOrWalkNodeKey("missing_key", h1)
+	assert.Equal(t, nilNode, gotID)
+	assert.False(t, walked)
+	assert.False(t, found)
+	gotID, found = cEmpty.lookupNodeKeyWithHash("missing_key", h1)
+	assert.Equal(t, nilNode, gotID)
+	assert.False(t, found)
+	gotID, found = cEmpty.getNodeKeyWithHash("missing_key", h1)
+	assert.Equal(t, nilNode, gotID)
+	assert.False(t, found)
+	gotID, found, mapMiss = cEmpty.getNodeKeyForPut("missing_key", h1)
+	assert.Equal(t, nilNode, gotID)
+	assert.False(t, found)
+	assert.True(t, mapMiss)
+	assert.Equal(t, fallbacksEmpty, cEmpty.arenaHashFallbacks.Load())
+
+	savedSlots, savedMask, savedCount := c.hashSlots, c.hashMask, c.hashCount
+	c.hashSlots = nil
+	c.hashMask = 0
+	c.hashCount = 0
+	fallbacksBeforeNilWalk := c.arenaHashFallbacks.Load()
+	gotID, walked, found = c.lookupOrWalkNodeKey("key1", h1)
+	assert.Equal(t, id1, gotID)
+	assert.True(t, walked)
+	assert.True(t, found)
+	assert.Zero(t, c.hashCount)
+	assert.Nil(t, c.hashSlots)
+	gotID, found = c.lookupNodeKeyWithHash("key1", h1)
+	assert.Equal(t, id1, gotID)
+	assert.True(t, found)
+	assert.Zero(t, c.hashCount)
+	assert.Nil(t, c.hashSlots)
+	gotID, found = c.getNodeKeyWithHash("key1", h1)
+	assert.Equal(t, id1, gotID)
+	assert.True(t, found)
+	assert.Equal(t, 1, c.hashCount, "getNodeKeyWithHash fallback walk must heal hashSlots")
+	c.hashSlots = nil
+	c.hashMask = 0
+	c.hashCount = 0
+	gotID, found, mapMiss = c.getNodeKeyForPut("key1", h1)
+	assert.Equal(t, id1, gotID)
+	assert.True(t, found)
+	assert.False(t, mapMiss)
+	assert.Equal(t, 1, c.hashCount, "getNodeKeyForPut fallback walk must heal hashSlots")
+	assert.Equal(t, fallbacksBeforeNilWalk+4, c.arenaHashFallbacks.Load())
+	c.hashSlots, c.hashMask, c.hashCount = savedSlots, savedMask, savedCount
 	c.checkInvariants()
 }
 
