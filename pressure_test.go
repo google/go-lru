@@ -4911,3 +4911,121 @@ func testNonReclaimingLowPressureDoesNotOverwriteElevatedEpoch(t *testing.T) {
 		})
 	}
 }
+
+func TestPressure_DefaultProbeFastPathWindowAndCrossShardAdoption(t *testing.T) {
+	for _, b := range []Backend{BackendMap, BackendRadix, BackendArenaRadix} {
+		t.Run("SingleShardWindow_"+b.String(), func(t *testing.T) {
+			c := New[int](512, WithBackend(b), WithInvariantChecking(true))
+			ps := c.(shardEngine[int]).pressureStatePtr()
+
+			// Write 1: cold start samples once and populates cachedAppliedPubSeq.
+			_, err := c.Put("k1", 1)
+			require.NoError(t, err)
+			assert.Equal(t, uint64(1), ps.pressureInvokeSeq.Load())
+			assert.Equal(t, uint64(1), ps.localWriteSeq)
+			assert.NotZero(t, ps.cachedAppliedPubSeq)
+			assert.False(t, ps.windowSampleDue.Load())
+
+			// Writes 2..255: reuse applied low-pressure sample without re-sampling.
+			for i := 2; i <= 255; i++ {
+				_, err = c.Put(fmt.Sprintf("k%d", i), i)
+				require.NoError(t, err)
+			}
+			assert.Equal(t, uint64(1), ps.pressureInvokeSeq.Load())
+			assert.Equal(t, uint64(255), ps.localWriteSeq)
+			assert.False(t, ps.windowSampleDue.Load())
+
+			// Write 256: still reuses sample and arms windowSampleDue for write 257.
+			_, err = c.Put("k256", 256)
+			require.NoError(t, err)
+			assert.Equal(t, uint64(1), ps.pressureInvokeSeq.Load())
+			assert.Equal(t, uint64(256), ps.localWriteSeq)
+			assert.True(t, ps.windowSampleDue.Load())
+
+			// Write 257: consumes windowSampleDue before mu.Lock() and refreshes sample.
+			_, err = c.Put("k257", 257)
+			require.NoError(t, err)
+			assert.Equal(t, uint64(2), ps.pressureInvokeSeq.Load())
+			assert.Equal(t, uint64(257), ps.localWriteSeq)
+			assert.False(t, ps.windowSampleDue.Load())
+			assert.NotZero(t, ps.cachedAppliedPubSeq)
+		})
+
+		t.Run("ShardedCrossShardAdoption_"+b.String(), func(t *testing.T) {
+			c := NewShardedCache[int](1024, 2,
+				func(key string, _ int) int {
+					if strings.HasPrefix(key, "s0/") {
+						return 0
+					}
+					return 1
+				},
+				WithBackend(b),
+				WithInvariantChecking(true),
+			)
+			sc := c.(*shardedCache[int])
+			s0PS := sc.shards[0].pressureStatePtr()
+			s1PS := sc.shards[1].pressureStatePtr()
+
+			// Shard 0 Write 1: initializes coordinator pressure sample.
+			_, err := c.Put("s0/k1", 1)
+			require.NoError(t, err)
+			assert.Equal(t, uint64(1), sc.coord.pressureInvokeSeq.Load())
+			assert.Equal(t, uint64(1), s0PS.localWriteSeq)
+			assert.NotZero(t, s0PS.cachedAppliedPubSeq)
+
+			// Shard 1 Write 1: adopts coordinator's cached sample under mu.Lock() without invoking PressureFunc.
+			_, err = c.Put("s1/k1", 1)
+			require.NoError(t, err)
+			assert.Equal(t, uint64(1), sc.coord.pressureInvokeSeq.Load(), "Shard 1 must adopt coordinator sample without re-sampling")
+			assert.Equal(t, uint64(1), s1PS.localWriteSeq)
+			assert.Equal(t, s0PS.cachedAppliedPubSeq, s1PS.cachedAppliedPubSeq)
+
+			// Shard 1 Writes 2..256: reuse applied sample and arm windowSampleDue on Write 256.
+			for i := 2; i <= 256; i++ {
+				_, err = c.Put(fmt.Sprintf("s1/k%d", i), i)
+				require.NoError(t, err)
+			}
+			assert.Equal(t, uint64(1), sc.coord.pressureInvokeSeq.Load())
+			assert.Equal(t, uint64(256), s1PS.localWriteSeq)
+			assert.True(t, s1PS.windowSampleDue.Load())
+
+			// Shard 1 Write 257: triggers fresh coordinator sample.
+			_, err = c.Put("s1/k257", 257)
+			require.NoError(t, err)
+			assert.Equal(t, uint64(2), sc.coord.pressureInvokeSeq.Load())
+			assert.Equal(t, uint64(257), s1PS.localWriteSeq)
+			assert.False(t, s1PS.windowSampleDue.Load())
+		})
+
+		t.Run("ConcurrentBoundaryNoStampede_"+b.String(), func(t *testing.T) {
+			c := New[int](2048, WithBackend(b), WithInvariantChecking(true))
+			ps := c.(shardEngine[int]).pressureStatePtr()
+
+			for i := 1; i <= 256; i++ {
+				_, err := c.Put(fmt.Sprintf("k%d", i), i)
+				require.NoError(t, err)
+			}
+			require.Equal(t, uint64(1), ps.pressureInvokeSeq.Load())
+			require.True(t, ps.windowSampleDue.Load())
+
+			const workers = 16
+			start := make(chan struct{})
+			var wg sync.WaitGroup
+			wg.Add(workers)
+			for g := range workers {
+				go func(id int) {
+					defer wg.Done()
+					<-start
+					_, putErr := c.Put(fmt.Sprintf("concurrent-%d", id), id)
+					assert.NoError(t, putErr)
+				}(g)
+			}
+			close(start)
+			wg.Wait()
+
+			assert.Equal(t, uint64(2), ps.pressureInvokeSeq.Load(), "only the single CAS winner at the 256-write boundary should sample")
+			assert.Equal(t, uint64(256+workers), ps.localWriteSeq)
+			assert.False(t, ps.windowSampleDue.Load())
+		})
+	}
+}

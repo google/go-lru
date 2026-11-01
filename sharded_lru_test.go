@@ -9578,7 +9578,7 @@ func runR19C2OutOfOrderLockAcquisitionCase(t *testing.T, backend Backend, initia
 
 	sc := c.(*shardedCache[int])
 
-	// Hold s0 RLock so G1 finishes sampleForLock on s0 (seq = N) and waits before acquiring s0.mu.Lock().
+	// Hold s0 RLock so G1 finishes samplePressureFreshOnCoord on s0 (seq = N) and waits before acquiring s0.mu.Lock().
 	probeBefore := probeCount.Load()
 	unlockS0 := holdShardRLockViaAll(t, sc.shards[0])
 	evalDone := make(chan struct{})
