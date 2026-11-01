@@ -2005,6 +2005,127 @@ func TestArenaRadixCache_HashCollisionAndNodeMapHealing(t *testing.T) {
 	})
 }
 
+func TestArenaRadixCache_CompactHashSlotsFastPathInPlaceAndResizeBranches(t *testing.T) {
+	t.Run("FragmentedInPlaceAndShrinkRemap", func(t *testing.T) {
+		c := NewArenaRadixCache[testData](10000, WithInvariantChecking(true), testDataWeigher).(*arenaRadix[testData])
+
+		// 1. Fragmented compaction with len(c.hashSlots) == newCap (in-place nodeID remap without reallocating hashSlots).
+		for i := range 10 {
+			_, err := c.Put(fmt.Sprintf("inplace-%d", i), testData{value: int64(i), dataSize: 10})
+			require.NoError(t, err)
+		}
+		_, ok := c.Delete("inplace-0") // deletes first entry so remaining 9 entries still fit in minHashSlotsCap (16)
+		require.True(t, ok)
+		require.NotEqual(t, nilNode, c.freeHead)
+		require.Len(t, c.hashSlots, hashSlotsCapFor(c.len))
+		slotsPtrBefore := &c.hashSlots[0]
+
+		c.Compact()
+		assert.Same(t, slotsPtrBefore, &c.hashSlots[0], "hashSlots backing array should be reused in-place when capacity is unchanged")
+		for i := 1; i < 10; i++ {
+			v, exists := c.Get(fmt.Sprintf("inplace-%d", i))
+			require.True(t, exists)
+			assert.Equal(t, int64(i), v.value)
+		}
+
+		// 2. Fragmented compaction with len(c.hashSlots) > newCap (shrinks hashSlots and remaps nodeIDs across probe chains).
+		for i := 10; i < 60; i++ {
+			_, err := c.Put(fmt.Sprintf("shrink-%d", i), testData{value: int64(i), dataSize: 10})
+			require.NoError(t, err)
+		}
+		require.Greater(t, len(c.hashSlots), minHashSlotsCap)
+
+		// By the Pigeonhole Principle across the 16 mod-16 home slots, at least one "shrink-*"
+		// key shares its mod-16 home slot with "inplace-1" (or another surviving key), guaranteeing
+		// that compactHashSlotsLocked exercises its linear-probe collision loop for every maphash seed.
+		slotOwners := make(map[uint32]string, minHashSlotsCap)
+		for i := 1; i < 10; i++ {
+			k := fmt.Sprintf("inplace-%d", i)
+			slotOwners[arenaHashTag(c.hashKey(k))&(minHashSlotsCap-1)] = k
+		}
+		slotOwners[arenaHashTag(c.hashKey("shrink-59"))&(minHashSlotsCap-1)] = "shrink-59"
+
+		var collidingKey, collidingPeer string
+		for i := 10; i < 59; i++ {
+			k := fmt.Sprintf("shrink-%d", i)
+			slot := arenaHashTag(c.hashKey(k)) & (minHashSlotsCap - 1)
+			if peer, exists := slotOwners[slot]; exists {
+				collidingKey = k
+				collidingPeer = peer
+				break
+			}
+			slotOwners[slot] = k
+		}
+		require.NotEmpty(t, collidingKey)
+
+		for i := 10; i < 59; i++ {
+			k := fmt.Sprintf("shrink-%d", i)
+			if k != collidingKey && k != collidingPeer {
+				_, ok := c.Delete(k)
+				require.True(t, ok)
+			}
+		}
+		require.Equal(t, minHashSlotsCap, hashSlotsCapFor(c.len))
+		require.Greater(t, len(c.hashSlots), hashSlotsCapFor(c.len))
+
+		c.Compact()
+		assert.Len(t, c.hashSlots, hashSlotsCapFor(c.len))
+		for _, k := range []string{collidingKey, collidingPeer, "shrink-59", "inplace-1", "inplace-9"} {
+			_, exists := c.Get(k)
+			require.True(t, exists, "missing key %s after shrink compaction", k)
+		}
+	})
+
+	t.Run("ContiguousShrinkAndInPlaceNoOp", func(t *testing.T) {
+		// 3. Contiguous compaction (c.freeHead == nilNode) with overgrown hashSlots shrinks via fast path:
+		// Inserting "" (stored at c.root) plus 12 child keys brings c.len to 13 (hashSlotsCapFor(13) == 32).
+		// Deleting "" clears the root value without freeing c.root (c.freeHead remains nilNode) and drops
+		// c.len to 12 (hashSlotsCapFor(12) == 16), so Compact() takes compactContiguousLocked -> compactHashSlotsLocked(nil).
+		cContig := NewArenaRadixCache[testData](10000, WithInvariantChecking(true), testDataWeigher).(*arenaRadix[testData])
+		_, err := cContig.Put("", testData{value: 0, dataSize: 10})
+		require.NoError(t, err)
+		for i := range 12 {
+			_, err = cContig.Put(fmt.Sprintf("child-%02d", i), testData{value: int64(i + 1), dataSize: 10})
+			require.NoError(t, err)
+		}
+		require.Len(t, cContig.hashSlots, 32)
+		_, ok := cContig.Delete("")
+		require.True(t, ok)
+		require.Equal(t, nilNode, cContig.freeHead)
+		cContig.Compact()
+		assert.Len(t, cContig.hashSlots, 16)
+		for i := range 12 {
+			v, exists := cContig.Get(fmt.Sprintf("child-%02d", i))
+			require.True(t, exists)
+			assert.Equal(t, int64(i+1), v.value)
+		}
+		cContig.checkInvariants()
+
+		// 4. Contiguous compaction (c.freeHead == nilNode) with len(c.hashSlots) == newCap and oldToNew == nil:
+		// Delete "child-11" and compact so cContig has 11 child keys and len(cContig.hashSlots) == 16,
+		// then insert and delete "" at cContig.root so freeHead remains nilNode, len == 11 < peakEntryLen (12),
+		// nodeMapDirty is true, and len(cContig.hashSlots) == 16 == hashSlotsCapFor(11).
+		_, ok = cContig.Delete("child-11")
+		require.True(t, ok)
+		cContig.Compact()
+		require.Len(t, cContig.hashSlots, 16)
+
+		_, err = cContig.Put("", testData{value: 0, dataSize: 10})
+		require.NoError(t, err)
+		_, ok = cContig.Delete("")
+		require.True(t, ok)
+		require.Equal(t, nilNode, cContig.freeHead)
+		require.True(t, cContig.nodeMapDirty)
+		require.Len(t, cContig.hashSlots, hashSlotsCapFor(cContig.len))
+
+		contigSlotsPtr := &cContig.hashSlots[0]
+		cContig.Compact()
+		assert.Same(t, contigSlotsPtr, &cContig.hashSlots[0])
+		assert.False(t, cContig.nodeMapDirty)
+		cContig.checkInvariants()
+	})
+}
+
 func TestArenaRadixCache_DeepHierarchyOver64LevelsAndRoutingPrefixCloning(t *testing.T) {
 	t.Run("DeepRadixTreeOver64LevelsAndFreeSubtree", func(t *testing.T) {
 		// Arrange: Build a radix tree with > 80 branching levels so freeSubtree exceeds 64 levels.

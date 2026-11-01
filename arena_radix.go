@@ -831,7 +831,7 @@ func (c *arenaRadix[V]) nodeMapAt(keyHash uint64) uint32 {
 
 func (c *arenaRadix[V]) nodeMapSet(keyHash uint64, nodeID uint32) {
 	if (c.hashCount+1)*5 > len(c.hashSlots)*4 {
-		c.growHashSlotsLocked(hashSlotsCapFor(c.hashCount + 1))
+		c.resizeHashSlotsLocked(hashSlotsCapFor(c.hashCount + 1))
 	}
 	idx, exists := c.findHashSlotIndex(keyHash)
 	tag := arenaHashTag(keyHash)
@@ -859,7 +859,7 @@ func (c *arenaRadix[V]) nodeMapLen() int {
 
 func (c *arenaRadix[V]) insertNewHashSlotLocked(keyHash uint64, nodeID uint32) {
 	if (c.hashCount+1)*5 > len(c.hashSlots)*4 {
-		c.growHashSlotsLocked(hashSlotsCapFor(c.hashCount + 1))
+		c.resizeHashSlotsLocked(hashSlotsCapFor(c.hashCount + 1))
 	}
 	tag := arenaHashTag(keyHash)
 	mask := c.hashMask
@@ -872,7 +872,7 @@ func (c *arenaRadix[V]) insertNewHashSlotLocked(keyHash uint64, nodeID uint32) {
 	c.hashCount++
 }
 
-func (c *arenaRadix[V]) growHashSlotsLocked(newCap int) {
+func (c *arenaRadix[V]) resizeHashSlotsLocked(newCap int) {
 	newCap = max(newCap, minHashSlotsCap)
 	newSlots := make([]arenaHashSlot, newCap)
 	newMask := uint32(newCap - 1)
@@ -1786,6 +1786,53 @@ func (c *arenaRadix[V]) rebuildHashSlotsLocked() {
 	c.nodeMapDirty = false
 }
 
+// compactHashSlotsLocked shrinks or remaps c.hashSlots in O(cap(hashSlots)) without
+// walking parent pointers or recomputing maphash when every live value-bearing node
+// is already uniquely represented in c.hashSlots (collisionCount == 0 && hashCount == len).
+// When collisions or displaced slots exist, it falls back to rebuildHashSlotsLocked
+// to heal c.hashSlots and c.collisionPeers from the live radix trie.
+func (c *arenaRadix[V]) compactHashSlotsLocked(oldToNew []uint32) {
+	if c.collisionCount != 0 || c.hashCount != c.len {
+		c.rebuildHashSlotsLocked()
+		return
+	}
+	newCap := hashSlotsCapFor(c.len)
+	if len(c.hashSlots) == newCap {
+		if oldToNew != nil {
+			for i, slot := range c.hashSlots {
+				if slot.tag != 0 {
+					c.hashSlots[i].nodeID = oldToNew[slot.nodeID]
+				}
+			}
+		}
+		c.nodeMapDirty = false
+		return
+	}
+	if oldToNew == nil {
+		c.resizeHashSlotsLocked(newCap)
+		c.nodeMapDirty = false
+		return
+	}
+	newSlots := make([]arenaHashSlot, newCap)
+	newMask := uint32(newCap - 1)
+	for _, slot := range c.hashSlots {
+		if slot.tag == 0 {
+			continue
+		}
+		idx := slot.tag & newMask
+		for newSlots[idx].tag != 0 {
+			idx = (idx + 1) & newMask
+		}
+		newSlots[idx] = arenaHashSlot{
+			tag:    slot.tag,
+			nodeID: oldToNew[slot.nodeID],
+		}
+	}
+	c.hashSlots = newSlots
+	c.hashMask = newMask
+	c.nodeMapDirty = false
+}
+
 func (c *arenaRadix[V]) compactContiguousLocked() bool {
 	if !c.hasContiguousSlackLocked() {
 		return false
@@ -1803,7 +1850,7 @@ func (c *arenaRadix[V]) compactContiguousLocked() bool {
 		c.compactPrefixArenaExactLocked()
 	}
 	if c.nodeMapDirty {
-		c.rebuildHashSlotsLocked()
+		c.compactHashSlotsLocked(nil)
 	}
 	c.onCompacted(c.len)
 	return true
@@ -1862,7 +1909,7 @@ func (c *arenaRadix[V]) compactDataStructuresLocked() bool {
 		}
 	}
 
-	// Remap top-level arena indices, compact prefixArena, and rebuild hashSlots.
+	// Remap top-level arena indices, compact prefixArena, and compact hashSlots.
 	c.root = remap(c.root)
 	c.head = remap(c.head)
 	c.tail = remap(c.tail)
@@ -1870,7 +1917,7 @@ func (c *arenaRadix[V]) compactDataStructuresLocked() bool {
 	c.freeCount = 0
 	c.nodes = newNodes
 	c.compactPrefixArenaExactLocked()
-	c.rebuildHashSlotsLocked()
+	c.compactHashSlotsLocked(oldToNew)
 	c.onCompacted(c.len)
 	return true
 }
@@ -1878,7 +1925,7 @@ func (c *arenaRadix[V]) compactDataStructuresLocked() bool {
 // compactLocked performs lossless O(N) compaction of the node arena slice, prefix arena, and hash lookup table.
 // It eliminates all free-list slots so len(c.nodes) == cap(c.nodes) == liveCount and c.freeHead == nilNode,
 // remaps all 8 uint32 index pointers (root, head, tail, parent, child, sibling, prev, next),
-// and reallocates c.hashSlots while preserving 100% of live entries and LRU order.
+// and compacts or remaps c.hashSlots while preserving 100% of live entries and LRU order.
 // Caller MUST hold c.mu.Lock().
 func (c *arenaRadix[V]) compactLocked() {
 	if c.compactDataStructuresLocked() {
