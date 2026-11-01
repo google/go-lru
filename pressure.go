@@ -680,20 +680,52 @@ func newEvictLabelRing() *[evictLabelRingSize]unsafe.Pointer {
 	return tags
 }
 
+type atomicPool[T any] struct {
+	slots [64]atomic.Pointer[T]
+	pool  sync.Pool
+}
+
+func (p *atomicPool[T]) Get() *T {
+	for i := range len(p.slots) {
+		if ptr := p.slots[i].Swap(nil); ptr != nil {
+			return ptr
+		}
+	}
+	return p.pool.Get().(*T)
+}
+
+func (p *atomicPool[T]) Put(ptr *T) {
+	if ptr == nil {
+		return
+	}
+	for i := range len(p.slots) {
+		if p.slots[i].Load() == nil && p.slots[i].CompareAndSwap(nil, ptr) {
+			return
+		}
+	}
+	p.pool.Put(ptr)
+}
+
 var (
-	goroutineStackBufPool = sync.Pool{
-		New: func() any {
-			return new([4096]byte)
+	goroutineStackBufPool = atomicPool[[4096]byte]{
+		pool: sync.Pool{
+			New: func() any {
+				return new([4096]byte)
+			},
 		},
 	}
-	allGoroutineStacksBufPool = sync.Pool{
-		New: func() any {
-			return new([16384]byte)
+	allGoroutineStacksBufPool = atomicPool[[16384]byte]{
+		pool: sync.Pool{
+			New: func() any {
+				return new([16384]byte)
+			},
 		},
 	}
-	goroutinesCreatedSamplePool = sync.Pool{
-		New: func() any {
-			return &[1]metrics.Sample{{Name: goroutinesCreatedMetric}}
+	goroutinesCreatedSamplePool = atomicPool[[1]metrics.Sample]{
+		pool: sync.Pool{
+			New: func() any {
+				return &[1]metrics.Sample{{Name: goroutinesCreatedMetric}}
+			},
 		},
 	}
 )
@@ -710,7 +742,7 @@ func readGoroutinesCreatedInto(samplePtr *[1]metrics.Sample) uint64 {
 }
 
 func readGoroutinesCreated() uint64 {
-	samplePtr := goroutinesCreatedSamplePool.Get().(*[1]metrics.Sample)
+	samplePtr := goroutinesCreatedSamplePool.Get()
 	val := readGoroutinesCreatedInto(samplePtr)
 	goroutinesCreatedSamplePool.Put(samplePtr)
 	return val
@@ -731,7 +763,7 @@ func parseDecimalUint64(b []byte) (uint64, int) {
 }
 
 func captureCurrentGoroutineStack() ([]byte, *[4096]byte) {
-	bufPtr := goroutineStackBufPool.Get().(*[4096]byte)
+	bufPtr := goroutineStackBufPool.Get()
 	n := runtime.Stack(bufPtr[:], false)
 	if n < len(bufPtr) {
 		return bufPtr[:n], bufPtr
@@ -776,7 +808,7 @@ func parseStackGoroutineParentAndCreator(stack []byte) (gid, parentGID uint64, c
 }
 
 func captureAllGoroutineStacks() ([]byte, *[16384]byte) {
-	bufPtr := allGoroutineStacksBufPool.Get().(*[16384]byte)
+	bufPtr := allGoroutineStacksBufPool.Get()
 	n := runtime.Stack(bufPtr[:], true)
 	if n < len(bufPtr) {
 		return bufPtr[:n], bufPtr
