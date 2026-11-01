@@ -13,12 +13,12 @@ This document details the internal data structures, concurrency models, and memo
 | **Per-Node Heap Allocations** | 1 allocation per new entry during growth (0 on update; capacity turnover in `Put` recycles evicted `*entry[V]` in-place via `recycledEntry`) | 1 allocation per node during growth (capacity turnover in `Put` recycles evicted `*radixNode[V]` in-place via `recycleNodes [2]*radixNode[V]`) | **0 node allocations** (recycled via intrusive free-list; prefixes stored in contiguous `prefixArena []byte` with `freePrefixSpans` reuse) |
 | **Node Pointer Width** | 64-bit pointers | 64-bit pointers (5 pointers / node) | **32-bit indices** (`uint32`, sentinel `nilNode = math.MaxUint32`) |
 | **Max Entry Capacity** | Memory / Heap limited | Memory / Heap limited | **`2^32 - 2` total arena nodes** (`0..math.MaxUint32-2`; `nilNode = MaxUint32`, `foregroundNoProtect = MaxUint32-1`) |
-| **Point Get Latency** | **~50 ns/op** (`O(1)` Hash Map) | ~170 ns/op (`O(K)` Trie Descent) | **~100 ns/op** (`O(1)` Seeded `maphash` Flat Hash Index + Zero-Alloc `keyLen` & Suffix Check) |
-| **Sequential Put Latency** | ~98 ns/op in-place (~383 ns/op turnover) | ~175 ns/op in-place (~472 ns/op turnover) | ~270 ns/op in-place (~515 ns/op turnover, 0 node allocs) |
-| **Point Replace Latency** | ~71 ns/op (0 allocs) | ~121 ns/op (0 allocs) | ~124 ns/op (0 allocs) |
-| **Prefix Delete (100 items)** | ~151.2–219.9 µs (`O(N)` full scan) | **~2.25–2.50 µs** (**65.7x–88.0x faster**) | **~7.3–7.6 µs** (**20.7x–28.9x faster**) |
-| **Prefix Delete (50K/100K items)** | ~21.6 ms | **~1.05 ms** (**20.5x faster**) | **~5.1 ms** (**4.2x faster**) |
-| **Live Heap Memory** | ~135.9 B/entry at 1M (~163.0 `heap-B/entry` at 100K) | **~94.2 B/entry at 1M** (~96.0 `heap-B/entry` at 100K, **~30.7%–41.1% reduction**) | **~106.9 B/entry at 1M** (~111.2 `heap-B/entry` at 100K, **~21.4%–31.8% reduction**) |
+| **Point Get Latency** | **~49 ns/op** (`O(1)` Hash Map; ~48–69 ns/op across depths) | ~178–194 ns/op (`O(K)` Trie Descent) | **~82–100 ns/op** (`O(1)` Seeded `maphash` Flat Hash Index + Zero-Alloc `keyLen` & Suffix Check) |
+| **Sequential Put Latency** | ~67–90 ns/op in-place (~243–321 ns/op turnover) | ~221–235 ns/op in-place (~373–438 ns/op turnover) | **~102–120 ns/op in-place** (~435–484 ns/op turnover, 0 node allocs) |
+| **Point Replace Latency** | **~54 ns/op** (0 allocs) | ~108 ns/op (0 allocs) | **~86 ns/op** (0 allocs) |
+| **Prefix Delete (100 items)** | ~93.7–106.4 µs (`O(N)` full scan) | **~2.48–2.63 µs** (**35.6x–42.9x faster**) | **~4.70–4.74 µs** (**19.9x–22.4x faster**) |
+| **Prefix Delete (50K/100K items)** | ~10.7 ms | **~1.39 ms** (**7.7x faster**) | **~3.49 ms** (**3.1x faster**) |
+| **Live Heap Memory** | ~135.8–199.8 B/entry at 1M (~115.0 `heap-B/entry` at 100K; ~293.4 `heap-B/entry` on 32K 187B Orbax paths) | ~111.5–113.1 B/entry at 1M (~96.0 `heap-B/entry` at 100K; ~145.4 `heap-B/entry` on 32K Orbax, **~16.5%–50.4% reduction**) | **~88.2–89.8 B/entry at 1M** (~78.9 `heap-B/entry` at 100K; ~162.1 `heap-B/entry` on 32K Orbax, **~31.4%–55.1% reduction**) |
 | **GC Pressure & Overhead** | High (millions of distinct heap objects) | Moderate (heap nodes with pointers) | **Ultra-Low** (flat slice; `arenaRadixNode[V]` is 100% pointer-free `noscan` for scalar/pointer-free `V`) |
 | **Telemetry & Introspection** | `Stats()` (`0 allocs/op`) + `otellru` (14 instruments) | `Stats()` (`0 allocs/op`) + `otellru` (14 instruments) | `Stats()` (`0 allocs/op`) + `otellru` (**16 instruments**, incl. arena node states & hash fallbacks) |
 | **Concurrency Lock** | `sync.RWMutex` | `sync.RWMutex` | `sync.RWMutex` |

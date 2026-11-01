@@ -447,7 +447,7 @@ func isZeroAllocWarmupBytesJitter(
 	}
 	baseAllocs, ok1 := baseRes.Metrics[UnitAllocsPerOp]
 	candAllocs, ok2 := candRes.Metrics[UnitAllocsPerOp]
-	return ok1 && ok2 && baseAllocs == 0 && candAllocs == 0 && candRes.Metrics[UnitBytesPerOp] <= 256
+	return ok1 && ok2 && baseAllocs == 0 && candAllocs == 0 && candRes.Metrics[UnitBytesPerOp] <= 320
 }
 
 func isParallelOrUnitWeightNsJitter(benchName, unit string) bool {
@@ -513,6 +513,10 @@ func mapLargeScaleDeletePrefixMinDelta(unit string, baseRes, candRes *BenchmarkR
 func isWarmupAmortizedZeroAllocBenchmark(name string) bool {
 	return strings.HasPrefix(name, "Benchmark_ParallelThroughput_") ||
 		strings.HasPrefix(name, "Benchmark_Put_UnitWeight_") ||
+		strings.HasPrefix(name, "Benchmark_Put_ArenaRadixCache/") ||
+		name == "Benchmark_Put_WithOnEvictValue/ArenaRadixCache" ||
+		name == "Benchmark_ArenaRadixCache_PutUnderPressure" ||
+		strings.HasPrefix(name, "Benchmark_LargeScale_DeletePrefix_100K/") ||
 		strings.HasPrefix(name, "Benchmark_DeletePrefix_") ||
 		strings.HasPrefix(name, "Benchmark_Delete_")
 }

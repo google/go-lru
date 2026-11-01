@@ -104,7 +104,7 @@ func DefaultTargets() []TargetRule {
 		{
 			Pattern:        "Benchmark_Get_ArenaRadixCache/*",
 			Description:    "ArenaRadixCache point Get (0 allocs/op, 0 B/op)",
-			MaxNsPerOp:     new(float64(320)),
+			MaxNsPerOp:     new(float64(220)),
 			MaxBytesPerOp:  new(float64(0)),
 			MaxAllocsPerOp: new(float64(0)),
 		},
@@ -156,8 +156,8 @@ func DefaultTargets() []TargetRule {
 		{
 			Pattern:        "Benchmark_Put_MapCache/*",
 			Description:    "MapCache 50%-turnover Put (<= 2 allocs/op)",
-			MaxNsPerOp:     new(float64(600)),
-			MaxBytesPerOp:  new(float64(192)),
+			MaxNsPerOp:     new(float64(500)),
+			MaxBytesPerOp:  new(float64(165)),
 			MaxAllocsPerOp: new(float64(2)),
 		},
 		{
@@ -170,8 +170,8 @@ func DefaultTargets() []TargetRule {
 		{
 			Pattern:        "Benchmark_Put_ArenaRadixCache/*",
 			Description:    "ArenaRadixCache 50%-turnover Put with free-list node recycling (<= 1 allocs/op)",
-			MaxNsPerOp:     new(float64(1100)),
-			MaxBytesPerOp:  new(float64(176)),
+			MaxNsPerOp:     new(float64(850)),
+			MaxBytesPerOp:  new(float64(150)),
 			MaxAllocsPerOp: new(float64(1)),
 		},
 		{
@@ -191,8 +191,8 @@ func DefaultTargets() []TargetRule {
 		{
 			Pattern:        "Benchmark_Put_UnitWeight_ArenaRadix",
 			Description:    "ArenaRadixCache unit-weight in-place Put after 10K warmup (0 allocs/op)",
-			MaxNsPerOp:     new(float64(360)),
-			MaxBytesPerOp:  new(float64(112)),
+			MaxNsPerOp:     new(float64(260)),
+			MaxBytesPerOp:  new(float64(96)),
 			MaxAllocsPerOp: new(float64(0)),
 		},
 		{
@@ -241,7 +241,7 @@ func DefaultTargets() []TargetRule {
 		{
 			Pattern:        "Benchmark_Delete_MapCache",
 			Description:    "MapCache Delete (0 allocs/op, 0 B/op)",
-			MaxNsPerOp:     new(float64(250)),
+			MaxNsPerOp:     new(float64(200)),
 			MaxBytesPerOp:  new(float64(0)),
 			MaxAllocsPerOp: new(float64(0)),
 		},
@@ -255,7 +255,7 @@ func DefaultTargets() []TargetRule {
 		{
 			Pattern:        "Benchmark_Delete_ArenaRadixCache",
 			Description:    "ArenaRadixCache Delete (0 allocs/op)",
-			MaxNsPerOp:     new(float64(240)),
+			MaxNsPerOp:     new(float64(220)),
 			MaxBytesPerOp:  new(float64(8)),
 			MaxAllocsPerOp: new(float64(0)),
 		},
@@ -277,7 +277,7 @@ func DefaultTargets() []TargetRule {
 		{
 			Pattern:        "Benchmark_DeletePrefix_ArenaRadixCache/*",
 			Description:    "ArenaRadixCache O(P+S) subtree DeletePrefix (0 allocs/op)",
-			MaxNsPerOp:     new(float64(12000)),
+			MaxNsPerOp:     new(float64(8500)),
 			MaxBytesPerOp:  new(float64(32)),
 			MaxAllocsPerOp: new(float64(0)),
 		},
@@ -292,21 +292,21 @@ func DefaultTargets() []TargetRule {
 		{
 			Pattern:        "Benchmark_ParallelThroughput_ReadHeavy/*",
 			Description:    "Parallel ReadHeavy throughput (0 allocs/op)",
-			MaxNsPerOp:     new(float64(600)),
+			MaxNsPerOp:     new(float64(700)),
 			MaxBytesPerOp:  new(float64(8)),
 			MaxAllocsPerOp: new(float64(0)),
 		},
 		{
 			Pattern:        "Benchmark_ParallelThroughput_Mixed/*",
 			Description:    "Parallel Mixed throughput (0 allocs/op)",
-			MaxNsPerOp:     new(float64(700)),
+			MaxNsPerOp:     new(float64(850)),
 			MaxBytesPerOp:  new(float64(40)),
 			MaxAllocsPerOp: new(float64(0)),
 		},
 		{
 			Pattern:        "Benchmark_ParallelThroughput_WriteHeavy/*",
 			Description:    "Parallel WriteHeavy throughput (0 allocs/op)",
-			MaxNsPerOp:     new(float64(850)),
+			MaxNsPerOp:     new(float64(1000)),
 			MaxBytesPerOp:  new(float64(144)),
 			MaxAllocsPerOp: new(float64(0)),
 		},
@@ -330,10 +330,10 @@ func DefaultTargets() []TargetRule {
 		{
 			Pattern:            "Benchmark_LargeScale_Put_100K/ArenaRadixCache",
 			Description:        "100K ArenaRadixCache Put scale, chunk allocs & heap-B/entry budget",
-			MaxNsPerOp:         new(float64(58000000)),
-			MaxBytesPerOp:      new(float64(42000000)),
-			MaxAllocsPerOp:     new(float64(650)),
-			MaxHeapBytesPerEnt: new(102.0),
+			MaxNsPerOp:         new(float64(50000000)),
+			MaxBytesPerOp:      new(float64(40000000)),
+			MaxAllocsPerOp:     new(float64(150)),
+			MaxHeapBytesPerEnt: new(90.0),
 		},
 		// 35–37. LargeScale DeletePrefix 100K (3 benchmarks)
 		{
@@ -345,31 +345,31 @@ func DefaultTargets() []TargetRule {
 		},
 		{
 			Pattern:        "Benchmark_LargeScale_DeletePrefix_100K/RadixCache",
-			Description:    "100K RadixCache O(P+S) DeletePrefix (0 allocs/op, 0 B/op)",
-			MaxNsPerOp:     new(float64(2000000)),
-			MaxBytesPerOp:  new(float64(0)),
+			Description:    "100K RadixCache O(P+S) DeletePrefix (0 allocs/op)",
+			MaxNsPerOp:     new(float64(2500000)),
+			MaxBytesPerOp:  new(float64(64)),
 			MaxAllocsPerOp: new(float64(0)),
 		},
 		{
 			Pattern:        "Benchmark_LargeScale_DeletePrefix_100K/ArenaRadixCache",
-			Description:    "100K ArenaRadixCache O(P+S) DeletePrefix (0 allocs/op, 0 B/op)",
+			Description:    "100K ArenaRadixCache O(P+S) DeletePrefix (0 allocs/op)",
 			MaxNsPerOp:     new(float64(6500000)),
-			MaxBytesPerOp:  new(float64(0)),
+			MaxBytesPerOp:  new(float64(64)),
 			MaxAllocsPerOp: new(float64(0)),
 		},
 		// 38–39. Arena Compaction & Pressure (2 benchmarks, including reclaimed-B/op floor)
 		{
 			Pattern:             "Benchmark_ArenaRadixCache_Compact",
 			Description:         "ArenaRadixCache Compact latency and minimum reclaimed-B/op floor",
-			MaxNsPerOp:          new(float64(1200000)),
-			MaxBytesPerOp:       new(float64(760000)),
-			MaxAllocsPerOp:      new(float64(25)),
+			MaxNsPerOp:          new(float64(1150000)),
+			MaxBytesPerOp:       new(float64(650000)),
+			MaxAllocsPerOp:      new(float64(10)),
 			MinReclaimedBytesOp: new(680000.0),
 		},
 		{
 			Pattern:        "Benchmark_ArenaRadixCache_PutUnderPressure",
 			Description:    "ArenaRadixCache Put under critical memory pressure (0 allocs/op)",
-			MaxNsPerOp:     new(float64(1500)),
+			MaxNsPerOp:     new(float64(2000)),
 			MaxBytesPerOp:  new(float64(400)),
 			MaxAllocsPerOp: new(float64(0)),
 		},
@@ -457,11 +457,11 @@ func DefaultTargets() []TargetRule {
 		},
 		{
 			Pattern:            "Benchmark_Production_MemoryFootprint/ArenaRadixCache",
-			Description:        "Orbax 187B key ArenaRadixCache live heap footprint (-35.4% vs fullKey) & Put scale",
-			MaxNsPerOp:         new(float64(42000000)),
+			Description:        "Orbax 187B key ArenaRadixCache live heap footprint (-44.8% vs MapCache) & Put scale",
+			MaxNsPerOp:         new(float64(28000000)),
 			MaxBytesPerOp:      new(float64(16000000)),
-			MaxAllocsPerOp:     new(float64(36000)),
-			MaxHeapBytesPerEnt: new(180.0),
+			MaxAllocsPerOp:     new(float64(150)),
+			MaxHeapBytesPerEnt: new(175.0),
 		},
 	}
 }

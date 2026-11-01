@@ -26,102 +26,102 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-const full89BenchmarkSampleOutput = `goos: linux
+const full92BenchmarkSampleOutput = `goos: linux
 goarch: amd64
 pkg: github.com/google/go-lru
 cpu: Intel(R) Xeon(R) CPU @ 2.60GHz
-Benchmark_Put_MapCache/Flat-96                                	  355476	       334.6 ns/op	     106 B/op	       2 allocs/op
-Benchmark_Put_MapCache/Nested_Depth2-96                       	  356649	       333.6 ns/op	     106 B/op	       2 allocs/op
-Benchmark_Put_MapCache/DeeplyNested_Depth10-96                	  286614	       411.6 ns/op	     163 B/op	       2 allocs/op
-Benchmark_Put_RadixCache/Flat-96                              	  231214	       478.8 ns/op	     119 B/op	       2 allocs/op
-Benchmark_Put_RadixCache/Nested_Depth2-96                     	  243220	       470.6 ns/op	     119 B/op	       2 allocs/op
-Benchmark_Put_RadixCache/DeeplyNested_Depth10-96              	  218532	       520.5 ns/op	     119 B/op	       2 allocs/op
-Benchmark_Put_ArenaRadixCache/Flat-96                         	  218076	       535.0 ns/op	      37 B/op	       1 allocs/op
-Benchmark_Put_ArenaRadixCache/Nested_Depth2-96                	  206865	       552.0 ns/op	      38 B/op	       1 allocs/op
-Benchmark_Put_ArenaRadixCache/DeeplyNested_Depth10-96         	  146055	       811.0 ns/op	      46 B/op	       1 allocs/op
-Benchmark_Put_UnitWeight_Map-96                               	  624321	        84.82 ns/op	       2 B/op	       0 allocs/op
-Benchmark_Put_UnitWeight_Radix-96                             	  274110	       210.2 ns/op	       4 B/op	       0 allocs/op
-Benchmark_Put_UnitWeight_ArenaRadix-96                        	  321954	       152.5 ns/op	      10 B/op	       0 allocs/op
-Benchmark_Get_MapCache/Flat-96                                	 1181358	        50.61 ns/op	       0 B/op	       0 allocs/op
-Benchmark_Get_MapCache/Nested_Depth2-96                       	 1200840	        49.82 ns/op	       0 B/op	       0 allocs/op
-Benchmark_Get_MapCache/DeeplyNested_Depth10-96                	  684912	        89.31 ns/op	       0 B/op	       0 allocs/op
-Benchmark_Get_RadixCache/Flat-96                              	  312084	       194.1 ns/op	       0 B/op	       0 allocs/op
-Benchmark_Get_RadixCache/Nested_Depth2-96                     	  318204	       191.3 ns/op	       0 B/op	       0 allocs/op
-Benchmark_Get_RadixCache/DeeplyNested_Depth10-96              	  290112	       207.3 ns/op	       0 B/op	       0 allocs/op
-Benchmark_Get_ArenaRadixCache/Flat-96                         	  574112	       104.6 ns/op	       0 B/op	       0 allocs/op
-Benchmark_Get_ArenaRadixCache/Nested_Depth2-96                	  518912	       115.7 ns/op	       0 B/op	       0 allocs/op
-Benchmark_Get_ArenaRadixCache/DeeplyNested_Depth10-96         	  310440	       193.3 ns/op	       0 B/op	       0 allocs/op
-Benchmark_Peek_MapCache-96                                    	 1471200	        40.79 ns/op	       0 B/op	       0 allocs/op
-Benchmark_Peek_RadixCache-96                                  	  328412	       182.9 ns/op	       0 B/op	       0 allocs/op
-Benchmark_Peek_ArenaRadixCache-96                             	  558102	       107.6 ns/op	       0 B/op	       0 allocs/op
-Benchmark_Replace_MapCache-96                                 	  841200	        71.33 ns/op	       0 B/op	       0 allocs/op
-Benchmark_Replace_RadixCache-96                               	  482100	       124.0 ns/op	       0 B/op	       0 allocs/op
-Benchmark_Replace_ArenaRadixCache-96                          	  464200	       129.3 ns/op	       0 B/op	       0 allocs/op
-Benchmark_Replace_UnitWeight_Map-96                           	  850120	        70.57 ns/op	       0 B/op	       0 allocs/op
-Benchmark_Replace_UnitWeight_Radix-96                         	  483120	       124.0 ns/op	       0 B/op	       0 allocs/op
-Benchmark_Replace_UnitWeight_ArenaRadix-96                    	  471200	       127.3 ns/op	       0 B/op	       0 allocs/op
-Benchmark_Delete_MapCache-96                                  	  536100	       111.9 ns/op	       0 B/op	       0 allocs/op
-Benchmark_Delete_RadixCache-96                                	  645120	        92.94 ns/op	       0 B/op	       0 allocs/op
-Benchmark_Delete_ArenaRadixCache-96                           	  347200	       172.7 ns/op	       4 B/op	       0 allocs/op
-Benchmark_DeletePrefix_MapCache/Flat-96                       	     648	     92650 ns/op	       0 B/op	       0 allocs/op
-Benchmark_DeletePrefix_MapCache/Nested_Depth2-96              	     652	     91958 ns/op	       0 B/op	       0 allocs/op
-Benchmark_DeletePrefix_MapCache/DeeplyNested_Depth10-96       	     570	    105221 ns/op	      23 B/op	       0 allocs/op
-Benchmark_DeletePrefix_RadixCache/Flat-96                     	   22074	      2718 ns/op	       0 B/op	       0 allocs/op
-Benchmark_DeletePrefix_RadixCache/Nested_Depth2-96            	   21960	      2732 ns/op	       3 B/op	       0 allocs/op
-Benchmark_DeletePrefix_RadixCache/DeeplyNested_Depth10-96     	   25030	      2397 ns/op	      14 B/op	       0 allocs/op
-Benchmark_DeletePrefix_ArenaRadixCache/Flat-96                	    9214	      6512 ns/op	       2 B/op	       0 allocs/op
-Benchmark_DeletePrefix_ArenaRadixCache/Nested_Depth2-96       	    9006	      6662 ns/op	       4 B/op	       0 allocs/op
-Benchmark_DeletePrefix_ArenaRadixCache/DeeplyNested_Depth10-96	    8712	      6887 ns/op	      15 B/op	       0 allocs/op
-Benchmark_ParallelThroughput_Mixed/MapCache-96                	  133890	       348.1 ns/op	      15 B/op	       0 allocs/op
-Benchmark_ParallelThroughput_Mixed/RadixCache-96              	  117808	       369.3 ns/op	      10 B/op	       0 allocs/op
-Benchmark_ParallelThroughput_Mixed/ArenaRadixCache-96         	  130236	       360.7 ns/op	      11 B/op	       0 allocs/op
-Benchmark_ParallelThroughput_ReadHeavy/MapCache-96            	  126956	       272.6 ns/op	       2 B/op	       0 allocs/op
-Benchmark_ParallelThroughput_ReadHeavy/RadixCache-96          	  122248	       290.8 ns/op	       2 B/op	       0 allocs/op
-Benchmark_ParallelThroughput_ReadHeavy/ArenaRadixCache-96     	  199468	       200.8 ns/op	       0 B/op	       0 allocs/op
-Benchmark_ParallelThroughput_WriteHeavy/MapCache-96           	  112296	       334.3 ns/op	      17 B/op	       0 allocs/op
-Benchmark_ParallelThroughput_WriteHeavy/RadixCache-96         	   79030	       419.2 ns/op	      11 B/op	       0 allocs/op
-Benchmark_ParallelThroughput_WriteHeavy/ArenaRadixCache-96    	  101574	       390.7 ns/op	      42 B/op	       0 allocs/op
-Benchmark_ParallelThroughput_PeekOnly/MapCache-96             	  773000	        77.62 ns/op	       0 B/op	       0 allocs/op
-Benchmark_ParallelThroughput_PeekOnly/RadixCache-96           	  992880	        60.43 ns/op	       0 B/op	       0 allocs/op
-Benchmark_ParallelThroughput_PeekOnly/ArenaRadixCache-96      	  891264	        67.32 ns/op	       0 B/op	       0 allocs/op
-Benchmark_LargeScale_Put_100K/MapCache-96                     	       2	  26089822 ns/op	       115.0 heap-B/entry	15016976 B/op	  200537 allocs/op
-Benchmark_LargeScale_Put_100K/RadixCache-96                   	       2	  27057244 ns/op	        96.01 heap-B/entry	 9627472 B/op	  100011 allocs/op
-Benchmark_LargeScale_Put_100K/ArenaRadixCache-96              	       2	  42164830 ns/op	        95.25 heap-B/entry	39295464 B/op	     575 allocs/op
-Benchmark_LargeScale_DeletePrefix_100K/MapCache-96            	       4	  11051200 ns/op	       0 B/op	       0 allocs/op
-Benchmark_LargeScale_DeletePrefix_100K/RadixCache-96          	      48	    970400 ns/op	       0 B/op	       0 allocs/op
-Benchmark_LargeScale_DeletePrefix_100K/ArenaRadixCache-96     	      15	   4081200 ns/op	       0 B/op	       0 allocs/op
-Benchmark_ArenaRadixCache_Compact-96                          	     102	    523567 ns/op	    816664 reclaimed-B/op	  713072 B/op	      20 allocs/op
-Benchmark_ArenaRadixCache_PutUnderPressure-96                 	   81850	       733.0 ns/op	     312 B/op	       0 allocs/op
-Benchmark_Put_WithOnEvictValue/MapCache-96                    	  172410	       348.0 ns/op	     105 B/op	       2 allocs/op
-Benchmark_Put_WithOnEvictValue/RadixCache-96                  	  115096	       521.3 ns/op	     119 B/op	       2 allocs/op
-Benchmark_Put_WithOnEvictValue/ArenaRadixCache-96             	  105188	       570.4 ns/op	      35 B/op	       1 allocs/op
-Benchmark_Put_WithOnEvictEntry/MapCache-96                    	  170988	       350.9 ns/op	     105 B/op	       2 allocs/op
-Benchmark_Put_WithOnEvictEntry/RadixCache-96                  	   97292	       616.7 ns/op	     142 B/op	       3 allocs/op
-Benchmark_Put_WithOnEvictEntry/ArenaRadixCache-96             	   94696	       633.6 ns/op	      59 B/op	       2 allocs/op
-Benchmark_Replace_WithOnEvictValue/MapCache-96                	  801280	        74.88 ns/op	       0 B/op	       0 allocs/op
-Benchmark_Replace_WithOnEvictValue/RadixCache-96              	  466200	       118.7 ns/op	       0 B/op	       0 allocs/op
-Benchmark_Replace_WithOnEvictValue/ArenaRadixCache-96         	  437600	       117.1 ns/op	       0 B/op	       0 allocs/op
-Benchmark_Replace_WithOnEvictEntry/MapCache-96                	  819784	        73.19 ns/op	       0 B/op	       0 allocs/op
-Benchmark_Replace_WithOnEvictEntry/RadixCache-96              	  473560	       116.7 ns/op	       0 B/op	       0 allocs/op
-Benchmark_Replace_WithOnEvictEntry/ArenaRadixCache-96         	  455236	       119.8 ns/op	       0 B/op	       0 allocs/op
-Benchmark_All_MapCache-96                                     	   24188	      2729 ns/op	       0 B/op	       0 allocs/op
-Benchmark_All_RadixCache-96                                   	     918	     65374 ns/op	   24000 B/op	    1000 allocs/op
-Benchmark_All_ArenaRadixCache-96                              	     905	     66292 ns/op	   24000 B/op	    1000 allocs/op
-Benchmark_Keys_MapCache-96                                    	   25012	      2297 ns/op	       0 B/op	       0 allocs/op
-Benchmark_Keys_RadixCache-96                                  	     938	     63981 ns/op	   24000 B/op	    1000 allocs/op
-Benchmark_Keys_ArenaRadixCache-96                             	     896	     66945 ns/op	   24000 B/op	    1000 allocs/op
-Benchmark_Values_MapCache-96                                  	   14752	      4067 ns/op	       0 B/op	       0 allocs/op
-Benchmark_Values_RadixCache-96                                	   13838	      4336 ns/op	       0 B/op	       0 allocs/op
-Benchmark_Values_ArenaRadixCache-96                           	   14574	      4117 ns/op	       0 B/op	       0 allocs/op
-Benchmark_Stats_MapCache/Sequential-96                        	  800210	        74.98 ns/op	       0 B/op	       0 allocs/op
-Benchmark_Stats_MapCache/Parallel-96                          	 1054112	        56.92 ns/op	       0 B/op	       0 allocs/op
-Benchmark_Stats_RadixCache/Sequential-96                      	  810264	        74.05 ns/op	       0 B/op	       0 allocs/op
-Benchmark_Stats_RadixCache/Parallel-96                        	 1087350	        55.18 ns/op	       0 B/op	       0 allocs/op
-Benchmark_Stats_ArenaRadixCache/Sequential-96                 	  785236	        76.41 ns/op	       0 B/op	       0 allocs/op
-Benchmark_Stats_ArenaRadixCache/Parallel-96                   	 1080692	        55.52 ns/op	       0 B/op	       0 allocs/op
-Benchmark_Production_MemoryFootprint/MapCache-96              	       1	  13523256 ns/op	       293.4 heap-B/entry	11386280 B/op	   65817 allocs/op
-Benchmark_Production_MemoryFootprint/RadixCache-96            	       1	  15010355 ns/op	       145.4 heap-B/entry	 4816504 B/op	   67102 allocs/op
-Benchmark_Production_MemoryFootprint/ArenaRadixCache-96       	       1	  26303578 ns/op	       165.9 heap-B/entry	14329400 B/op	   34114 allocs/op
+Benchmark_Put_MapCache/Flat-96                                	  264638	       249.6 ns/op	      42 B/op	       2 allocs/op
+Benchmark_Put_MapCache/Nested_Depth2-96                       	  289612	       257.8 ns/op	      42 B/op	       2 allocs/op
+Benchmark_Put_MapCache/DeeplyNested_Depth10-96                	  187424	       321.1 ns/op	      99 B/op	       2 allocs/op
+Benchmark_Put_RadixCache/Flat-96                              	  158702	       396.1 ns/op	      25 B/op	       2 allocs/op
+Benchmark_Put_RadixCache/Nested_Depth2-96                     	  159285	       400.1 ns/op	      25 B/op	       2 allocs/op
+Benchmark_Put_RadixCache/DeeplyNested_Depth10-96              	  152318	       433.3 ns/op	      26 B/op	       2 allocs/op
+Benchmark_Put_ArenaRadixCache/Flat-96                         	  122172	       447.5 ns/op	      30 B/op	       0 allocs/op
+Benchmark_Put_ArenaRadixCache/Nested_Depth2-96                	  129919	       445.1 ns/op	      30 B/op	       0 allocs/op
+Benchmark_Put_ArenaRadixCache/DeeplyNested_Depth10-96         	  126817	       484.3 ns/op	      30 B/op	       0 allocs/op
+Benchmark_Put_UnitWeight_Map-96                               	  728718	        68.79 ns/op	       2 B/op	       0 allocs/op
+Benchmark_Put_UnitWeight_Radix-96                             	  287838	       203.9 ns/op	       3 B/op	       0 allocs/op
+Benchmark_Put_UnitWeight_ArenaRadix-96                        	  453702	       116.3 ns/op	       6 B/op	       0 allocs/op
+Benchmark_Get_MapCache/Flat-96                                	 1245382	        48.94 ns/op	       0 B/op	       0 allocs/op
+Benchmark_Get_MapCache/Nested_Depth2-96                       	 1232906	        48.12 ns/op	       0 B/op	       0 allocs/op
+Benchmark_Get_MapCache/DeeplyNested_Depth10-96                	  750001	        69.33 ns/op	       0 B/op	       0 allocs/op
+Benchmark_Get_RadixCache/Flat-96                              	  284599	       185.4 ns/op	       0 B/op	       0 allocs/op
+Benchmark_Get_RadixCache/Nested_Depth2-96                     	  294753	       185.2 ns/op	       0 B/op	       0 allocs/op
+Benchmark_Get_RadixCache/DeeplyNested_Depth10-96              	  282874	       198.4 ns/op	       0 B/op	       0 allocs/op
+Benchmark_Get_ArenaRadixCache/Flat-96                         	  665546	        84.16 ns/op	       0 B/op	       0 allocs/op
+Benchmark_Get_ArenaRadixCache/Nested_Depth2-96                	  602142	       100.2 ns/op	       0 B/op	       0 allocs/op
+Benchmark_Get_ArenaRadixCache/DeeplyNested_Depth10-96         	  525322	       103.9 ns/op	       0 B/op	       0 allocs/op
+Benchmark_Peek_MapCache-96                                    	 1669360	        35.67 ns/op	       0 B/op	       0 allocs/op
+Benchmark_Peek_RadixCache-96                                  	  326901	       179.1 ns/op	       0 B/op	       0 allocs/op
+Benchmark_Peek_ArenaRadixCache-96                             	  652372	        85.22 ns/op	       0 B/op	       0 allocs/op
+Benchmark_Replace_MapCache-96                                 	  954112	        54.76 ns/op	       0 B/op	       0 allocs/op
+Benchmark_Replace_RadixCache-96                               	  547815	       107.9 ns/op	       0 B/op	       0 allocs/op
+Benchmark_Replace_ArenaRadixCache-96                          	  682686	        85.65 ns/op	       0 B/op	       0 allocs/op
+Benchmark_Replace_UnitWeight_Map-96                           	 1098070	        54.09 ns/op	       0 B/op	       0 allocs/op
+Benchmark_Replace_UnitWeight_Radix-96                         	  551451	       106.9 ns/op	       0 B/op	       0 allocs/op
+Benchmark_Replace_UnitWeight_ArenaRadix-96                    	  683961	        85.27 ns/op	       0 B/op	       0 allocs/op
+Benchmark_Delete_MapCache-96                                  	  515457	       111.0 ns/op	       0 B/op	       0 allocs/op
+Benchmark_Delete_RadixCache-96                                	  800307	        79.81 ns/op	       0 B/op	       0 allocs/op
+Benchmark_Delete_ArenaRadixCache-96                           	  396787	       149.4 ns/op	       4 B/op	       0 allocs/op
+Benchmark_DeletePrefix_MapCache/Flat-96                       	     637	     94729 ns/op	       0 B/op	       0 allocs/op
+Benchmark_DeletePrefix_MapCache/Nested_Depth2-96              	     650	     93748 ns/op	       0 B/op	       0 allocs/op
+Benchmark_DeletePrefix_MapCache/DeeplyNested_Depth10-96       	     570	    106419 ns/op	       0 B/op	       0 allocs/op
+Benchmark_DeletePrefix_RadixCache/Flat-96                     	   20422	      2841 ns/op	       0 B/op	       0 allocs/op
+Benchmark_DeletePrefix_RadixCache/Nested_Depth2-96            	   20250	      2964 ns/op	       3 B/op	       0 allocs/op
+Benchmark_DeletePrefix_RadixCache/DeeplyNested_Depth10-96     	   21032	      2688 ns/op	      14 B/op	       0 allocs/op
+Benchmark_DeletePrefix_ArenaRadixCache/Flat-96                	   12432	      4864 ns/op	       1 B/op	       0 allocs/op
+Benchmark_DeletePrefix_ArenaRadixCache/Nested_Depth2-96       	   12604	      4812 ns/op	       1 B/op	       0 allocs/op
+Benchmark_DeletePrefix_ArenaRadixCache/DeeplyNested_Depth10-96	   12475	      4823 ns/op	       1 B/op	       0 allocs/op
+Benchmark_ParallelThroughput_Mixed/MapCache-96                	  130876	       511.5 ns/op	      14 B/op	       0 allocs/op
+Benchmark_ParallelThroughput_Mixed/RadixCache-96              	  116593	       664.4 ns/op	       9 B/op	       0 allocs/op
+Benchmark_ParallelThroughput_Mixed/ArenaRadixCache-96         	  148051	       489.9 ns/op	      13 B/op	       0 allocs/op
+Benchmark_ParallelThroughput_ReadHeavy/MapCache-96            	  107302	       568.7 ns/op	       2 B/op	       0 allocs/op
+Benchmark_ParallelThroughput_ReadHeavy/RadixCache-96          	  164427	       494.9 ns/op	       2 B/op	       0 allocs/op
+Benchmark_ParallelThroughput_ReadHeavy/ArenaRadixCache-96     	  127917	       549.7 ns/op	       0 B/op	       0 allocs/op
+Benchmark_ParallelThroughput_WriteHeavy/MapCache-96           	  101486	       585.6 ns/op	      19 B/op	       0 allocs/op
+Benchmark_ParallelThroughput_WriteHeavy/RadixCache-96         	   82234	       747.6 ns/op	      14 B/op	       0 allocs/op
+Benchmark_ParallelThroughput_WriteHeavy/ArenaRadixCache-96    	  158835	       516.5 ns/op	      14 B/op	       0 allocs/op
+Benchmark_ParallelThroughput_PeekOnly/MapCache-96             	  739455	        77.81 ns/op	       0 B/op	       0 allocs/op
+Benchmark_ParallelThroughput_PeekOnly/RadixCache-96           	  845473	        70.21 ns/op	       0 B/op	       0 allocs/op
+Benchmark_ParallelThroughput_PeekOnly/ArenaRadixCache-96      	  925633	        63.58 ns/op	       0 B/op	       0 allocs/op
+Benchmark_LargeScale_Put_100K/MapCache-96                     	       2	  27190649 ns/op	       115.0 heap-B/entry	15017000 B/op	  200538 allocs/op
+Benchmark_LargeScale_Put_100K/RadixCache-96                   	       2	  26215560 ns/op	        96.03 heap-B/entry	 9627424 B/op	  100010 allocs/op
+Benchmark_LargeScale_Put_100K/ArenaRadixCache-96              	       2	  32823904 ns/op	        78.92 heap-B/entry	34659320 B/op	      62 allocs/op
+Benchmark_LargeScale_DeletePrefix_100K/MapCache-96            	       6	  10670921 ns/op	       0 B/op	       0 allocs/op
+Benchmark_LargeScale_DeletePrefix_100K/RadixCache-96          	      40	   1394869 ns/op	       0 B/op	       0 allocs/op
+Benchmark_LargeScale_DeletePrefix_100K/ArenaRadixCache-96     	      16	   3489437 ns/op	       0 B/op	       0 allocs/op
+Benchmark_ArenaRadixCache_Compact-96                          	     100	    505357 ns/op	    729144 reclaimed-B/op	  587008 B/op	       4 allocs/op
+Benchmark_ArenaRadixCache_PutUnderPressure-96                 	   51706	      1408 ns/op	     243 B/op	       0 allocs/op
+Benchmark_Put_WithOnEvictValue/MapCache-96                    	  247870	       306.2 ns/op	      43 B/op	       2 allocs/op
+Benchmark_Put_WithOnEvictValue/RadixCache-96                  	  140259	       495.1 ns/op	      26 B/op	       2 allocs/op
+Benchmark_Put_WithOnEvictValue/ArenaRadixCache-96             	  137508	       524.5 ns/op	      28 B/op	       0 allocs/op
+Benchmark_Put_WithOnEvictEntry/MapCache-96                    	  258296	       312.3 ns/op	      42 B/op	       2 allocs/op
+Benchmark_Put_WithOnEvictEntry/RadixCache-96                  	  129181	       568.9 ns/op	      49 B/op	       3 allocs/op
+Benchmark_Put_WithOnEvictEntry/ArenaRadixCache-96             	  129796	       632.1 ns/op	      52 B/op	       1 allocs/op
+Benchmark_Replace_WithOnEvictValue/MapCache-96                	  494034	       114.7 ns/op	       0 B/op	       0 allocs/op
+Benchmark_Replace_WithOnEvictValue/RadixCache-96              	  355470	       165.7 ns/op	       0 B/op	       0 allocs/op
+Benchmark_Replace_WithOnEvictValue/ArenaRadixCache-96         	  408204	       141.8 ns/op	       0 B/op	       0 allocs/op
+Benchmark_Replace_WithOnEvictEntry/MapCache-96                	  481054	       115.7 ns/op	       0 B/op	       0 allocs/op
+Benchmark_Replace_WithOnEvictEntry/RadixCache-96              	  354140	       166.5 ns/op	       0 B/op	       0 allocs/op
+Benchmark_Replace_WithOnEvictEntry/ArenaRadixCache-96         	  410338	       143.6 ns/op	       0 B/op	       0 allocs/op
+Benchmark_All_MapCache-96                                     	   15080	      3978 ns/op	       0 B/op	       0 allocs/op
+Benchmark_All_RadixCache-96                                   	    1213	     53382 ns/op	   24000 B/op	    1000 allocs/op
+Benchmark_All_ArenaRadixCache-96                              	    1099	     59765 ns/op	   24000 B/op	    1000 allocs/op
+Benchmark_Keys_MapCache-96                                    	   14859	      4020 ns/op	       0 B/op	       0 allocs/op
+Benchmark_Keys_RadixCache-96                                  	    1269	     53821 ns/op	   24000 B/op	    1000 allocs/op
+Benchmark_Keys_ArenaRadixCache-96                             	    1062	     61030 ns/op	   24000 B/op	    1000 allocs/op
+Benchmark_Values_MapCache-96                                  	   14641	      4096 ns/op	       0 B/op	       0 allocs/op
+Benchmark_Values_RadixCache-96                                	   13774	      4356 ns/op	       0 B/op	       0 allocs/op
+Benchmark_Values_ArenaRadixCache-96                           	   14412	      4158 ns/op	       0 B/op	       0 allocs/op
+Benchmark_Stats_MapCache/Sequential-96                        	  838533	        67.35 ns/op	       0 B/op	       0 allocs/op
+Benchmark_Stats_MapCache/Parallel-96                          	  818098	        72.86 ns/op	       0 B/op	       0 allocs/op
+Benchmark_Stats_RadixCache/Sequential-96                      	  870392	        67.23 ns/op	       0 B/op	       0 allocs/op
+Benchmark_Stats_RadixCache/Parallel-96                        	  828441	        72.14 ns/op	       0 B/op	       0 allocs/op
+Benchmark_Stats_ArenaRadixCache/Sequential-96                 	  904075	        66.20 ns/op	       0 B/op	       0 allocs/op
+Benchmark_Stats_ArenaRadixCache/Parallel-96                   	  926281	        65.08 ns/op	       0 B/op	       0 allocs/op
+Benchmark_Production_MemoryFootprint/MapCache-96              	       4	  16130198 ns/op	       293.4 heap-B/entry	11381834 B/op	   65817 allocs/op
+Benchmark_Production_MemoryFootprint/RadixCache-96            	       4	  14018621 ns/op	       145.4 heap-B/entry	 4819954 B/op	   67103 allocs/op
+Benchmark_Production_MemoryFootprint/ArenaRadixCache-96       	       4	  13804221 ns/op	       162.1 heap-B/entry	14993524 B/op	      56 allocs/op
 PASS
 ok  	github.com/google/go-lru	12.345s
 `
@@ -468,21 +468,25 @@ func TestCompareSuites_IgnoresNoisyMicroDeltasBelowMinimumFloor(t *testing.T) {
 	// Arrange
 	baseInput := `
 Benchmark_Get_MapCache/Flat-96                              	 1000000	        50.0 ns/op	       0 B/op	       0 allocs/op
+Benchmark_Put_ArenaRadixCache/Flat-96                       	  120000	       445.0 ns/op	      30 B/op	       0 allocs/op
+Benchmark_ArenaRadixCache_PutUnderPressure-96               	   51000	      1390.0 ns/op	     230 B/op	       0 allocs/op
 Benchmark_DeletePrefix_RadixCache/Flat-96                   	   22000	      2500.0 ns/op	       0 B/op	       0 allocs/op
 Benchmark_ParallelThroughput_WriteHeavy/ArenaRadixCache-96  	  101574	       590.0 ns/op	      42 B/op	       0 allocs/op
 Benchmark_LargeScale_DeletePrefix_100K/MapCache-96          	       2	   6142951.0 ns/op	       0 B/op	       0 allocs/op
 Benchmark_LargeScale_DeletePrefix_100K/RadixCache-96        	      16	    681404.5 ns/op	       0 B/op	       0 allocs/op
 Benchmark_LargeScale_DeletePrefix_100K/ArenaRadixCache-96   	       3	   4376141.5 ns/op	       0 B/op	       0 allocs/op
-Benchmark_ArenaRadixCache_Compact-96                        	      18	    519373.5 ns/op	  810000 reclaimed-B/op	  713072 B/op	      20 allocs/op
+Benchmark_ArenaRadixCache_Compact-96                        	      18	    519373.5 ns/op	  810000 reclaimed-B/op	  587008 B/op	       4 allocs/op
 `
 	candInput := `
 Benchmark_Get_MapCache/Flat-96                              	 1000000	        58.0 ns/op	       0 B/op	       0 allocs/op
+Benchmark_Put_ArenaRadixCache/Flat-96                       	   60000	       455.0 ns/op	      81 B/op	       0 allocs/op
+Benchmark_ArenaRadixCache_PutUnderPressure-96               	   30000	      1420.0 ns/op	     295 B/op	       0 allocs/op
 Benchmark_DeletePrefix_RadixCache/Flat-96                   	   21000	      2550.0 ns/op	       4 B/op	       0 allocs/op
 Benchmark_ParallelThroughput_WriteHeavy/ArenaRadixCache-96  	   65000	       620.0 ns/op	     130 B/op	       0 allocs/op
 Benchmark_LargeScale_DeletePrefix_100K/MapCache-96          	       1	  11011284.0 ns/op	     192 B/op	       2 allocs/op
-Benchmark_LargeScale_DeletePrefix_100K/RadixCache-96        	      14	    932033.0 ns/op	       0 B/op	       0 allocs/op
-Benchmark_LargeScale_DeletePrefix_100K/ArenaRadixCache-96   	       2	   5700000.0 ns/op	       0 B/op	       0 allocs/op
-Benchmark_ArenaRadixCache_Compact-96                        	      14	    736689.0 ns/op	  805000 reclaimed-B/op	  713072 B/op	      20 allocs/op
+Benchmark_LargeScale_DeletePrefix_100K/RadixCache-96        	      14	    932033.0 ns/op	      14 B/op	       0 allocs/op
+Benchmark_LargeScale_DeletePrefix_100K/ArenaRadixCache-96   	       2	   5700000.0 ns/op	      28 B/op	       0 allocs/op
+Benchmark_ArenaRadixCache_Compact-96                        	      14	    736689.0 ns/op	  805000 reclaimed-B/op	  587008 B/op	       4 allocs/op
 `
 	baseSuite, err := Parse(strings.NewReader(baseInput), AggregateMedian)
 	require.NoError(t, err)
@@ -590,7 +594,7 @@ Benchmark_Added-4   1000 100.0 ns/op 0 B/op 0 allocs/op
 
 func TestCheckTargets_DefaultTargetsCoverAllRepositoryBenchmarks(t *testing.T) {
 	// Arrange
-	suite, err := Parse(strings.NewReader(full89BenchmarkSampleOutput), AggregateMedian)
+	suite, err := Parse(strings.NewReader(full92BenchmarkSampleOutput), AggregateMedian)
 	require.NoError(t, err)
 	rules := DefaultTargets()
 
@@ -633,7 +637,7 @@ func TestCheckTargets_DetectsZeroAllocLatencyBytesAndCustomViolations(t *testing
 Benchmark_Get_MapCache/Flat-96                    	 1000000	        55.0 ns/op	       8 B/op	       1 allocs/op
 Benchmark_Peek_MapCache-96                        	  100000	       950.0 ns/op	       0 B/op	       0 allocs/op
 Benchmark_LargeScale_Put_100K/RadixCache-96       	       2	  27000000 ns/op	       185.0 heap-B/entry	 9627472 B/op	  100011 allocs/op
-Benchmark_ArenaRadixCache_Compact-96              	     100	    520000 ns/op	    200000 reclaimed-B/op	  718000 B/op	      20 allocs/op
+Benchmark_ArenaRadixCache_Compact-96              	     100	    520000 ns/op	    200000 reclaimed-B/op	  587008 B/op	       4 allocs/op
 `
 	suite, err := Parse(strings.NewReader(violatingInput), AggregateMedian)
 	require.NoError(t, err)
@@ -665,7 +669,7 @@ Benchmark_ArenaRadixCache_Compact-96              	     100	    520000 ns/op	   
 	assert.Equal(t, UnitReclaimedBytesOp, rep.Violations[4].Metric)
 
 	// Also verify missing required custom metric is flagged as a violation.
-	missingCustomInput := "Benchmark_ArenaRadixCache_Compact-96 100 520000 ns/op 718000 B/op 20 allocs/op\n"
+	missingCustomInput := "Benchmark_ArenaRadixCache_Compact-96 100 520000 ns/op 587008 B/op 4 allocs/op\n"
 	missingSuite, err := Parse(strings.NewReader(missingCustomInput), AggregateMedian)
 	require.NoError(t, err)
 	missingRep, err := CheckTargets(missingSuite, DefaultTargets(), false)
@@ -717,7 +721,7 @@ func TestLoadTargets_CustomJSONConfig(t *testing.T) {
 
 func TestCLI_EndToEndExitCodesAndStepSummary(t *testing.T) {
 	tmpDir := t.TempDir()
-	validDataPath := writeTempDataFile(t, tmpDir, "valid_run.golden", full89BenchmarkSampleOutput)
+	validDataPath := writeTempDataFile(t, tmpDir, "valid_run.golden", full92BenchmarkSampleOutput)
 
 	t.Run("exit 0 when targets and baseline comparison pass and writes step summary", func(t *testing.T) {
 		// Arrange
@@ -755,7 +759,7 @@ func TestCLI_EndToEndExitCodesAndStepSummary(t *testing.T) {
 		// Act
 		code := run(
 			[]string{"-format", "text", validDataPath, "-"},
-			strings.NewReader(full89BenchmarkSampleOutput),
+			strings.NewReader(full92BenchmarkSampleOutput),
 			&stdout,
 			&stderr,
 		)
@@ -769,8 +773,8 @@ func TestCLI_EndToEndExitCodesAndStepSummary(t *testing.T) {
 	t.Run("exit 1 when relative regression exceeds threshold", func(t *testing.T) {
 		// Arrange
 		regressedOutput := strings.Replace(
-			full89BenchmarkSampleOutput,
-			"Benchmark_Get_MapCache/Flat-96                                \t 1181358\t        50.61 ns/op\t       0 B/op\t       0 allocs/op",
+			full92BenchmarkSampleOutput,
+			"Benchmark_Get_MapCache/Flat-96                                \t 1245382\t        48.94 ns/op\t       0 B/op\t       0 allocs/op",
 			"Benchmark_Get_MapCache/Flat-96                                \t  500000\t       180.00 ns/op\t       0 B/op\t       0 allocs/op",
 			1,
 		)

@@ -6,6 +6,8 @@ on:
       - main
       - master
       - "feat/**"
+      - "perf/**"
+      - "fix/**"
     tags:
       - "v*"
   pull_request:
