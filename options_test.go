@@ -681,12 +681,15 @@ func TestDefaultRuntimePressureFunc(t *testing.T) {
 		_ = probeUnbounded()
 	}), 1e-9)
 
-	// Act & Assert 2: Configured 1 GiB GOMEMLIMIT returns positive normalized pressure in (0.0, 1.0).
+	// Act & Assert 2: Configured 1 GiB GOMEMLIMIT returns positive normalized pressure in (0.0, 1.0) in 0 allocs.
 	const oneGiB = int64(1 << 30)
 	debug.SetMemoryLimit(oneGiB)
 	pLimit := probeUnbounded()
 	assert.Greater(t, pLimit, 0.0)
 	assert.Less(t, pLimit, 1.0)
+	assert.InDelta(t, 0.0, testing.AllocsPerRun(50, func() {
+		_ = probeUnbounded()
+	}), 1e-9)
 
 	// Act & Assert 3: Custom MemoryBudget overrides GOMEMLIMIT and allocates 0 heap objects per call.
 	probeBudget512MB := DefaultRuntimePressureFunc(512 << 20)
@@ -707,6 +710,7 @@ func TestDefaultRuntimePressureFunc(t *testing.T) {
 	for range 16 {
 		wg.Go(func() {
 			for range 100 {
+				assert.Greater(t, probeUnbounded(), 0.0)
 				assert.Greater(t, probeBudget512MB(), 0.0)
 			}
 		})

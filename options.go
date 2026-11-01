@@ -140,24 +140,28 @@ type ShardFunc func(key string, numShards int) int
 // gomemlimitSamplePool pools 1-element runtime/metrics sample arrays so DefaultRuntimePressureFunc(0)
 // can check /gc/gomemlimit:bytes without acquiring runtime.metricsLock or sweeping per-P heap stats
 // when GOMEMLIMIT is unbounded.
-var gomemlimitSamplePool = sync.Pool{
-	New: func() any {
-		return &[1]metrics.Sample{
-			{Name: "/gc/gomemlimit:bytes"},
-		}
+var gomemlimitSamplePool = atomicPool[[1]metrics.Sample]{
+	pool: sync.Pool{
+		New: func() any {
+			return &[1]metrics.Sample{
+				{Name: "/gc/gomemlimit:bytes"},
+			}
+		},
 	},
 }
 
 // metricsSamplePool pools 4-element runtime/metrics sample arrays so DefaultRuntimePressureFunc
 // executes with 0 heap allocations per call (avoiding slice escape to heap in metrics.Read).
-var metricsSamplePool = sync.Pool{
-	New: func() any {
-		return &[4]metrics.Sample{
-			{Name: "/memory/classes/total:bytes"},
-			{Name: "/memory/classes/heap/released:bytes"},
-			{Name: "/memory/classes/heap/free:bytes"},
-			{Name: "/memory/classes/heap/objects:bytes"},
-		}
+var metricsSamplePool = atomicPool[[4]metrics.Sample]{
+	pool: sync.Pool{
+		New: func() any {
+			return &[4]metrics.Sample{
+				{Name: "/memory/classes/total:bytes"},
+				{Name: "/memory/classes/heap/released:bytes"},
+				{Name: "/memory/classes/heap/free:bytes"},
+				{Name: "/memory/classes/heap/objects:bytes"},
+			}
+		},
 	},
 }
 
@@ -551,7 +555,7 @@ func DefaultRuntimePressureFunc(memoryBudget uint64) PressureFunc {
 	return func() float64 {
 		limitBytes := memoryBudget
 		if limitBytes == 0 {
-			limitSample := gomemlimitSamplePool.Get().(*[1]metrics.Sample)
+			limitSample := gomemlimitSamplePool.Get()
 			metrics.Read(limitSample[:])
 			gomemlimit := limitSample[0].Value.Uint64()
 			gomemlimitSamplePool.Put(limitSample)
@@ -561,7 +565,7 @@ func DefaultRuntimePressureFunc(memoryBudget uint64) PressureFunc {
 			limitBytes = gomemlimit
 		}
 
-		samples := metricsSamplePool.Get().(*[4]metrics.Sample)
+		samples := metricsSamplePool.Get()
 		metrics.Read(samples[:])
 
 		totalBytes := samples[0].Value.Uint64()

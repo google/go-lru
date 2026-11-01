@@ -5029,3 +5029,122 @@ func TestPressure_DefaultProbeFastPathWindowAndCrossShardAdoption(t *testing.T) 
 		})
 	}
 }
+
+func TestPressure_AtomicPool(t *testing.T) {
+	t.Run("PutNilIsNoOp", func(t *testing.T) {
+		pool := atomicPool[[64]byte]{
+			pool: sync.Pool{
+				New: func() any {
+					return new([64]byte)
+				},
+			},
+		}
+
+		// Act: Put(nil) on an empty pool must not populate any slot or poison sync.Pool.
+		pool.Put(nil)
+		for i := range len(pool.slots) {
+			assert.Nil(t, pool.slots[i].Load(), "slot %d must remain nil after Put(nil)", i)
+		}
+
+		ptr := pool.Get()
+		require.NotNil(t, ptr)
+		ptr[0] = 42
+		pool.Put(ptr)
+		pool.Put(nil)
+
+		// Assert: Put(nil) with a populated slot preserves the existing entry and leaves other slots nil.
+		assert.Same(t, ptr, pool.slots[0].Load())
+		for i := 1; i < len(pool.slots); i++ {
+			assert.Nil(t, pool.slots[i].Load(), "slot %d must remain nil after Put(nil)", i)
+		}
+		got := pool.Get()
+		assert.Same(t, ptr, got)
+		assert.Equal(t, byte(42), got[0])
+		pool.Put(got)
+	})
+
+	t.Run("SlotSaturationOverflowToSyncPool", func(t *testing.T) {
+		var created atomic.Int32
+		pool := atomicPool[int]{
+			pool: sync.Pool{
+				New: func() any {
+					v := int(created.Add(1))
+					return &v
+				},
+			},
+		}
+
+		const total = len(pool.slots) + 16 // 80 > 64 slots
+		items := make([]*int, total)
+		seen := make(map[*int]struct{}, total)
+		for i := range total {
+			ptr := pool.Get()
+			require.NotNil(t, ptr)
+			seen[ptr] = struct{}{}
+			items[i] = ptr
+		}
+		assert.Len(t, seen, total, "simultaneously checked-out pointers must be distinct")
+		assert.Equal(t, int32(total), created.Load())
+
+		// Return all 80 items: the first 64 saturate pool.slots[0..63] and the remaining 16 overflow to pool.pool.Put.
+		for _, ptr := range items {
+			pool.Put(ptr)
+		}
+		for i := range len(pool.slots) {
+			assert.NotNil(t, pool.slots[i].Load(), "slot %d must be populated when saturated", i)
+		}
+
+		// Drain all 64 slots plus overflow items and verify valid pointers are returned.
+		reacquired := make([]*int, total)
+		for i := range total {
+			ptr := pool.Get()
+			require.NotNil(t, ptr)
+			assert.Positive(t, *ptr)
+			reacquired[i] = ptr
+		}
+		for i := range len(pool.slots) {
+			assert.Nil(t, pool.slots[i].Load(), "slot %d must be empty after draining", i)
+		}
+		for _, ptr := range reacquired {
+			pool.Put(ptr)
+		}
+	})
+
+	t.Run("ConcurrentGetPutAndZeroAllocsSteadyState", func(t *testing.T) {
+		pool := atomicPool[[256]byte]{
+			pool: sync.Pool{
+				New: func() any {
+					return new([256]byte)
+				},
+			},
+		}
+
+		const workers = 32
+		const iterations = 200
+		start := make(chan struct{})
+		var wg sync.WaitGroup
+		wg.Add(workers)
+		for g := range workers {
+			go func(id int) {
+				defer wg.Done()
+				<-start
+				for i := range iterations {
+					buf := pool.Get()
+					buf[0] = byte(id)
+					buf[255] = byte(i)
+					assert.Equal(t, byte(id), buf[0])
+					pool.Put(buf)
+				}
+			}(g)
+		}
+		close(start)
+		wg.Wait()
+
+		allocs := testing.AllocsPerRun(100, func() {
+			buf := pool.Get()
+			buf[0] = 1
+			pool.Put(buf)
+		})
+		assert.Zero(t, allocs, "steady-state atomicPool Get/Put must allocate 0 objects/op")
+	})
+}
