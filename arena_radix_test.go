@@ -1055,6 +1055,14 @@ func TestArenaRadixCache_CheckInvariants_PanicScenarios(t *testing.T) {
 		assert.Panics(t, func() { c.checkInvariants() })
 		c.livePrefixBytes = 4
 
+		// 1b. putPrefixSpan not flushed after Put (recyclingForPut == true or putPrefixSpan != prefixSpan{})
+		c.recyclingForPut = true
+		assert.PanicsWithValue(t, "arenaRadix invariant violation: putPrefixSpan not flushed after Put", func() { c.checkInvariants() })
+		c.recyclingForPut = false
+		c.putPrefixSpan = prefixSpan{off: 0, len: 2}
+		assert.PanicsWithValue(t, "arenaRadix invariant violation: putPrefixSpan not flushed after Put", func() { c.checkInvariants() })
+		c.putPrefixSpan = prefixSpan{}
+
 		// 2. Invalid freePrefixCount
 		c.freePrefixCount = -1
 		assert.Panics(t, func() { c.checkInvariants() })
@@ -3489,4 +3497,268 @@ func TestArenaRadix_DeleteFromHashSlotsFast_ZeroTag21Fallback(t *testing.T) {
 	cBulk.Compact()
 	assert.Len(t, cBulk.prefixArena, cBulk.livePrefixBytes)
 	assert.Zero(t, cBulk.freePrefixCount)
+}
+
+func TestArenaRadix_InPlaceSiblingPrefixCollapseAndPutPrefixSpanHandoff(t *testing.T) {
+	t.Run("InPlaceCollapseSurplusAndExactLengthPreservesHashTag", func(t *testing.T) {
+		c := NewArenaRadixCache[int](100, WithInvariantChecking(true)).(*arenaRadix[int])
+
+		// 1. Insert "dir/sub/longer_leaf" first, then split it with "dir/sub/short", plus a trailing key "zzz".
+		// After splitting, parent ("dir/sub/") and deadLeaf ("longer_leaf") are contiguous in prefixArena,
+		// with deadLeaf.prefixLen (11) > onlyChild.prefixLen (5).
+		_, err := c.Put("dir/sub/longer_leaf", 1)
+		require.NoError(t, err)
+		_, err = c.Put("dir/sub/short", 2)
+		require.NoError(t, err)
+		_, err = c.Put("zzz_sentinel", 3)
+		require.NoError(t, err)
+
+		shortID, ok := c.nodeMapGet(c.hashKey("dir/sub/short"))
+		require.True(t, ok)
+		tagBefore := c.nodes[shortID].hashTag21()
+		require.NotZero(t, tagBefore)
+
+		arenaLenBefore := len(c.prefixArena)
+		val, deleted := c.Delete("dir/sub/longer_leaf")
+		require.True(t, deleted)
+		assert.Equal(t, 1, val)
+
+		// Verify in-place collapse occurred without growing prefixArena and preserved shortID's hashTag21.
+		assert.Len(t, c.prefixArena, arenaLenBefore)
+		assert.Zero(t, int(c.nodes[shortID].prefixOff), "collapsed survivor must reuse parent's prefixOff 0 in-place")
+		assert.Equal(t, "dir/sub/short", c.nodePrefix(shortID))
+		assert.Equal(t, tagBefore, c.nodes[shortID].hashTag21())
+		assert.Equal(t, 1, c.freePrefixCount)
+		assert.Equal(t, prefixSpan{off: 13, len: 11}, c.freePrefixSpans[0])
+
+		v, ok := c.Get("dir/sub/short")
+		require.True(t, ok)
+		assert.Equal(t, 2, v)
+		assert.Zero(t, c.Stats().ArenaHashFallbacks)
+
+		// 2. Non-contiguous surplus + oldChildOff (extraLen > 0, extraOff+extraLen != oldChildOff):
+		// Insert a separator between the two siblings so extraOff and oldChildOff are released separately.
+		cSep := NewArenaRadixCache[int](100, WithInvariantChecking(true)).(*arenaRadix[int])
+		_, err = cSep.Put("dir/sub/longer_leaf", 1)
+		require.NoError(t, err)
+		_, err = cSep.Put("mid_separator_key", 2)
+		require.NoError(t, err)
+		_, err = cSep.Put("dir/sub/short", 3)
+		require.NoError(t, err)
+		_, ok = cSep.Delete("dir/sub/longer_leaf")
+		require.True(t, ok)
+		vSep, ok := cSep.Get("dir/sub/short")
+		require.True(t, ok)
+		assert.Equal(t, 3, vSep)
+
+		// 3. Exact-length sibling collapse (dead.prefixLen == onlyChild.prefixLen, extraLen == 0):
+		cEq := NewArenaRadixCache[int](100, WithInvariantChecking(true)).(*arenaRadix[int])
+		_, err = cEq.Put("eq/sub/alpha", 10)
+		require.NoError(t, err)
+		_, err = cEq.Put("eq/sub/bravo", 20)
+		require.NoError(t, err)
+		_, err = cEq.Put("zzz_sentinel", 30)
+		require.NoError(t, err)
+
+		bravoID, ok := cEq.nodeMapGet(cEq.hashKey("eq/sub/bravo"))
+		require.True(t, ok)
+		bravoTagBefore := cEq.nodes[bravoID].hashTag21()
+		require.NotZero(t, bravoTagBefore)
+
+		eqArenaLenBefore := len(cEq.prefixArena)
+		valEq, deletedEq := cEq.Delete("eq/sub/alpha")
+		require.True(t, deletedEq)
+		assert.Equal(t, 10, valEq)
+		assert.Len(t, cEq.prefixArena, eqArenaLenBefore)
+		assert.Zero(t, int(cEq.nodes[bravoID].prefixOff), "exact-length collapsed survivor must reuse parent's prefixOff 0 in-place")
+		assert.Equal(t, "eq/sub/bravo", cEq.nodePrefix(bravoID))
+		assert.Equal(t, bravoTagBefore, cEq.nodes[bravoID].hashTag21())
+		assert.Equal(t, 1, cEq.freePrefixCount)
+		assert.Equal(t, prefixSpan{off: 12, len: 5}, cEq.freePrefixSpans[0])
+
+		vEq, ok := cEq.Get("eq/sub/bravo")
+		require.True(t, ok)
+		assert.Equal(t, 20, vEq)
+		assert.Zero(t, cEq.Stats().ArenaHashFallbacks)
+	})
+
+	t.Run("InPlaceCollapseFallbackWhenExposedPinnedOrShorter", func(t *testing.T) {
+		// Case A: deadLeaf.prefixLen < onlyChild.prefixLen falls back to mergeNodePrefixesLocked.
+		cShort := NewArenaRadixCache[int](100, WithInvariantChecking(true)).(*arenaRadix[int])
+		_, err := cShort.Put("pfx/a", 1)
+		require.NoError(t, err)
+		_, err = cShort.Put("pfx/longer_child", 2)
+		require.NoError(t, err)
+		_, ok := cShort.Delete("pfx/a")
+		require.True(t, ok)
+		v, ok := cShort.Get("pfx/longer_child")
+		require.True(t, ok)
+		assert.Equal(t, 2, v)
+
+		// Case B: prefixExposed == true prevents in-place overwrite of a previously exposed depth-1 key.
+		cExposed := NewArenaRadixCache[int](100, WithInvariantChecking(true)).(*arenaRadix[int])
+		_, err = cExposed.Put("pfx/longer_dead", 10)
+		require.NoError(t, err)
+		var exposedKey string
+		for k := range cExposed.Keys() {
+			exposedKey = k
+		}
+		require.True(t, cExposed.prefixExposed.Load())
+		_, err = cExposed.Put("pfx/short", 20)
+		require.NoError(t, err)
+		_, ok = cExposed.Delete("pfx/longer_dead")
+		require.True(t, ok)
+		assert.Equal(t, "pfx/longer_dead", exposedKey, "zero-copy exposed key string must not be overwritten in-place")
+		v, ok = cExposed.Get("pfx/short")
+		require.True(t, ok)
+		assert.Equal(t, 20, v)
+
+		// Case C: prefixFlagPinned on parent prevents in-place overwrite.
+		cPinned := NewArenaRadixCache[int](100, WithInvariantChecking(true)).(*arenaRadix[int])
+		_, err = cPinned.Put("pfx/longer_dead", 100)
+		require.NoError(t, err)
+		_, err = cPinned.Put("pfx/short", 200)
+		require.NoError(t, err)
+		deadID, ok := cPinned.nodeMapGet(cPinned.hashKey("pfx/longer_dead"))
+		require.True(t, ok)
+		parentID := cPinned.nodes[deadID].parent
+		cPinned.nodes[parentID].prefixFlags |= prefixFlagPinned
+		_, ok = cPinned.Delete("pfx/longer_dead")
+		require.True(t, ok)
+		v, ok = cPinned.Get("pfx/short")
+		require.True(t, ok)
+		assert.Equal(t, 200, v)
+	})
+
+	t.Run("PutPrefixSpanHandoffCarveMultiEvictAndTailTrim", func(t *testing.T) {
+		c := NewArenaRadixCache[testData](30, WithInvariantChecking(true), testDataWeigher).(*arenaRadix[testData])
+
+		// Insert 3 entries of weight 10:
+		// 1. "A_medium_12b" (12B, LRU oldest)
+		// 2. "B_larger_prefix_20b!" (20B)
+		// 3. "C_tail_key" (10B, at the end of prefixArena)
+		_, err := c.Put("A_medium_12b", testData{value: 1, dataSize: 10})
+		require.NoError(t, err)
+		_, err = c.Put("B_larger_prefix_20b!", testData{value: 2, dataSize: 10})
+		require.NoError(t, err)
+		_, err = c.Put("C_tail_key", testData{value: 3, dataSize: 10})
+		require.NoError(t, err)
+
+		// Evict all 3 entries on a single Put of weight 30:
+		// - First eviction ("A_medium_12b") populates putPrefixSpan (len=12).
+		// - Second eviction ("B_larger_prefix_20b!") replaces putPrefixSpan (len=20 > 12) and flushes the 12B span.
+		// - Third eviction ("C_tail_key") abuts len(prefixArena), triggering trimFreePrefixSpansAtTailLocked
+		//   while putPrefixSpan holds [12, 32), which then trims the entire prefixArena down to 0!
+		evicted, err := c.Put("D_new_8b", testData{value: 4, dataSize: 30})
+		require.NoError(t, err)
+		assertEvictedValues(t, evicted, []int64{1, 2, 3})
+		assert.Equal(t, 1, c.len)
+		assert.Zero(t, c.freePrefixCount)
+		assert.Len(t, c.prefixArena, len("D_new_8b"))
+
+		// Now test putPrefixSpan partial carve + finishPutPrefixRecycleLocked remainder flush:
+		// Add a sentinel so the evicted key is not at the tail of prefixArena.
+		c2 := NewArenaRadixCache[testData](20, WithInvariantChecking(true), testDataWeigher).(*arenaRadix[testData])
+		_, err = c2.Put("A_twenty_bytes_key!!", testData{value: 10, dataSize: 10})
+		require.NoError(t, err)
+		_, err = c2.Put("B_sentinel_keep", testData{value: 20, dataSize: 10})
+		require.NoError(t, err)
+
+		// Putting a 12-byte key of weight 10 evicts "A_twenty_bytes_key!!" (20B), carves 12B from putPrefixSpan,
+		// and flushes the remaining 8B to freePrefixSpans.
+		evicted, err = c2.Put("C_twelve_key", testData{value: 30, dataSize: 10})
+		require.NoError(t, err)
+		assertEvictedValues(t, evicted, []int64{10})
+		assert.Equal(t, 1, c2.freePrefixCount)
+		assert.Equal(t, prefixSpan{off: 12, len: 8}, c2.freePrefixSpans[0])
+
+		// Also test interior putPrefixSpan preservation during trimFreePrefixSpansAtTailLocked when another key is between them:
+		c3 := NewArenaRadixCache[testData](30, WithInvariantChecking(true), testDataWeigher).(*arenaRadix[testData])
+		_, err = c3.Put("1_first_10", testData{value: 1, dataSize: 10})
+		require.NoError(t, err)
+		_, err = c3.Put("2_keep_mid", testData{value: 2, dataSize: 10})
+		require.NoError(t, err)
+		_, err = c3.Put("3_tail_end", testData{value: 3, dataSize: 10})
+		require.NoError(t, err)
+		// Promote "2_keep_mid" so LRU eviction order is "1_first_10" (sets interior putPrefixSpan [0, 10))
+		// then "3_tail_end" (trims tail [20, 30) while preserving interior putPrefixSpan [0, 10) for insertNode).
+		_, ok := c3.Get("2_keep_mid")
+		require.True(t, ok)
+
+		evicted, err = c3.Put("4_reuse_10", testData{value: 4, dataSize: 20})
+		require.NoError(t, err)
+		assertEvictedValues(t, evicted, []int64{1, 3})
+		assert.Zero(t, c3.freePrefixCount)
+		assert.Len(t, c3.prefixArena, 20)
+		reuseID, ok := c3.nodeMapGet(c3.hashKey("4_reuse_10"))
+		require.True(t, ok)
+		assert.Zero(t, int(c3.nodes[reuseID].prefixOff), "preserved interior putPrefixSpan [0, 10) must be consumed by insertNode")
+		vMid, ok := c3.Get("2_keep_mid")
+		require.True(t, ok)
+		assert.Equal(t, int64(2), vMid.value)
+
+		// Also test second-pass tail trim where trimming a freePrefixSpan exposes putPrefixSpan at the new tail:
+		c3b := NewArenaRadixCache[testData](30, WithInvariantChecking(true), testDataWeigher).(*arenaRadix[testData])
+		_, err = c3b.Put("1_larger_20_bytes!!!", testData{value: 1, dataSize: 10})
+		require.NoError(t, err)
+		_, err = c3b.Put("2_medium_12b", testData{value: 2, dataSize: 10})
+		require.NoError(t, err)
+		_, err = c3b.Put("3_tail_10b", testData{value: 3, dataSize: 10})
+		require.NoError(t, err)
+		// Delete "2_medium_12b" while "3_tail_10b" is at the tail so [20, 32) is recorded in freePrefixSpans.
+		_, ok = c3b.Delete("2_medium_12b")
+		require.True(t, ok)
+		require.Equal(t, 1, c3b.freePrefixCount)
+		// Evict both remaining entries: "1_larger_20_bytes!!!" sets putPrefixSpan=[0, 20);
+		// "3_tail_10b" trims [32, 42), pass 1 trims freePrefixSpans [20, 32), and pass 2 trims putPrefixSpan [0, 20).
+		evicted, err = c3b.Put("4_new_key", testData{value: 4, dataSize: 30})
+		require.NoError(t, err)
+		assertEvictedValues(t, evicted, []int64{1, 3})
+		assert.Zero(t, c3b.freePrefixCount)
+		assert.Len(t, c3b.prefixArena, len("4_new_key"))
+
+		// Test putPrefixSpan coalescing in both directions when two adjacent spans are released during pre-Put eviction:
+		// 1. Forward coalescing (putPrefixSpan.off + putPrefixSpan.len == rawOff):
+		c4 := NewArenaRadixCache[testData](30, WithInvariantChecking(true), testDataWeigher).(*arenaRadix[testData])
+		_, err = c4.Put("A_first_10", testData{value: 1, dataSize: 10})
+		require.NoError(t, err)
+		_, err = c4.Put("B_next__10", testData{value: 2, dataSize: 10})
+		require.NoError(t, err)
+		_, err = c4.Put("C_keep__10", testData{value: 3, dataSize: 10})
+		require.NoError(t, err)
+
+		// Evicts "A_first_10" ([0, 10)) then "B_next__10" ([10, 20)), coalescing into putPrefixSpan [0, 20)
+		// which is consumed in full by "D_coalesced_20_bytes".
+		evicted, err = c4.Put("D_coalesced_20_bytes", testData{value: 4, dataSize: 20})
+		require.NoError(t, err)
+		assertEvictedValues(t, evicted, []int64{1, 2})
+		assert.Zero(t, c4.freePrefixCount)
+		assert.Len(t, c4.prefixArena, 30)
+		dID, ok := c4.nodeMapGet(c4.hashKey("D_coalesced_20_bytes"))
+		require.True(t, ok)
+		assert.Zero(t, int(c4.nodes[dID].prefixOff))
+
+		// 2. Backward coalescing (rawOff + rawLen == putPrefixSpan.off):
+		c5 := NewArenaRadixCache[testData](30, WithInvariantChecking(true), testDataWeigher).(*arenaRadix[testData])
+		_, err = c5.Put("A_first_10", testData{value: 1, dataSize: 10})
+		require.NoError(t, err)
+		_, err = c5.Put("B_next__10", testData{value: 2, dataSize: 10})
+		require.NoError(t, err)
+		_, err = c5.Put("C_keep__10", testData{value: 3, dataSize: 10})
+		require.NoError(t, err)
+		// Promote "A_first_10" and "C_keep__10" so LRU eviction order is "B_next__10" ([10, 20)) then "A_first_10" ([0, 10)).
+		_, ok = c5.Get("A_first_10")
+		require.True(t, ok)
+		_, ok = c5.Get("C_keep__10")
+		require.True(t, ok)
+
+		evicted, err = c5.Put("E_coalesced_20_bytes", testData{value: 5, dataSize: 20})
+		require.NoError(t, err)
+		assertEvictedValues(t, evicted, []int64{2, 1})
+		assert.Zero(t, c5.freePrefixCount)
+		assert.Len(t, c5.prefixArena, 30)
+		eID, ok := c5.nodeMapGet(c5.hashKey("E_coalesced_20_bytes"))
+		require.True(t, ok)
+		assert.Zero(t, int(c5.nodes[eID].prefixOff))
+	})
 }
