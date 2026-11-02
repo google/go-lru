@@ -10,6 +10,32 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ---
 
+## [1.2.0] - 2026-11-02
+
+### Added
+- **Production Orbax Memory Footprint Benchmark & Target-Bounded Regression Verification (`cmd/benchcheck`)**:
+  - Added `Benchmark_Production_MemoryFootprint` measuring live `heap-B/entry` across `MapCache`, `RadixCache`, and `ArenaRadixCache` at 32K 187-byte production Orbax checkpoint paths (#24).
+  - Extended `./cmd/benchcheck` with `-allow-within-targets` (default `true`) and calibrated low-iteration noise floors across all 92 target-enforced `Benchmark_*` sub-benchmarks (#24, #25, #30).
+
+### Changed
+- **`ArenaRadixCache` Contiguous `prefixArena`, Open-Addressed `hashSlots`, and `hash/maphash` Lookup & Compaction Engine**:
+  - Replaced per-node `string` headers and `map[uint64]uint32` node index with a contiguous `prefixArena []byte` (managed via a 32-slot `freePrefixSpans` table and 1-slot `putPrefixSpan` eviction handoff) and an open-addressed flat hash table `hashSlots []arenaHashSlot` indexed by seeded 64-bit `hash/maphash` (`arenaHashTag` + Robin Hood backshift deletion), shrinking `arenaRadixNode[V]` to 48 bytes (for 8-byte `V`) and making it 100% pointer-free (`noscan`) for scalar/pointer-free value types (#23, #24, #25, #28).
+  - Packed a 21-bit `hashTag` and 17-bit saturating full-key byte length (`keyLen`) into `arenaRadixNode`, enabling `O(1)` length rejection and zero-allocation backward suffix verification (`verifyKey`), single-pass key reconstruction (`reconstructKey`), inlined `hashSlots` probe loops across `Get`/`Peek`/`Put`/`Replace` lookup helpers, single-walk sibling-chain insertion/splitting (`findChildWithPrev` / `linkChildAt`), and in-place parent-sibling prefix collapsing (`tryCollapseSiblingPrefixInPlaceLocked`) (#24, #25, #28, #31).
+  - Added `compactHashSlotsLocked` fast path in `ArenaRadixCache.Compact()` to remap or re-index `hashSlots` directly via `slot.tag` when `collisionCount == 0` (~2x faster `Compact()` and up to 1.37x faster Tier 2 pressure shedding) (#29).
+- **In-Place Node Recycling on Capacity Turnover & Single-Hash Sharded Routing**:
+  - Added steady-state capacity-turnover node recycling in `MapCache` (`recycledEntry`) and `RadixCache` (`recycleNodes [2]*radixNode[V]`) to reuse evicted node structs in-place during `Put` (#25).
+  - Switched `DefaultShardFunc` to seeded 64-bit `hash/maphash` and added single-hash `arenaShards` routing in `ShardedCache` (`arenaShardAndHash` -> `*WithHash`) so sharded `BackendArenaRadix` point operations hash each key once (#23, #25).
+- **Zero-RMW Amortized Pressure Sampling (`lockWithPressure`)**:
+  - Eliminated pre-lock atomic RMW operations on the 255/256 cached-write fast path in `lockWithPressure` by tracking per-shard write sequences (`localWriteSeq` / `windowSampleDue`) under `mu.Lock()` and adopting coordinator samples via seqlock reads (#26).
+- **CI & Documentation Updates**:
+  - Upgraded GitHub Actions workflow dependencies and synchronized architecture and performance documentation with empirical benchmarks (#27, #30).
+
+### Fixed
+- **Lock-Free `atomicPool` Fronting for Zero-Allocation Stack & Runtime Metrics Pools Under `-race`**:
+  - Fronted stack-dump and `runtime/metrics` sample pools (`metricsSamplePool`, `gomemlimitSamplePool`, `stackBufPool`) with a 64-slot lock-free `atomicPool` (using a TTAS `Load() != nil` pre-check before `Swap(nil)`) backed by `sync.Pool`, preventing Go's race detector from randomly dropping 25% of pooled buffers in `sync.Pool.Put` (#32).
+
+---
+
 ## [1.1.0] - 2026-10-27
 
 ### Added
@@ -80,7 +106,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## Release & Versioning Workflow
 
-To cut a new semantic version release (e.g. `v1.1.0` and `otellru/v1.1.0`):
+To cut a new semantic version release (e.g. `v1.2.0` and `otellru/v1.2.0`):
 
 ```bash
 # 1. Verify formatting, static analysis, race-enabled test suite, and examples (root and otellru)
@@ -96,9 +122,9 @@ go test -v -run=^Example ./...
 go test -run=^$ -bench=. -benchmem -benchtime=10ms ./...
 (cd otellru && go test -run=^$ -bench=. -benchmem -benchtime=10ms ./...)
 
-# 3. Update otellru/go.mod to require github.com/google/go-lru v1.1.0 (if releasing together),
+# 3. Update otellru/go.mod to require github.com/google/go-lru v1.2.0 (if releasing together),
 #    then create and push annotated semantic version tags
-git tag -a v1.1.0 -m "Release v1.1.0"
-git tag -a otellru/v1.1.0 -m "Release otellru/v1.1.0"
+git tag -a v1.2.0 -m "Release v1.2.0"
+git tag -a otellru/v1.2.0 -m "Release otellru/v1.2.0"
 git push origin --tags
 ```
